@@ -1,0 +1,50 @@
+installers:
+  codex:
+    supported: true
+    manager: npm
+    command: [npm, install, -g, "@openai/codex"]
+    verify_command: [codex, --version]
+    docs_url: https://help.openai.com/en/articles/11096431
+    notes: Installs OpenAI Codex CLI via npm.
+  claude-code:
+    supported: true
+    manager: npm
+    command: [npm, install, -g, "@anthropic-ai/claude-code"]
+    verify_command: [claude, --version]
+    docs_url: https://docs.claude.com/en/docs/claude-code/setup
+    notes: Installs Anthropic Claude Code via npm.
+  qwen:
+    supported: true
+    manager: npm
+    command: [npm, install, -g, "@qwen-code/qwen-code@latest"]
+    verify_command: [qwen, --version]
+    docs_url: https://qwenlm.github.io/qwen-code-docs/en/users/overview
+    notes: Installs Qwen Code via npm.
+  kimi:
+    supported: true
+    manager: npm
+    command: [npm, install, -g, "@moonshot-ai/kimi-code@latest"]
+    verify_command: [kimi, --version]
+    docs_url: https://www.kimi.com/code/docs/en/kimi-code-cli/getting-started.html
+    notes: Installs Kimi Code via npm. Kimi's official script installer is also available upstream.
+  mock:
+    supported: false
+    manager: builtin
+    command: []
+    verify_command: []
+    docs_url: ""
+    notes: MockProvider is built into muxdev and does not need installation.
+  trae:
+    supported: false
+    manager: manual
+    command: []
+    verify_command: []
+    docs_url: ""
+    notes: Trae is kept as a manual/experimental provider in M0.
+  antigravity:
+    supported: false
+    manager: manual
+    command: []
+    verify_command: []
+    docs_url: ""
+    notes: Antigravity is kept as a manual/experimental provider in M0.

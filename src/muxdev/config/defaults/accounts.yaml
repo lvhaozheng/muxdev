@@ -1,0 +1,43 @@
+accounts:
+  mock:
+    required: false
+    signup_url: ""
+    docs_url: ""
+    login_command: ""
+    notes: MockProvider is local and deterministic; no account is required.
+  codex:
+    required: true
+    signup_url: https://chatgpt.com/
+    docs_url: https://help.openai.com/en/articles/11381614-api-codex-cli-and-sign-in-with-chatgpt
+    login_command: codex login
+    notes: Use a ChatGPT account to sign in to Codex CLI.
+  claude-code:
+    required: true
+    signup_url: https://claude.ai/
+    docs_url: https://code.claude.com/docs/en/quickstart
+    login_command: claude
+    notes: Claude Code requires a Claude account; follow the first-run login flow.
+  qwen:
+    required: true
+    signup_url: https://modelstudio.console.alibabacloud.com/
+    docs_url: https://qwenlm.github.io/qwen-code-docs/en/users/configuration/auth/
+    login_command: qwen auth
+    notes: Qwen Code authentication can use Alibaba Cloud Coding Plan or API key options.
+  kimi:
+    required: true
+    signup_url: https://www.kimi.com/
+    docs_url: https://www.kimi.com/code/docs/en/kimi-code-cli/getting-started.html
+    login_command: kimi login
+    notes: Kimi Code supports Kimi OAuth or Moonshot AI Open Platform API key login.
+  trae:
+    required: true
+    signup_url: https://www.trae.ai/
+    docs_url: https://www.trae.ai/
+    login_command: ""
+    notes: Trae is manual/experimental in M0; follow the official product login flow.
+  antigravity:
+    required: true
+    signup_url: https://antigravity.google/
+    docs_url: https://antigravity.google/
+    login_command: ""
+    notes: Antigravity is manual/experimental in M0; follow the official product login flow.

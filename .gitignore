@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.pyc.*
+*.egg-info/
+*.sqlite
+*.sqlite-journal
+.pytest_cache/
+.muxdev/
+.test_workspaces/
+*.egg-info/
+src/*.egg-info/
+pytest-cache-files-*/

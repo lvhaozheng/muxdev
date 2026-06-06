@@ -1,0 +1,71 @@
+providers:
+  mock:
+    mode: builtin
+    commands: [mock]
+    status_hint: P0
+    probe: mock
+    notes: built-in deterministic provider for workflow and matrix tests
+    runtime:
+      kind: mock
+  codex:
+    mode: local CLI
+    commands: [codex]
+    status_hint: P0
+    probe: codex
+    runtime:
+      kind: headless_cli
+      command:
+        - codex
+        - --ask-for-approval
+        - never
+        - exec
+        - --json
+        - --skip-git-repo-check
+        - --sandbox
+        - workspace-write
+      prompt_template: "You are running muxdev stage '{stage_id}'. Keep output concise. If you modify files, stay inside the current workspace. Task: {task}"
+  claude-code:
+    mode: local CLI
+    commands: [claude, claude-code]
+    status_hint: P0/P1
+    probe: generic
+    runtime:
+      kind: headless_cli
+      command: [claude, -p]
+      prompt_template: "You are running muxdev stage '{stage_id}'. Keep output concise. If you modify files, stay inside the current workspace. Task: {task}"
+  qwen:
+    mode: local CLI
+    commands: [qwen]
+    status_hint: P0/P1
+    probe: generic
+    runtime:
+      kind: headless_cli
+      command: [qwen, --bare, --approval-mode, auto, --output-format, stream-json, -p]
+      prompt_template: "You are running muxdev stage '{stage_id}'. Keep output concise. If you modify files, stay inside the current workspace. Task: {task}"
+  kimi:
+    mode: local CLI
+    commands: [kimi]
+    status_hint: P2
+    probe: generic
+    runtime:
+      kind: headless_cli
+      command: [kimi]
+      prompt_template: "You are running muxdev stage '{stage_id}'. Keep output concise. If you modify files, stay inside the current workspace. Task: {task}"
+  trae:
+    mode: IDE/shell
+    commands: [trae]
+    status_hint: P2
+    probe: generic
+    runtime:
+      kind: headless_cli
+      command: [trae]
+      prompt_template: "You are running muxdev stage '{stage_id}'. Keep output concise. If you modify files, stay inside the current workspace. Task: {task}"
+  antigravity:
+    mode: beta
+    commands: [antigravity]
+    status_hint: P2
+    probe: generic
+    runtime:
+      kind: headless_cli
+      command: [antigravity]
+      prompt_template: "You are running muxdev stage '{stage_id}'. Keep output concise. If you modify files, stay inside the current workspace. Task: {task}"

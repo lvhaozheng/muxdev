@@ -1,0 +1,27 @@
+ui:
+  slash_commands:
+    /help: Show TUI commands
+    /refresh: Refresh dashboard
+    /run: Start a mock workflow task
+    /continue: Continue latest task
+    /report: Show latest report
+    /trace: Show recent trace events
+    /providers: List provider status
+    /provider doctor: Inspect one provider
+    /agents: List role/provider assignments
+    /skills: List installed skills
+    /skill install: Install a local skill
+    /usage: Show usage totals
+    /new: Create a muxdev project
+    /approvals: List pending approvals
+    /approve: Approve an approval id
+    /deny: Deny an approval id
+    /repl: Open the muxdev REPL in another shell
+    /quit: Exit TUI
+    "!shell": Evaluate a shell command against policy
+  quick_commands:
+    run: muxdev dev "task" --provider mock
+    continue: muxdev continue latest
+    trace: muxdev trace view latest
+    report: muxdev report latest
+    attach: muxdev tui latest --attach implementer

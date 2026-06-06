@@ -1,0 +1,1 @@
+"""Bundled muxdev default configuration."""

@@ -1,0 +1,116 @@
+workflows:
+  dev:
+    name: dev
+    max_parallel: 1
+    stages:
+      - id: plan
+        role: plan
+        deps: []
+        read_only: true
+        output_schema: PlanArtifact
+      - id: approve_plan
+        type: human_gate
+        deps: [plan]
+      - id: code
+        role: code
+        deps: [approve_plan]
+        allow_write: true
+        checkpoint: true
+      - id: test
+        role: test
+        deps: [code]
+        allow_shell: true
+        output_schema: TestResult
+      - id: review
+        role: review
+        deps: [test]
+        read_only: true
+        output_schema: ReviewResult
+      - id: fix
+        role: code
+        deps: [review]
+        when: review.has_blockers && loop < 2
+        allow_write: true
+        max_loops: 2
+  fix:
+    name: fix
+    max_parallel: 1
+    stages:
+      - id: code
+        role: code
+        deps: []
+        allow_write: true
+        checkpoint: true
+      - id: test
+        role: test
+        deps: [code]
+        allow_shell: true
+        output_schema: TestResult
+      - id: review
+        role: review
+        deps: [test]
+        read_only: true
+        output_schema: ReviewResult
+  review:
+    name: review
+    max_parallel: 1
+    stages:
+      - id: review
+        role: review
+        deps: []
+        read_only: true
+        output_schema: ReviewResult
+  test:
+    name: test
+    max_parallel: 1
+    stages:
+      - id: test
+        role: test
+        deps: []
+        allow_shell: true
+        output_schema: TestResult
+  docs:
+    name: docs
+    max_parallel: 1
+    stages:
+      - id: docs
+        role: docs
+        deps: []
+        allow_write: true
+      - id: review
+        role: review
+        deps: [docs]
+        read_only: true
+  software-dev:
+    name: software-dev
+    max_parallel: 1
+    stages:
+      - id: design
+        role: architect
+        deps: []
+        read_only: true
+        output_schema: PlanArtifact
+      - id: approve_plan
+        type: human_gate
+        deps: [design]
+      - id: implement
+        role: implementer
+        deps: [approve_plan]
+        allow_write: true
+        checkpoint: true
+      - id: test
+        role: tester
+        deps: [implement]
+        allow_shell: true
+        output_schema: TestResult
+      - id: review
+        role: reviewer
+        deps: [test]
+        read_only: true
+        output_schema: ReviewResult
+      - id: fix
+        role: implementer
+        deps: [review]
+        when: review.has_blockers && loop < 2
+        allow_write: true
+        max_loops: 2

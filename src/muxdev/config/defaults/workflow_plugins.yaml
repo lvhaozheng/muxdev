@@ -1,0 +1,59 @@
+command_dialects:
+  codex:
+    prefix: "$"
+    colon: "-"
+  opencode:
+    prefix: "/"
+    colon: "-"
+  cursor:
+    prefix: "/"
+    colon: "-"
+workflow_plugins:
+  void:
+    description: Plain provider session with no spec-driven command injection.
+    phases: [running]
+    supported_providers: [mock, codex, claude-code, qwen, kimi, trae, antigravity]
+    commands:
+      running: "{task}"
+    artifacts: {}
+    notes: Inspired by agtx's void plugin for full human control.
+  muxdev:
+    description: Default muxdev design, approve, implement, test, review workflow.
+    phases: [design, implement, test, review, fix]
+    supported_providers: [mock, codex, claude-code, qwen, kimi]
+    commands:
+      design: "/muxdev:design {task}"
+      implement: "/muxdev:implement {task}"
+      test: "/muxdev:test {task}"
+      review: "/muxdev:review {task}"
+      fix: "/muxdev:fix {task}"
+    artifacts:
+      design: plan.md
+      test: test.log
+      review: review.md
+      fix: diff.patch
+    notes: Maps muxdev's built-in DAG to an agtx-style phase catalog.
+  spec-lite:
+    description: Small spec-driven workflow for projects that want planning artifacts before implementation.
+    phases: [research, planning, running, review]
+    supported_providers: [codex, claude-code, qwen, kimi]
+    commands:
+      research: "/spec-lite:research {task}"
+      planning: "/spec-lite:plan {task}"
+      running: "/spec-lite:execute {task}"
+      review: "/spec-lite:review {task}"
+    artifacts:
+      research: .muxdev/spec/research.md
+      planning: .muxdev/spec/plan.md
+      running: .muxdev/spec/summary.md
+      review: .muxdev/spec/review.md
+    notes: A compact local analogue to agtx spec-driven plugins such as spec-kit/OpenSpec.
+  review-only:
+    description: Read-only review workflow for parallel reviewer agents.
+    phases: [review]
+    supported_providers: [codex, claude-code, qwen, kimi]
+    commands:
+      review: "/muxdev:review {task}"
+    artifacts:
+      review: review.md
+    notes: Useful for CAO-style parallel review fan-out.

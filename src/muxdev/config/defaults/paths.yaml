@@ -1,0 +1,9 @@
+paths:
+  runtime_root: .muxdev
+  runs: runs
+  worktrees: worktrees
+  skills: skills
+  sessions: sessions
+  flows: flows
+  rag: rag
+  dashboard: dashboard.html
