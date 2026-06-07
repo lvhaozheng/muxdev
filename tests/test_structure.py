@@ -3,7 +3,11 @@ from pathlib import Path
 
 def test_src_contains_only_package_source():
     repo_root = Path(__file__).resolve().parents[1]
-    src_files = [path.relative_to(repo_root) for path in (repo_root / "src").rglob("*") if path.is_file()]
+    src_files = [
+        path.relative_to(repo_root)
+        for path in (repo_root / "src").rglob("*")
+        if path.is_file() and not any(part.endswith(".egg-info") for part in path.parts)
+    ]
 
     assert src_files
     assert all(parts[0] == "src" and parts[1] == "muxdev" for parts in (path.parts for path in src_files))
@@ -11,7 +15,7 @@ def test_src_contains_only_package_source():
 
 def test_canonical_layers_import():
     from muxdev.api import handle_jsonrpc, server_manifest, write_dashboard
-    from muxdev.clients.sessions import HeadlessSubprocessBackend, SessionManager
+    from muxdev.clients.sessions import ConptyBackend, DockerBackend, HeadlessSubprocessBackend, SessionManager
     from muxdev.clients.stream import StreamAdapter
     from muxdev.config import get_account_info, get_install_plan
     from muxdev.models import ApprovalStatus, WorkflowDefinition
@@ -22,6 +26,8 @@ def test_canonical_layers_import():
     assert callable(server_manifest)
     assert callable(write_dashboard)
     assert HeadlessSubprocessBackend.__name__ == "HeadlessSubprocessBackend"
+    assert ConptyBackend.__name__ == "ConptyBackend"
+    assert DockerBackend.__name__ == "DockerBackend"
     assert SessionManager.__name__ == "SessionManager"
     assert StreamAdapter.__name__ == "StreamAdapter"
     assert get_account_info("mock").required is False

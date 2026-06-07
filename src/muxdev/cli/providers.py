@@ -6,10 +6,12 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
+from rich.table import Table
 
+from ..daemon.paths import DEFAULT_API_PORT, DEFAULT_HOST
 from ..providers import detect_providers, probe_provider
 from ..ui.render import provider_table
-from .common import _account_command, _install_provider_command, _print_json
+from .common import _account_command, _daemon_client, _install_provider_command, _print_json
 
 
 provider_app = typer.Typer(help="Provider discovery and diagnostics")
@@ -60,6 +62,34 @@ def provider_doctor(
         _print_json(probe.to_dict())
         return
     console.print(provider_table([probe]))
+
+
+@provider_app.command("score")
+def provider_score(
+    role: Annotated[str | None, typer.Option("--role", help="Filter scores to one role.")] = None,
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit machine-readable JSON."),
+    ] = False,
+) -> None:
+    """Show provider reliability scores from recorded runtime attempts."""
+    rows = _daemon_client(host, port).provider_scores(role=role)
+    if json_output:
+        _print_json(rows)
+        return
+    table = Table(title="Provider Scores")
+    for column in ("provider", "role", "score", "attempts", "successes", "failures", "retries", "human_actions", "last_failure_kind"):
+        table.add_column(column)
+    for row in rows:
+        table.add_row(
+            *(
+                str(row.get(column) if row.get(column) is not None else "")
+                for column in ("provider", "role", "score", "attempts", "successes", "failures", "retries", "human_actions", "last_failure_kind")
+            )
+        )
+    console.print(table)
 
 
 @provider_app.command("account")

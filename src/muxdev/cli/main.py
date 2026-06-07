@@ -41,11 +41,18 @@ from ..core.platforms import follow_file_command, hidden_subprocess_kwargs, spli
 from ..models import ApprovalStatus
 from ..api.mcp import handle_jsonrpc, server_manifest
 from ..services.orchestration import deep_agent_task_pack, workflow_to_langgraph
+from ..services.automation import render_why
+from ..services.design import latest_design_contract
 from ..config.loader import config_sources, load_config, path_config, validate_config
 from ..services.rag import LocalRagIndex
 from ..services.reports import generate_final_report
+from ..services.evidence import verify_run_evidence
+from ..services.plugin_manifest import validate_plugin_manifest
+from ..services.advanced_parallel import detect_parallel_conflicts, record_parallel_conflicts
 from ..services.dashboard import dashboard_path, write_run_dashboard
 from ..services.flows import FlowRegistry
+from ..services.multirepo import plan_multi_repo_orchestration
+from ..services.provider_learning import refresh_provider_learning
 from ..services.workflow_plugins import get_workflow_plugin, list_workflow_plugins, render_plugin_command
 from ..services.skill_engine import (
     add_skill,
@@ -62,14 +69,15 @@ from ..services.skill_engine import (
     unbind_skill,
     validate_skill_path,
 )
+from ..services.skill_lock import write_skill_lock
 from ..runtime import SupervisorRuntime
 from ..core.safety import SafetyPolicyEngine
 from ..clients.sessions import SessionManager, TmuxBackend
-from ..daemon.paths import DEFAULT_API_PORT, DEFAULT_HOST, DEFAULT_UI_PORT
+from ..daemon.paths import DEFAULT_API_PORT, DEFAULT_HOST, DEFAULT_UI_PORT, default_daemon_paths
 from ..daemon.process import daemon_status as daemon_process_status
 from ..daemon.process import start_daemon, stop_daemon
 from ..services.skills import SkillRegistry
-from ..storage import Blackboard, RunStore, compact_trace, read_trace
+from ..storage import Blackboard, MemoryStore, RunStore, compact_trace, read_trace
 from ..ui.repl import start_repl
 from ..ui.tui import status_panel
 from ..workflows import SOFTWARE_DEV_WORKFLOW
@@ -107,6 +115,15 @@ deep_agent_app = typer.Typer(help="Deep-agent integration tools")
 workflow_app = typer.Typer(help="Workflow plugin catalog tools")
 flow_app = typer.Typer(help="Scheduled flow tools")
 config_app = typer.Typer(help="Configuration inspection tools", invoke_without_command=True, no_args_is_help=False)
+memory_app = typer.Typer(help="Evidence-grounded project memory tools")
+parallel_app = typer.Typer(help="Advanced parallel-squad tools")
+learning_app = typer.Typer(help="Long-term learning tools")
+multirepo_app = typer.Typer(help="Multi-repo orchestration tools")
+ci_app = typer.Typer(help="CI rescue commands")
+evidence_app = typer.Typer(help="Evidence bundle and ledger tools")
+action_app = typer.Typer(help="Provider action handoff tools")
+feedback_app = typer.Typer(help="External feedback routing tools")
+cache_app = typer.Typer(help="Content-addressed cache tools")
 app.add_typer(provider_app, name="provider")
 app.add_typer(policy_app, name="policy")
 app.add_typer(trace_app, name="trace")
@@ -121,6 +138,15 @@ app.add_typer(deep_agent_app, name="deep-agent")
 app.add_typer(workflow_app, name="workflow")
 app.add_typer(flow_app, name="flow")
 app.add_typer(config_app, name="config")
+app.add_typer(memory_app, name="memory")
+app.add_typer(parallel_app, name="parallel")
+app.add_typer(learning_app, name="learning")
+app.add_typer(multirepo_app, name="multirepo")
+app.add_typer(ci_app, name="ci")
+app.add_typer(evidence_app, name="evidence")
+app.add_typer(action_app, name="action")
+app.add_typer(feedback_app, name="feedback")
+app.add_typer(cache_app, name="cache")
 console = Console(width=320)
 
 
@@ -235,9 +261,14 @@ def dev(
     task: Annotated[str | None, typer.Argument(help="Development task to submit.")] = None,
     profile: Annotated[str | None, typer.Option("-p", "--profile", help="Profile: solo, pair, squad, ci.")] = None,
     gate: Annotated[str | None, typer.Option("-g", "--gate", help="Gate: auto, safe, strict, ci.")] = None,
+    simple: Annotated[bool, typer.Option("--simple", help="Force simple auto flow depth.")] = False,
+    safe_depth: Annotated[bool, typer.Option("--safe", help="Force safe auto flow depth.")] = False,
+    deep: Annotated[bool, typer.Option("--deep", help="Force deep auto flow depth.")] = False,
+    parallel: Annotated[bool, typer.Option("--parallel", help="Force parallel auto flow depth.")] = False,
     role: Annotated[list[str] | None, typer.Option("--role", help="Role provider override, e.g. --role code=codex.")] = None,
     skill: Annotated[list[str] | None, typer.Option("-s", "--skill", help="Skill activation, e.g. -s review=security-review.")] = None,
     task_file: Annotated[Path | None, typer.Option("-f", "--file", help="Task TOML file.")] = None,
+    from_design: Annotated[str | None, typer.Option("--from-design", help="Use a design contract path or 'latest'.")] = None,
     provider: Annotated[str | None, typer.Option("--provider", help="Fallback provider for all roles.")] = None,
     workflow: Annotated[str | None, typer.Option("--workflow", help="Workflow name or YAML path.")] = None,
     require_approval: Annotated[str, typer.Option("--require-approval", help="Comma-separated extra approval types.")] = "",
@@ -253,9 +284,11 @@ def dev(
         task=task,
         profile=profile,
         gate=gate,
+        depth=_depth_override(simple=simple, safe=safe_depth, deep=deep, parallel=parallel),
         role=role,
         skill=skill,
         task_file=task_file,
+        from_design=from_design,
         provider=provider,
         workflow=workflow,
         require_approval=require_approval,
@@ -322,6 +355,432 @@ def test_command(
 
 
 @app.command()
+def design(
+    task: Annotated[str | None, typer.Argument(help="Design task to submit.")] = None,
+    profile: Annotated[str | None, typer.Option("-p", "--profile", help="Profile: auto, solo, pair, squad, ci.")] = None,
+    gate: Annotated[str | None, typer.Option("-g", "--gate", help="Gate: auto, safe, strict, ci.")] = None,
+    role: Annotated[list[str] | None, typer.Option("--role", help="Role provider override.")] = None,
+    skill: Annotated[list[str] | None, typer.Option("-s", "--skill", help="Skill activation.")] = None,
+    task_file: Annotated[Path | None, typer.Option("-f", "--file", help="Task TOML file.")] = None,
+    provider: Annotated[str | None, typer.Option("--provider", help="Fallback provider.")] = None,
+    max_cost_usd: Annotated[float, typer.Option("--max-cost-usd", help="Budget limit for this task.")] = 0.5,
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Submit a design-only task that produces a design pack."""
+    _submit_main_task("design", task=task, profile=profile, gate=gate or "auto", role=role, skill=skill, task_file=task_file, provider=provider, workflow="design", require_approval="", max_cost_usd=max_cost_usd, host=host, port=port, json_output=json_output, title="muxdev design", depth="deep")
+
+
+@app.command()
+def refactor(
+    task: Annotated[str | None, typer.Argument(help="Refactor task to submit.")] = None,
+    profile: Annotated[str | None, typer.Option("-p", "--profile", help="Profile: auto, solo, pair, squad, ci.")] = None,
+    gate: Annotated[str | None, typer.Option("-g", "--gate", help="Gate: auto, safe, strict, ci.")] = None,
+    simple: Annotated[bool, typer.Option("--simple", help="Force simple auto flow depth.")] = False,
+    safe_depth: Annotated[bool, typer.Option("--safe", help="Force safe auto flow depth.")] = False,
+    deep: Annotated[bool, typer.Option("--deep", help="Force deep auto flow depth.")] = False,
+    parallel: Annotated[bool, typer.Option("--parallel", help="Force parallel auto flow depth.")] = False,
+    role: Annotated[list[str] | None, typer.Option("--role", help="Role provider override.")] = None,
+    skill: Annotated[list[str] | None, typer.Option("-s", "--skill", help="Skill activation.")] = None,
+    task_file: Annotated[Path | None, typer.Option("-f", "--file", help="Task TOML file.")] = None,
+    provider: Annotated[str | None, typer.Option("--provider", help="Fallback provider.")] = None,
+    max_cost_usd: Annotated[float, typer.Option("--max-cost-usd", help="Budget limit for this task.")] = 0.5,
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Submit a refactor task through the auto-orchestrated dev workflow."""
+    _submit_main_task("refactor", task=task, profile=profile, gate=gate, role=role, skill=skill, task_file=task_file, provider=provider, workflow="dev", require_approval="", max_cost_usd=max_cost_usd, host=host, port=port, json_output=json_output, title="muxdev refactor", depth=_depth_override(simple=simple, safe=safe_depth, deep=deep, parallel=parallel))
+
+
+@ci_app.command("fix")
+def ci_fix(
+    task: Annotated[str | None, typer.Argument(help="CI failure description.")] = None,
+    role: Annotated[list[str] | None, typer.Option("--role", help="Role provider override.")] = None,
+    skill: Annotated[list[str] | None, typer.Option("-s", "--skill", help="Skill activation.")] = None,
+    task_file: Annotated[Path | None, typer.Option("-f", "--file", help="Task TOML file.")] = None,
+    provider: Annotated[str | None, typer.Option("--provider", help="Fallback provider.")] = None,
+    max_cost_usd: Annotated[float, typer.Option("--max-cost-usd", help="Budget limit for this task.")] = 0.5,
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Submit a non-interactive CI rescue task."""
+    _submit_main_task("ci", task=task or "fix CI failures", profile="ci", gate="ci", role=role, skill=skill, task_file=task_file, provider=provider, workflow="dev", require_approval="", max_cost_usd=max_cost_usd, host=host, port=port, json_output=json_output, title="muxdev ci fix", depth="ci")
+
+
+@ci_app.command("rescue")
+def ci_rescue(
+    content: Annotated[str, typer.Argument(help="CI log, failure summary, or URL.")],
+    source: Annotated[str, typer.Option("--source", help="Feedback source label.")] = "ci",
+    run_id: Annotated[str | None, typer.Option("--run-id", help="Related muxdev run id.")] = None,
+    provider: Annotated[str, typer.Option("--provider", help="Provider for the rescue task.")] = "mock",
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Route CI failure feedback and auto-submit a rescue task."""
+    payload = _daemon_client(host, port).feedback(
+        {
+            "kind": "ci_failed",
+            "source": source,
+            "content": content,
+            "workspace": str(Path.cwd()),
+            "run_id": run_id,
+            "severity": "high",
+            "provider": provider,
+            "auto_submit": True,
+        }
+    )
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="CI Rescue"))
+
+
+@feedback_app.command("add")
+def feedback_add(
+    kind: Annotated[str, typer.Argument(help="Feedback kind, e.g. ci_failed, review_comment, manual_feedback.")],
+    content: Annotated[str, typer.Argument(help="Feedback text, log excerpt, URL, or comment.")],
+    source: Annotated[str, typer.Option("--source", help="Feedback source label.")] = "manual",
+    run_id: Annotated[str | None, typer.Option("--run-id", help="Related muxdev run id.")] = None,
+    severity: Annotated[str, typer.Option("--severity", help="low/medium/high.")] = "medium",
+    provider: Annotated[str, typer.Option("--provider", help="Provider for auto-submitted rescue tasks.")] = "mock",
+    auto_submit: Annotated[bool, typer.Option("--auto-submit/--no-auto-submit", help="Auto-submit routed tasks when rules allow.")] = True,
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Ingest external feedback into the muxdev feedback router."""
+    payload = _daemon_client(host, port).feedback(
+        {
+            "kind": kind,
+            "source": source,
+            "content": content,
+            "workspace": str(Path.cwd()),
+            "run_id": run_id,
+            "severity": severity,
+            "provider": provider,
+            "auto_submit": auto_submit,
+        }
+    )
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Feedback Routed"))
+
+
+@feedback_app.command("list")
+def feedback_list(
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """List feedback router state from the daemon."""
+    payload = _daemon_client(host, port).ecosystem()
+    rows = payload.get("feedback_events", []) if isinstance(payload, dict) else []
+    if json_output:
+        _print_json(rows)
+        return
+    table = Table(title="Feedback Events")
+    for column in ("feedback_id", "kind", "source", "status", "route_to", "severity", "content"):
+        table.add_column(column)
+    for row in rows:
+        table.add_row(*(str(row.get(column) or "") for column in ("feedback_id", "kind", "source", "status", "route_to", "severity", "content")))
+    console.print(table)
+
+
+@cache_app.command("list")
+def cache_list(
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """List CAS cache entries recorded by the daemon."""
+    payload = _daemon_client(host, port).ecosystem()
+    rows = payload.get("cache_entries", []) if isinstance(payload, dict) else []
+    if json_output:
+        _print_json(rows)
+        return
+    table = Table(title="CAS Cache")
+    for column in ("cache_key", "kind", "path", "value_hash", "last_accessed_at"):
+        table.add_column(column)
+    for row in rows:
+        table.add_row(*(str(row.get(column) or "") for column in ("cache_key", "kind", "path", "value_hash", "last_accessed_at")))
+    console.print(table)
+
+
+@app.command()
+def why(
+    run_id: Annotated[str, typer.Argument(help="Run id, or 'latest'.")] = "latest",
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Explain why muxdev selected the current intent, flow depth, and roles."""
+    payload = _load_run_context(run_id, host=host, port=port)
+    context = payload.get("context", {}) if isinstance(payload, dict) else {}
+    automation = context.get("automation", context) if isinstance(context, dict) else {}
+    if json_output:
+        _print_json({"run_id": payload.get("run_id", run_id) if isinstance(payload, dict) else run_id, "automation": automation})
+        return
+    console.print(Panel(render_why({"automation": automation}), title="muxdev why"))
+
+
+@memory_app.command("status")
+def memory_status(
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Show project memory database status."""
+    with MemoryStore(Path.cwd()) as store:
+        payload = store.status()
+    if json_output:
+        _print_json(payload)
+        return
+    lines = [f"path: {payload['path']}", f"total: {payload['total']}"]
+    counts = payload.get("counts", {})
+    if isinstance(counts, dict):
+        lines.extend(f"{key}: {value}" for key, value in sorted(counts.items()))
+    console.print(Panel("\n".join(lines), title="muxdev memory status"))
+
+
+@memory_app.command("query")
+def memory_query(
+    query: Annotated[str, typer.Argument(help="Text to search in active project memory.")] = "",
+    status: Annotated[str, typer.Option("--status", help="Memory status to search.")] = "active",
+    limit: Annotated[int, typer.Option("--limit", help="Maximum rows to return.")] = 8,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Search evidence-grounded project memory."""
+    with MemoryStore(Path.cwd()) as store:
+        rows = store.query(query, status=status, limit=limit)
+    if json_output:
+        _print_json(rows)
+        return
+    table = Table(title="muxdev memory query")
+    for column in ("id", "status", "kind", "role", "claim"):
+        table.add_column(column)
+    for row in rows:
+        table.add_row(*(str(row.get(column) or "") for column in ("id", "status", "kind", "role", "claim")))
+    console.print(table)
+
+
+@memory_app.command("propose")
+def memory_propose(
+    run_id: Annotated[str, typer.Argument(help="Run id, or 'latest'.")] = "latest",
+    run_dir: Annotated[Path | None, typer.Option("--run-dir", help="Explicit run directory.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Propose memory items from a completed run's evidence."""
+    resolved_run_dir = run_dir or RunStore(Path.cwd()).find_run_dir(_resolve_run_id(run_id))
+    with MemoryStore(Path.cwd()) as store:
+        rows = store.propose_from_run(resolved_run_dir, resolved_run_dir.name)
+    if json_output:
+        _print_json(rows)
+        return
+    console.print(Panel("\n".join(f"{row['id']}: {row['claim']}" for row in rows), title="muxdev memory propose"))
+
+
+@memory_app.command("approve")
+def memory_approve(
+    memory_id: Annotated[str, typer.Argument(help="Memory item id.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Approve a proposed memory item and make it active."""
+    try:
+        with MemoryStore(Path.cwd()) as store:
+            payload = store.approve(memory_id)
+    except KeyError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(f"{payload['id']}: {payload['status']}", title="muxdev memory approve"))
+
+
+@memory_app.command("quarantine")
+def memory_quarantine(
+    memory_id: Annotated[str, typer.Argument(help="Memory item id.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Quarantine an obsolete or unsafe memory item."""
+    try:
+        with MemoryStore(Path.cwd()) as store:
+            payload = store.quarantine(memory_id)
+    except KeyError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(f"{payload['id']}: {payload['status']}", title="muxdev memory quarantine"))
+
+
+@memory_app.command("contradictions")
+def memory_contradictions(
+    status: Annotated[str | None, typer.Option("--status", help="Filter by pending/quarantined/stale.")] = None,
+    detect: Annotated[bool, typer.Option("--detect/--no-detect", help="Run contradiction detection before listing.")] = True,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Detect and list contradictory project memory records."""
+    with MemoryStore(Path.cwd()) as store:
+        if detect:
+            store.detect_contradictions()
+        rows = store.list_contradictions(status=status)
+    if json_output:
+        _print_json(rows)
+        return
+    table = Table(title="muxdev memory contradictions")
+    for column in ("contradiction_id", "memory_id", "conflicting_memory_id", "status", "reason", "quarantine_target"):
+        table.add_column(column)
+    for row in rows:
+        table.add_row(*(str(row.get(column) or "") for column in ("contradiction_id", "memory_id", "conflicting_memory_id", "status", "reason", "quarantine_target")))
+    console.print(table)
+
+
+@memory_app.command("quarantine-auto")
+def memory_quarantine_auto(
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Automatically quarantine lower-confidence contradictory memory."""
+    with MemoryStore(Path.cwd()) as store:
+        store.detect_contradictions()
+        rows = store.auto_quarantine_contradictions()
+    if json_output:
+        _print_json(rows)
+        return
+    console.print(Panel(f"quarantined: {len(rows)}", title="muxdev memory quarantine-auto"))
+
+
+@parallel_app.command("conflicts")
+def parallel_conflicts(
+    plan_file: Annotated[Path | None, typer.Option("--file", help="JSON file mapping stage id to planned write paths.")] = None,
+    run_id: Annotated[str | None, typer.Option("--run-id", help="Filter or record against a run id.")] = None,
+    status: Annotated[str | None, typer.Option("--status", help="Filter daemon conflict status.")] = None,
+    record: Annotated[bool, typer.Option("--record", help="Persist detected conflicts in local ecosystem DB.")] = False,
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Detect or list conflict-aware parallel-squad write conflicts."""
+    if plan_file:
+        try:
+            data = json.loads(plan_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise typer.BadParameter(f"invalid JSON file: {plan_file}") from exc
+        if not isinstance(data, dict):
+            raise typer.BadParameter("--file must contain a JSON object")
+        if record:
+            with _ecosystem_blackboard(Path.cwd()) as board:
+                rows = record_parallel_conflicts(board, run_id=run_id, stage_id="cli", stage_writes=data)
+        else:
+            rows = detect_parallel_conflicts(data)
+        payload: object = {"source": str(plan_file), "conflicts": rows}
+    else:
+        payload = _daemon_client(host, port).parallel_conflicts(status=status, task_id=run_id)
+    if json_output:
+        _print_json(payload)
+        return
+    rows = payload.get("conflicts", payload) if isinstance(payload, dict) else payload
+    table = Table(title="muxdev parallel conflicts")
+    for column in ("conflict_id", "stages", "files", "severity", "status", "resolution"):
+        table.add_column(column)
+    for row in rows if isinstance(rows, list) else []:
+        table.add_row(*(str(row.get(column) or "") for column in ("conflict_id", "stages", "files", "severity", "status", "resolution")))
+    console.print(table)
+
+
+@learning_app.command("provider")
+def learning_provider(
+    role: Annotated[str | None, typer.Option("--role", help="Filter by role.")] = None,
+    local: Annotated[bool, typer.Option("--local", help="Read/write local ecosystem DB instead of daemon.")] = False,
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Show persisted cross-run provider learning snapshots."""
+    if local:
+        with _ecosystem_blackboard(Path.cwd()) as board:
+            rows = refresh_provider_learning(board, role=role)
+    else:
+        rows = _daemon_client(host, port).provider_learning(role=role)
+    if json_output:
+        _print_json(rows)
+        return
+    table = Table(title="muxdev provider learning")
+    for column in ("provider", "role", "attempts", "successes", "failures", "human_actions", "score"):
+        table.add_column(column)
+    for row in rows:
+        table.add_row(*(str(row.get(column) or "") for column in ("provider", "role", "attempts", "successes", "failures", "human_actions", "score")))
+    console.print(table)
+
+
+@multirepo_app.command("plan")
+def multirepo_plan(
+    task: Annotated[str, typer.Argument(help="Task to coordinate across repositories.")],
+    repo: Annotated[list[Path] | None, typer.Option("--repo", help="Repository path. Repeat for multiple repos.")] = None,
+    mode: Annotated[str, typer.Option("--mode", help="design or dev.")] = "design",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Plan a multi-repo design/dev orchestration."""
+    repos = repo or [Path.cwd()]
+    try:
+        with _ecosystem_blackboard(Path.cwd()) as board:
+            payload = plan_multi_repo_orchestration(Path.cwd(), repos=repos, task=task, mode=mode, blackboard=board)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="muxdev multirepo plan"))
+
+
+@multirepo_app.command("design")
+def multirepo_design(
+    task: Annotated[str, typer.Argument(help="Design task to coordinate across repositories.")],
+    repo: Annotated[list[Path] | None, typer.Option("--repo", help="Repository path. Repeat for multiple repos.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Plan a multi-repo design orchestration."""
+    multirepo_plan(task=task, repo=repo, mode="design", json_output=json_output)
+
+
+@multirepo_app.command("dev")
+def multirepo_dev(
+    task: Annotated[str, typer.Argument(help="Dev task to coordinate across repositories.")],
+    repo: Annotated[list[Path] | None, typer.Option("--repo", help="Repository path. Repeat for multiple repos.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Plan a multi-repo dev orchestration."""
+    multirepo_plan(task=task, repo=repo, mode="dev", json_output=json_output)
+
+
+@evidence_app.command("verify")
+def evidence_verify(
+    run_id: Annotated[str, typer.Argument(help="Run id, or 'latest'.")] = "latest",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Verify role contracts, evidence bundles, validators, and ledger chain."""
+    resolved, run_dir = _resolve_evidence_run(run_id)
+    with _evidence_blackboard(run_dir) as blackboard:
+        payload = verify_run_evidence(run_dir, resolved, blackboard)
+    if json_output:
+        _print_json(payload)
+        return
+    lines = [
+        f"run_id: {payload['run_id']}",
+        f"valid: {payload['valid']}",
+        f"ledger events: {payload['ledger']['events']}",
+        f"contracts: {payload['contracts']}",
+        f"evidence bundles: {payload['evidence_bundles']}",
+        f"validators: {payload['validators']}",
+    ]
+    for error in payload.get("errors", []):
+        lines.append(f"error: {error}")
+    console.print(Panel("\n".join(lines), title="muxdev evidence verify"))
+
+
+@app.command()
 def new(
     path: Annotated[Path, typer.Argument(help="Project directory to create or initialize.")],
     force: Annotated[bool, typer.Option("--force", help="Allow initializing a non-empty directory.")] = False,
@@ -375,10 +834,10 @@ def tasks(
         _print_json(rows)
         return
     table = Table(title="Tasks")
-    for column in ("task_id", "task", "status", "current_stage", "pending_approvals"):
+    for column in ("task_id", "task", "status", "current_stage", "pending_approvals", "pending_provider_actions"):
         table.add_column(column)
     for row in rows:
-        table.add_row(*(str(row.get(column) or "") for column in ("task_id", "task", "status", "current_stage", "pending_approvals")))
+        table.add_row(*(str(row.get(column) or "") for column in ("task_id", "task", "status", "current_stage", "pending_approvals", "pending_provider_actions")))
     console.print(table)
 
 
@@ -508,12 +967,13 @@ def diff(
 @app.command()
 def rollback(
     run_id: Annotated[str, typer.Argument(help="Run id, or 'latest'.")] = "latest",
+    to_stage: Annotated[str | None, typer.Option("--to-stage", help="Rollback worktree to the snapshot captured before this stage.")] = None,
     host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
     port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     """Rollback changes inside the daemon task worktree."""
-    payload = _daemon_client(host, port).rollback(run_id)
+    payload = _daemon_client(host, port).rollback(run_id, to_stage=to_stage)
     if json_output:
         _print_json(payload)
         return
@@ -538,6 +998,67 @@ def approvals(
     for row in rows:
         table.add_row(*(str(row.get(column) or "") for column in ("approval_id", "run_id", "stage_id", "type", "status", "reason")))
     console.print(table)
+
+
+@app.command()
+def actions(
+    status: Annotated[str | None, typer.Option("--status", help="Filter by pending/handled/dismissed/expired.")] = "pending",
+    run_id: Annotated[str | None, typer.Option("--run-id", help="Filter to one task id.")] = None,
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """List provider-side CLI actions that need human handling."""
+    try:
+        rows = _daemon_client(host, port).provider_actions(status=status, task_id=run_id)
+    except DaemonConnectionError as exc:
+        if _provider_actions_api_unavailable(exc):
+            payload = {"provider_actions": [], "warning": _provider_actions_restart_hint()}
+            if json_output:
+                _print_json(payload)
+                return
+            console.print(Panel(payload["warning"], title="Provider Actions"))
+            return
+        raise
+    if json_output:
+        _print_json(rows)
+        return
+    table = Table(title="Provider Actions")
+    for column in ("action_id", "run_id", "stage_id", "provider", "kind", "status", "prompt_text", "attach_command"):
+        table.add_column(column)
+    for row in rows:
+        table.add_row(*(str(row.get(column) or "") for column in ("action_id", "run_id", "stage_id", "provider", "kind", "status", "prompt_text", "attach_command")))
+    console.print(table)
+
+
+@action_app.command("handled")
+def action_handled(
+    action_id: Annotated[str, typer.Argument(help="Provider action id to mark handled.")],
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Mark a provider action handled after dealing with the CLI/session."""
+    payload = _daemon_client(host, port).provider_action_handled(action_id)
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Provider Action Handled"))
+
+
+@action_app.command("dismiss")
+def action_dismiss(
+    action_id: Annotated[str, typer.Argument(help="Provider action id to dismiss.")],
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Dismiss a provider action without treating it as muxdev approval."""
+    payload = _daemon_client(host, port).provider_action_dismiss(action_id)
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Provider Action Dismiss"))
 
 
 @app.command()
@@ -1318,6 +1839,32 @@ def skill_sync(
     console.print(Panel("\n".join(f"{key}: {value}" for key, value in payload.items()), title="Skill Sync"))
 
 
+@skill_app.command("lock")
+def skill_lock(
+    promote_memory: Annotated[bool, typer.Option("--memory/--no-memory", help="Propose skill memory items from the lock.")] = True,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Write a deterministic skill lock and optional skill memory proposals."""
+    payload = write_skill_lock(Path.cwd(), promote_memory=promote_memory)
+    with _ecosystem_blackboard(Path.cwd()) as board:
+        for row in payload.get("skills", []):
+            if isinstance(row, dict):
+                board.upsert_skill_lock(
+                    skill_name=str(row.get("name") or "skill"),
+                    run_id=None,
+                    skill_version=str(row.get("version") or "") or None,
+                    skill_hash=str(row.get("skill_hash") or ""),
+                    path=Path(str(row.get("path") or ".")),
+                    compatible_roles=[str(item) for item in row.get("compatible_roles", []) if item] if isinstance(row.get("compatible_roles"), list) else [],
+                    status="locked",
+                    metadata=row,
+                )
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps({"path": payload["path"], "skills": len(payload.get("skills", [])), "memory_proposals": len(payload.get("memory_proposals", []))}, ensure_ascii=False, indent=2), title="Skill Lock"))
+
+
 @skill_app.command("doctor")
 def skill_doctor_command(
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
@@ -1490,6 +2037,32 @@ def plugin_add(
     console.print(Panel("\n".join(f"{key}: {value}" for key, value in payload.items()), title="Plugin Add"))
 
 
+@plugin_app.command("validate")
+def plugin_validate(
+    source: Annotated[str, typer.Argument(help="Plugin path or manifest path.")],
+    name: Annotated[str | None, typer.Option("--name", help="Plugin name override.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Validate a safe plugin manifest without executing plugin code."""
+    payload = validate_plugin_manifest(source, name=name)
+    with _ecosystem_blackboard(Path.cwd()) as board:
+        board.upsert_plugin_manifest(
+            plugin_name=str(payload["name"]),
+            run_id=None,
+            source=str(payload["source"]),
+            manifest_path=Path(str(payload["manifest_path"])) if payload.get("manifest_path") else None,
+            manifest_hash=str(payload["manifest_hash"]),
+            trust=str(payload["trust"]),
+            permissions=[str(item) for item in payload.get("permissions", [])],
+            status=str(payload["status"]),
+            warnings=[str(item) for item in payload.get("warnings", [])],
+        )
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Plugin Validate"))
+
+
 @plugin_app.command("show")
 def plugin_show(
     name: Annotated[str, typer.Argument(help="Plugin name.")],
@@ -1561,7 +2134,13 @@ def tui(
         tasks_payload = client.tasks()
         payload = client.task(run_id) if run_id != "latest" or tasks_payload else tasks_payload
         if isinstance(payload, list):
-            payload = {"tasks": payload, "run": None, "app": {"workspace": str(Path.cwd()), "version": __version__, "providers": {"ready": [], "partial": [], "total": 0}}, "approvals": []}
+            payload = {
+                "tasks": payload,
+                "run": None,
+                "app": {"workspace": str(Path.cwd()), "version": __version__, "providers": {"ready": [], "partial": [], "total": 0}},
+                "approvals": [],
+                "provider_actions": [],
+            }
     except DaemonConnectionError as exc:
         if json_output:
             _print_json({"error": exc.message, "hint": _daemon_error_hint(exc)})
@@ -1573,6 +2152,71 @@ def tui(
         _print_json(payload)
         return
     Console(width=120).print(status_panel(payload) if payload.get("run") else Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="muxdev tui"))
+
+
+def _depth_override(*, simple: bool = False, safe: bool = False, deep: bool = False, parallel: bool = False) -> str | None:
+    selected = [name for name, enabled in (("simple", simple), ("safe", safe), ("deep", deep), ("parallel", parallel)) if enabled]
+    if len(selected) > 1:
+        raise typer.BadParameter("choose only one flow depth override")
+    return selected[0] if selected else None
+
+
+def _task_with_design_contract(task: str | None, from_design: str | None) -> str | None:
+    if not from_design:
+        return task
+    if from_design == "latest":
+        contract_path = latest_design_contract(Path.cwd())
+        if contract_path is None:
+            raise typer.BadParameter("no local design contract found under .muxdev/runs")
+    else:
+        contract_path = Path(from_design)
+    if not contract_path.exists():
+        raise typer.BadParameter(f"design contract not found: {contract_path}")
+    try:
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise typer.BadParameter(f"invalid design contract JSON: {contract_path}") from exc
+    base_task = task or str(contract.get("task") or "implement design contract")
+    return "\n\n".join(
+        [
+            base_task,
+            "From muxdev design contract:",
+            json.dumps(
+                {
+                    "path": str(contract_path),
+                    "run_id": contract.get("run_id"),
+                    "contract_version": contract.get("contract_version"),
+                    "artifacts": contract.get("artifacts", []),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        ]
+    )
+
+
+def _load_run_context(run_id: str, *, host: str, port: int) -> dict[str, object]:
+    try:
+        detail = _daemon_client(host, port).task(run_id)
+        run = detail.get("run", {}) if isinstance(detail, dict) else {}
+        return {
+            "run_id": run.get("run_id", run_id) if isinstance(run, dict) else run_id,
+            "context": detail.get("context", {}) if isinstance(detail, dict) else {},
+        }
+    except DaemonConnectionError:
+        try:
+            resolved = _resolve_run_id(run_id)
+            run_dir = RunStore(Path.cwd()).find_run_dir(resolved)
+        except (FileNotFoundError, ValueError) as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        context_path = run_dir / "task_context.json"
+        if not context_path.exists():
+            return {"run_id": resolved, "context": {}}
+        try:
+            context = json.loads(context_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            context = {}
+        return {"run_id": resolved, "context": context if isinstance(context, dict) else {}}
 
 
 def _submit_main_task(
@@ -1592,8 +2236,11 @@ def _submit_main_task(
     port: int,
     json_output: bool,
     title: str,
+    depth: str | None = None,
+    from_design: str | None = None,
 ) -> None:
     try:
+        task = _task_with_design_contract(task, from_design)
         request = resolve_task_request(
             workspace=Path.cwd(),
             task=task,
@@ -1602,6 +2249,7 @@ def _submit_main_task(
             workflow=workflow,
             profile=profile,
             gate=gate,
+            depth=depth,
             role_overrides=role,
             skill_specs=skill,
             task_file=task_file,
@@ -1624,22 +2272,27 @@ def _submit_main_task(
             "workflow": request["workflow"],
             "profile": request["profile"],
             "gate": request["gate"],
+            "depth": request["depth"],
+            "topology": request["topology"],
             "require_approval": request["require_approval"],
             "max_cost_usd": max_cost_usd,
             "role_providers": request["role_providers"],
             "skills": active_skills,
             "ci_block_on_approval": request["ci_block_on_approval"],
+            "automation": request["automation"],
         }
     )
     payload.setdefault("profile", request["profile"])
     payload.setdefault("gate", request["gate"])
+    payload.setdefault("depth", request["depth"])
+    payload.setdefault("topology", request["topology"])
     payload.setdefault("skills", [skill_payload.get("name") for skill_payload in active_skills])
     if json_output:
         _print_json(payload)
         return
     lines = [
         f"Task submitted: {payload['task_id']}",
-        f"profile: {request['profile']}  gate: {request['gate']}  workflow: {request['workflow']}",
+        f"profile: {request['profile']}  gate: {request['gate']}  depth: {request['depth']}  topology: {request['topology']}  workflow: {request['workflow']}",
         f"provider: {request['provider']}",
         f"skills: {', '.join(str(item) for item in payload.get('skills', [])) or '-'}",
         f"Use 'muxdev status {payload['task_id']}' to track progress",
@@ -1672,6 +2325,12 @@ def _plugin_registry_path() -> Path:
     return Path.cwd() / ".muxdev" / "plugins" / "plugins.json"
 
 
+def _ecosystem_blackboard(workspace: Path) -> Blackboard:
+    root = workspace / ".muxdev"
+    root.mkdir(parents=True, exist_ok=True)
+    return Blackboard(root, db_path=root / "ecosystem.sqlite")
+
+
 def _plugin_registry_read() -> dict[str, object]:
     path = _plugin_registry_path()
     if not path.exists():
@@ -1698,12 +2357,33 @@ def _plugin_registry_upsert(source: str, *, name: str | None, enabled: bool) -> 
     plugins = data.get("plugins", [])
     if not isinstance(plugins, list):
         plugins = []
-    plugin_name = name or _plugin_name_from_source(source)
-    row = {"name": plugin_name, "source": source, "enabled": enabled, "status": "registered"}
+    manifest = validate_plugin_manifest(source, name=name)
+    plugin_name = str(manifest["name"])
+    row = {
+        "name": plugin_name,
+        "source": source,
+        "enabled": enabled,
+        "status": manifest["status"],
+        "manifest_hash": manifest["manifest_hash"],
+        "trust": manifest["trust"],
+        "warnings": manifest["warnings"],
+    }
     plugins = [item for item in plugins if not (isinstance(item, dict) and item.get("name") == plugin_name)]
     plugins.append(row)
     data["plugins"] = sorted(plugins, key=lambda item: str(item.get("name", "")) if isinstance(item, dict) else "")
     _plugin_registry_write(data)
+    with _ecosystem_blackboard(Path.cwd()) as board:
+        board.upsert_plugin_manifest(
+            plugin_name=plugin_name,
+            run_id=None,
+            source=source,
+            manifest_path=Path(str(manifest["manifest_path"])) if manifest.get("manifest_path") else None,
+            manifest_hash=str(manifest["manifest_hash"]),
+            trust=str(manifest["trust"]),
+            permissions=[str(item) for item in manifest.get("permissions", [])],
+            status=str(manifest["status"]),
+            warnings=[str(item) for item in manifest.get("warnings", [])],
+        )
     return {**row, "path": str(_plugin_registry_path())}
 
 
@@ -1757,6 +2437,14 @@ def _ensure_run_dashboard(run_id: str) -> Path:
     return write_run_dashboard(Path.cwd(), run_dir, run_id).resolve()
 
 
+def _provider_actions_api_unavailable(exc: DaemonConnectionError) -> bool:
+    return getattr(exc, "status_code", None) == 404 and "provider-actions" in str(getattr(exc, "path", "") or "")
+
+
+def _provider_actions_restart_hint() -> str:
+    return "Provider Actions API is not available on the running daemon. Run `muxdev serve --restart` to restart the daemon with the current muxdev code."
+
+
 def _resolve_run_id(run_id: str) -> str:
     if run_id != "latest":
         return run_id
@@ -1764,6 +2452,37 @@ def _resolve_run_id(run_id: str) -> str:
     if not latest:
         raise typer.BadParameter("no muxdev runs found")
     return latest
+
+
+def _resolve_evidence_run(run_id: str) -> tuple[str, Path]:
+    local_store = RunStore(Path.cwd())
+    if run_id == "latest":
+        local_latest = local_store.latest_run_id()
+        if local_latest:
+            return local_latest, local_store.find_run_dir(local_latest)
+        daemon_runs = default_daemon_paths().runs_dir
+        candidates = [path for path in daemon_runs.iterdir() if path.is_dir()] if daemon_runs.exists() else []
+        if candidates:
+            latest = max(candidates, key=lambda path: path.stat().st_mtime)
+            return latest.name, latest
+        raise typer.BadParameter("no muxdev runs found")
+    try:
+        return run_id, local_store.find_run_dir(run_id)
+    except FileNotFoundError:
+        daemon_dir = default_daemon_paths().runs_dir / run_id
+        if daemon_dir.exists():
+            return run_id, daemon_dir
+        raise typer.BadParameter(f"run not found: {run_id}")
+
+
+def _evidence_blackboard(run_dir: Path) -> Blackboard:
+    daemon_paths = default_daemon_paths()
+    try:
+        if run_dir.resolve().is_relative_to(daemon_paths.runs_dir.resolve()) and daemon_paths.db_path.exists():
+            return Blackboard(daemon_paths.data_dir, db_path=daemon_paths.db_path)
+    except OSError:
+        pass
+    return Blackboard(run_dir)
 
 
 def _iter_run_blackboards() -> list[tuple[str, Path, Blackboard]]:

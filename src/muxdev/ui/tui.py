@@ -22,7 +22,7 @@ from rich.text import Text
 
 from .. import __version__
 from ..config.loader import load_config, path_config
-from ..models import ApprovalStatus
+from ..models import ApprovalStatus, ProviderActionStatus
 from ..providers import detect_providers
 from ..providers import probe_provider
 from ..services.reports import generate_final_report
@@ -44,7 +44,12 @@ MUXDEV_ASCII_LOGO = r"""
 
 DAEMON_COMMAND_GROUPS: dict[str, list[tuple[str, str]]] = {
     "Work": [
-        ("/run <task>", "submit a daemon task"),
+        ("/dev <task>", "submit a dev task with auto routing"),
+        ("/design <task>", "submit a design task"),
+        ("/fix <task>", "submit a fix task"),
+        ("/review [task]", "submit a review task"),
+        ("/test [task]", "submit a test task"),
+        ("/run <task>", "alias for /dev"),
         ("/continue [id]", "continue a paused task"),
         ("/stop <id>", "abort a task"),
         ("/status [id]", "show compact task detail"),
@@ -54,6 +59,15 @@ DAEMON_COMMAND_GROUPS: dict[str, list[tuple[str, str]]] = {
         ("/approvals", "list pending approvals"),
         ("/approve <id>", "approve an item"),
         ("/deny <id>", "deny an item"),
+    ],
+    "Provider Actions": [
+        ("/actions", "list pending provider CLI actions"),
+        ("/action handled <id>", "mark an action handled after attach"),
+        ("/action dismiss <id>", "dismiss a provider action"),
+    ],
+    "Advanced": [
+        ("/parallel", "list open parallel-squad conflicts"),
+        ("/learning", "show provider learning snapshots"),
     ],
     "Output": [
         ("/report [id]", "preview final report"),
@@ -149,6 +163,7 @@ def daemon_chat_view(
     tasks: list[dict[str, Any]] | None = None,
     task_payload: dict[str, Any] | None = None,
     approvals: list[dict[str, Any]] | None = None,
+    provider_actions: list[dict[str, Any]] | None = None,
     command: str = "",
     message: str = "",
 ) -> Group:
@@ -158,10 +173,20 @@ def daemon_chat_view(
     pass it in, so drawing the TUI never probes provider CLIs or mutates state.
     """
     return Group(
-        _daemon_hero_panel(workspace=workspace, version=version, host=host, api_port=api_port, ui_port=ui_port, daemon=daemon, tasks=tasks or [], approvals=approvals or []),
-        _daemon_focus_panel(task_payload=task_payload, tasks=tasks or [], approvals=approvals or []),
+        _daemon_hero_panel(
+            workspace=workspace,
+            version=version,
+            host=host,
+            api_port=api_port,
+            ui_port=ui_port,
+            daemon=daemon,
+            tasks=tasks or [],
+            approvals=approvals or [],
+            provider_actions=provider_actions or [],
+        ),
+        _daemon_focus_panel(task_payload=task_payload, tasks=tasks or [], approvals=approvals or [], provider_actions=provider_actions or []),
         _daemon_result_panel(command, message) if message else Text(""),
-        Text("muxdev > /run <task>   /tasks   /status [id]   /approvals   /help   /quit", style="dim"),
+        Text("muxdev > /dev <task>   /design <task>   /parallel   /learning   /actions   /help   /quit", style="dim"),
     )
 
 
@@ -179,13 +204,14 @@ def daemon_tasks_text(rows: list[dict[str, Any]]) -> str:
     lines = ["Recent tasks:"]
     for row in rows[:12]:
         lines.append(
-            "  {task_id:<22} {status:<17} stage={stage:<12} approvals={approvals:<2} tokens={tokens:<6} {task}".format(
+            "  {task_id:<22} {status:<25} stage={stage:<12} approvals={approvals:<2} actions={actions:<2} tokens={tokens:<6} {task}".format(
                 task_id=_clip(row.get("task_id") or row.get("run_id") or "-", 22),
-                status=_clip(row.get("status") or "-", 17),
+                status=_clip(row.get("status") or "-", 25),
                 stage=_clip(row.get("current_stage") or "-", 12),
                 approvals=row.get("pending_approvals", 0),
+                actions=row.get("pending_provider_actions", 0),
                 tokens=row.get("tokens", 0),
-                task=_clip(row.get("task") or "", 58),
+                task=_clip(row.get("task") or "", 40),
             )
         )
     if len(rows) > 12:
@@ -211,6 +237,32 @@ def daemon_approvals_text(rows: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def daemon_provider_actions_text(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return "No pending provider actions."
+    lines = [
+        "Pending provider actions:",
+        "Handle the provider CLI/session first, then run `/action handled <id>` and `/continue <task>`.",
+    ]
+    for row in rows[:12]:
+        options = _option_labels(row)
+        lines.append(
+            "  {action:<24} task={task:<22} {kind:<18} {provider}/{stage}".format(
+                action=_clip(row.get("action_id") or "-", 24),
+                task=_clip(row.get("run_id") or row.get("task_id") or "-", 22),
+                kind=_clip(row.get("kind") or "-", 18),
+                provider=_clip(row.get("provider") or "-", 12),
+                stage=_clip(row.get("stage_id") or "-", 12),
+            )
+        )
+        lines.append(f"    prompt: {_clip(row.get('prompt_text') or '', 120)}")
+        lines.append(f"    options: {options or '-'}")
+        lines.append(f"    attach: {_clip(row.get('attach_command') or row.get('transcript_path') or '-', 120)}")
+    if len(rows) > 12:
+        lines.append(f"  ... {len(rows) - 12} more")
+    return "\n".join(lines)
+
+
 def daemon_task_detail_text(payload: dict[str, Any]) -> str:
     run = payload.get("run") or {}
     if not run:
@@ -222,9 +274,16 @@ def daemon_task_detail_text(payload: dict[str, Any]) -> str:
         f"{run.get('run_id') or payload.get('task_id')}: {run.get('status', '-')}",
         _clip(run.get("task") or "", 110),
         f"workflow={run.get('workflow', '-')} provider={run.get('provider', '-')} profile={context.get('profile') or '-'} gate={context.get('gate') or '-'}",
-        f"stage={_current_stage(payload)} approvals={summary.get('pending_approvals', 0)} usage={summary.get('tokens', 0)} tokens ${float(summary.get('cost_usd') or 0):.4f}",
+        f"stage={_current_stage(payload)} approvals={summary.get('pending_approvals', 0)} provider_actions={summary.get('pending_provider_actions', 0)} usage={summary.get('tokens', 0)} tokens ${float(summary.get('cost_usd') or 0):.4f}",
         f"skills={', '.join(skills) if skills else '-'}",
     ]
+    actions = [row for row in payload.get("provider_actions", []) if isinstance(row, dict) and row.get("status") == "pending"]
+    if actions:
+        lines.append("")
+        lines.append("Provider actions:")
+        for row in actions[:3]:
+            lines.append(f"  {row.get('action_id')}: {_clip(row.get('prompt_text') or '', 96)}")
+            lines.append(f"    attach: {_clip(row.get('attach_command') or row.get('transcript_path') or '-', 96)}")
     events = _recent_event_lines(payload.get("trace", []), limit=5)
     if events:
         lines.append("")
@@ -253,6 +312,7 @@ def _daemon_hero_panel(
     daemon: dict[str, Any] | None,
     tasks: list[dict[str, Any]],
     approvals: list[dict[str, Any]],
+    provider_actions: list[dict[str, Any]],
 ) -> Panel:
     daemon = daemon or {}
     running = daemon.get("running_tasks", 0)
@@ -271,7 +331,8 @@ def _daemon_hero_panel(
             Text(f"workspace  {_display_path(workspace, 78)}", style="dim"),
             Text(f"daemon     http://{host}:{api_port}", style="dim"),
             Text(f"dashboard  http://{host}:{ui_port}", style="dim"),
-            Text(f"tasks={task_count}  running={running}  queue={queue}  approvals={len(approvals)}", style="cyan"),
+            Text(f"tasks={task_count}  running={running}  queue={queue}  approvals={len(approvals)}  provider_actions={len(provider_actions)}", style="cyan"),
+            *[Text(str(warning), style="yellow") for warning in daemon.get("warnings", []) if warning],
         ),
     )
     return Panel(body, title="muxdev", box=box.ASCII, border_style="cyan", padding=(1, 2))
@@ -282,11 +343,12 @@ def _daemon_focus_panel(
     task_payload: dict[str, Any] | None,
     tasks: list[dict[str, Any]],
     approvals: list[dict[str, Any]],
+    provider_actions: list[dict[str, Any]],
 ) -> Panel:
     if not task_payload or not (task_payload.get("run") or {}):
         lines = [
             Text("No active task selected.", style="bold"),
-            Text("Start with /run <task>", style="cyan"),
+            Text("Start with /dev <task> or /design <task>", style="cyan"),
             Text("Open dashboard with /dashboard", style="cyan"),
             Text("Use /help for commands", style="cyan"),
         ]
@@ -299,6 +361,12 @@ def _daemon_focus_panel(
     context = task_payload.get("context", {}) if isinstance(task_payload.get("context"), dict) else {}
     summary = task_payload.get("summary", {}) if isinstance(task_payload.get("summary"), dict) else {}
     skills = _skill_names(context.get("skills", []))
+    run_id = str(run.get("run_id") or task_payload.get("task_id") or "")
+    pending_actions = [
+        row
+        for row in provider_actions
+        if isinstance(row, dict) and (not run_id or str(row.get("run_id") or row.get("task_id") or "") == run_id)
+    ]
     grid = Table.grid(expand=True)
     grid.add_column(ratio=1, style="bold")
     grid.add_column(ratio=4)
@@ -309,6 +377,22 @@ def _daemon_focus_panel(
     grid.add_row("profile/gate", f"{context.get('profile') or '-'} / {context.get('gate') or '-'}")
     grid.add_row("usage", f"{summary.get('tokens', 0)} tokens  ${float(summary.get('cost_usd') or 0):.4f}")
     grid.add_row("approvals", str(summary.get("pending_approvals", len(approvals))))
+    grid.add_row("provider actions", str(summary.get("pending_provider_actions", len(pending_actions))))
+    conflicts = [row for row in task_payload.get("parallel_conflicts", []) if isinstance(row, dict) and row.get("status") == "open"]
+    semantic_reviews = [row for row in task_payload.get("semantic_merge_reviews", []) if isinstance(row, dict)]
+    provider_learning = [row for row in task_payload.get("provider_learning", []) if isinstance(row, dict)]
+    grid.add_row("parallel conflicts", str(len(conflicts)))
+    if semantic_reviews:
+        latest_review = semantic_reviews[0]
+        grid.add_row("semantic merge", f"{latest_review.get('decision', '-')} {str(latest_review.get('patch_hash') or '')[:20]}")
+    if provider_learning:
+        grid.add_row("provider learning", f"{len(provider_learning)} snapshot(s)")
+    if pending_actions:
+        first = pending_actions[0]
+        grid.add_row("provider prompt", _clip(first.get("prompt_text") or "", 104))
+        grid.add_row("options", _option_labels(first) or "-")
+        grid.add_row("attach", _clip(first.get("attach_command") or first.get("transcript_path") or "-", 104))
+        grid.add_row("after attach", f"/action handled {first.get('action_id')}  then  /continue {run_id or 'latest'}")
     grid.add_row("skills", ", ".join(skills) if skills else "-")
     events = _recent_event_lines(task_payload.get("trace", []), limit=5)
     if events:
@@ -374,7 +458,7 @@ def _status_border(status: str) -> str:
         return "green"
     if status in {"running", "created"}:
         return "cyan"
-    if status in {"awaiting_approval", "paused_budget"}:
+    if status in {"awaiting_approval", "awaiting_provider_action", "paused_budget"}:
         return "yellow"
     if status in {"blocked", "aborted", "failed"}:
         return "red"
@@ -392,10 +476,24 @@ def _normalize_command(line: str) -> str:
         return "q"
     if text.startswith("/run "):
         return "run " + text.split(maxsplit=1)[1]
+    if text.startswith("/dev "):
+        return "run " + text.split(maxsplit=1)[1]
+    if text.startswith("/design"):
+        return "workflow design" + ((" " + text.split(maxsplit=1)[1]) if " " in text else "")
+    if text.startswith("/fix "):
+        return "workflow fix " + text.split(maxsplit=1)[1]
+    if text.startswith("/review"):
+        return "workflow review" + ((" " + text.split(maxsplit=1)[1]) if " " in text else "")
+    if text.startswith("/test"):
+        return "workflow test" + ((" " + text.split(maxsplit=1)[1]) if " " in text else "")
     if text.startswith("/approve "):
         return "approve " + text.split(maxsplit=1)[1]
     if text.startswith("/deny "):
         return "deny " + text.split(maxsplit=1)[1]
+    if text.startswith("/action handled "):
+        return "action handled " + text.split(maxsplit=2)[2]
+    if text.startswith("/action dismiss "):
+        return "action dismiss " + text.split(maxsplit=2)[2]
     if text.startswith("/provider doctor "):
         return "provider doctor " + text.split(maxsplit=2)[2]
     if text.startswith("/skill install "):
@@ -411,6 +509,9 @@ def _normalize_command(line: str) -> str:
         "/agents": "agents",
         "/skills": "skills",
         "/usage": "usage",
+        "/actions": "actions",
+        "/parallel": "parallel",
+        "/learning": "learning",
         "/approvals": "approvals",
         "/repl": "repl",
     }
@@ -455,10 +556,33 @@ def _handle_tui_command(line: str, workspace: Path, run_id: str) -> str:
         if not pending:
             return "no pending approvals"
         return "\n".join(f"{row['approval_id']} {row['type']} {row['reason']}" for row in pending)
+    if line == "actions":
+        pending_actions = _pending_provider_actions(workspace)
+        return daemon_provider_actions_text(pending_actions)
+    if line == "parallel":
+        rows = _latest_rows(workspace, "parallel_conflicts")
+        if not rows:
+            return "no parallel conflicts recorded"
+        return "\n".join(f"{row.get('conflict_id')} {row.get('severity')} {row.get('status')} {row.get('files_json')}" for row in rows)
+    if line == "learning":
+        rows = _latest_rows(workspace, "provider_learning")
+        if not rows:
+            return "no provider learning snapshots recorded"
+        return "\n".join(f"{row.get('provider')}/{row.get('role')}: score={row.get('score')} attempts={row.get('attempts')}" for row in rows)
+    if line.startswith("action handled "):
+        return _update_provider_action(workspace, line.split(maxsplit=2)[2], ProviderActionStatus.HANDLED)
+    if line.startswith("action dismiss "):
+        return _update_provider_action(workspace, line.split(maxsplit=2)[2], ProviderActionStatus.DISMISSED)
     if line == "repl":
         return "Open a separate shell and run: muxdev repl"
     if line.startswith("run "):
         result = SupervisorRuntime(workspace).run(line.split(maxsplit=1)[1], provider="mock")
+        return f"started {result.run_id}: {result.status}"
+    if line.startswith("workflow "):
+        parts = line.split(maxsplit=2)
+        workflow = parts[1]
+        task = parts[2] if len(parts) > 2 else None
+        result = SupervisorRuntime(workspace).run(task or f"{workflow} current workspace", provider="mock", workflow_name=workflow)
         return f"started {result.run_id}: {result.status}"
     if line.startswith("new "):
         target = (workspace / line.split(maxsplit=1)[1]).resolve()
@@ -526,6 +650,22 @@ def _pending_approvals(workspace: Path) -> list[dict[str, object]]:
     return rows
 
 
+def _pending_provider_actions(workspace: Path) -> list[dict[str, object]]:
+    store = RunStore(workspace)
+    if not store.runs_dir.exists():
+        return []
+    rows: list[dict[str, object]] = []
+    for run_dir in store.runs_dir.iterdir():
+        if not (run_dir / "blackboard.sqlite").exists():
+            continue
+        blackboard = Blackboard(run_dir)
+        try:
+            rows.extend(blackboard.list_provider_actions(status=str(ProviderActionStatus.PENDING), run_id=run_dir.name))
+        finally:
+            blackboard.close()
+    return rows
+
+
 def _decide_approval(workspace: Path, approval_id: str, status: ApprovalStatus) -> str:
     store = RunStore(workspace)
     if not store.runs_dir.exists():
@@ -542,6 +682,24 @@ def _decide_approval(workspace: Path, approval_id: str, status: ApprovalStatus) 
         finally:
             blackboard.close()
     return f"approval not found: {approval_id}"
+
+
+def _update_provider_action(workspace: Path, action_id: str, status: ProviderActionStatus) -> str:
+    store = RunStore(workspace)
+    if not store.runs_dir.exists():
+        return f"provider action not found: {action_id}"
+    for run_dir in store.runs_dir.iterdir():
+        if not (run_dir / "blackboard.sqlite").exists():
+            continue
+        blackboard = Blackboard(run_dir)
+        try:
+            rows = blackboard.list_provider_actions(run_id=run_dir.name)
+            if any(row["action_id"] == action_id for row in rows):
+                blackboard.update_provider_action_status(action_id, status)
+                return f"{action_id}: {status}"
+        finally:
+            blackboard.close()
+    return f"provider action not found: {action_id}"
 
 
 def app_payload(workspace: Path) -> dict[str, Any]:
@@ -633,17 +791,23 @@ def _provider_summary(payload: dict[str, Any]) -> Table:
 
 def _quick_summary(payload: dict[str, Any]) -> Table:
     pending = [row for row in payload["approvals"] if row["status"] == "pending"]
+    pending_actions = [row for row in payload.get("provider_actions", []) if row.get("status") == "pending"]
     table = Table.grid(expand=True)
     table.add_column(ratio=1, style="bold")
     table.add_column(ratio=3)
-    if pending:
+    if pending_actions:
+        first = pending_actions[0]
+        table.add_row("attach", str(first.get("attach_command") or first.get("transcript_path") or "-"))
+        table.add_row("handled", f"/action handled {first['action_id']}")
+    elif pending:
         first = pending[0]
         table.add_row("approve", f"/approve {first['approval_id']}")
         table.add_row("deny", f"/deny {first['approval_id']}")
     else:
         table.add_row("approvals", "none pending")
     quick = _quick_commands()
-    table.add_row("run", "/run <task>")
+    table.add_row("dev", "/dev <task>")
+    table.add_row("design", "/design <task>")
     table.add_row("continue", "/continue")
     table.add_row("report", quick.get("report", "muxdev report latest"))
     return table
@@ -663,10 +827,16 @@ def _work_panel(payload: dict[str, Any]) -> Panel:
     meta.add_column(ratio=1, style="bold")
     meta.add_column(ratio=4)
     pending = [row for row in payload["approvals"] if row["status"] == "pending"]
+    pending_actions = [row for row in payload.get("provider_actions", []) if row.get("status") == "pending"]
     context = payload.get("context", {}) if isinstance(payload.get("context"), dict) else {}
     skills = context.get("skills", []) if isinstance(context.get("skills"), list) else []
     meta.add_row("worktree", _display_path(run["worktree"], 96))
     meta.add_row("pending approvals", str(len(pending)))
+    meta.add_row("provider actions", str(len(pending_actions)))
+    if pending_actions:
+        first = pending_actions[0]
+        meta.add_row("provider prompt", _clip(first.get("prompt_text") or "", 96))
+        meta.add_row("attach", _clip(first.get("attach_command") or first.get("transcript_path") or "-", 96))
     meta.add_row("usage", f"{payload['summary']['tokens']} tokens  ${payload['summary']['cost_usd']:.4f}")
     if skills:
         meta.add_row("skills", ", ".join(str(skill.get("name", skill)) if isinstance(skill, dict) else str(skill) for skill in skills))
@@ -700,6 +870,7 @@ def _status_text(status: str) -> Text:
         "completed": "bold green",
         "running": "bold cyan",
         "awaiting_approval": "bold yellow",
+        "awaiting_provider_action": "bold yellow",
         "paused_budget": "bold yellow",
         "blocked": "bold red",
         "failed": "bold red",
@@ -729,6 +900,13 @@ def _display_path(value: object, width: int) -> str:
 
 def _display_value(value: object) -> str:
     return str(value).replace("\\", "/")
+
+
+def _option_labels(row: dict[str, Any]) -> str:
+    options = row.get("options")
+    if not isinstance(options, list):
+        return ""
+    return ", ".join(str(option.get("label") or option.get("value")) for option in options if isinstance(option, dict) and (option.get("label") or option.get("value")))
 
 
 def _slash_commands(workspace: Path | None = None) -> dict[str, str]:

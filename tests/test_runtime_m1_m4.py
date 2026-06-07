@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from muxdev.models import ApprovalStatus, RunStatus
+from muxdev.models import ApprovalStatus, ProviderActionStatus, RunStatus
 from muxdev.runtime import SupervisorRuntime
 from muxdev.providers.adapters import ProviderStageOutput
 from muxdev.storage import Blackboard
@@ -207,19 +207,53 @@ def test_review_blockers_drive_fix_loop(monkeypatch: pytest.MonkeyPatch, workspa
     assert stages["fix"] == "skipped"
 
 
-def test_external_confirmation_output_creates_pending_approval(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
+def test_external_confirmation_output_creates_provider_action_not_approval(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
     class ExternalPromptProvider:
         def run_stage(self, *, stage_id: str, task: str, worktree: Path) -> ProviderStageOutput:
             return ProviderStageOutput("session/external.log", "waiting_external_confirmation: continue?", "needs confirmation")
 
     monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: ExternalPromptProvider())
 
-    result = SupervisorRuntime(workspace).run("external approval smoke", provider="mock")
+    result = SupervisorRuntime(workspace).run("external provider action smoke", provider="mock")
 
-    assert result.status == RunStatus.AWAITING_APPROVAL
+    assert result.status == RunStatus.AWAITING_PROVIDER_ACTION
     blackboard = Blackboard(result.run_dir)
     try:
         approvals = blackboard.list_approvals(status="pending")
+        actions = blackboard.list_provider_actions(status=str(ProviderActionStatus.PENDING))
     finally:
         blackboard.close()
-    assert approvals[0]["type"] == "external"
+    assert approvals == []
+    assert actions[0]["kind"] == "cli_confirmation"
+    assert "continue?" in actions[0]["prompt_text"]
+    assert actions[0]["attach_command"].startswith(f"muxdev attach {result.run_id}")
+
+
+def test_provider_action_must_be_handled_before_resume(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
+    class ExternalPromptProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run_stage(self, *, stage_id: str, task: str, worktree: Path) -> ProviderStageOutput:
+            self.calls += 1
+            if self.calls == 1:
+                return ProviderStageOutput("session/external.log", "Apply this change? [y/N]", "needs confirmation")
+            return ProviderStageOutput(f"{stage_id}.md", "{}", "ok")
+
+    provider = ExternalPromptProvider()
+    monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: provider)
+
+    runtime = SupervisorRuntime(workspace)
+    paused = runtime.run("provider action resume smoke", provider="mock")
+    blocked_resume = runtime.resume(paused.run_id)
+    blackboard = Blackboard(paused.run_dir)
+    try:
+        action = blackboard.list_provider_actions(status=str(ProviderActionStatus.PENDING))[0]
+        blackboard.update_provider_action_status(action["action_id"], ProviderActionStatus.HANDLED)
+    finally:
+        blackboard.close()
+    resumed = runtime.resume(paused.run_id)
+
+    assert paused.status == RunStatus.AWAITING_PROVIDER_ACTION
+    assert blocked_resume.status == RunStatus.AWAITING_PROVIDER_ACTION
+    assert resumed.status == RunStatus.COMPLETED

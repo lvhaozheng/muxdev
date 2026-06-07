@@ -34,10 +34,14 @@ GATES = {
 }
 
 WORKFLOW_ALIASES = {
+    "design": "design",
     "dev": "dev",
     "fix": "fix",
+    "refactor": "dev",
     "review": "review",
     "test": "test",
+    "ci": "dev",
+    "ci-fix": "dev",
     "docs": "docs",
     "software-dev": "software-dev",
 }
@@ -55,18 +59,38 @@ ROLE_ALIASES = {
 RUNTIME_ROLE_TO_LEGACY_ROLE = {
     "lead": "architect",
     "plan": "architect",
+    "requirements": "architect",
+    "architect": "architect",
     "code": "implementer",
     "test": "tester",
+    "test_strategy": "tester",
     "review": "reviewer",
     "secure": "reviewer",
     "docs": "implementer",
+    "memory_curator": "architect",
 }
 
 BUILTIN_RUNTIME_CONFIG: dict[str, Any] = {
-    "version": 1,
+    "version": 2,
     "profile": DEFAULT_PROFILE,
     "gate": DEFAULT_GATE,
+    "automation": {
+        "mode": "auto",
+        "profile": "auto",
+        "depth": "auto",
+        "allow_parallel": True,
+    },
     "roles": {},
+    "memory": {
+        "enabled": True,
+        "mode": "evidence-grounded",
+        "local_only": True,
+        "auto_promote_low_risk": True,
+        "require_approval_for": ["architecture_decision", "security_rule", "payment_rule"],
+        "ttl_days": 180,
+        "max_items_per_role": 8,
+        "redact_secrets": True,
+    },
     "cli": {
         "fallback": ["codex", "claude-code", "qwen", "mock"],
         "codex": {"command": "codex"},
@@ -175,6 +199,8 @@ def load_task_file(path: Path) -> dict[str, Any]:
         task_config["cli"] = data["cli"]
     if "task" in data:
         task_config["task"] = str(data["task"])
+    if "depth" in data:
+        task_config["depth"] = str(data["depth"])
     skills = data.get("skill", [])
     if isinstance(skills, dict):
         skills = [skills]
@@ -215,30 +241,57 @@ def resolve_task_request(
     workflow: str | None = None,
     profile: str | None = None,
     gate: str | None = None,
+    depth: str | None = None,
     role_overrides: list[str] | None = None,
     skill_specs: list[str] | None = None,
     task_file: Path | None = None,
     require_approval: set[str] | None = None,
 ) -> dict[str, Any]:
+    from ..services.automation import resolve_automation
+
     task_config = load_task_file(task_file) if task_file else {}
     effective = load_runtime_config(workspace, task_config=task_config)
-    selected_profile = profile or str(task_config.get("profile") or effective["profile"])
     selected_gate = gate or str(task_config.get("gate") or effective["gate"])
-    selected_profile = selected_profile if selected_profile in PROFILES else DEFAULT_PROFILE
     selected_gate = selected_gate if selected_gate in GATES else DEFAULT_GATE
-    selected_workflow = workflow or WORKFLOW_ALIASES.get(command_workflow, command_workflow)
-    if selected_workflow == "profile":
-        selected_workflow = str(PROFILES[selected_profile]["workflow"])
-    selected_workflow = WORKFLOW_ALIASES.get(selected_workflow, selected_workflow)
     resolved_task = task or str(task_config.get("task") or "").strip()
+    if not resolved_task and command_workflow == "design":
+        resolved_task = "design current workspace"
     if not resolved_task and command_workflow == "review":
         resolved_task = "review current workspace"
     if not resolved_task and command_workflow == "test":
         resolved_task = "test current workspace"
+    if not resolved_task and command_workflow == "ci":
+        resolved_task = "fix CI failures"
     if not resolved_task:
         raise ValueError("task is required")
 
-    roles = dict(effective.get("roles", {}))
+    requested_profile = profile or (str(task_config.get("profile")) if task_config.get("profile") else None)
+    requested_depth = depth or (str(task_config.get("depth")) if task_config.get("depth") else None)
+    automation = resolve_automation(
+        workspace=workspace,
+        command_workflow=command_workflow,
+        task=resolved_task,
+        config=effective,
+        profile=requested_profile,
+        workflow=workflow,
+        depth=requested_depth,
+    )
+    selected_profile = automation.profile if automation.profile in PROFILES else DEFAULT_PROFILE
+    selected_workflow = automation.workflow
+    if selected_workflow == "profile":
+        selected_workflow = str(PROFILES[selected_profile]["workflow"])
+    selected_workflow = WORKFLOW_ALIASES.get(selected_workflow, selected_workflow)
+
+    configured_roles = {
+        normalize_role(role): str(value)
+        for role, value in (effective.get("roles", {}) if isinstance(effective.get("roles"), dict) else {}).items()
+        if value and str(value) != "auto"
+    }
+    roles: dict[str, str] = {}
+    for role in automation.roles:
+        value = configured_roles.get(role) or configured_roles.get(_provider_role_fallback(role))
+        if value:
+            roles[role] = value
     roles.update(parse_role_overrides(role_overrides))
     default_provider = provider or choose_default_provider(effective)
     role_providers: dict[str, str] = {}
@@ -247,7 +300,7 @@ def resolve_task_request(
             continue
         role_providers[normalize_role(role)] = value
         role_providers[legacy_role(role)] = value
-    if roles:
+    if roles and not provider:
         default_provider = next(iter(roles.values()))
     approvals = set(GATES[selected_gate]["require_approval"])
     approvals.update(require_approval or set())
@@ -268,11 +321,14 @@ def resolve_task_request(
         "workflow": selected_workflow,
         "profile": selected_profile,
         "gate": selected_gate,
+        "depth": automation.depth,
+        "topology": automation.topology,
         "require_approval": sorted(approvals),
         "role_providers": role_providers,
-        "runtime_roles": roles,
+        "runtime_roles": {role: roles.get(role, "auto") for role in automation.roles},
         "skill_specs": skill_inputs,
         "ci_block_on_approval": bool(GATES[selected_gate].get("block_on_approval")),
+        "automation": automation.to_dict(),
         "config": effective,
     }
 
@@ -287,6 +343,14 @@ def choose_default_provider(config: dict[str, Any], *, probes: list[ProviderProb
     return "mock"
 
 
+def _provider_role_fallback(role: str) -> str:
+    if role in {"requirements", "architect", "memory_curator"}:
+        return "plan"
+    if role == "test_strategy":
+        return "test"
+    return role
+
+
 def recommended_config(probes: list[ProviderProbe] | None = None) -> dict[str, Any]:
     probes = detect_providers() if probes is None else probes
     config = deepcopy(BUILTIN_RUNTIME_CONFIG)
@@ -297,6 +361,10 @@ def recommended_config(probes: list[ProviderProbe] | None = None) -> dict[str, A
         "code": "codex" if "codex" in ready else preferred,
         "test": "qwen" if "qwen" in ready else preferred,
         "review": "codex" if "codex" in ready else preferred,
+        "secure": "claude-code" if "claude-code" in ready else preferred,
+        "docs": preferred,
+        "architect": "codex" if "codex" in ready else preferred,
+        "memory_curator": preferred,
     }
     config["roles"] = roles
     return config

@@ -11,7 +11,9 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from ..models import ApprovalStatus
+from ..models import ApprovalStatus, ProviderActionStatus
+from ..services.multirepo import plan_multi_repo_orchestration
+from ..storage import MemoryStore
 
 
 def render_dashboard_html(payload: dict[str, Any]) -> str:
@@ -76,7 +78,7 @@ def render_dashboard_html(payload: dict[str, Any]) -> str:
     .status {{ display: inline-flex; align-items: center; border-radius: 999px; padding: 2px 8px; border: 1px solid var(--line); font-weight: 700; }}
     .status.completed {{ color: var(--good); border-color: #bbf7d0; background: #f0fdf4; }}
     .status.running {{ color: var(--accent); border-color: #99f6e4; background: #f0fdfa; }}
-    .status.awaiting_approval, .status.needs_approval, .status.paused_budget {{ color: var(--warn); border-color: #fde68a; background: #fffbeb; }}
+    .status.awaiting_approval, .status.awaiting_provider_action, .status.needs_approval, .status.paused_budget {{ color: var(--warn); border-color: #fde68a; background: #fffbeb; }}
     .status.blocked, .status.failed, .status.aborted {{ color: var(--bad); border-color: #fecaca; background: #fef2f2; }}
     .progress {{ width: 100%; height: 8px; background: #e5e7eb; border-radius: 999px; overflow: hidden; }}
     .progress > div {{ height: 100%; width: {_number(summary.get("progress", 0))}%; background: var(--accent); }}
@@ -129,6 +131,56 @@ def render_dashboard_html(payload: dict[str, Any]) -> str:
       {_table(payload.get("approvals", []), ["approval_id", "stage_id", "type", "status", "reason", "decided_at"])}
     </section>
     <section class="panel span-6">
+      <h2>Provider Actions</h2>
+      {_table(_provider_action_rows(payload.get("provider_actions", [])), ["action_id", "stage_id", "provider", "kind", "status", "prompt", "options", "attach"])}
+    </section>
+    <section class="panel span-6">
+      <h2>Provider Attempts</h2>
+      {_table(payload.get("provider_attempts", []), ["stage_id", "role", "provider", "attempt", "status", "failure_kind", "returncode", "summary"])}
+    </section>
+    <section class="panel span-6">
+      <h2>Session Capsules</h2>
+      {_table(payload.get("session_capsules", []), ["capsule_id", "stage_id", "provider", "kind", "status", "path"])}
+    </section>
+    <section class="panel span-6">
+      <h2>Feedback Router</h2>
+      {_table(payload.get("feedback_events", []), ["feedback_id", "source", "kind", "status", "route_to", "severity", "content"])}
+    </section>
+    <section class="panel span-6">
+      <h2>CI Rescue</h2>
+      {_table(payload.get("ci_rescues", []), ["rescue_id", "feedback_id", "rescue_run_id", "route_to", "status", "summary"])}
+    </section>
+    <section class="panel span-6">
+      <h2>Cache / Skills / Plugins</h2>
+      <h3>CAS Cache</h3>
+      {_table(payload.get("cache_entries", []), ["cache_key", "kind", "path", "value_hash"])}
+      <h3>Skill Lock</h3>
+      {_table(payload.get("skill_locks", []), ["skill_name", "skill_version", "skill_hash", "status", "path"])}
+      <h3>Plugin Manifest</h3>
+      {_table(payload.get("plugin_manifests", []), ["plugin_name", "trust", "status", "manifest_hash", "source"])}
+    </section>
+    <section class="panel span-6">
+      <h2>Memory / Guardrails</h2>
+      <h3>Memory Context</h3>
+      {_table(payload.get("memory_context", []), ["id", "kind", "role", "claim"])}
+      <h3>Guardrail Events</h3>
+      {_table(payload.get("guardrail_events", []), ["event_id", "tool", "decision", "reason", "created_at"])}
+    </section>
+    <section class="panel span-6">
+      <h2>Advanced Parallel</h2>
+      <h3>Parallel Conflicts</h3>
+      {_table(payload.get("parallel_conflicts", []), ["conflict_id", "stages", "files", "severity", "status", "resolution"])}
+      <h3>Semantic Merge</h3>
+      {_table(payload.get("semantic_merge_reviews", []), ["review_id", "decision", "patch_hash", "findings", "path"])}
+    </section>
+    <section class="panel span-6">
+      <h2>Long-Term Learning</h2>
+      <h3>Provider Learning</h3>
+      {_table(payload.get("provider_learning", []), ["provider", "role", "attempts", "successes", "failures", "human_actions", "score"])}
+      <h3>Multi-Repo Orchestration</h3>
+      {_table(payload.get("multi_repo_orchestrations", []), ["orchestration_id", "mode", "status", "task", "plan_path"])}
+    </section>
+    <section class="panel span-6">
       <h2>Action Hints</h2>
       {_action_hints(payload)}
     </section>
@@ -170,6 +222,7 @@ def _summary_cards(summary: dict[str, Any]) -> str:
         ("Progress", f"{_number(summary.get('progress', 0))}%", '<div class="progress"><div></div></div>'),
         ("Stages", f"{_escape(summary.get('stage_done', 0))}/{_escape(summary.get('stage_total', 0))}", "completed / total"),
         ("Pending Approvals", str(summary.get("pending_approvals", 0)), "human gates"),
+        ("Provider Actions", str(summary.get("pending_provider_actions", 0)), "CLI/session handoffs"),
         ("Usage", f"{summary.get('tokens', 0)} tokens", f"${float(summary.get('cost_usd') or 0):.4f}"),
     ]
     return "\n".join(
@@ -204,8 +257,15 @@ def _trace_table(rows: list[dict[str, Any]]) -> str:
 
 def _action_hints(payload: dict[str, Any]) -> str:
     pending = [row for row in payload.get("approvals", []) if row.get("status") == "pending"]
+    provider_actions = [row for row in payload.get("provider_actions", []) if row.get("status") == "pending"]
     run_id = (payload.get("run") or {}).get("run_id", "latest")
     commands = []
+    if provider_actions:
+        action = provider_actions[0]
+        if action.get("attach_command"):
+            commands.append(str(action["attach_command"]))
+        commands.append(f"muxdev action handled {action.get('action_id', '<action_id>')}")
+        commands.append(f"muxdev continue {action.get('run_id', run_id)}")
     if pending:
         approval_id = pending[0].get("approval_id", "<approval_id>")
         commands.extend([f"muxdev approve {approval_id}", f"muxdev deny {approval_id}"])
@@ -218,6 +278,34 @@ def _action_hints(payload: dict[str, Any]) -> str:
         ]
     )
     return '<div class="commands">' + "".join(f"<code>{_escape(command)}</code>" for command in commands) + "</div>"
+
+
+def _provider_action_rows(rows: object) -> list[dict[str, Any]]:
+    if not isinstance(rows, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        options = row.get("options")
+        if not isinstance(options, list):
+            try:
+                options = json.loads(str(row.get("options_json") or "[]"))
+            except json.JSONDecodeError:
+                options = []
+        normalized.append(
+            {
+                "action_id": row.get("action_id"),
+                "stage_id": row.get("stage_id"),
+                "provider": row.get("provider"),
+                "kind": row.get("kind"),
+                "status": row.get("status"),
+                "prompt": row.get("prompt_text"),
+                "options": ", ".join(str(option.get("label") or option.get("value")) for option in options if isinstance(option, dict)) or "-",
+                "attach": row.get("attach_command") or row.get("transcript_path"),
+            }
+        )
+    return normalized
 
 
 def _provider_health(app: dict[str, Any]) -> str:
@@ -236,6 +324,8 @@ def _kv(label: str, value: object) -> str:
 def _format_cell(value: object) -> str:
     if value is None or value == "":
         return '<span class="muted">-</span>'
+    if isinstance(value, (list, dict)):
+        return _escape(json.dumps(value, ensure_ascii=False))
     return _escape(value)
 
 
@@ -266,10 +356,32 @@ class TaskCreateRequest(BaseModel):
     role_providers: dict[str, str] = Field(default_factory=dict)
     skills: list[dict[str, Any]] = Field(default_factory=list)
     ci_block_on_approval: bool = False
+    depth: str | None = None
+    topology: str | None = None
+    automation: dict[str, Any] = Field(default_factory=dict)
 
 
 class ContinueRequest(BaseModel):
     max_cost_usd: float = 0.5
+
+
+class MultiRepoPlanRequest(BaseModel):
+    task: str
+    repos: list[str] = Field(default_factory=list)
+    mode: str = "design"
+    workspace: str | None = None
+
+
+class FeedbackRequest(BaseModel):
+    kind: str
+    source: str = "manual"
+    content: str
+    workspace: str | None = None
+    run_id: str | None = None
+    severity: str = "medium"
+    provider: str = "mock"
+    payload: dict[str, Any] = Field(default_factory=dict)
+    auto_submit: bool = True
 
 
 def create_app(*, task_manager: object | None = None, paths: object | None = None) -> FastAPI:
@@ -315,6 +427,9 @@ def create_app(*, task_manager: object | None = None, paths: object | None = Non
             role_providers=request.role_providers,
             skills=request.skills,
             ci_block_on_approval=request.ci_block_on_approval,
+            depth=request.depth,
+            topology=request.topology,
+            automation=request.automation,
         )
 
     @app.get("/api/tasks")
@@ -359,9 +474,9 @@ def create_app(*, task_manager: object | None = None, paths: object | None = Non
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/tasks/{task_id}/rollback")
-    def rollback_task(task_id: str) -> dict[str, object]:
+    def rollback_task(task_id: str, to_stage: str | None = None) -> dict[str, object]:
         try:
-            return manager.rollback(task_id)
+            return manager.rollback(task_id, to_stage=to_stage)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -369,6 +484,109 @@ def create_app(*, task_manager: object | None = None, paths: object | None = Non
     def attach_command(task_id: str, agent: str = "implementer") -> dict[str, object]:
         try:
             return manager.attach_command(task_id, agent=agent)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/provider-actions")
+    def provider_actions(status: str | None = None) -> list[dict[str, object]]:
+        return manager.provider_actions(status=status)
+
+    @app.get("/api/provider-scores")
+    def provider_scores(role: str | None = None) -> list[dict[str, object]]:
+        return manager.provider_scores(role=role)
+
+    @app.get("/api/learning/provider")
+    def provider_learning(role: str | None = None) -> list[dict[str, object]]:
+        return manager.provider_learning(role=role)
+
+    @app.get("/api/parallel-conflicts")
+    def parallel_conflicts(status: str | None = None) -> list[dict[str, object]]:
+        return manager.parallel_conflicts(status=status)
+
+    @app.get("/api/semantic-merge-reviews")
+    def semantic_merge_reviews() -> list[dict[str, object]]:
+        return manager.semantic_merge_reviews()
+
+    @app.get("/api/multi-repo/orchestrations")
+    def multi_repo_orchestrations(status: str | None = None) -> list[dict[str, object]]:
+        return manager.multi_repo_orchestrations(status=status)
+
+    @app.post("/api/multi-repo/plan")
+    def multi_repo_plan(request: MultiRepoPlanRequest) -> dict[str, object]:
+        workspace = Path(request.workspace or Path.cwd()).resolve()
+        with manager.board() as board:
+            return plan_multi_repo_orchestration(
+                workspace,
+                repos=[Path(repo) for repo in request.repos],
+                task=request.task,
+                mode=request.mode,
+                blackboard=board,
+            )
+
+    @app.post("/api/feedback")
+    def feedback(request: FeedbackRequest) -> dict[str, object]:
+        workspace = Path(request.workspace or Path.cwd()).resolve()
+        return manager.ingest_feedback(
+            kind=request.kind,
+            source=request.source,
+            content=request.content,
+            workspace=workspace,
+            run_id=request.run_id,
+            severity=request.severity,
+            provider=request.provider,
+            payload=request.payload,
+            auto_submit=request.auto_submit,
+        )
+
+    @app.get("/api/ecosystem")
+    def ecosystem() -> dict[str, object]:
+        return manager.ecosystem_state()
+
+    @app.get("/api/tasks/{task_id}/provider-actions")
+    def task_provider_actions(task_id: str, status: str | None = None) -> list[dict[str, object]]:
+        try:
+            return manager.provider_actions(status=status, task_id=task_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/tasks/{task_id}/parallel-conflicts")
+    def task_parallel_conflicts(task_id: str, status: str | None = None) -> list[dict[str, object]]:
+        try:
+            return manager.parallel_conflicts(status=status, task_id=task_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/tasks/{task_id}/semantic-merge-reviews")
+    def task_semantic_merge_reviews(task_id: str) -> list[dict[str, object]]:
+        try:
+            return manager.semantic_merge_reviews(task_id=task_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/memory/contradictions")
+    def memory_contradictions(workspace: str | None = None, status: str | None = None) -> list[dict[str, object]]:
+        with MemoryStore(Path(workspace or Path.cwd()).resolve()) as store:
+            if status is None:
+                store.detect_contradictions()
+            return store.list_contradictions(status=status)
+
+    @app.post("/api/memory/quarantine-auto")
+    def memory_quarantine_auto(workspace: str | None = None) -> list[dict[str, object]]:
+        with MemoryStore(Path(workspace or Path.cwd()).resolve()) as store:
+            store.detect_contradictions()
+            return store.auto_quarantine_contradictions()
+
+    @app.post("/api/provider-actions/{action_id}/handled")
+    def provider_action_handled(action_id: str) -> dict[str, object]:
+        try:
+            return manager.update_provider_action(action_id, ProviderActionStatus.HANDLED)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/provider-actions/{action_id}/dismiss")
+    def provider_action_dismiss(action_id: str) -> dict[str, object]:
+        try:
+            return manager.update_provider_action(action_id, ProviderActionStatus.DISMISSED)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -443,7 +661,7 @@ def render_live_dashboard_html(task_id: str | None = None) -> str:
     .status {{ display: inline-flex; border: 1px solid var(--line); border-radius: 999px; padding: 1px 7px; font-weight: 700; }}
     .completed {{ color: var(--good); background: #f0fdf4; border-color: #bbf7d0; }}
     .running {{ color: var(--accent); background: #f0fdfa; border-color: #99f6e4; }}
-    .awaiting_approval, .paused_budget {{ color: var(--warn); background: #fffbeb; border-color: #fde68a; }}
+    .awaiting_approval, .awaiting_provider_action, .paused_budget {{ color: var(--warn); background: #fffbeb; border-color: #fde68a; }}
     .blocked, .aborted {{ color: var(--bad); background: #fef2f2; border-color: #fecaca; }}
     table {{ width: 100%; border-collapse: collapse; table-layout: fixed; }}
     th, td {{ border-bottom: 1px solid #edf1f7; padding: 7px 6px; text-align: left; vertical-align: top; overflow-wrap: anywhere; }}
@@ -467,6 +685,7 @@ def render_live_dashboard_html(task_id: str | None = None) -> str:
     </section>
     <section class="stack">
       <div class="panel"><h2>Task Detail</h2><div id="detail" class="meta">Select a task.</div></div>
+      <div class="panel"><h2>Provider Actions</h2><div id="provider-actions"></div></div>
       <div class="panel"><h2>Approvals</h2><div id="approvals"></div></div>
       <div class="panel"><h2>Recent Events</h2><pre id="events"></pre></div>
     </section>
@@ -475,10 +694,14 @@ def render_live_dashboard_html(task_id: str | None = None) -> str:
     const state = {{ taskId: document.body.dataset.taskId || null, events: [] }};
     const statusClass = value => `status ${{value || ''}}`;
     const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}})[ch]);
+    const fmt = value => Array.isArray(value) || (value && typeof value === 'object') ? JSON.stringify(value) : value;
     async function api(path, options) {{
       const response = await fetch('/api' + path, options);
       if (!response.ok) throw new Error(await response.text());
       return response.json();
+    }}
+    async function optionalApi(path, fallback) {{
+      try {{ return await api(path); }} catch (_error) {{ return fallback; }}
     }}
     async function refresh() {{
       const health = await api('/health');
@@ -486,6 +709,7 @@ def render_live_dashboard_html(task_id: str | None = None) -> str:
       const tasks = await api('/tasks');
       if (!state.taskId && tasks.length) state.taskId = tasks[0].task_id;
       renderTasks(tasks);
+      renderProviderActions(await optionalApi('/provider-actions?status=pending', []));
       renderApprovals(await api('/approvals?status=pending'));
       if (state.taskId) renderDetail(await api('/tasks/' + encodeURIComponent(state.taskId)));
     }}
@@ -494,7 +718,7 @@ def render_live_dashboard_html(task_id: str | None = None) -> str:
         <div class="task ${{task.task_id === state.taskId ? 'active' : ''}}" onclick="state.taskId='${{esc(task.task_id)}}'; refresh()">
           <strong>${{esc(task.task_id)}}</strong> <span class="${{statusClass(task.status)}}">${{esc(task.status)}}</span>
           <div>${{esc(task.task)}}</div>
-          <div class="meta">profile=${{esc(task.profile || '-')}} gate=${{esc(task.gate || '-')}} stage=${{esc(task.current_stage || '-')}} approvals=${{task.pending_approvals}} tokens=${{task.tokens}}</div>
+          <div class="meta">profile=${{esc(task.profile || '-')}} gate=${{esc(task.gate || '-')}} stage=${{esc(task.current_stage || '-')}} approvals=${{task.pending_approvals}} provider_actions=${{task.pending_provider_actions || 0}} tokens=${{task.tokens}}</div>
           <div class="meta">skills=${{esc((task.skills || []).join(', ') || '-')}}</div>
         </div>`).join('') || '<div class="meta">No tasks yet.</div>';
     }}
@@ -513,12 +737,45 @@ def render_live_dashboard_html(task_id: str | None = None) -> str:
           <button onclick="loadText('/tasks/${{encodeURIComponent(run.run_id)}}/diff','diff')">Diff</button>
           <button onclick="loadText('/tasks/${{encodeURIComponent(run.run_id)}}/report','content')">Report</button>
         </div>
+        <h2>Timeline</h2>
         <table><thead><tr><th>Stage</th><th>Role</th><th>Status</th><th>Summary</th></tr></thead><tbody>
         ${{stages.map(row => `<tr><td>${{esc(row.stage_id)}}</td><td>${{esc(row.role)}}</td><td>${{esc(row.status)}}</td><td>${{esc(row.summary)}}</td></tr>`).join('')}}
-        </tbody></table>`;
+        </tbody></table>
+        ${{tableBlock('Evidence', payload.evidence_bundles || [], ['stage_id','bundle_hash','path'])}}
+        ${{tableBlock('Memory Context', payload.memory_context || [], ['id','kind','role','claim'])}}
+        ${{tableBlock('Role Sessions', payload.session_capsules || [], ['stage_id','provider','kind','status','path'])}}
+        ${{tableBlock('Feedback / CI Rescue', payload.feedback_events || [], ['feedback_id','kind','status','route_to','content'])}}
+        ${{tableBlock('CAS Cache', payload.cache_entries || [], ['cache_key','kind','path','value_hash'])}}
+        ${{tableBlock('Skill Lock', payload.skill_locks || [], ['skill_name','skill_hash','status','path'])}}
+        ${{tableBlock('Plugin Manifests', payload.plugin_manifests || [], ['plugin_name','trust','status','manifest_hash'])}}
+        ${{tableBlock('Guardrails', payload.guardrail_events || [], ['tool','decision','reason','created_at'])}}
+        ${{tableBlock('Parallel Conflicts', payload.parallel_conflicts || [], ['conflict_id','severity','status','stages','files'])}}
+        ${{tableBlock('Semantic Merge Reviews', payload.semantic_merge_reviews || [], ['review_id','decision','patch_hash','path'])}}
+        ${{tableBlock('Provider Learning', payload.provider_learning || [], ['provider','role','attempts','successes','failures','human_actions','score'])}}
+        ${{tableBlock('Multi-Repo Orchestration', payload.multi_repo_orchestrations || [], ['orchestration_id','mode','status','task','plan_path'])}}`;
+    }}
+    function tableBlock(title, rows, columns) {{
+      if (!rows.length) return `<h2>${{esc(title)}}</h2><div class="meta">No records.</div>`;
+      return `<h2>${{esc(title)}}</h2><table><thead><tr>${{columns.map(column => `<th>${{esc(column)}}</th>`).join('')}}</tr></thead><tbody>${{rows.map(row => `<tr>${{columns.map(column => `<td>${{esc(fmt(row[column]))}}</td>`).join('')}}</tr>`).join('')}}</tbody></table>`;
     }}
     function renderApprovals(rows) {{
       document.getElementById('approvals').innerHTML = rows.length ? `<table><thead><tr><th>ID</th><th>Task</th><th>Type</th><th>Action</th></tr></thead><tbody>${{rows.map(row => `<tr><td>${{esc(row.approval_id)}}</td><td>${{esc(row.run_id)}}</td><td>${{esc(row.type)}}</td><td><button class="primary" onclick="post('/approvals/${{encodeURIComponent(row.approval_id)}}/approve')">Approve</button> <button onclick="post('/approvals/${{encodeURIComponent(row.approval_id)}}/deny')">Deny</button></td></tr>`).join('')}}</tbody></table>` : '<div class="meta">No pending approvals.</div>';
+    }}
+    function renderProviderActions(rows) {{
+      document.getElementById('provider-actions').innerHTML = rows.length ? `<table><thead><tr><th>ID</th><th>Task</th><th>Prompt</th><th>Attach / Actions</th></tr></thead><tbody>${{rows.map(row => `
+        <tr>
+          <td>${{esc(row.action_id)}}<div class="meta">${{esc(row.kind)}} / ${{esc(row.provider)}} / ${{esc(row.stage_id || '-')}}</div></td>
+          <td>${{esc(row.run_id)}}</td>
+          <td>${{esc(row.prompt_text)}}<div class="meta">options=${{esc((row.options || []).map(option => option.label || option.value).join(', ') || '-')}}</div></td>
+          <td>
+            <code>${{esc(row.attach_command || row.transcript_path || '-')}}</code>
+            <div class="actions">
+              <button class="primary" onclick="post('/provider-actions/${{encodeURIComponent(row.action_id)}}/handled')">Mark handled</button>
+              <button onclick="post('/provider-actions/${{encodeURIComponent(row.action_id)}}/dismiss')">Dismiss</button>
+              <button onclick="post('/tasks/${{encodeURIComponent(row.run_id)}}/stop')">Stop task</button>
+            </div>
+          </td>
+        </tr>`).join('')}}</tbody></table>` : '<div class="meta">No pending provider actions.</div>';
     }}
     async function post(path) {{ await api(path, {{ method: 'POST' }}); await refresh(); }}
     async function loadText(path, key) {{ const payload = await api(path); document.getElementById('events').textContent = payload[key] || ''; }}

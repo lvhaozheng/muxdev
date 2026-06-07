@@ -17,9 +17,32 @@ def test_stream_adapter_detects_plain_and_ansi_approval_prompts() -> None:
 
     plain = adapter.parse_chunk("Apply this change? [y/N]")
     ansi = adapter.parse_chunk("\x1b[31mApprove?\x1b[0m")
+    explicit = adapter.parse_chunk("Do you want to continue?")
 
     assert any(event.type == StreamEventType.APPROVAL_PROMPT_DETECTED for event in plain)
     assert any(event.type == StreamEventType.APPROVAL_PROMPT_DETECTED for event in ansi)
+    assert any(event.type == StreamEventType.APPROVAL_PROMPT_DETECTED for event in explicit)
+
+
+def test_stream_adapter_extracts_provider_action_options() -> None:
+    adapter = StreamAdapter()
+
+    actions = adapter.provider_actions(adapter.parse_chunk("Apply this change? [y/N]"))
+    auth_actions = adapter.provider_actions(adapter.parse_chunk("Please sign in to continue."))
+
+    assert actions[0].kind == "cli_confirmation"
+    assert actions[0].options == [{"label": "Yes", "value": "y"}, {"label": "No", "value": "n", "default": True}]
+    assert "Apply this change" in actions[0].prompt_text
+    assert auth_actions[0].kind == "auth_required"
+
+
+def test_stream_adapter_does_not_treat_status_text_as_approval() -> None:
+    adapter = StreamAdapter()
+
+    events = adapter.parse_chunk("I confirmed there are no browser instances exposed here. Continue reading the docs.")
+
+    assert not any(event.type == StreamEventType.APPROVAL_PROMPT_DETECTED for event in events)
+    assert not any(event.type == StreamEventType.WAITING_EXTERNAL_CONFIRMATION for event in events)
 
 
 def test_stream_adapter_idle_and_cli_exit_events() -> None:
@@ -56,6 +79,17 @@ def test_headless_backend_parses_output_in_chunks() -> None:
     assert any(event.type == StreamEventType.APPROVAL_PROMPT_DETECTED for event in result.events)
     assert "first line" in transcript.read_text(encoding="utf-8")
     assert len(chunks.read_text(encoding="utf-8").splitlines()) >= 2
+
+
+def test_headless_backend_enforces_idle_timeout_without_output() -> None:
+    result = HeadlessSubprocessBackend().run(
+        [sys.executable, "-c", "import time; time.sleep(5)"],
+        cwd=Path.cwd(),
+        timeout=0.2,
+    )
+
+    assert result.returncode == 124
+    assert any(event.type == StreamEventType.IDLE_TIMEOUT for event in result.events)
 
 
 def test_tmux_backend_reports_missing_binary() -> None:

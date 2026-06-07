@@ -14,9 +14,11 @@ from ..daemon.paths import DEFAULT_API_PORT, DEFAULT_HOST
 class DaemonConnectionError(click.ClickException):
     """Raised when the muxdev daemon API is unavailable."""
 
-    def __init__(self, message: str, *, suggest_start: bool = False):
+    def __init__(self, message: str, *, suggest_start: bool = False, status_code: int | None = None, path: str | None = None):
         super().__init__(message)
         self.suggest_start = suggest_start
+        self.status_code = status_code
+        self.path = path
 
 
 class DaemonClient:
@@ -49,6 +51,65 @@ class DaemonClient:
         path = "/api/approvals" + (f"?status={status}" if status else "")
         return self._request("GET", path)
 
+    def provider_actions(self, *, status: str | None = None, task_id: str | None = None) -> list[dict[str, Any]]:
+        if task_id:
+            path = f"/api/tasks/{task_id}/provider-actions"
+        else:
+            path = "/api/provider-actions"
+        if status:
+            path += f"?status={status}"
+        return self._request("GET", path)
+
+    def provider_scores(self, *, role: str | None = None) -> list[dict[str, Any]]:
+        path = "/api/provider-scores" + (f"?role={role}" if role else "")
+        return self._request("GET", path)
+
+    def provider_learning(self, *, role: str | None = None) -> list[dict[str, Any]]:
+        path = "/api/learning/provider" + (f"?role={role}" if role else "")
+        return self._request("GET", path)
+
+    def parallel_conflicts(self, *, status: str | None = None, task_id: str | None = None) -> list[dict[str, Any]]:
+        path = f"/api/tasks/{task_id}/parallel-conflicts" if task_id else "/api/parallel-conflicts"
+        if status:
+            path += f"?status={status}"
+        return self._request("GET", path)
+
+    def semantic_merge_reviews(self, *, task_id: str | None = None) -> list[dict[str, Any]]:
+        path = f"/api/tasks/{task_id}/semantic-merge-reviews" if task_id else "/api/semantic-merge-reviews"
+        return self._request("GET", path)
+
+    def multi_repo_orchestrations(self, *, status: str | None = None) -> list[dict[str, Any]]:
+        path = "/api/multi-repo/orchestrations" + (f"?status={status}" if status else "")
+        return self._request("GET", path)
+
+    def multi_repo_plan(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._request("POST", "/api/multi-repo/plan", json=payload)
+
+    def memory_contradictions(self, *, workspace: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
+        params = []
+        if workspace:
+            params.append(f"workspace={workspace}")
+        if status:
+            params.append(f"status={status}")
+        path = "/api/memory/contradictions" + (("?" + "&".join(params)) if params else "")
+        return self._request("GET", path)
+
+    def memory_quarantine_auto(self, *, workspace: str | None = None) -> list[dict[str, Any]]:
+        path = "/api/memory/quarantine-auto" + (f"?workspace={workspace}" if workspace else "")
+        return self._request("POST", path)
+
+    def feedback(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._request("POST", "/api/feedback", json=payload)
+
+    def ecosystem(self) -> dict[str, Any]:
+        return self._request("GET", "/api/ecosystem")
+
+    def provider_action_handled(self, action_id: str) -> dict[str, Any]:
+        return self._request("POST", f"/api/provider-actions/{action_id}/handled")
+
+    def provider_action_dismiss(self, action_id: str) -> dict[str, Any]:
+        return self._request("POST", f"/api/provider-actions/{action_id}/dismiss")
+
     def approve(self, approval_id: str) -> dict[str, Any]:
         return self._request("POST", f"/api/approvals/{approval_id}/approve")
 
@@ -61,8 +122,9 @@ class DaemonClient:
     def report(self, task_id: str) -> dict[str, Any]:
         return self._request("GET", f"/api/tasks/{task_id}/report")
 
-    def rollback(self, task_id: str) -> dict[str, Any]:
-        return self._request("POST", f"/api/tasks/{task_id}/rollback")
+    def rollback(self, task_id: str, *, to_stage: str | None = None) -> dict[str, Any]:
+        suffix = f"?to_stage={to_stage}" if to_stage else ""
+        return self._request("POST", f"/api/tasks/{task_id}/rollback{suffix}")
 
     def attach_command(self, task_id: str, *, agent: str = "implementer") -> dict[str, Any]:
         return self._request("GET", f"/api/tasks/{task_id}/attach-command?agent={agent}")
@@ -81,6 +143,10 @@ class DaemonClient:
             raise DaemonConnectionError(f"muxdev daemon is not reachable at {self.base_url}", suggest_start=True) from exc
         except httpx.HTTPStatusError as exc:
             detail = exc.response.text
-            raise DaemonConnectionError(f"muxdev daemon request failed at {self.base_url}: {exc.response.status_code} {detail}") from exc
+            raise DaemonConnectionError(
+                f"muxdev daemon request failed at {self.base_url}: {exc.response.status_code} {detail}",
+                status_code=exc.response.status_code,
+                path=path,
+            ) from exc
         except httpx.HTTPError as exc:
             raise DaemonConnectionError(f"muxdev daemon request failed at {self.base_url}: {exc}") from exc

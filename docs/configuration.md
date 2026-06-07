@@ -166,6 +166,71 @@ gate = "safe"
 muxdev dev "task" -g strict
 ```
 
+## P0 automation and memory
+
+P0 adds deterministic auto orchestration on top of the existing profile/gate
+settings. The short default config is:
+
+```toml
+[automation]
+mode = "auto"
+profile = "auto"
+depth = "auto"
+allow_parallel = true
+
+[memory]
+enabled = true
+mode = "evidence-grounded"
+local_only = true
+auto_promote_low_risk = true
+require_approval_for = ["architecture_decision", "security_rule", "payment_rule"]
+ttl_days = 180
+max_items_per_role = 8
+redact_secrets = true
+```
+
+`automation.depth = "auto"` lets muxdev choose `simple`, `safe`, `deep`,
+`parallel`, or `ci` from the command intent, task text, repository signals, and
+memory context. CLI flags still win:
+
+```powershell
+muxdev dev "small fix" --simple
+muxdev dev "security-sensitive change" --deep
+muxdev dev "split modules" --parallel
+muxdev dev "ship feature" -p pair --role code=codex
+```
+
+Project memory is stored in `.muxdev/memory.sqlite` and is intentionally
+evidence-grounded. Use:
+
+```powershell
+muxdev memory status
+muxdev memory query "auth boundary"
+muxdev memory propose latest
+muxdev memory approve mem_xxxxx
+```
+
+See `docs/p0_acceptance_ready.md` for the end-to-end readiness checklist.
+
+## P1 trusted delivery evidence
+
+P1 does not require a new user-facing config file. The trusted delivery loop is
+enabled by the runtime itself:
+
+```powershell
+muxdev dev "trusted delivery smoke" --provider mock --gate auto --json
+muxdev evidence verify latest --json
+muxdev rollback latest --to-stage implement --json
+```
+
+Every run writes stage contracts, role result contracts, evidence bundles,
+stage snapshots, a hash-chained ledger, and a blind validator panel. Human
+approval records also include `subject_hash` and `subject_json`, so approvals
+are reused only when the approved plan, patch, validator, and policy subject
+still match.
+
+See `docs/p1_trusted_delivery_ready.md` for the full acceptance checklist.
+
 ## Role 和 provider
 
 ### Canonical roles

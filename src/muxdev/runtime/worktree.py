@@ -51,8 +51,8 @@ class WorktreeManager:
                 return WorktreeResult(worktree_path, "git_worktree", result.stdout.strip())
             # Existing branch/path edge cases should not prevent M1 mock runs.
             fallback = run_dir / "worktree"
-            shutil.copytree(self.workspace, fallback, ignore=shutil.ignore_patterns(".git", ".muxdev", "__pycache__"))
-            subprocess.run(["git", "init"], cwd=fallback, capture_output=True, check=False, **hidden_subprocess_kwargs())
+            shutil.copytree(self.workspace, fallback, ignore=self._fallback_copy_ignore(run_dir))
+            self._init_minimal_git_repo(fallback)
             return WorktreeResult(fallback, "git_worktree_fallback_copy", result.stderr.strip())
 
         worktree_path = run_dir / "worktree"
@@ -71,6 +71,24 @@ class WorktreeManager:
             **hidden_subprocess_kwargs(),
         )
         return result.returncode == 0 and result.stdout.strip() == "true"
+
+    def _fallback_copy_ignore(self, run_dir: Path):
+        """Exclude muxdev runtime roots from copy fallbacks to prevent recursion."""
+        targets = [run_dir.resolve()]
+        if self.worktrees_root is not None:
+            targets.append(self.worktrees_root.resolve())
+
+        def ignore(directory: str, names: list[str]) -> set[str]:
+            ignored = {".git", ".muxdev", "__pycache__"}
+            current = Path(directory).resolve()
+            for name in names:
+                child = (current / name).resolve()
+                for target in targets:
+                    if child == target or child in target.parents:
+                        ignored.add(name)
+            return ignored
+
+        return ignore
 
     @staticmethod
     def _init_minimal_git_repo(path: Path) -> None:

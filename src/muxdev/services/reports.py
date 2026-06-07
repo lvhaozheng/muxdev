@@ -16,6 +16,11 @@ def generate_final_report(run_dir: Path, run_id: str, blackboard: Blackboard) ->
     artifacts = blackboard.table_rows("artifacts")
     checkpoints = blackboard.table_rows("checkpoints")
     errors = blackboard.table_rows("error_details")
+    stage_contracts = blackboard.table_rows("stage_contracts")
+    evidence_bundles = blackboard.table_rows("evidence_bundles")
+    ledger_events = blackboard.table_rows("ledger_events")
+    snapshots = blackboard.table_rows("snapshots")
+    validators = blackboard.table_rows("validator_panels")
     lines = [
         f"# muxdev final report: {run_id}",
         "",
@@ -60,6 +65,16 @@ def generate_final_report(run_dir: Path, run_id: str, blackboard: Blackboard) ->
     lines.extend(["", "## Artifacts"])
     for artifact in artifacts:
         lines.append(f"- {artifact['name']}: {artifact['path']}")
+    lines.extend(["", "## Trusted Delivery Evidence"])
+    lines.append(f"- stage contracts: {len(stage_contracts)}")
+    lines.append(f"- evidence bundles: {len(evidence_bundles)}")
+    lines.append(f"- ledger events: {len(ledger_events)}")
+    lines.append(f"- snapshots: {len(snapshots)}")
+    if validators:
+        for validator in validators:
+            lines.append(f"- validator {validator['validator_id']}: {validator['decision']} {validator['validator_hash']}")
+    else:
+        lines.append("- validators: none")
     path = run_dir / "final_report.md"
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     blackboard.add_artifact(run_id, None, "final_report.md", path, "report")

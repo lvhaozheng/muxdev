@@ -50,6 +50,7 @@ Run `muxdev start` once to launch the local daemon and Web Dashboard. Task lifec
 - **Skill Engine**: auto-discovers standard `SKILL.md` packages and injects them by task, role, and binding policy.
 - **Daemon-owned state**: a single local SQLite state store under `~/.muxdev/data/muxdev.sqlite`, with task artifacts, traces, reports, diffs, and session logs under `~/.muxdev/data/runs/`.
 - **Approvals and safety policy**: plan/write/shell/merge approvals, shell policy checks, and secret redaction.
+- **Trusted delivery evidence**: stage contracts, role result contracts, evidence bundles, hash-chained ledgers, blind validator panels, approval subject hashes, and stage snapshot rollback.
 - **TUI and REPL**: daemon-backed terminal dashboard, slash commands, provider status, approvals, reports, and trace views.
 - **Workflow plugins and flows**: agtx-inspired plugin catalog and CAO-inspired manually triggered flow definitions.
 - **MCP surface**: provider detection, workspace search, RAG query, workflow plugin, and flow listing tools.
@@ -244,6 +245,7 @@ muxdev rag query "approval policy" --json
 muxdev metrics latest --json
 muxdev metrics latest --prometheus
 muxdev trace chrome latest --json
+muxdev evidence verify latest --json
 ```
 
 `rag index` uses deterministic local embeddings by default. Set `MUXDEV_EMBEDDING_COMMAND` to delegate embeddings to an external command, or `MUXDEV_EMBEDDING_FILE` for deterministic file-backed tests.
@@ -370,6 +372,8 @@ Current MCP tools include:
 ```powershell
 muxdev policy shell "pytest" --json
 muxdev policy shell "rm -rf /" --json
+muxdev evidence verify latest --json
+muxdev rollback latest --to-stage implement --json
 ```
 
 Safety defaults:
@@ -378,6 +382,8 @@ Safety defaults:
 - Provider installs are dry-run unless `--execute` is passed.
 - Merge is dry-run unless `--execute` is passed.
 - Approval gates can pause plan, write, shell, and merge actions.
+- Approval subjects include stable hashes for plans, patches, validators, and policy state; stale approved subjects require a new approval.
+- Completed runs write a hash-chained ledger, evidence bundles, role contracts, and a blind validator result before final merge approval.
 - Common `sk-*` and `Bearer *` secrets are redacted from traces, reports, and archived provider output.
 
 ## Project Structure
@@ -431,6 +437,8 @@ The suite covers provider detection, install/account plans, dynamic configuratio
 - [Architecture](docs/architecture.md)
 - [Best practices](docs/best_practices.md)
 - [Configuration](docs/configuration.md)
+- [P0 acceptance ready guide](docs/p0_acceptance_ready.md)
+- [P1 trusted delivery ready guide](docs/p1_trusted_delivery_ready.md)
 - [Source walkthrough](docs/source_walkthrough.md)
 
 ## References

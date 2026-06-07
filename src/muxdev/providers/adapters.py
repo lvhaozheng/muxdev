@@ -11,7 +11,7 @@ from __future__ import annotations
 import shutil
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +31,7 @@ class ProviderStageOutput:
     tokens: int = 100
     cost_usd: float = 0.01
     returncode: int = 0
+    provider_actions: list[dict[str, Any]] = field(default_factory=list)
 
 
 class ProviderAdapter:
@@ -119,6 +120,16 @@ class HeadlessCliProviderAdapter(ProviderAdapter):
         if event_lines:
             content = content + "\n\n# Stream Events\n" + redact(event_lines) + "\n"
         content += f"\n# Session Archives\ntranscript: {transcript_path}\nchunks: {chunks_path}\n"
+        provider_actions = [
+            {
+                "kind": action.kind,
+                "prompt_text": action.prompt_text,
+                "options": action.options,
+                "transcript_path": str(transcript_path),
+                "chunks_path": str(chunks_path),
+            }
+            for action in self.backend.adapter.provider_actions(result.events)
+        ]
         return ProviderStageOutput(
             artifact_name=f"session/{self.id}_{stage_id}.log",
             content=content,
@@ -126,6 +137,7 @@ class HeadlessCliProviderAdapter(ProviderAdapter):
             tokens=0,
             cost_usd=0,
             returncode=result.returncode,
+            provider_actions=provider_actions,
         )
 
     def _prompt(self, stage_id: str, task: str, *, skills: list[dict[str, object]] | None = None) -> str:

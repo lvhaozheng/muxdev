@@ -15,7 +15,7 @@ from muxdev.cli import app
 from muxdev.daemon.paths import default_daemon_paths
 from muxdev.daemon.process import daemon_status, start_daemon
 from muxdev.daemon.tasks import TaskManager
-from muxdev.models import ApprovalStatus
+from muxdev.models import ApprovalStatus, ProviderActionStatus
 
 
 runner = CliRunner()
@@ -167,6 +167,76 @@ def test_daemon_approvals_and_continue() -> None:
     assert continued["status"] == "continue_requested"
 
 
+def test_daemon_provider_actions_api_and_continue_wait() -> None:
+    workspace = _workspace_temp("provider-action")
+    try:
+        manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())
+        run_dir = manager.paths.runs_dir / "run_provider_action"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        with manager.board() as board:
+            board.create_run(
+                run_id="run_provider_action",
+                task="provider action smoke",
+                workflow="software-dev",
+                provider="mock",
+                workspace=workspace,
+                worktree=workspace / "worktree",
+            )
+            action_id = board.create_provider_action(
+                run_id="run_provider_action",
+                stage_id="design",
+                provider="codex",
+                role="designer",
+                kind="cli_confirmation",
+                prompt_text="Apply this change? [y/N]",
+                options=[{"label": "Yes", "value": "y"}, {"label": "No", "value": "n"}],
+                transcript_path="transcript.log",
+                chunks_path="chunks.jsonl",
+                attach_command="muxdev attach run_provider_action --agent designer",
+            )
+        client = TestClient(create_app(task_manager=manager))
+
+        listed = client.get("/api/provider-actions?status=pending").json()
+        task_listed = client.get("/api/tasks/run_provider_action/provider-actions?status=pending").json()
+        continued = client.post("/api/tasks/run_provider_action/continue").json()
+        handled = client.post(f"/api/provider-actions/{action_id}/handled").json()
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    assert listed[0]["action_id"] == action_id
+    assert task_listed[0]["options"][0]["label"] == "Yes"
+    assert continued["status"] == "awaiting_provider_action"
+    assert handled["status"] == str(ProviderActionStatus.HANDLED)
+
+
+def test_daemon_continue_does_not_start_duplicate_worker(monkeypatch) -> None:
+    workspace = _workspace_temp("continue-dedupe")
+    try:
+        manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())
+        with manager.board() as board:
+            board.create_run(
+                run_id="run_duplicate_continue",
+                task="duplicate continue",
+                workflow="software-dev",
+                provider="mock",
+                workspace=workspace,
+                worktree=workspace / "worktree",
+            )
+
+        def slow_resume(task_id: str, workspace: Path, *, max_cost_usd: float) -> None:
+            time.sleep(0.5)
+
+        monkeypatch.setattr(manager, "_resume_task", slow_resume)
+
+        first = manager.continue_task("run_duplicate_continue")
+        second = manager.continue_task("run_duplicate_continue")
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    assert first["status"] == "continue_requested"
+    assert second["status"] == "already_running"
+
+
 def test_cli_task_commands_use_daemon_client(monkeypatch) -> None:
     class FakeClient:
         def __init__(self, *, host: str, port: int) -> None:
@@ -192,6 +262,26 @@ def test_cli_task_commands_use_daemon_client(monkeypatch) -> None:
         def approvals(self, *, status: str | None = None) -> list[dict[str, object]]:
             return [{"approval_id": "appr-1", "run_id": "task-1", "stage_id": "design", "type": "plan", "status": status or "pending", "reason": "check"}]
 
+        def provider_actions(self, *, status: str | None = None, task_id: str | None = None) -> list[dict[str, object]]:
+            return [
+                {
+                    "action_id": "pact-1",
+                    "run_id": task_id or "task-1",
+                    "stage_id": "design",
+                    "provider": "codex",
+                    "kind": "cli_confirmation",
+                    "status": status or "pending",
+                    "prompt_text": "Apply this change? [y/N]",
+                    "attach_command": "muxdev attach task-1 --agent designer",
+                }
+            ]
+
+        def provider_action_handled(self, action_id: str) -> dict[str, object]:
+            return {"action_id": action_id, "run_id": "task-1", "status": "handled"}
+
+        def provider_action_dismiss(self, action_id: str) -> dict[str, object]:
+            return {"action_id": action_id, "run_id": "task-1", "status": "dismissed"}
+
         def approve(self, approval_id: str) -> dict[str, object]:
             return {"approval_id": approval_id, "status": "approved"}
 
@@ -204,8 +294,8 @@ def test_cli_task_commands_use_daemon_client(monkeypatch) -> None:
         def report(self, task_id: str) -> dict[str, object]:
             return {"task_id": task_id, "content": "# report", "path": "final_report.md"}
 
-        def rollback(self, task_id: str) -> dict[str, object]:
-            return {"task_id": task_id, "status": "rolled_back"}
+        def rollback(self, task_id: str, *, to_stage: str | None = None) -> dict[str, object]:
+            return {"task_id": task_id, "status": "rolled_back", "to_stage": to_stage}
 
         def attach_command(self, task_id: str, *, agent: str = "implementer") -> dict[str, object]:
             return {"task_id": task_id, "agent": agent, "status": "attached", "handoff": {"command": ["tail", "-f", "trace.jsonl"]}}
@@ -217,6 +307,8 @@ def test_cli_task_commands_use_daemon_client(monkeypatch) -> None:
     tasks = runner.invoke(app, ["tasks", "--json"])
     status = runner.invoke(app, ["status", "task-1", "--json"])
     approve = runner.invoke(app, ["approve", "appr-1", "--json"])
+    actions = runner.invoke(app, ["actions", "--json"])
+    handled = runner.invoke(app, ["action", "handled", "pact-1", "--json"])
 
     assert run.exit_code == 0
     assert json.loads(run.stdout)["task_id"] == "task-1"
@@ -226,6 +318,10 @@ def test_cli_task_commands_use_daemon_client(monkeypatch) -> None:
     assert json.loads(status.stdout)["run"]["run_id"] == "task-1"
     assert approve.exit_code == 0
     assert json.loads(approve.stdout)["status"] == "approved"
+    assert actions.exit_code == 0
+    assert json.loads(actions.stdout)[0]["action_id"] == "pact-1"
+    assert handled.exit_code == 0
+    assert json.loads(handled.stdout)["status"] == "handled"
 
 
 def test_daemon_status_uses_pid_file_without_repo_state() -> None:
@@ -320,7 +416,7 @@ def test_stop_daemon_can_stop_health_only_daemon_by_port(monkeypatch) -> None:
 def _wait_for_terminal(client: TestClient, task_id: str) -> str:
     for _ in range(80):
         status = client.get(f"/api/tasks/{task_id}").json()["run"]["status"]
-        if status in {"completed", "blocked", "awaiting_approval", "paused_budget", "aborted"}:
+        if status in {"completed", "blocked", "awaiting_approval", "awaiting_provider_action", "paused_budget", "aborted"}:
             return status
         time.sleep(0.1)
     raise AssertionError("task did not reach a terminal or waiting state")

@@ -23,6 +23,7 @@ class RunStatus(StrEnum):
     CREATED = "created"
     RUNNING = "running"
     AWAITING_APPROVAL = "awaiting_approval"
+    AWAITING_PROVIDER_ACTION = "awaiting_provider_action"
     PAUSED_BUDGET = "paused_budget"
     BLOCKED = "blocked"
     COMPLETED = "completed"
@@ -41,6 +42,21 @@ class ApprovalStatus(StrEnum):
     PENDING = "pending"
     APPROVED = "approved"
     DENIED = "denied"
+
+
+class ProviderActionStatus(StrEnum):
+    PENDING = "pending"
+    HANDLED = "handled"
+    DISMISSED = "dismissed"
+    EXPIRED = "expired"
+
+
+class ProviderActionKind(StrEnum):
+    CLI_CONFIRMATION = "cli_confirmation"
+    AUTH_REQUIRED = "auth_required"
+    RATE_LIMIT = "rate_limit"
+    PROVIDER_BLOCKED = "provider_blocked"
+    IDLE_TIMEOUT = "idle_timeout"
 
 
 class PolicyDecision(StrEnum):

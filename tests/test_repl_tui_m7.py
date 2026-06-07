@@ -14,6 +14,7 @@ from muxdev.ui.repl import handle_repl_command
 from muxdev.ui.tui import (
     daemon_chat_view,
     daemon_help_text,
+    daemon_provider_actions_text,
     daemon_task_detail_text,
     daemon_tasks_text,
     _handle_tui_command,
@@ -48,7 +49,10 @@ def test_tui_slash_commands_normalize() -> None:
     assert _normalize_command("/refresh") == "r"
     assert _normalize_command("/quit") == "q"
     assert _normalize_command("/run add tests") == "run add tests"
+    assert _normalize_command("/dev add tests") == "run add tests"
+    assert _normalize_command("/design plan it") == "workflow design plan it"
     assert _normalize_command("/approve appr_1") == "approve appr_1"
+    assert _normalize_command("/action handled pact_1") == "action handled pact_1"
 
 
 def test_tui_help_lists_slash_commands() -> None:
@@ -110,6 +114,12 @@ def test_daemon_tui_command_results_use_chat_format(monkeypatch) -> None:
     cli_app_module = importlib.import_module("muxdev.cli.tui")
 
     class FakeClient:
+        submitted: list[dict[str, object]] = []
+
+        def submit_task(self, payload: dict[str, object]) -> dict[str, object]:
+            self.submitted.append(payload)
+            return {"task_id": "run_submit", "run_id": "run_submit", "status": "created"}
+
         def tasks(self) -> list[dict[str, object]]:
             return [{"task_id": "run_1", "status": "running", "current_stage": "code", "pending_approvals": 0, "tokens": 100, "task": "chat tui"}]
 
@@ -122,19 +132,71 @@ def test_daemon_tui_command_results_use_chat_format(monkeypatch) -> None:
         def diff(self, task_id: str) -> dict[str, object]:
             return {"task_id": "run_1", "diff": "diff --git a/a b/a\n+hello"}
 
+        def provider_actions(self, *, status: str | None = None) -> list[dict[str, object]]:
+            return [_provider_action()]
+
+        def provider_action_handled(self, action_id: str) -> dict[str, object]:
+            return {"action_id": action_id, "run_id": "run_1", "status": "handled"}
+
+        def provider_action_dismiss(self, action_id: str) -> dict[str, object]:
+            return {"action_id": action_id, "run_id": "run_1", "status": "dismissed"}
+
     monkeypatch.setattr(cli_app_module, "_daemon_client", lambda host, port: FakeClient())
 
     tasks, _ = cli_app_module._handle_daemon_tui_command("/tasks", "latest", host="127.0.0.1", port=8788, commands={})
+    dev, dev_selected = cli_app_module._handle_daemon_tui_command("/dev --provider mock --simple chat tui", "latest", host="127.0.0.1", port=8788, commands={})
+    design, design_selected = cli_app_module._handle_daemon_tui_command("/design --provider mock design tui", "latest", host="127.0.0.1", port=8788, commands={})
     status, selected = cli_app_module._handle_daemon_tui_command("/status run_1", "latest", host="127.0.0.1", port=8788, commands={})
     report, report_selected = cli_app_module._handle_daemon_tui_command("/report run_1", "latest", host="127.0.0.1", port=8788, commands={})
+    actions, _ = cli_app_module._handle_daemon_tui_command("/actions", "latest", host="127.0.0.1", port=8788, commands={})
+    handled, handled_selected = cli_app_module._handle_daemon_tui_command("/action handled pact_1", "latest", host="127.0.0.1", port=8788, commands={})
 
     assert "Recent tasks" in tasks
     assert "run_1" in tasks
+    assert "workflow=dev" in dev
+    assert "depth=simple" in dev
+    assert dev_selected == "run_submit"
+    assert "workflow=design" in design
+    assert design_selected == "run_submit"
     assert "Recent events" in status
     assert selected == "run_running"
     assert "Full report: muxdev report run_1" in report
     assert "line 29" not in report
     assert report_selected == "run_1"
+    assert "Pending provider actions" in actions
+    assert "Apply this change" in actions
+    assert handled == "pact_1: handled"
+    assert handled_selected == "run_1"
+
+
+def test_daemon_tui_tolerates_old_daemon_without_provider_actions(monkeypatch) -> None:
+    cli_app_module = importlib.import_module("muxdev.cli.tui")
+    from muxdev.clients.daemon import DaemonConnectionError
+
+    class OldDaemonClient:
+        def health(self) -> dict[str, object]:
+            return {"status": "ok", "tasks": 1, "running_tasks": 0, "queue_length": 0}
+
+        def tasks(self) -> list[dict[str, object]]:
+            return [{"task_id": "run_1", "status": "running", "current_stage": "code", "pending_approvals": 0, "tokens": 10, "task": "old daemon"}]
+
+        def approvals(self, *, status: str | None = None) -> list[dict[str, object]]:
+            return []
+
+        def task(self, task_id: str) -> dict[str, object]:
+            return _daemon_payload("running")
+
+        def provider_actions(self, *, status: str | None = None) -> list[dict[str, object]]:
+            raise DaemonConnectionError("404", status_code=404, path="/api/provider-actions?status=pending")
+
+    monkeypatch.setattr(cli_app_module, "_daemon_client", lambda host, port: OldDaemonClient())
+
+    snapshot = cli_app_module._daemon_tui_snapshot("latest", host="127.0.0.1", port=8788)
+    message, _ = cli_app_module._handle_daemon_tui_command("/actions", "latest", host="127.0.0.1", port=8788, commands={})
+
+    assert snapshot["provider_actions"] == []
+    assert "Provider Actions API is not available" in snapshot["daemon"]["warnings"][0]
+    assert "muxdev serve --restart" in message
 
 
 def test_daemon_chat_view_renders_intro_and_empty_state(monkeypatch) -> None:
@@ -163,17 +225,20 @@ def test_daemon_chat_view_renders_intro_and_empty_state(monkeypatch) -> None:
     assert "task lifecycle | approvals | reports | diffs | skills" in text
     assert "http://127.0.0.1:8788" in text
     assert "http://127.0.0.1:8787" in text
-    assert "Start with /run <task>" in text
+    assert "Start with /dev <task> or /design <task>" in text
     assert "/help" in text
 
 
 def test_daemon_task_summary_handles_core_statuses() -> None:
-    for status in ["running", "awaiting_approval", "completed"]:
+    for status in ["running", "awaiting_approval", "awaiting_provider_action", "completed"]:
         text = daemon_task_detail_text(_daemon_payload(status))
         assert f": {status}" in text
         assert "profile=squad" in text
         assert "gate=safe" in text
         assert "Recent events" in text
+        if status == "awaiting_provider_action":
+            assert "Provider actions" in text
+            assert "muxdev attach" in text
 
 
 def test_daemon_help_and_tasks_are_grouped_and_compact() -> None:
@@ -192,13 +257,26 @@ def test_daemon_help_and_tasks_are_grouped_and_compact() -> None:
     )
 
     assert "Work:" in help_text
+    assert "/dev <task>" in help_text
+    assert "/design <task>" in help_text
     assert "/run <task>" in help_text
     assert "Review:" in help_text
     assert "/approve <id>" in help_text
+    assert "Provider Actions:" in help_text
+    assert "/action handled <id>" in help_text
     assert "Output:" in help_text
     assert "/dashboard" in help_text
     assert "run_1" in tasks_text
     assert len(tasks_text.splitlines()[1]) < 150
+
+
+def test_daemon_provider_actions_text_shows_prompt_and_attach() -> None:
+    text = daemon_provider_actions_text([_provider_action()])
+
+    assert "pact_1" in text
+    assert "Apply this change" in text
+    assert "Yes, No" in text
+    assert "muxdev attach run_1 --agent designer" in text
 
 
 class _FakeConsole:
@@ -227,10 +305,31 @@ def _render_to_text(renderable: object) -> str:
 
 
 def _daemon_payload(status: str) -> dict[str, object]:
+    provider_actions = [_provider_action()] if status == "awaiting_provider_action" else []
     return {
         "run": {"run_id": f"run_{status}", "status": status, "task": "ship polished tui", "workflow": "dev", "provider": "mock"},
         "stages": [{"stage_id": "code", "role": "code", "status": "running" if status == "running" else "completed", "summary": "working"}],
-        "summary": {"pending_approvals": 1 if status == "awaiting_approval" else 0, "tokens": 100, "cost_usd": 0.01},
+        "summary": {
+            "pending_approvals": 1 if status == "awaiting_approval" else 0,
+            "pending_provider_actions": len(provider_actions),
+            "tokens": 100,
+            "cost_usd": 0.01,
+        },
         "context": {"profile": "squad", "gate": "safe", "skills": [{"name": "demo"}]},
         "trace": [{"type": "stage_started", "stage": "code", "data": {"role": "code"}}],
+        "provider_actions": provider_actions,
+    }
+
+
+def _provider_action() -> dict[str, object]:
+    return {
+        "action_id": "pact_1",
+        "run_id": "run_1",
+        "stage_id": "design",
+        "provider": "codex",
+        "kind": "cli_confirmation",
+        "status": "pending",
+        "prompt_text": "Apply this change? [y/N]",
+        "options": [{"label": "Yes", "value": "y"}, {"label": "No", "value": "n"}],
+        "attach_command": "muxdev attach run_1 --agent designer",
     }

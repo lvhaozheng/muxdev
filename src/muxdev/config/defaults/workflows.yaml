@@ -1,4 +1,52 @@
 workflows:
+  design:
+    name: design
+    max_parallel: 1
+    stages:
+      - id: problem_statement
+        role: requirements
+        deps: []
+        read_only: true
+      - id: requirements
+        role: requirements
+        deps: [problem_statement]
+        read_only: true
+      - id: architecture_options
+        role: architect
+        deps: [requirements]
+        read_only: true
+      - id: decision_record
+        role: architect
+        deps: [architecture_options]
+        read_only: true
+      - id: system_design
+        role: architect
+        deps: [decision_record]
+        read_only: true
+      - id: api_and_data_model
+        role: architect
+        deps: [system_design]
+        read_only: true
+      - id: risk_and_threat_model
+        role: secure
+        deps: [api_and_data_model]
+        read_only: true
+      - id: test_strategy
+        role: test_strategy
+        deps: [risk_and_threat_model]
+        read_only: true
+      - id: implementation_roadmap
+        role: architect
+        deps: [test_strategy]
+        read_only: true
+      - id: final_design_review
+        role: review
+        deps: [implementation_roadmap]
+        read_only: true
+      - id: memory_proposals
+        role: memory_curator
+        deps: [final_design_review]
+        read_only: true
   dev:
     name: dev
     max_parallel: 1

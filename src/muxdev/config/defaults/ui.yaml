@@ -2,7 +2,12 @@ ui:
   slash_commands:
     /help: Show TUI commands
     /refresh: Refresh dashboard
-    /run: Start a mock workflow task
+    /run: Alias for /dev
+    /dev: Start a dev workflow task
+    /design: Start a design workflow task
+    /fix: Start a fix workflow task
+    /review: Start a review workflow task
+    /test: Start a test workflow task
     /continue: Continue latest task
     /report: Show latest report
     /trace: Show recent trace events
@@ -16,6 +21,11 @@ ui:
     /approvals: List pending approvals
     /approve: Approve an approval id
     /deny: Deny an approval id
+    /actions: List pending provider CLI actions
+    /action handled: Mark a provider action handled
+    /action dismiss: Dismiss a provider action
+    /parallel: List open parallel-squad conflicts
+    /learning: Show provider learning snapshots
     /repl: Open the muxdev REPL in another shell
     /quit: Exit TUI
     "!shell": Evaluate a shell command against policy
@@ -25,3 +35,5 @@ ui:
     trace: muxdev trace view latest
     report: muxdev report latest
     attach: muxdev tui latest --attach implementer
+    parallel: muxdev parallel conflicts
+    learning: muxdev learning provider

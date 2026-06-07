@@ -35,11 +35,21 @@ class FakeDaemonClient:
             "run": {"run_id": task_id, "status": "running", "task": "fake task"},
             "agents": [],
             "approvals": [],
+            "provider_actions": [],
             "events": [],
         }
 
     def approvals(self, status: str = "pending") -> list[dict[str, object]]:
         return []
+
+    def provider_actions(self, *, status: str | None = None, task_id: str | None = None) -> list[dict[str, object]]:
+        return [{"action_id": "pact_fake", "run_id": task_id or "run_fake", "status": status or "pending", "prompt_text": "Apply? [y/N]"}]
+
+    def provider_action_handled(self, action_id: str) -> dict[str, object]:
+        return {"action_id": action_id, "status": "handled", "run_id": "run_fake"}
+
+    def provider_action_dismiss(self, action_id: str) -> dict[str, object]:
+        return {"action_id": action_id, "status": "dismissed", "run_id": "run_fake"}
 
     def approve(self, approval_id: str) -> dict[str, object]:
         return {"approval_id": approval_id, "status": "approved", "run_id": "run_fake"}
@@ -151,6 +161,8 @@ def test_continue_dashboard_and_tui_json_use_daemon_client(monkeypatch) -> None:
     continued = runner.invoke(app, ["continue", "run_fake", "--json"])
     dashboard = runner.invoke(app, ["dashboard", "--json"])
     tui = runner.invoke(app, ["tui", "run_fake", "--json"])
+    actions = runner.invoke(app, ["actions", "--json"])
+    handled = runner.invoke(app, ["action", "handled", "pact_fake", "--json"])
 
     assert continued.exit_code == 0
     assert json.loads(continued.stdout)["status"] == "running"
@@ -158,6 +170,10 @@ def test_continue_dashboard_and_tui_json_use_daemon_client(monkeypatch) -> None:
     assert json.loads(dashboard.stdout)["dashboard"] == "http://127.0.0.1:8787"
     assert tui.exit_code == 0
     assert json.loads(tui.stdout)["run"]["run_id"] == "run_fake"
+    assert actions.exit_code == 0
+    assert json.loads(actions.stdout)[0]["action_id"] == "pact_fake"
+    assert handled.exit_code == 0
+    assert json.loads(handled.stdout)["status"] == "handled"
 
 
 def test_no_args_enters_daemon_tui(monkeypatch) -> None:

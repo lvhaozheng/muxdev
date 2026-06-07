@@ -8,13 +8,15 @@ without forcing every platform to provide native terminal takeover.
 from __future__ import annotations
 
 import json
+import queue
 import subprocess
 import shutil
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from time import time
 
-from ...core.platforms import hidden_subprocess_kwargs, shell_join
+from ...core.platforms import hidden_subprocess_kwargs, is_windows, shell_join
 from ..stream import StreamAdapter, StreamEvent
 
 
@@ -48,6 +50,7 @@ class HeadlessSubprocessBackend:
             process = subprocess.Popen(
                 command,
                 cwd=cwd,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -57,17 +60,34 @@ class HeadlessSubprocessBackend:
             )
             events: list[StreamEvent] = []
             stdout_parts: list[str] = []
-            start = time()
+            last_activity = time()
             transcript_handle = transcript_path.open("a", encoding="utf-8") if transcript_path else None
             chunks_handle = chunks_path.open("a", encoding="utf-8") if chunks_path else None
-            try:
+            lines: queue.Queue[str] = queue.Queue()
+            returncode: int | None = None
+
+            def read_stdout() -> None:
                 assert process.stdout is not None
-                for line in process.stdout:
-                    if time() - start > timeout:
-                        process.kill()
-                        events.append(self.adapter.idle_timeout(timeout))
-                        returncode = 124
+                for stdout_line in process.stdout:
+                    lines.put(stdout_line)
+
+            reader = threading.Thread(target=read_stdout, name="muxdev-provider-stdout", daemon=True)
+            reader.start()
+            try:
+                while True:
+                    if process.poll() is not None and lines.empty() and not reader.is_alive():
                         break
+                    try:
+                        line = lines.get(timeout=0.1)
+                    except queue.Empty:
+                        if time() - last_activity > timeout:
+                            _terminate_process_tree(process)
+                            process.wait(timeout=3)
+                            events.append(self.adapter.idle_timeout(timeout))
+                            returncode = 124
+                            break
+                        continue
+                    last_activity = time()
                     stdout_parts.append(line)
                     if transcript_handle:
                         transcript_handle.write(line)
@@ -87,9 +107,10 @@ class HeadlessSubprocessBackend:
                             + "\n"
                         )
                         chunks_handle.flush()
-                else:
-                    returncode = process.wait(timeout=max(0.1, timeout - (time() - start)))
+                if returncode is None:
+                    returncode = process.wait(timeout=3)
             finally:
+                reader.join(timeout=1)
                 if transcript_handle:
                     transcript_handle.close()
                 if chunks_handle:
@@ -97,6 +118,10 @@ class HeadlessSubprocessBackend:
             events.append(self.adapter.cli_exited(returncode))
             return SessionResult(returncode, "".join(stdout_parts), "", events)
         except subprocess.TimeoutExpired:
+            try:
+                _terminate_process_tree(process)
+            except UnboundLocalError:
+                pass
             events = self.adapter.parse_chunk("")
             events.append(self.adapter.idle_timeout(timeout))
             return SessionResult(124, "", "", events)
@@ -110,6 +135,19 @@ class PtyBackend(HeadlessSubprocessBackend):
 
     def detach(self, session_id: str) -> str:
         return f"detach requested for {session_id}"
+
+
+class ConptyBackend(PtyBackend):
+    """Windows ConPTY-capable session placeholder with subprocess fallback."""
+
+    @property
+    def available(self) -> bool:
+        return is_windows()
+
+    def attach(self, session_id: str) -> str:
+        if not self.available:
+            return f"conpty is only available on Windows; attach requested for {session_id}"
+        return f"conpty attach requested for {session_id}; interactive takeover is handled by provider CLI"
 
 
 class TmuxBackend:
@@ -166,6 +204,64 @@ class TmuxBackend:
         return SessionResult(completed.returncode, completed.stdout or "", completed.stderr or "", [])
 
 
+class DockerBackend:
+    """Run a provider command inside a Docker workdir mount when Docker exists."""
+
+    def __init__(self, docker: str | None = None, adapter: StreamAdapter | None = None):
+        self.docker = shutil.which("docker") if docker is None else docker
+        self.headless = HeadlessSubprocessBackend(adapter=adapter)
+
+    @property
+    def available(self) -> bool:
+        return bool(self.docker)
+
+    def run(
+        self,
+        command: list[str],
+        *,
+        cwd: Path,
+        image: str = "python:3.11-slim",
+        timeout: float = 30,
+        transcript_path: Path | None = None,
+        chunks_path: Path | None = None,
+    ) -> SessionResult:
+        if not self.docker:
+            return SessionResult(127, "", "docker command not found", [])
+        docker_command = [
+            self.docker,
+            "run",
+            "--rm",
+            "-v",
+            f"{cwd}:/workspace",
+            "-w",
+            "/workspace",
+            image,
+            *command,
+        ]
+        return self.headless.run(
+            docker_command,
+            cwd=cwd,
+            timeout=timeout,
+            transcript_path=transcript_path,
+            chunks_path=chunks_path,
+        )
+
+
 def _chunks(text: str) -> list[str]:
     lines = text.splitlines(keepends=True)
     return lines or ([text] if text else [])
+
+
+def _terminate_process_tree(process: subprocess.Popen[object]) -> None:
+    if process.poll() is not None:
+        return
+    if is_windows():
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            capture_output=True,
+            text=True,
+            check=False,
+            **hidden_subprocess_kwargs(),
+        )
+        return
+    process.kill()

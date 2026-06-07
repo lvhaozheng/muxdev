@@ -13,9 +13,12 @@ from typing import Any
 
 from ..clients.sessions import TmuxBackend
 from ..core.platforms import follow_file_command, hidden_subprocess_kwargs
-from ..models import ApprovalStatus, RunStatus
+from ..models import ApprovalStatus, ProviderActionStatus, RunStatus
 from ..runtime import SupervisorRuntime, new_run_id
 from ..services.dashboard import build_run_dashboard_payload, startup_dashboard_payload
+from ..services.feedback import route_feedback
+from ..services.provider_learning import refresh_provider_learning
+from ..services.provider_scores import build_provider_scores
 from ..storage import Blackboard, compact_trace, read_trace
 from .paths import DaemonPaths, default_daemon_paths
 
@@ -54,6 +57,9 @@ class TaskManager:
         role_providers: dict[str, str] | None = None,
         skills: list[dict[str, object]] | None = None,
         ci_block_on_approval: bool = False,
+        depth: str | None = None,
+        topology: str | None = None,
+        automation: dict[str, object] | None = None,
     ) -> dict[str, Any]:
         task_id = new_run_id()
         run_dir = self.paths.runs_dir / task_id
@@ -66,6 +72,9 @@ class TaskManager:
                     "skills": skills or [],
                     "role_providers": role_providers or {},
                     "ci_block_on_approval": ci_block_on_approval,
+                    "depth": depth,
+                    "topology": topology,
+                    "automation": automation or {},
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -95,6 +104,9 @@ class TaskManager:
                 "role_providers": role_providers or {},
                 "skills": skills or [],
                 "ci_block_on_approval": ci_block_on_approval,
+                "depth": depth,
+                "topology": topology,
+                "automation": automation or {},
             },
             name=f"muxdev-task-{task_id}",
             daemon=True,
@@ -110,6 +122,8 @@ class TaskManager:
             "dashboard_url": f"/tasks/{task_id}",
             "profile": profile,
             "gate": gate,
+            "depth": depth,
+            "topology": topology,
             "skills": [skill.get("name") for skill in skills or [] if isinstance(skill, dict)],
         }
 
@@ -117,6 +131,16 @@ class TaskManager:
         resolved = self.resolve_task_id(task_id or "latest")
         run = self.get_run(resolved)
         workspace = Path(run["workspace"])
+        with self.board() as board:
+            pending_actions = board.list_provider_actions(status=str(ProviderActionStatus.PENDING), run_id=resolved)
+            if pending_actions:
+                board.set_run_status(resolved, RunStatus.AWAITING_PROVIDER_ACTION)
+                return {
+                    "task_id": resolved,
+                    "run_id": resolved,
+                    "status": str(RunStatus.AWAITING_PROVIDER_ACTION),
+                    "provider_actions": pending_actions,
+                }
         thread = threading.Thread(
             target=self._resume_task,
             args=(resolved, workspace),
@@ -125,6 +149,9 @@ class TaskManager:
             daemon=True,
         )
         with self.lock:
+            existing = self.workers.get(resolved)
+            if existing and existing.is_alive():
+                return {"task_id": resolved, "run_id": resolved, "status": "already_running"}
             self.workers[resolved] = thread
         thread.start()
         self.broadcast({"type": "task_continue_requested", "task_id": resolved})
@@ -156,6 +183,98 @@ class TaskManager:
         with self.board() as board:
             return board.list_approvals(status=status)
 
+    def provider_actions(self, *, status: str | None = None, task_id: str | None = None) -> list[dict[str, Any]]:
+        run_id = self.resolve_task_id(task_id) if task_id else None
+        with self.board() as board:
+            return board.list_provider_actions(status=status, run_id=run_id)
+
+    def provider_scores(self, *, role: str | None = None) -> list[dict[str, Any]]:
+        with self.board() as board:
+            return build_provider_scores(board, role=role)
+
+    def provider_learning(self, *, role: str | None = None) -> list[dict[str, Any]]:
+        with self.board() as board:
+            refresh_provider_learning(board, role=role)
+            return board.list_provider_learning(role=role)
+
+    def parallel_conflicts(self, *, status: str | None = None, task_id: str | None = None) -> list[dict[str, Any]]:
+        run_id = self.resolve_task_id(task_id) if task_id else None
+        with self.board() as board:
+            return board.list_parallel_conflicts(status=status, run_id=run_id)
+
+    def semantic_merge_reviews(self, *, task_id: str | None = None) -> list[dict[str, Any]]:
+        run_id = self.resolve_task_id(task_id) if task_id else None
+        with self.board() as board:
+            return board.list_semantic_merge_reviews(run_id=run_id)
+
+    def multi_repo_orchestrations(self, *, status: str | None = None) -> list[dict[str, Any]]:
+        with self.board() as board:
+            return board.list_multi_repo_orchestrations(status=status)
+
+    def ingest_feedback(
+        self,
+        *,
+        kind: str,
+        source: str,
+        content: str,
+        workspace: Path,
+        run_id: str | None = None,
+        severity: str = "medium",
+        provider: str = "mock",
+        payload: dict[str, Any] | None = None,
+        auto_submit: bool = True,
+    ) -> dict[str, Any]:
+        with self.board() as board:
+            routed = route_feedback(
+                workspace,
+                board,
+                kind=kind,
+                source=source,
+                content=content,
+                run_id=run_id,
+                severity=severity,
+                payload=payload or {},
+            )
+        result = routed.to_dict()
+        if routed.auto and auto_submit:
+            submitted = self.submit_task(
+                task=routed.task,
+                workspace=workspace,
+                provider=provider,
+                workflow=routed.workflow,
+                profile="ci" if kind in {"ci_failed", "local_test_failure"} else None,
+                gate="ci" if kind in {"ci_failed", "local_test_failure"} else None,
+                require_approval=set(),
+                max_cost_usd=0.5,
+                role_providers={routed.route_to: provider},
+                skills=[],
+                ci_block_on_approval=kind in {"ci_failed", "local_test_failure"},
+                depth="ci" if kind in {"ci_failed", "local_test_failure"} else None,
+                topology="ci" if kind in {"ci_failed", "local_test_failure"} else None,
+                automation={"intent": "ci" if kind in {"ci_failed", "local_test_failure"} else "feedback", "feedback_id": routed.feedback_id, "route_to": routed.route_to},
+            )
+            result["submitted"] = submitted
+            if routed.rescue_id:
+                with self.board() as board:
+                    board.update_ci_rescue(routed.rescue_id, rescue_run_id=str(submitted["run_id"]), status="submitted")
+        self.broadcast({"type": "feedback_routed", "feedback_id": routed.feedback_id, "route_to": routed.route_to, "auto": routed.auto})
+        return result
+
+    def ecosystem_state(self) -> dict[str, Any]:
+        with self.board() as board:
+            return {
+                "feedback_events": board.table_rows("feedback_events"),
+                "ci_rescues": board.table_rows("ci_rescues"),
+                "cache_entries": board.table_rows("cache_entries"),
+                "skill_locks": board.table_rows("skill_locks"),
+                "plugin_manifests": board.table_rows("plugin_manifests"),
+                "guardrail_events": board.table_rows("guardrail_events"),
+                "parallel_conflicts": board.list_parallel_conflicts(),
+                "semantic_merge_reviews": board.list_semantic_merge_reviews(),
+                "provider_learning": board.list_provider_learning(),
+                "multi_repo_orchestrations": board.list_multi_repo_orchestrations(),
+            }
+
     def decide_approval(self, approval_id: str, status: ApprovalStatus) -> dict[str, Any]:
         with self.board() as board:
             match: dict[str, Any] | None = None
@@ -171,6 +290,21 @@ class TaskManager:
         self.broadcast({"type": "approval_decided", "approval_id": approval_id, "status": str(status)})
         return match
 
+    def update_provider_action(self, action_id: str, status: ProviderActionStatus) -> dict[str, Any]:
+        with self.board() as board:
+            match: dict[str, Any] | None = None
+            for row in board.table_rows("provider_actions"):
+                if row["action_id"] == action_id:
+                    match = row
+                    break
+            if match is None:
+                raise KeyError(f"provider action not found: {action_id}")
+            board.update_provider_action_status(action_id, status)
+            match["status"] = str(status)
+            match["updated"] = True
+        self.broadcast({"type": "provider_action_updated", "action_id": action_id, "status": str(status)})
+        return match
+
     def diff(self, task_id: str) -> dict[str, Any]:
         resolved = self.resolve_task_id(task_id)
         path = self.paths.runs_dir / resolved / "diff.patch"
@@ -181,12 +315,14 @@ class TaskManager:
         path = self.paths.runs_dir / resolved / "final_report.md"
         return {"task_id": resolved, "run_id": resolved, "path": str(path), "content": path.read_text(encoding="utf-8") if path.exists() else ""}
 
-    def rollback(self, task_id: str) -> dict[str, Any]:
+    def rollback(self, task_id: str, *, to_stage: str | None = None) -> dict[str, Any]:
         resolved = self.resolve_task_id(task_id)
         run = self.get_run(resolved)
         worktree = Path(run["worktree"])
         if not worktree.exists():
             return {"task_id": resolved, "run_id": resolved, "status": "failed", "error": f"worktree not found: {worktree}"}
+        if to_stage:
+            return self._rollback_to_stage_snapshot(resolved, worktree, to_stage)
         checkout = subprocess.run(
             ["git", "checkout", "--", "."],
             cwd=worktree,
@@ -213,6 +349,45 @@ class TaskManager:
             "status": "rolled_back" if fallback or (checkout.returncode == 0 and clean.returncode == 0) else "failed",
             "stdout": (checkout.stdout or "") + (clean.stdout or ""),
             "stderr": (checkout.stderr or "") + (clean.stderr or ""),
+            "fallback": fallback,
+        }
+
+    def _rollback_to_stage_snapshot(self, task_id: str, worktree: Path, stage_id: str) -> dict[str, Any]:
+        with self.board() as board:
+            rows = [row for row in board.table_rows("snapshots", run_id=task_id) if row.get("stage_id") == stage_id]
+        if not rows:
+            return {"task_id": task_id, "run_id": task_id, "status": "failed", "error": f"snapshot not found for stage: {stage_id}"}
+        patch_path = Path(str(rows[-1]["path"]))
+        if not patch_path.exists():
+            return {"task_id": task_id, "run_id": task_id, "status": "failed", "error": f"snapshot patch missing: {patch_path}"}
+        checkout = subprocess.run(["git", "checkout", "--", "."], cwd=worktree, capture_output=True, text=True, check=False, **hidden_subprocess_kwargs())
+        clean = subprocess.run(["git", "clean", "-fd"], cwd=worktree, capture_output=True, text=True, check=False, **hidden_subprocess_kwargs())
+        fallback = ""
+        git_failed = checkout.returncode != 0 or clean.returncode != 0
+        if git_failed:
+            fallback = "fallback cleaned run worktree: " + ", ".join(_clean_worktree_without_git(worktree))
+        apply_result = None
+        patch_text = patch_path.read_text(encoding="utf-8", errors="replace")
+        if patch_text.strip():
+            apply_result = subprocess.run(
+                ["git", "apply", str(patch_path)],
+                cwd=worktree,
+                capture_output=True,
+                text=True,
+                check=False,
+                **hidden_subprocess_kwargs(),
+            )
+        apply_failed = apply_result is not None and apply_result.returncode != 0
+        failed = apply_failed or (git_failed and not fallback)
+        return {
+            "task_id": task_id,
+            "run_id": task_id,
+            "worktree": str(worktree),
+            "to_stage": stage_id,
+            "snapshot": str(patch_path),
+            "status": "failed" if failed else "rolled_back",
+            "stdout": (checkout.stdout or "") + (clean.stdout or "") + ((apply_result.stdout or "") if apply_result else ""),
+            "stderr": (checkout.stderr or "") + (clean.stderr or "") + ((apply_result.stderr or "") if apply_result else ""),
             "fallback": fallback,
         }
 
@@ -290,6 +465,9 @@ class TaskManager:
         role_providers: dict[str, str],
         skills: list[dict[str, object]],
         ci_block_on_approval: bool,
+        depth: str | None,
+        topology: str | None,
+        automation: dict[str, object],
     ) -> None:
         try:
             runtime = self._runtime(workspace)
@@ -305,6 +483,9 @@ class TaskManager:
                 gate=gate,
                 skills=skills,
                 ci_block_on_approval=ci_block_on_approval,
+                depth=depth,
+                topology=topology,
+                automation=automation,
             )
             self.broadcast({"type": "task_updated", "task_id": result.run_id, "status": str(result.status)})
         except Exception as exc:
@@ -338,6 +519,7 @@ class TaskManager:
         context = self._task_context(run_id)
         stages = board.table_rows("stages", run_id=run_id)
         approvals = board.table_rows("approvals", run_id=run_id)
+        provider_actions = board.list_provider_actions(run_id=run_id)
         usage = board.table_rows("usage_records", run_id=run_id)
         errors = board.table_rows("error_details", run_id=run_id)
         current = next((row["stage_id"] for row in stages if row.get("status") == "running"), "")
@@ -347,11 +529,14 @@ class TaskManager:
             "run_id": run_id,
             "current_stage": current,
             "pending_approvals": sum(1 for row in approvals if row.get("status") == str(ApprovalStatus.PENDING)),
+            "pending_provider_actions": sum(1 for row in provider_actions if row.get("status") == str(ProviderActionStatus.PENDING)),
             "tokens": sum(int(row.get("tokens") or 0) for row in usage),
             "cost_usd": round(sum(float(row.get("cost_usd") or 0) for row in usage), 6),
             "errors": len(errors),
             "profile": context.get("profile"),
             "gate": context.get("gate"),
+            "depth": context.get("depth"),
+            "topology": context.get("topology"),
             "skills": [skill.get("name") for skill in context.get("skills", []) if isinstance(skill, dict)],
         }
 
