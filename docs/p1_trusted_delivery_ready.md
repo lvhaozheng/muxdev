@@ -185,4 +185,4 @@ muxdev rollback latest --to-stage implement --json
 python -B -m pytest tests\test_p1_trusted_delivery.py -q
 ```
 
-P1 ready 后，后续 P2 可以继续扩展 provider score、跨 run 质量趋势、远端签名、公证存储或更严格的 validator panel。
+当前仓库已在 P2/P4 继续补齐 provider action、provider score、provider learning 和 semantic merge；本文件只聚焦 P1 的可信交付闭环验收。

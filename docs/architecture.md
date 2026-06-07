@@ -1,38 +1,36 @@
-# muxdev 架构文档
+# muxdev 架构
 
-本文描述当前 `muxdev` 的实现架构。当前主线是本地 Client-Server 控制面：CLI/TUI/Dashboard 作为客户端，daemon 作为唯一任务生命周期控制者，运行时复用 `SupervisorRuntime` 执行 workflow、provider、安全策略和 artifact 生成。
+本文描述当前 muxdev 的实现架构。当前形态可以概括为：
 
-## 目标
+```text
+Role-aware, memory-grounded, local-first Agentic SDLC control plane
+```
 
-muxdev 的目标是把本地 AI coding 工作流收敛到一个可观测、可审批、可恢复的控制面：
+也就是说，muxdev 不是单个 provider CLI 的包装器，而是一个本地 daemon 驱动的任务控制面：CLI/TUI/Dashboard/API 负责提交和观察任务，daemon 负责生命周期，runtime 负责编排 provider、角色、审批、证据、记忆和交付闭环。
 
-- 用 `muxdev start` / `muxdev serve` 启动本地 daemon。
-- 用 `muxdev dev/fix/review/test` 提交任务。
-- daemon 统一管理任务状态、审批、报告、diff、rollback、attach command、事件流和 Dashboard。
-- provider/config/skill/RAG/flow/MCP 等工具命令保留为本地 CLI 能力。
-
-旧的顶层兼容命令和 Python shim 已被移除。公开命令以 `dev/fix/review/test`、`continue`、`dashboard`、`provider ...` 为准。
-
-## 运行视图
+## 顶层视图
 
 ```text
 User
   |
-  | muxdev / muxdev tui / muxdev dev
+  | muxdev / muxdev tui / muxdev dashboard / HTTP API
   v
-CLI and TUI clients
+CLI, TUI, Dashboard
   |
-  | HTTP via DaemonClient
+  | DaemonClient / REST / WebSocket
   v
 FastAPI daemon
   |
-  | TaskManager owns state and workers
+  | TaskManager owns lifecycle, workers, DB writes
   v
 SupervisorRuntime
   |
-  | workflow stages, provider adapters, safety gates
+  | role stages, provider adapters, safety, evidence, memory, merge
   v
-Global state store + run artifacts
+Provider CLIs + isolated worktrees + artifacts
+  |
+  v
+Blackboard, memory store, run artifacts, ecosystem store
 ```
 
 默认端口：
@@ -40,71 +38,320 @@ Global state store + run artifacts
 - Dashboard: `http://127.0.0.1:8787`
 - API: `http://127.0.0.1:8788`
 
-两个端口运行同一套 FastAPI 应用和 `/api` 合约。Dashboard 使用相对 `/api` 请求，CLI 默认通过 `DaemonClient` 访问 API 端口。
+Dashboard 和 API 由同一套 FastAPI app 提供。CLI/TUI 默认通过 `DaemonClient` 访问 API 端口。
 
 ## 目录结构
 
-当前源码主层级如下：
-
 ```text
 src/muxdev/
-  api/        FastAPI app、MCP JSON-RPC、Dashboard HTML
-  cli/        Typer 命令入口、TUI 客户端、provider 子命令
-  clients/    daemon HTTP client、session/stream client
-  config/     TOML 主配置、默认 YAML、provider account/install 配置
-  core/       平台适配、脱敏、安全策略
-  daemon/     daemon 路径、进程管理、server、TaskManager
-  models/     领域模型和状态枚举
-  providers/  provider 探测、registry、runtime adapters
-  runtime/    SupervisorRuntime 和 worktree 管理
-  services/   dashboard、flows、RAG、reports、skills、orchestration helpers
-  storage/    SQLite blackboard 和 JSONL trace
-  ui/         Rich 渲染、REPL、TUI 视图
-  workflows/  workflow parser 和 DAG 工具
+  api/        FastAPI app, MCP JSON-RPC, Dashboard HTML
+  cli/        Typer commands, daemon-backed TUI, provider subcommands
+  clients/    daemon HTTP client, stream parser
+  config/     TOML-first runtime config, profiles, gates, provider setup
+  core/       platform helpers, safety policy, redaction
+  daemon/     daemon process/server paths and TaskManager
+  models/     shared domain dataclasses and status enums
+  providers/  provider registry, mock provider, runtime adapters
+  runtime/    SupervisorRuntime and isolated worktree support
+  services/   automation, design, evidence, feedback, cache, learning, merge
+  storage/    SQLite blackboard, memory store, hash ledger, trace
+  ui/         Rich render helpers and REPL
+  workflows/  workflow parser and DAG helpers
 ```
 
-`reports/`、`sessions/`、`stream/`、`workflow/`、`orchestration/`、`safety/` 旧源码入口已清理或迁移。若本地还能看到这些目录，通常是权限锁住的 `__pycache__` 残留，不应再放入源码。
+旧的顶层 shim 或历史入口已经不再作为主路径使用。新增能力应优先放在 `services/`、`runtime/`、`daemon/`、`api/`、`cli/` 或 canonical storage/config/provider 层，避免恢复旧目录式入口。
 
-## 组件职责
+## 数据存储
 
-### CLI
+### Daemon Blackboard
 
-入口为 `muxdev.cli:app`，由 `pyproject.toml` 暴露为 `muxdev` 命令。
+daemon 运行状态写入：
+
+```text
+~/.muxdev/data/muxdev.sqlite
+```
+
+主要表包括：
+
+- `runs`
+- `stages`
+- `agents`
+- `approvals`
+- `provider_actions`
+- `provider_attempts`
+- `artifacts`
+- `test_results`
+- `review_blockers`
+- `usage_records`
+- `checkpoints`
+- `error_details`
+- `hash_ledger`
+- `feedback_events`
+- `ci_rescues`
+- `cache_entries`
+- `skill_locks`
+- `guardrail_events`
+- `parallel_conflicts`
+- `semantic_merge_reviews`
+- `provider_learning`
+- `multi_repo_orchestrations`
+
+CLI 不直接写 daemon DB。daemon 中的 `TaskManager` 是全局状态库的边界。
+
+### Run Artifacts
+
+每个 run 写入：
+
+```text
+~/.muxdev/data/runs/<run_id>/
+```
+
+常见产物：
+
+- `task.md`
+- `workflow.yaml`
+- `task_context.json`
+- `trace.jsonl`
+- `final_report.md`
+- `diff.patch`
+- `role_contracts/*.json`
+- `role_results/*.json`
+- `evidence/*.json`
+- `validation/blind_validator_panel.json`
+- `snapshots/*.json`
+- `capsules/*.session_capsule.json`
+- `capsules/*.handoff.patch`
+
+### Project Memory
+
+项目级长期记忆写入：
+
+```text
+<repo>/.muxdev/memory.sqlite
+```
+
+记忆项可以经历 `proposed -> accepted -> archived/quarantined`。P4 新增矛盾检测与自动隔离能力，避免低置信或互相否定的记忆继续污染上下文。
+
+### Ecosystem Store
+
+本地非 daemon 生态命令写入：
+
+```text
+<repo>/.muxdev/ecosystem.sqlite
+```
+
+例如 feedback、CAS cache、provider learning、parallel conflict、本地 multi-repo plan 等。daemon API 场景则写 daemon DB。
+
+## 任务生命周期
+
+以 `muxdev dev "add feature" --provider mock --json` 为例：
+
+```text
+cli/main.py
+  -> resolve_task_request()
+  -> resolve_active_skills()
+  -> DaemonClient.submit_task()
+  -> POST /api/tasks
+  -> TaskManager.submit_task()
+  -> Blackboard.create_run()
+  -> worker thread
+  -> SupervisorRuntime.run()
+  -> role stages / providers / approvals / evidence / memory
+  -> final report / diff / validator / learning
+  -> TaskManager.broadcast()
+```
+
+`continue` 路径类似，但会先检查待处理项：
+
+- 存在 pending muxdev approval 时，等待审批。
+- 存在 pending provider action 时，返回 `awaiting_provider_action`，不重复启动 worker。
+- 待处理项完成后，`SupervisorRuntime.resume()` 继续执行。
+
+## Runtime 分层
+
+`runtime/supervisor.py::SupervisorRuntime` 是实际执行器。核心职责：
+
+1. 创建 run 目录和隔离 worktree。
+2. 解析 workflow DAG。
+3. 创建 role contract 和 agent/stage 记录。
+4. 绑定项目 memory context。
+5. 调用 provider adapter。
+6. 解析 provider stream 和 provider actions。
+7. 执行 safety policy、approval gates、budget gates。
+8. 记录 provider attempts、session capsules、handoff patch。
+9. 写入 role results、evidence、hash ledger。
+10. 运行 semantic merge 和 Blind Validator。
+11. 生成 final report、diff、rollback snapshot。
+12. 更新 provider score 与 provider learning。
+
+`SupervisorRuntime` 支持 daemon 注入：
+
+```python
+SupervisorRuntime(
+    workspace,
+    runs_dir=paths.runs_dir,
+    state_db=paths.db_path,
+    worktrees_root=paths.worktrees_dir,
+    write_dashboards=False,
+)
+```
+
+这保证了 runtime 可以复用本地执行能力，同时由 daemon 统一持久化任务状态。
+
+## Approval 与 Provider Action
+
+muxdev 将两类人工介入分开处理。
+
+### Approvals
+
+Approvals 是 muxdev 自己的策略审批，例如：
+
+- `plan`
+- `write`
+- `shell`
+- `merge`
+- `external`
+
+相关入口：
+
+```powershell
+muxdev approvals --status pending --json
+muxdev approve <approval_id>
+muxdev deny <approval_id>
+```
+
+API：
+
+- `GET /api/approvals`
+- `POST /api/approvals/{approval_id}/approve`
+- `POST /api/approvals/{approval_id}/deny`
+
+### Provider Actions
+
+Provider Actions 是外部 provider CLI/session 阻塞，例如：
+
+- `cli_confirmation`
+- `auth_required`
+- `rate_limit`
+- `provider_blocked`
+- `idle_timeout`
+
+它们不再伪装成 external approval。系统会保存 prompt、可解析选项、transcript/chunks 路径和 attach command。
+
+相关入口：
+
+```powershell
+muxdev actions --status pending --json
+muxdev action handled <action_id>
+muxdev action dismiss <action_id>
+```
+
+API：
+
+- `GET /api/provider-actions`
+- `GET /api/tasks/{run_id}/provider-actions`
+- `POST /api/provider-actions/{action_id}/handled`
+- `POST /api/provider-actions/{action_id}/dismiss`
+
+设计约束：v1 不从 Dashboard/TUI 直接向 provider CLI 输入 yes/no。用户先进入对应 attach/session 处理，再回到 muxdev 标记 handled 并 continue。
+
+## P0-P4 能力层
+
+### P0: 自动 + 角色 + 设计 + 记忆骨架
 
 主要模块：
 
-- `cli/main.py`: Typer 根命令和大多数命令注册。
-- `cli/common.py`: JSON 输出、daemon client 创建、provider account/install 输出辅助。
-- `cli/providers.py`: `muxdev provider detect/list/doctor/account/install`。
-- `cli/tui.py`: daemon-backed 对话式 TUI 客户端循环。
-- `cli/app.py`: 只保留 `app` 兼容导出，不承载命令实现。
+- `services/automation.py`
+- `services/design.py`
+- `storage/memory.py`
+- `config/runtime.py`
 
-任务类命令不直接写 SQLite，也不直接运行 `SupervisorRuntime`。它们解析配置、profile、gate、roles、skills 后，通过 `DaemonClient` 提交到 daemon。
+能力：
 
-### Daemon
+- intent resolver
+- auto flow selector
+- role topology compiler
+- simple/safe/deep/parallel/ci 自动路由
+- `design` 命令与 dev 前设计产物
+- 项目 memory 最小闭环
 
-daemon 相关模块位于 `daemon/`：
+### P1: 可信交付闭环
 
-- `paths.py`: `MUXDEV_HOME`、数据目录、PID、日志、DB、runs/worktrees 路径。
-- `process.py`: 后台启动、停止、状态检查。Windows 下通过隐藏 subprocess 启动，避免频繁弹 terminal。
-- `server.py`: uvicorn server 入口，同时启动 API 和 UI 端口。
-- `tasks.py`: `TaskManager`，负责任务生命周期、状态库写入、worker 线程、事件广播。
+主要模块：
 
-daemon 首次启动会确保：
+- `services/evidence.py`
+- `storage/ledger.py`
+- `services/reports.py`
 
-```text
-~/.muxdev/
-  config.toml
-  data/
-    muxdev.sqlite
-    logs/daemon.log
-    runs/<run_id>/
-    worktrees/
-```
+能力：
 
-### API 和 Dashboard
+- role output contract
+- evidence snapshot
+- hash ledger
+- stage snapshot
+- rollback metadata
+- Blind Validator Panel
 
-`api/web.py` 创建 FastAPI app，并提供：
+### P2: 运行时安全与 Provider 可信化
+
+主要模块：
+
+- `clients/stream.py`
+- `services/session_capsules.py`
+- `services/provider_scores.py`
+
+能力：
+
+- provider stream 解析
+- provider action 持久化
+- provider attempt 记录
+- role fallback
+- read-only provider gate
+- session capsule 和 handoff patch
+- provider score
+
+### P3: 生态与自动化闭环
+
+主要模块：
+
+- `services/feedback.py`
+- `services/cas_cache.py`
+- `services/skill_lock.py`
+- `services/plugin_manifest.py`
+- `api/mcp.py`
+
+能力：
+
+- feedback router
+- CI rescue
+- CAS cache
+- Skill Lock 和 Skill Memory
+- Safe Plugin Manifest
+- MCP guardrail 工具
+- Dashboard/TUI 生态可见性
+
+### P4: 并行、语义合并、学习与多仓编排
+
+主要模块：
+
+- `services/advanced_parallel.py`
+- `services/semantic_merge.py`
+- `services/provider_learning.py`
+- `services/multirepo.py`
+- `storage/memory.py`
+
+能力：
+
+- conflict-aware parallel-squad
+- semantic merge reviewer
+- cross-run provider learning
+- memory contradiction detection
+- memory quarantine automation
+- multi-repo orchestration planning
+
+## API Surface
+
+核心任务 API：
 
 - `GET /api/health`
 - `GET /api/daemon/status`
@@ -117,187 +364,172 @@ daemon 首次启动会确保：
 - `GET /api/tasks/{task_id}/report`
 - `POST /api/tasks/{task_id}/rollback`
 - `GET /api/tasks/{task_id}/attach-command`
+
+交付与等待项：
+
 - `GET /api/approvals`
 - `POST /api/approvals/{approval_id}/approve`
 - `POST /api/approvals/{approval_id}/deny`
+- `GET /api/provider-actions`
+- `GET /api/tasks/{task_id}/provider-actions`
+- `POST /api/provider-actions/{action_id}/handled`
+- `POST /api/provider-actions/{action_id}/dismiss`
+
+生态、学习与并行：
+
+- `POST /api/feedback`
+- `GET /api/ecosystem`
+- `GET /api/provider-scores`
+- `GET /api/learning/provider`
+- `GET /api/parallel-conflicts`
+- `GET /api/tasks/{task_id}/parallel-conflicts`
+- `GET /api/semantic-merge-reviews`
+- `GET /api/tasks/{task_id}/semantic-merge-reviews`
+- `GET /api/multi-repo/orchestrations`
+- `POST /api/multi-repo/plan`
+- `GET /api/memory/contradictions`
+- `POST /api/memory/quarantine-auto`
+
+事件：
+
 - `WS /events`
 - `WS /api/events`
 
-同一个模块还渲染 live dashboard HTML。历史 run-level 静态 dashboard 的渲染函数仍作为 service 能力保留，但公开入口已经转向 daemon Dashboard。
+## CLI/TUI/Dashboard
 
-### TaskManager
+### CLI
 
-`TaskManager` 是 daemon 侧任务控制核心：
+`cli/main.py` 是命令注册中心。主路径命令包括：
 
-- 创建 task id / run id。
-- 创建 daemon run artifact 目录。
-- 在全局 SQLite 中创建 run。
-- 启动后台 worker 线程运行 `SupervisorRuntime`。
-- 处理 `continue/stop/rollback/approve/deny/attach`。
-- 汇总 task list/detail payload。
-- 维护 WebSocket subscriber queue。
-
-TaskManager 使用 daemon-owned `Blackboard`：
-
-```python
-Blackboard(paths.data_dir, db_path=paths.db_path)
-```
-
-这保证只有 daemon runtime 写全局 `muxdev.sqlite`。
-
-### Runtime
-
-`runtime/supervisor.py` 中的 `SupervisorRuntime` 负责实际 workflow 执行：
-
-- 加载 workflow DAG。
-- 准备 worktree。
-- 选择 provider adapter。
-- 执行 stage。
-- 应用 safety policy、approval gates、budget gates。
-- 写 trace、blackboard、artifacts、report、diff。
-- 支持 resume/retry。
-
-daemon 注入：
-
-- `runs_dir=~/.muxdev/data/runs`
-- `state_db=~/.muxdev/data/muxdev.sqlite`
-- `worktrees_root=~/.muxdev/data/worktrees`
-- `write_dashboards=False`
-
-这使 runtime 行为复用原有逻辑，但状态归 daemon 管。
-
-### Storage
-
-`storage/blackboard.py` 是 SQLite state store。核心语义包括：
-
-- `runs`
-- `stages`
-- `agents`
+- `design`
+- `dev`
+- `fix`
+- `refactor`
+- `review`
+- `test`
+- `ci`
+- `why`
+- `tasks`
+- `status`
+- `continue`
+- `stop`
+- `report`
+- `diff`
+- `rollback`
 - `approvals`
-- `artifacts`
-- `test_results`
-- `review_blockers`
-- `usage_records`
-- `checkpoints`
-- `error_details`
+- `actions`
+- `memory`
+- `parallel`
+- `learning`
+- `multirepo`
+- `feedback`
+- `cache`
+- `skill`
+- `plugin`
+- `provider`
 
-`storage/trace.py` 负责 JSONL trace 读写和压缩展示。trace 文件仍放在每个 run artifact 目录中：
+Provider 子命令在 `cli/providers.py` 中，负责 detect/list/doctor/account/install。
 
-```text
-~/.muxdev/data/runs/<run_id>/trace.jsonl
-```
+### TUI
 
-### Config
+`cli/tui.py` 是 daemon-backed TUI。它不做实时 provider detect，避免 Windows 上外部 CLI 反复弹窗。当前支持：
 
-当前配置主路径是 TOML：
+- `/design`
+- `/dev`
+- `/fix`
+- `/refactor`
+- `/review`
+- `/test`
+- `/ci`
+- `/why`
+- `/tasks`
+- `/status`
+- `/approvals`
+- `/actions`
+- `/action handled <id>`
+- `/action dismiss <id>`
+- `/parallel`
+- `/learning`
+- `/continue`
 
-- 全局: `~/.muxdev/config.toml`
-- 项目: `<repo>/.muxdev/config.toml`
-- 任务文件: `-f task.toml` 或 `MUXDEV_TASK_CONFIG`
+当当前任务存在 provider action 时，TUI 会显示 prompt 摘要、选项和 attach 指令，并提示用户去 provider CLI/session 处理。
 
-合并顺序：
+### Dashboard
+
+`api/web.py::render_live_dashboard_html` 输出 live dashboard。Dashboard 展示：
+
+- task summary
+- timeline
+- approvals
+- Provider Actions
+- provider attempts
+- session capsules
+- role sessions
+- evidence
+- memory context
+- feedback / CI rescue / CAS cache
+- skill lock / plugin manifest
+- guardrail events
+- parallel conflicts
+- semantic merge reviews
+- provider learning
+- artifacts, tests, blockers, usage, trace
+
+Dashboard 的 Provider Actions 面板只提供 `Mark handled`、`Dismiss` 和任务操作，不提供误导性的 approve/deny。
+
+## 配置模型
+
+配置是 TOML-first：
 
 ```text
 builtin < global < project < task < CLI options
 ```
 
-旧 YAML loader 仍用于默认 provider/workflow/path 等低层配置兼容，但新命令默认写 TOML。
-
-### Skill Engine
-
-`services/skill_engine.py` 负责：
-
-- 扫描 `SKILL.md`
-- 解析 frontmatter
-- 处理 `skills.toml`
-- role binding
-- disable/enable/trust/auto policy
-- task explicit activation
-- metadata auto-match
-- provider injection mode 标记
-
-扫描优先级为：
+常用文件：
 
 ```text
-configured dirs > project dirs > global dirs > builtin
+~/.muxdev/config.toml
+<repo>/.muxdev/config.toml
+~/.muxdev/skills.toml
+<repo>/.muxdev/skills.toml
 ```
 
-同名 skill 由高优先级覆盖低优先级。
+主实现：
 
-## 数据流
+- `config/runtime.py`: runtime config merge 和 task request resolve
+- `config/loader.py`: 历史 YAML provider/workflow/path 兼容
+- `services/skill_engine.py`: skill discovery, binding, trust, auto-match
 
-### 提交任务
+## 扩展原则
 
-```text
-muxdev dev "task"
-  -> cli/main.py resolves config/profile/gate/roles/skills
-  -> DaemonClient.post /api/tasks
-  -> FastAPI create_task
-  -> TaskManager.submit_task
-  -> Blackboard.create_run
-  -> background Thread
-  -> SupervisorRuntime.run
-  -> stages/provider/safety/storage/artifacts
-  -> TaskManager.broadcast task_updated
+新增能力建议遵循：
+
+- 状态写入经过 `TaskManager` 或明确的本地 ecosystem store。
+- CLI 只做参数解析、格式化输出和 daemon client 调用。
+- Provider 阻塞用 Provider Action，不用 muxdev approval 伪装。
+- 能力实现放 service 层，runtime 只编排。
+- Dashboard/TUI 只展示和触发 muxdev 状态操作，不替用户向外部 provider CLI 输入确认。
+- 涉及交付可信度的能力必须写入证据、hash 或可追踪 artifact。
+
+## 测试布局
+
+主要测试文件：
+
+- `tests/test_p0_automation_memory.py`
+- `tests/test_p1_trusted_delivery.py`
+- `tests/test_p2_runtime_safety_provider.py`
+- `tests/test_p3_ecosystem_automation.py`
+- `tests/test_p4_advanced_parallel_learning.py`
+- `tests/test_daemon_client_server.py`
+- `tests/test_repl_tui_m7.py`
+- `tests/test_strategy_main_path.py`
+- `tests/test_runtime_m1_m4.py`
+- `tests/test_stream_workflow_safety.py`
+- `tests/test_structure.py`
+
+推荐回归：
+
+```powershell
+$env:PYTHONDONTWRITEBYTECODE = "1"
+python -m pytest -q
 ```
-
-### 审批
-
-```text
-runtime hits approval gate
-  -> Blackboard.approvals pending
-  -> task status awaiting_approval
-  -> Dashboard/TUI/CLI list approvals
-  -> muxdev approve <id>
-  -> POST /api/approvals/<id>/approve
-  -> Blackboard.decide_approval
-  -> muxdev continue latest
-  -> SupervisorRuntime.resume
-```
-
-### TUI
-
-```text
-muxdev or muxdev tui
-  -> cli/tui.py
-  -> DaemonClient.health/tasks/task/approvals
-  -> ui/tui.py Rich render functions
-  -> slash commands call daemon API
-```
-
-TUI 渲染路径不做 provider 实时探测，避免 Windows 环境下触发外部 CLI 导致 terminal 反复弹出。
-
-## 进程模型
-
-`muxdev start` 和 `muxdev serve --daemon` 通过 `daemon/process.py` 启动后台服务。Windows 下使用隐藏窗口 subprocess 参数；POSIX 下使用普通后台 subprocess。
-
-PID 文件用于：
-
-- `muxdev serve --status`
-- `muxdev serve --stop`
-- `muxdev serve --restart`
-
-当前没有 systemd/launchd installer，后续可扩展为服务注册器。
-
-## 错误和边界
-
-- CLI task 命令不直接写数据库。
-- daemon 是全局状态库唯一写入方。
-- provider discovery 是静态探测，不执行模型调用。
-- local daemon HTTP client 使用 `trust_env=False`，避免 localhost 请求被代理转发导致 502。
-- `ci` gate 下需要人工审批时，runtime 可进入 blocked，而不是等待交互。
-- Windows 运行外部命令时使用 `hidden_subprocess_kwargs()` 降低弹窗风险。
-
-## 扩展点
-
-当前已经有以下扩展入口：
-
-- provider registry 和 adapters
-- workflow YAML / built-in workflow aliases
-- skill engine 和 `skills.toml`
-- MCP JSON-RPC tools
-- flow registry
-- plugin registry stub
-- Dashboard/TUI 对 daemon API 的客户端化渲染
-
-新增能力应优先挂在 `services/`、`providers/`、`workflows/` 或 `daemon/`，避免恢复旧的根级 shim。

@@ -145,7 +145,7 @@ python -B -m pytest tests\test_strategy_main_path.py tests\test_cli.py tests\tes
 - P0 memory retrieval 是轻量关键词匹配，不是向量检索或冲突检测。
 - `memory approve` 是本地命令审批，P1 需要把 approval 绑定到 hash。
 - `design` 现在生成 Design Pack 骨架和 provider stage 输出，P1 可升级为结构化 DesignContract 校验。
-- Blind Validator、Hash Ledger、Rollback stage snapshot、Provider score 属于 P1/P2。
+- Blind Validator、Hash Ledger、Rollback stage snapshot、Provider score 已在 P1/P2 落地；P0 验收只确认这些后续能力能从自动决策、角色拓扑、设计产物和 memory context 继续接上。
 
 ## Ready 判定
 

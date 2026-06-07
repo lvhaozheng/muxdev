@@ -166,4 +166,4 @@ python -B -m pytest tests\test_p3_ecosystem_automation.py -q
 python -B -m pytest -q
 ```
 
-P3 ready 后，后续 P4 可以继续扩展 conflict-aware parallel squad、semantic merge reviewer、cross-run provider learning、memory contradiction detection、memory quarantine automation 和 multi-repo orchestration。
+当前仓库已在 P4 继续补齐 conflict-aware parallel-squad、semantic merge reviewer、cross-run provider learning、memory contradiction detection、memory quarantine automation 和 multi-repo orchestration；本文件只聚焦 P3 的生态与自动化闭环验收。

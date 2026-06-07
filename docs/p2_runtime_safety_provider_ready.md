@@ -178,4 +178,4 @@ python -B -m pytest tests\test_p2_runtime_safety_provider.py -q
 python -B -m pytest -q
 ```
 
-P2 ready 后，后续 P3 可以继续扩展 Feedback Router、CI Rescue、CAS Cache、Skill Lock、MCP Guardrail Server 和 Dashboard timeline/evidence/memory/session 的更完整展示。
+当前仓库已在 P3/P4 继续补齐 Feedback Router、CI Rescue、CAS Cache、Skill Lock、MCP Guardrail、Dashboard/TUI 可见性、provider learning 和 parallel/semantic merge；本文件只聚焦 P2 的运行时安全与 Provider 可信化验收。

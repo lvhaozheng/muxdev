@@ -1,6 +1,6 @@
-# muxdev 配置高阶用法
+# muxdev 配置指南
 
-本文说明当前 TOML-first 配置体系、profile/gate/role/skill 的合并规则，以及常见高级配置写法。
+本文说明当前 muxdev 的 TOML-first 配置体系、任务解析优先级、角色/provider 路由、自动化、记忆、安全门禁，以及 P0-P4 新能力对配置和命令面的影响。
 
 ## 配置文件
 
@@ -27,7 +27,7 @@ task.toml
 也可以通过环境变量指定任务级配置：
 
 ```powershell
-$env:MUXDEV_TASK_CONFIG = "task.toml"
+$env:MUXDEV_TASK_CONFIG = ".muxdev/tasks/refactor-auth.toml"
 ```
 
 ## 合并顺序
@@ -40,11 +40,11 @@ builtin < global < project < task < CLI options
 
 含义：
 
-- builtin 是代码中的默认值。
-- global 是用户级默认。
-- project 是仓库级约定。
-- task 是一次性任务覆盖。
-- CLI options 拥有最高优先级。
+- `builtin`: 代码内置默认值。
+- `global`: 用户级默认配置。
+- `project`: 仓库级约定。
+- `task`: 单次任务覆盖。
+- `CLI options`: 命令行参数，优先级最高。
 
 skill policy 合并顺序：
 
@@ -69,6 +69,7 @@ $env:MUXDEV_HOME = "D:\muxdev-home"
 - daemon data
 - daemon logs
 - daemon SQLite
+- daemon runs/worktrees
 
 ### `MUXDEV_API_URL`
 
@@ -78,7 +79,7 @@ $env:MUXDEV_HOME = "D:\muxdev-home"
 $env:MUXDEV_API_URL = "http://127.0.0.1:8788"
 ```
 
-优先级高于 `--host --port` 构造出的默认 URL。
+`DaemonClient` 对 localhost 请求使用 `trust_env=False`，避免被系统 HTTP proxy 转发。
 
 ### `MUXDEV_TASK_CONFIG`
 
@@ -120,63 +121,28 @@ muxdev setup --project --yes --full
 ~/.muxdev/cache/providers.json
 ```
 
-## Built-in profile
-
-当前内置 profile：
-
-| Profile | 目标 | 默认 roles |
-| --- | --- | --- |
-| `solo` | 单角色快速修复 | `code` |
-| `pair` | code + review | `code`, `review` |
-| `squad` | 默认协作路径 | `plan`, `code`, `test`, `review` |
-| `ci` | 非交互主路径 | `plan`, `code`, `test`, `review` |
-
-默认：
+## 推荐最小配置
 
 ```toml
-profile = "squad"
-```
-
-命令覆盖：
-
-```powershell
-muxdev dev "task" -p pair
-```
-
-## Built-in gate
-
-当前内置 gate：
-
-| Gate | require_approval | 行为 |
-| --- | --- | --- |
-| `auto` | `[]` | 尽量自动执行 |
-| `safe` | `plan`, `write`, `shell`, `merge` | 默认安全模式 |
-| `strict` | `plan`, `write`, `shell`, `merge`, `external` | 高风险模式 |
-| `ci` | 同 strict | 需要审批时阻塞 |
-
-默认：
-
-```toml
+version = 2
+profile = "auto"
 gate = "safe"
-```
 
-命令覆盖：
-
-```powershell
-muxdev dev "task" -g strict
-```
-
-## P0 automation and memory
-
-P0 adds deterministic auto orchestration on top of the existing profile/gate
-settings. The short default config is:
-
-```toml
 [automation]
 mode = "auto"
 profile = "auto"
 depth = "auto"
 allow_parallel = true
+
+[roles]
+plan = "auto"
+code = "auto"
+test = "auto"
+review = "auto"
+secure = "auto"
+docs = "auto"
+architect = "auto"
+memory_curator = "auto"
 
 [memory]
 enabled = true
@@ -187,21 +153,71 @@ require_approval_for = ["architecture_decision", "security_rule", "payment_rule"
 ttl_days = 180
 max_items_per_role = 8
 redact_secrets = true
+
+[safety]
+level = "balanced"
+sensitive_paths = ["auth/**", "payment/**", "migrations/**", ".env"]
+require_approval_for = ["dependency_change", "network", "security_sensitive", "merge"]
 ```
 
-`automation.depth = "auto"` lets muxdev choose `simple`, `safe`, `deep`,
-`parallel`, or `ci` from the command intent, task text, repository signals, and
-memory context. CLI flags still win:
+## Profiles
+
+| Profile | 目标 | 默认 roles |
+| --- | --- | --- |
+| `auto` | 交给 Auto Flow Selector | 由任务决定 |
+| `solo` | 单角色快速修改 | `code` |
+| `pair` | code + review | `code`, `review` |
+| `squad` | 默认协作路径 | `plan`, `code`, `test`, `review` |
+| `ci` | 非交互 CI 路径 | `plan`, `code`, `test`, `review` |
+
+命令覆盖：
 
 ```powershell
-muxdev dev "small fix" --simple
-muxdev dev "security-sensitive change" --deep
-muxdev dev "split modules" --parallel
-muxdev dev "ship feature" -p pair --role code=codex
+muxdev dev "task" -p pair
 ```
 
-Project memory is stored in `.muxdev/memory.sqlite` and is intentionally
-evidence-grounded. Use:
+## Gates
+
+| Gate | require approval | 行为 |
+| --- | --- | --- |
+| `auto` | `[]` | 尽量自动执行 |
+| `safe` | `plan`, `write`, `shell`, `merge` | 默认安全模式 |
+| `strict` | `plan`, `write`, `shell`, `merge`, `external` | 高风险模式 |
+| `ci` | 类似 strict | 需要审批时进入 blocked，不等待交互 |
+
+命令覆盖：
+
+```powershell
+muxdev dev "task" -g strict
+muxdev dev "task" --require-approval plan --json
+```
+
+## P0: 自动化、设计、记忆
+
+Auto Flow Selector 会根据命令、任务文本、仓库信号、敏感路径、memory context 决定：
+
+- intent: `design/dev/fix/refactor/review/test/ci`
+- depth: `simple/safe/deep/parallel/ci`
+- topology: `solo/pair/squad/parallel-squad/ci`
+- roles
+
+常用命令：
+
+```powershell
+muxdev design "design persistent memory" --provider mock --json
+muxdev dev "small fix" --simple --provider mock --json
+muxdev dev "security-sensitive auth change" --deep --provider mock --json
+muxdev dev "parallel module migration" --parallel --provider mock --json
+muxdev why latest
+```
+
+项目 memory 存在：
+
+```text
+<repo>/.muxdev/memory.sqlite
+```
+
+命令：
 
 ```powershell
 muxdev memory status
@@ -210,12 +226,19 @@ muxdev memory propose latest
 muxdev memory approve mem_xxxxx
 ```
 
-See `docs/p0_acceptance_ready.md` for the end-to-end readiness checklist.
+## P1: 可信交付
 
-## P1 trusted delivery evidence
+P1 不需要额外配置文件，runtime 默认写入：
 
-P1 does not require a new user-facing config file. The trusted delivery loop is
-enabled by the runtime itself:
+- `contracts/*.stage_contract.json`
+- `contracts/*.role_result.json`
+- `evidence/*.evidence.json`
+- `ledger.jsonl`
+- `snapshots/*.patch`
+- `validation/blind_validator_panel.json`
+- approval `subject_hash` 和 `subject_json`
+
+命令：
 
 ```powershell
 muxdev dev "trusted delivery smoke" --provider mock --gate auto --json
@@ -223,19 +246,128 @@ muxdev evidence verify latest --json
 muxdev rollback latest --to-stage implement --json
 ```
 
-Every run writes stage contracts, role result contracts, evidence bundles,
-stage snapshots, a hash-chained ledger, and a blind validator panel. Human
-approval records also include `subject_hash` and `subject_json`, so approvals
-are reused only when the approved plan, patch, validator, and policy subject
-still match.
+## P2: 运行时安全和 Provider 稳定性
 
-See `docs/p1_trusted_delivery_ready.md` for the full acceptance checklist.
+Provider Action 与 muxdev approval 分离：
 
-## Role 和 provider
+```powershell
+muxdev actions --status pending --json
+muxdev attach <run_id> --agent code
+muxdev action handled <action_id>
+muxdev action dismiss <action_id>
+muxdev continue <run_id>
+```
 
-### Canonical roles
+Provider scoring：
 
-当前主角色：
+```powershell
+muxdev provider score --json
+muxdev provider score --role code --json
+```
+
+P2 相关黑板表：
+
+- `provider_actions`
+- `provider_attempts`
+- `session_capsules`
+
+## P3: 生态与自动化
+
+Feedback Router 和 CI Rescue：
+
+```powershell
+muxdev feedback add ci_failed "pytest failed in tests/test_login.py" --source github-actions --provider mock --json
+muxdev feedback list --json
+muxdev ci rescue "npm test failed on auth flow" --source github-actions --provider mock --json
+```
+
+CAS cache：
+
+```powershell
+muxdev cache list --json
+```
+
+Skill Lock：
+
+```powershell
+muxdev skill lock --json
+muxdev skill lock --no-memory --json
+```
+
+Safe Plugin Manifest：
+
+```powershell
+muxdev plugin validate path\to\plugin --json
+muxdev plugin add path\to\plugin --json
+```
+
+MCP Guardrail：
+
+```powershell
+muxdev mcp manifest --json
+muxdev mcp serve --request '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+P3 相关黑板表：
+
+- `feedback_events`
+- `ci_rescues`
+- `cache_entries`
+- `skill_locks`
+- `plugin_manifests`
+- `guardrail_events`
+
+## P4: 高级并行与长期学习
+
+Conflict-aware parallel-squad：
+
+```powershell
+muxdev parallel conflicts --file writes.json --json
+muxdev parallel conflicts --status open --json
+```
+
+Semantic Merge Reviewer：
+
+- 每次最终 diff 会写 `validation/semantic_merge_review.json`。
+- unresolved conflict markers 会触发 `semantic_merge_reject`。
+
+Provider Learning：
+
+```powershell
+muxdev learning provider --json
+muxdev learning provider --role code --json
+```
+
+Memory contradiction 和自动隔离：
+
+```powershell
+muxdev memory contradictions --json
+muxdev memory quarantine-auto --json
+```
+
+Multi-repo orchestration：
+
+```powershell
+muxdev multirepo plan "coordinate API change" --repo repo-a --repo repo-b --mode design --json
+muxdev multirepo dev "coordinate API change" --repo repo-a --repo repo-b --json
+```
+
+P4 v1 生成可审计计划，不自动跨仓提交修改。
+
+P4 相关黑板表：
+
+- `parallel_conflicts`
+- `semantic_merge_reviews`
+- `provider_learning`
+- `multi_repo_orchestrations`
+
+Memory DB 新增：
+
+- `memory_contradictions`
+
+## Role 和 Provider
+
+Canonical roles：
 
 - `lead`
 - `plan`
@@ -244,54 +376,30 @@ See `docs/p1_trusted_delivery_ready.md` for the full acceptance checklist.
 - `review`
 - `secure`
 - `docs`
+- `requirements`
+- `architect`
+- `test_strategy`
+- `memory_curator`
 
-兼容 role alias 会在配置解析时归一化：
-
-| Alias | Canonical |
-| --- | --- |
-| `supervisor` | `lead` |
-| `architect` | `plan` |
-| `implementer` | `code` |
-| `tester` | `test` |
-| `reviewer` | `review` |
-| `security` | `secure` |
-| `doc_writer` | `docs` |
-
-### 项目级 role provider
+项目级 role provider：
 
 ```toml
 [roles]
 plan = "claude-code"
 code = "codex"
-test = "qwen"
-review = "codex"
+test = "mock"
+review = "claude-code"
+secure = "claude-code"
+docs = "mock"
 ```
 
-### 命令行覆盖
+命令行覆盖：
 
 ```powershell
 muxdev dev "task" --role code=codex --role review=claude-code
 ```
 
-### Legacy runtime role 映射
-
-`SupervisorRuntime` 仍使用旧 workflow role 名称执行部分内置 workflow。解析层会把 canonical role 映射到 runtime legacy role：
-
-| Runtime role | Legacy role |
-| --- | --- |
-| `lead` | `architect` |
-| `plan` | `architect` |
-| `code` | `implementer` |
-| `test` | `tester` |
-| `review` | `reviewer` |
-| `secure` | `reviewer` |
-| `docs` | `implementer` |
-
-因此同时看到 `code` 和 `implementer` provider 映射是正常现象。
-
 ## Provider fallback
-
-内置 fallback：
 
 ```toml
 [cli]
@@ -310,9 +418,7 @@ command = "qwen"
 command = "mock"
 ```
 
-选择默认 provider 时会优先选 fallback 中探测为 ready 的 provider。`mock` 始终可作为安全兜底。
-
-如果团队希望默认使用 mock：
+如果团队希望默认只用 mock：
 
 ```toml
 [cli]
@@ -326,6 +432,7 @@ fallback = ["mock"]
 - `task`
 - `profile`
 - `gate`
+- `depth`
 - `[roles]`
 - `[cli]`
 - `[[skill]]`
@@ -336,6 +443,7 @@ fallback = ["mock"]
 task = "重构 storage trace 并补测试"
 profile = "pair"
 gate = "strict"
+depth = "deep"
 
 [roles]
 code = "codex"
@@ -355,88 +463,9 @@ name = "api-review"
 muxdev dev -f task.toml --json
 ```
 
-命令行参数优先级更高：
+## Skill 配置
 
-```powershell
-muxdev dev -f task.toml -g safe --provider mock --json
-```
-
-## Config 命令
-
-显示 effective config：
-
-```powershell
-muxdev config
-muxdev config --json
-```
-
-查看来源：
-
-```powershell
-muxdev config source
-```
-
-检查：
-
-```powershell
-muxdev config check
-```
-
-设置值：
-
-```powershell
-muxdev config set gate strict --project
-muxdev config set roles.code codex --project
-muxdev config set cli.fallback mock --global
-```
-
-打开编辑器：
-
-```powershell
-muxdev config edit --project
-```
-
-## Preset
-
-列出内置 profile/gate/workflow：
-
-```powershell
-muxdev preset list
-```
-
-查看：
-
-```powershell
-muxdev preset show profile squad
-muxdev preset show gate safe
-muxdev preset show workflow dev
-```
-
-复制到项目：
-
-```powershell
-muxdev preset copy gate safe --project
-```
-
-编辑：
-
-```powershell
-muxdev preset edit workflow dev --project
-```
-
-当前 preset copy/edit 是高级用法，默认项目不需要这些文件。
-
-## skills.toml
-
-默认不生成 `skills.toml`。只有需要以下能力时再创建：
-
-- 自定义扫描目录。
-- 绑定 role 到 skill。
-- disable/enable skill。
-- trust 策略。
-- auto 策略。
-
-基础示例：
+`skills.toml` 只在需要长期 skill 策略时创建。
 
 ```toml
 version = 1
@@ -454,153 +483,15 @@ disabled = false
 auto = true
 ```
 
-## Skill 扫描路径
-
-项目路径：
-
-```text
-.agents/skills
-.muxdev/skills
-.claude/skills
-skills
-```
-
-全局路径：
-
-```text
-~/.agents/skills
-~/.muxdev/skills
-~/.claude/skills
-~/.codex/skills
-```
-
-再加上 builtin skills。
-
-同名 skill 使用高优先级版本。
-
-## Skill 激活
-
-显式指定：
-
-```powershell
-muxdev dev "review API" -s review=api-review
-muxdev dev "write docs" -s docs-style
-```
-
-绑定：
-
-```powershell
-muxdev skill bind review api-review --project
-```
-
-自动匹配依赖 `name`、`description`、`keywords` 是否命中 task 文本。
-
-## Skill 管理命令
-
-安装或添加：
+常用命令：
 
 ```powershell
 muxdev skill add .\.agents\skills\api-review
-muxdev skill install builtin:demo
-```
-
-列出：
-
-```powershell
 muxdev skill list --json
-```
-
-查看：
-
-```powershell
 muxdev skill show api-review
-```
-
-诊断：
-
-```powershell
+muxdev skill bind review api-review --project
 muxdev skill doctor
-```
-
-策略：
-
-```powershell
-muxdev skill disable api-review --project
-muxdev skill enable api-review --project
-muxdev skill trust api-review trusted --project
-muxdev skill auto api-review false --project
-```
-
-导出：
-
-```powershell
-muxdev skill export api-review --output .\.muxdev\exports\api-review
-```
-
-## 完整示例
-
-### 个人全局配置
-
-`~/.muxdev/config.toml`：
-
-```toml
-version = 1
-profile = "squad"
-gate = "safe"
-
-[cli]
-fallback = ["codex", "claude-code", "mock"]
-
-[cli.codex]
-command = "codex"
-
-[cli.claude-code]
-command = "claude"
-
-[roles]
-code = "codex"
-review = "codex"
-```
-
-### 项目配置
-
-`<repo>/.muxdev/config.toml`：
-
-```toml
-version = 1
-profile = "pair"
-gate = "strict"
-
-[roles]
-code = "codex"
-review = "claude-code"
-test = "mock"
-```
-
-### 项目 skills
-
-`<repo>/.muxdev/skills.toml`：
-
-```toml
-version = 1
-dirs = [".agents/skills"]
-auto = true
-
-[bind]
-review = ["api-review"]
-test = ["pytest-style"]
-```
-
-### 执行任务
-
-```powershell
-muxdev dev "重构 API response shape 并补兼容测试" --json
-```
-
-如果需要临时降低 gate：
-
-```powershell
-muxdev dev "只更新 README" -g auto --provider mock --json
+muxdev skill lock --json
 ```
 
 ## 配置排障
@@ -609,11 +500,6 @@ muxdev dev "只更新 README" -g auto --provider mock --json
 
 ```powershell
 muxdev config --json
-```
-
-查看来源：
-
-```powershell
 muxdev config source --json
 ```
 
@@ -621,6 +507,7 @@ muxdev config source --json
 
 ```powershell
 muxdev provider detect --json
+muxdev provider doctor codex --json
 ```
 
 检查 skill：
@@ -635,11 +522,11 @@ muxdev skill doctor --json
 2. task file 是否覆盖了 `[roles]`。
 3. project config 是否覆盖了 global config。
 4. provider 是否 ready。
-5. fallback 是否把 `mock` 放在前面。
+5. fallback 是否把 `mock` 放在了前面。
 
 如果审批行为不符合预期，优先检查：
 
 1. `gate` 是否被 CLI 覆盖。
 2. task file 是否指定了 gate。
 3. `--require-approval` 是否额外添加了 gate。
-4. `ci` gate 是否设置了 `ci_block_on_approval`。
+4. 是否存在 pending provider action，导致 `continue` 返回 `awaiting_provider_action`。
