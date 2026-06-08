@@ -21,6 +21,22 @@ from ..clients.sessions import HeadlessSubprocessBackend
 from .mock import MockProvider
 
 
+EVIDENCE_PROMPT_BLOCK = """# muxdev Evidence Contract
+Return structured evidence whenever this stage makes a delivery claim. Do not only say "done", "tests passed", or "looks good".
+Each conclusion must be tied to an evidence item. If you did not run tests, list that in missing_evidence. Model-only judgments must use strength "D".
+
+Use this JSON shape when possible:
+{
+  "summary": "...",
+  "claims": [{"id": "claim-1", "text": "...", "supports_acceptance": ["AC-1"]}],
+  "evidence": [{"claim_id": "claim-1", "kind": "change_evidence", "strength": "B", "files": ["path"], "human_summary": "..."}],
+  "tests": [{"command": "pytest -q", "exit_code": 0, "relevance": "targeted", "summary": "..."}],
+  "missing_evidence": ["..."],
+  "risks": [{"severity": "medium", "reason": "..."}]
+}
+"""
+
+
 @dataclass(frozen=True)
 class ProviderStageOutput:
     """Normalized stage result returned by every provider adapter."""
@@ -46,6 +62,7 @@ class ProviderAdapter:
         task: str,
         worktree: Path,
         skills: list[dict[str, object]] | None = None,
+        session_dir: Path | None = None,
     ) -> ProviderStageOutput:
         raise NotImplementedError
 
@@ -63,6 +80,7 @@ class MockProviderAdapter(ProviderAdapter):
         task: str,
         worktree: Path,
         skills: list[dict[str, object]] | None = None,
+        session_dir: Path | None = None,
     ) -> ProviderStageOutput:
         output = self._mock.run_stage(stage_id=stage_id, task=task, worktree=worktree)
         skill_lines = _skill_context_lines(skills or [], include_content=False)
@@ -100,11 +118,12 @@ class HeadlessCliProviderAdapter(ProviderAdapter):
         task: str,
         worktree: Path,
         skills: list[dict[str, object]] | None = None,
+        session_dir: Path | None = None,
     ) -> ProviderStageOutput:
         """Execute one workflow stage in a worktree and archive transcripts."""
         prompt = self._prompt(stage_id, task, skills=skills or [])
         command = [*self.command, prompt]
-        session_dir = path_config(worktree, "runtime_root") / "provider_sessions"
+        session_dir = session_dir or path_config(worktree, "runtime_root") / "provider_sessions"
         session_dir.mkdir(parents=True, exist_ok=True)
         transcript_path = session_dir / f"{self.id}_{stage_id}.transcript.log"
         chunks_path = session_dir / f"{self.id}_{stage_id}.chunks.jsonl"
@@ -141,7 +160,7 @@ class HeadlessCliProviderAdapter(ProviderAdapter):
         )
 
     def _prompt(self, stage_id: str, task: str, *, skills: list[dict[str, object]] | None = None) -> str:
-        prompt = self.prompt_template.format(stage_id=stage_id, task=task)
+        prompt = self.prompt_template.format(stage_id=stage_id, task=task) + "\n\n" + EVIDENCE_PROMPT_BLOCK
         skills = skills or []
         if not skills:
             return prompt

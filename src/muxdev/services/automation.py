@@ -34,6 +34,11 @@ TOPOLOGY_ROLES = {
 }
 
 DESIGN_ROLES = ["requirements", "architect", "test_strategy", "review", "docs", "memory_curator"]
+DESIGN_TOPOLOGY_ROLES = {
+    "solo": ["architect"],
+    "pair": ["requirements", "architect"],
+    "squad": DESIGN_ROLES,
+}
 
 SENSITIVE_TERMS = {
     "auth",
@@ -72,6 +77,26 @@ DESIGN_TERMS = {
 }
 
 SMALL_FIX_TERMS = {"typo", "lint", "small", "minor", "bug", "fix", "小修复", "修复", "报错"}
+SIMPLE_TASK_TERMS = {
+    "simple",
+    "small",
+    "tiny",
+    "minimal",
+    "basic",
+    "demo",
+    "prototype",
+    "toy",
+    "snake",
+    "tetris",
+    "todo",
+    "counter",
+    "landing page",
+    "简单",
+    "小游戏",
+    "贪吃蛇",
+    "原型",
+    "演示",
+}
 
 
 @dataclass(frozen=True)
@@ -137,7 +162,7 @@ def resolve_automation(
         configured=str(automation.get("profile", "auto")),
     )
     topology = _compile_topology(intent, selected_depth, selected_profile)
-    roles = DESIGN_ROLES if intent == "design" else TOPOLOGY_ROLES[topology]
+    roles = DESIGN_TOPOLOGY_ROLES.get(topology, DESIGN_ROLES) if intent == "design" else TOPOLOGY_ROLES[topology]
     selected_workflow = _select_workflow(intent, command_workflow, selected_depth, requested=workflow)
     memory_context = _load_memory_context(workspace, task, roles, limit=int(config.get("memory", {}).get("max_items_per_role", 8)) if isinstance(config.get("memory"), dict) else 8)
     reasons = _reasons(intent, selected_depth, topology, repo, bool(memory_context), requested_depth=depth, requested_profile=profile)
@@ -227,9 +252,11 @@ def _select_depth(intent: str, task: str, repo: RepoSignals, *, requested: str |
     lowered = task.lower()
     if intent == "ci":
         return "ci"
-    if intent in {"design", "refactor"}:
-        return "deep"
     if repo.sensitive_hits:
+        return "deep"
+    if _is_simple_task(lowered):
+        return "simple"
+    if intent in {"design", "refactor"}:
         return "deep"
     if "parallel" in lowered or "并行" in lowered:
         return "parallel"
@@ -256,6 +283,10 @@ def _select_profile(intent: str, depth: str, *, requested: str | None, configure
 
 def _compile_topology(intent: str, depth: str, profile: str) -> str:
     if intent == "design":
+        if depth == "simple":
+            return "solo"
+        if depth == "safe":
+            return "pair"
         return "squad"
     if depth == "parallel":
         return "parallel-squad"
@@ -267,9 +298,15 @@ def _compile_topology(intent: str, depth: str, profile: str) -> str:
 def _select_workflow(intent: str, command_workflow: str, depth: str, *, requested: str | None) -> str:
     if requested:
         return requested
+    if intent == "design" and depth == "simple":
+        return "design-lite"
     if command_workflow == "dev" and depth == "simple":
         return "dev"
     return INTENT_WORKFLOWS.get(intent, INTENT_WORKFLOWS.get(command_workflow, command_workflow))
+
+
+def _is_simple_task(lowered_task: str) -> bool:
+    return any(term in lowered_task for term in SIMPLE_TASK_TERMS)
 
 
 def _load_memory_context(workspace: Path, task: str, roles: list[str], *, limit: int) -> list[dict[str, object]]:

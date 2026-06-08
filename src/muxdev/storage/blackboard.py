@@ -76,6 +76,8 @@ class Blackboard:
         "error_details",
         "stage_contracts",
         "evidence_bundles",
+        "evidence_items",
+        "evidence_scorecards",
         "ledger_events",
         "snapshots",
         "validator_panels",
@@ -370,6 +372,33 @@ class Blackboard:
               stage_id TEXT,
               path TEXT NOT NULL,
               bundle_hash TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS evidence_items (
+              evidence_id TEXT PRIMARY KEY,
+              run_id TEXT NOT NULL,
+              stage_id TEXT,
+              kind TEXT NOT NULL,
+              strength TEXT NOT NULL,
+              claim TEXT NOT NULL,
+              supports_json TEXT NOT NULL,
+              relevance REAL,
+              confidence REAL,
+              artifact_refs_json TEXT NOT NULL,
+              human_summary TEXT,
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS evidence_scorecards (
+              run_id TEXT PRIMARY KEY,
+              score INTEGER NOT NULL,
+              label TEXT NOT NULL,
+              recommendation TEXT NOT NULL,
+              components_json TEXT NOT NULL,
+              risk_penalty INTEGER NOT NULL,
+              missing_evidence_json TEXT,
+              next_actions_json TEXT,
+              path TEXT NOT NULL,
+              scorecard_hash TEXT NOT NULL,
               created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS ledger_events (
@@ -1132,6 +1161,98 @@ class Blackboard:
         )
         self.conn.commit()
 
+    def upsert_evidence_item(
+        self,
+        *,
+        run_id: str,
+        evidence_id: str,
+        stage_id: str | None,
+        kind: str,
+        strength: str,
+        claim: str,
+        supports: list[str],
+        relevance: float | None,
+        confidence: float | None,
+        artifact_refs: list[dict[str, Any]],
+        human_summary: str,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO evidence_items(
+              evidence_id, run_id, stage_id, kind, strength, claim,
+              supports_json, relevance, confidence, artifact_refs_json,
+              human_summary, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(evidence_id) DO UPDATE SET
+              run_id=excluded.run_id, stage_id=excluded.stage_id, kind=excluded.kind,
+              strength=excluded.strength, claim=excluded.claim,
+              supports_json=excluded.supports_json, relevance=excluded.relevance,
+              confidence=excluded.confidence, artifact_refs_json=excluded.artifact_refs_json,
+              human_summary=excluded.human_summary, created_at=excluded.created_at
+            """,
+            (
+                evidence_id,
+                run_id,
+                stage_id,
+                kind,
+                strength,
+                redact(claim),
+                json.dumps(supports, ensure_ascii=False),
+                relevance,
+                confidence,
+                json.dumps(artifact_refs, ensure_ascii=False, sort_keys=True),
+                redact(human_summary),
+                utc_now(),
+            ),
+        )
+        self.conn.commit()
+
+    def upsert_evidence_scorecard(
+        self,
+        *,
+        run_id: str,
+        score: int,
+        label: str,
+        recommendation: str,
+        components: dict[str, int],
+        risk_penalty: int,
+        missing_evidence: list[str],
+        next_actions: list[dict[str, Any]],
+        path: Path,
+        scorecard_hash: str,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO evidence_scorecards(
+              run_id, score, label, recommendation, components_json,
+              risk_penalty, missing_evidence_json, next_actions_json,
+              path, scorecard_hash, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id) DO UPDATE SET
+              score=excluded.score, label=excluded.label, recommendation=excluded.recommendation,
+              components_json=excluded.components_json, risk_penalty=excluded.risk_penalty,
+              missing_evidence_json=excluded.missing_evidence_json,
+              next_actions_json=excluded.next_actions_json, path=excluded.path,
+              scorecard_hash=excluded.scorecard_hash, created_at=excluded.created_at
+            """,
+            (
+                run_id,
+                int(score),
+                label,
+                recommendation,
+                json.dumps(components, ensure_ascii=False, sort_keys=True),
+                int(risk_penalty),
+                json.dumps(missing_evidence, ensure_ascii=False),
+                json.dumps(next_actions, ensure_ascii=False, sort_keys=True),
+                str(path),
+                scorecard_hash,
+                utc_now(),
+            ),
+        )
+        self.conn.commit()
+
     def add_ledger_event(self, event: dict[str, Any]) -> None:
         self.conn.execute(
             """
@@ -1288,8 +1409,19 @@ class Blackboard:
         if table not in self.RUN_FILTERED_TABLES:
             raise ValueError(f"unknown blackboard table: {table}")
         if run_id and table in self.RUN_FILTERED_TABLES:
-            return [dict(row) for row in self.conn.execute(f"SELECT * FROM {table} WHERE run_id = ?", (run_id,))]
-        return [dict(row) for row in self.conn.execute(f"SELECT * FROM {table}")]
+            rows = [dict(row) for row in self.conn.execute(f"SELECT * FROM {table} WHERE run_id = ?", (run_id,))]
+        else:
+            rows = [dict(row) for row in self.conn.execute(f"SELECT * FROM {table}")]
+        if table == "evidence_items":
+            for row in rows:
+                row["supports"] = _json_list(row.get("supports_json"))
+                row["artifact_refs"] = _json_list(row.get("artifact_refs_json"))
+        if table == "evidence_scorecards":
+            for row in rows:
+                row["components"] = _json_dict(row.get("components_json"))
+                row["missing_evidence"] = _json_list(row.get("missing_evidence_json"))
+                row["next_actions"] = _json_list(row.get("next_actions_json"))
+        return rows
 
 
 def _json_list(value: object) -> list[object]:
@@ -1298,6 +1430,14 @@ def _json_list(value: object) -> list[object]:
     except json.JSONDecodeError:
         return []
     return parsed if isinstance(parsed, list) else []
+
+
+def _json_dict(value: object) -> dict[str, object]:
+    try:
+        parsed = json.loads(str(value or "{}"))
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 class TraceWriter:

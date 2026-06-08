@@ -18,7 +18,8 @@ runner = CliRunner()
 
 
 class FakeDaemonClient:
-    submitted: list[dict[str, object]] = []
+    def __init__(self) -> None:
+        self.submitted: list[dict[str, object]] = []
 
     def submit_task(self, payload: dict[str, object]) -> dict[str, object]:
         self.submitted.append(payload)
@@ -59,6 +60,9 @@ class FakeDaemonClient:
 
     def attach_command(self, task_id: str, *, agent: str) -> dict[str, object]:
         return {"task_id": task_id, "agent": agent, "status": "attached"}
+
+    def rollback(self, task_id: str, *, to_stage: str | None = None) -> dict[str, object]:
+        return {"task_id": task_id, "run_id": task_id, "status": "rolled_back", "to_stage": to_stage}
 
 
 def test_provider_detect_json_contains_all_providers() -> None:
@@ -115,9 +119,29 @@ def test_provider_account_json_outputs_signup_and_login() -> None:
 
 
 def test_removed_top_level_aliases_are_unknown_commands() -> None:
-    for command in ("run", "resume", "web", "account", "install", "doctor"):
+    for command in ("run", "resume", "web", "account", "install"):
         result = runner.invoke(app, [command])
         assert result.exit_code != 0, command
+
+
+def test_root_task_submits_default_dev_task(monkeypatch) -> None:
+    fake = FakeDaemonClient()
+    monkeypatch.setattr("muxdev.cli.main._daemon_client", lambda *_args, **_kwargs: fake)
+
+    result = runner.invoke(app, ["fix failing login test"])
+
+    assert result.exit_code == 0
+    assert fake.submitted[0]["task"] == "fix failing login test"
+    assert fake.submitted[0]["workflow"] == "dev"
+    assert "Task submitted: run_fake" in result.stdout
+
+
+def test_doctor_json_reports_runtime_config() -> None:
+    result = runner.invoke(app, ["doctor", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert {"valid", "errors", "warnings", "effective"} <= set(payload)
 
 
 def test_dev_submits_daemon_task_with_resolved_main_path_options(monkeypatch) -> None:
@@ -163,6 +187,7 @@ def test_continue_dashboard_and_tui_json_use_daemon_client(monkeypatch) -> None:
     tui = runner.invoke(app, ["tui", "run_fake", "--json"])
     actions = runner.invoke(app, ["actions", "--json"])
     handled = runner.invoke(app, ["action", "handled", "pact_fake", "--json"])
+    undo = runner.invoke(app, ["undo", "run_fake", "--to-stage", "implement", "--json"])
 
     assert continued.exit_code == 0
     assert json.loads(continued.stdout)["status"] == "running"
@@ -174,6 +199,8 @@ def test_continue_dashboard_and_tui_json_use_daemon_client(monkeypatch) -> None:
     assert json.loads(actions.stdout)[0]["action_id"] == "pact_fake"
     assert handled.exit_code == 0
     assert json.loads(handled.stdout)["status"] == "handled"
+    assert undo.exit_code == 0
+    assert json.loads(undo.stdout)["status"] == "rolled_back"
 
 
 def test_no_args_enters_daemon_tui(monkeypatch) -> None:
@@ -209,6 +236,7 @@ def test_trace_skip_merge_metrics_and_search_commands() -> None:
             trace = runner.invoke(app, ["trace", "view", run_id, "--json"])
             skipped = runner.invoke(app, ["skip", run_id, "--stage", "review", "--json"])
             merged = runner.invoke(app, ["merge", run_id, "--gate-command", "python --version", "--json"])
+            shipped = runner.invoke(app, ["ship", run_id, "--dry-run", "--json"])
             chrome = runner.invoke(app, ["trace", "chrome", run_id, "--json"])
             metrics = runner.invoke(app, ["metrics", run_id, "--json"])
             prometheus = runner.invoke(app, ["metrics", run_id, "--prometheus"])
@@ -222,6 +250,8 @@ def test_trace_skip_merge_metrics_and_search_commands() -> None:
     assert json.loads(skipped.stdout)["status"] == "skipped"
     assert merged.exit_code == 0
     assert json.loads(merged.stdout)["status"] == "dry_run"
+    assert shipped.exit_code == 0
+    assert json.loads(shipped.stdout)["status"] == "dry_run"
     assert chrome.exit_code == 0
     assert json.loads(chrome.stdout)["events"] > 0
     assert metrics.exit_code == 0

@@ -10,6 +10,7 @@ workflow semantics.
 from __future__ import annotations
 
 import json
+import inspect
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ from ..services.design import write_design_pack
 from ..services.advanced_parallel import planned_stage_writes_from_automation, record_parallel_conflicts, write_parallel_conflict_report
 from ..services.provider_learning import refresh_provider_learning
 from ..services.provider_scores import recommend_provider
+from ..services.evidence_scorecard import write_evidence_scorecard
 from ..services.reports import generate_final_report
 from ..services.semantic_merge import review_semantic_merge
 from ..services.session_capsules import write_session_capsule
@@ -473,6 +475,7 @@ class SupervisorRuntime:
                     task=bound_task,
                     worktree=worktree,
                     skills=stage_skills,
+                    session_dir=run_dir / "provider_sessions",
                 )
                 artifact_path = run_dir / output.artifact_name
                 artifact_path.parent.mkdir(parents=True, exist_ok=True)
@@ -717,6 +720,7 @@ class SupervisorRuntime:
                 _refresh_provider_learning(blackboard, run_id)
                 blackboard.set_run_status(run_id, RunStatus.BLOCKED)
                 blackboard.add_error(run_id, None, "semantic_merge_reject", "semantic merge reviewer rejected the patch")
+                _record_evidence_scorecard(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
                 trace.write("run_blocked", reason="semantic merge reviewer rejected the patch", semantic_review_hash=semantic.get("review_hash"))
                 return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
             validator = _record_blind_validator(blackboard, run_dir=run_dir, run_id=run_id, task_hash=task_hash, patch_hash=sha256_file(diff_path))
@@ -724,6 +728,7 @@ class SupervisorRuntime:
                 _refresh_provider_learning(blackboard, run_id)
                 blackboard.set_run_status(run_id, RunStatus.BLOCKED)
                 blackboard.add_error(run_id, None, "blind_validator_reject", "blind validator rejected the patch")
+                _record_evidence_scorecard(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
                 trace.write("run_blocked", reason="blind validator rejected the patch", validator_hash=validator.get("validator_hash"))
                 return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
             if self._approval_gate(
@@ -746,8 +751,9 @@ class SupervisorRuntime:
                 blackboard.set_run_status(run_id, _approval_wait_status(ci_block_on_approval))
                 return RunResult(run_id, _approval_wait_status(ci_block_on_approval), run_dir, None)
             blackboard.set_run_status(run_id, RunStatus.COMPLETED)
-            if workflow.name == "design":
+            if workflow.name in {"design", "design-lite"}:
                 _record_design_pack(blackboard, workspace=self.workspace, run_dir=run_dir, run_id=run_id, task=task, workflow=workflow.name, automation=automation)
+            _record_evidence_scorecard(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
             report_path = generate_final_report(run_dir, run_id, blackboard)
             _refresh_provider_learning(blackboard, run_id)
             _record_ledger(blackboard, run_dir, run_id, "run_completed", payload={"report": str(report_path), "patch_hash": sha256_file(diff_path)})
@@ -850,7 +856,15 @@ class SupervisorRuntime:
                     attempt = _next_provider_attempt(blackboard, run_id, stage.id, stage_provider)
                     blackboard.start_provider_attempt(run_id, stage.id, provider=stage_provider, role=stage.role, attempt=attempt)
                     trace.write("provider_attempt_started", stage=stage.id, provider=stage_provider, attempt=attempt)
-                    future = executor.submit(_run_provider_stage, provider_impl, stage_id=stage.id, task=bound_task, worktree=worktree, skills=stage_skills)
+                    future = executor.submit(
+                        _run_provider_stage,
+                        provider_impl,
+                        stage_id=stage.id,
+                        task=bound_task,
+                        worktree=worktree,
+                        skills=stage_skills,
+                        session_dir=run_dir / "provider_sessions",
+                    )
                     futures[future] = (stage, stage_provider, attempt)
                 for future in as_completed(futures):
                     stage, stage_provider, attempt = futures[future]
@@ -1062,6 +1076,7 @@ class SupervisorRuntime:
             _refresh_provider_learning(blackboard, run_id)
             blackboard.set_run_status(run_id, RunStatus.BLOCKED)
             blackboard.add_error(run_id, None, "semantic_merge_reject", "semantic merge reviewer rejected the patch")
+            _record_evidence_scorecard(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
             trace.write("run_blocked", reason="semantic merge reviewer rejected the patch", semantic_review_hash=semantic.get("review_hash"))
             return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
         validator = _record_blind_validator(blackboard, run_dir=run_dir, run_id=run_id, task_hash=task_hash, patch_hash=sha256_file(diff_path))
@@ -1069,6 +1084,7 @@ class SupervisorRuntime:
             _refresh_provider_learning(blackboard, run_id)
             blackboard.set_run_status(run_id, RunStatus.BLOCKED)
             blackboard.add_error(run_id, None, "blind_validator_reject", "blind validator rejected the patch")
+            _record_evidence_scorecard(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
             trace.write("run_blocked", reason="blind validator rejected the patch", validator_hash=validator.get("validator_hash"))
             return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
         if self._approval_gate(
@@ -1091,8 +1107,9 @@ class SupervisorRuntime:
             blackboard.set_run_status(run_id, _approval_wait_status(ci_block_on_approval))
             return RunResult(run_id, _approval_wait_status(ci_block_on_approval), run_dir, None)
         blackboard.set_run_status(run_id, RunStatus.COMPLETED)
-        if workflow.name == "design":
+        if workflow.name in {"design", "design-lite"}:
             _record_design_pack(blackboard, workspace=self.workspace, run_dir=run_dir, run_id=run_id, task=task, workflow=workflow.name, automation=automation)
+        _record_evidence_scorecard(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
         report_path = generate_final_report(run_dir, run_id, blackboard)
         _refresh_provider_learning(blackboard, run_id)
         _record_ledger(blackboard, run_dir, run_id, "run_completed", payload={"report": str(report_path), "patch_hash": sha256_file(diff_path)})
@@ -1458,6 +1475,36 @@ def _record_design_pack(
         pass
 
 
+def _record_evidence_scorecard(
+    blackboard: Blackboard,
+    *,
+    run_dir: Path,
+    run_id: str,
+    trace: TraceWriter,
+) -> None:
+    try:
+        manifest = write_evidence_scorecard(run_dir, run_id, blackboard)
+    except Exception as exc:
+        blackboard.add_error(run_id, None, "evidence_scorecard_failed", str(exc))
+        trace.write("evidence_scorecard_failed", error=redact(str(exc)))
+        return
+    artifacts = manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}
+    scorecard = manifest.get("scorecard", {}) if isinstance(manifest.get("scorecard"), dict) else {}
+    _record_ledger(
+        blackboard,
+        run_dir,
+        run_id,
+        "evidence_scorecard_written",
+        payload={
+            "score": scorecard.get("score"),
+            "label": scorecard.get("label"),
+            "scorecard_hash": artifacts.get("scorecard_hash"),
+            "coverage_hash": artifacts.get("coverage_hash"),
+        },
+    )
+    trace.write("evidence_scorecard_written", score=scorecard.get("score"), label=scorecard.get("label"))
+
+
 def _iter_untracked_files(worktree: Path) -> list[str]:
     result = subprocess.run(
         ["git", "ls-files", "--others", "--exclude-standard"],
@@ -1470,13 +1517,20 @@ def _iter_untracked_files(worktree: Path) -> list[str]:
         **hidden_subprocess_kwargs(),
     )
     if result.returncode == 0:
-        return [line for line in (result.stdout or "").splitlines() if line]
+        return [line for line in (result.stdout or "").splitlines() if line and not _is_runtime_archive_path(line)]
     files: list[str] = []
     for path in worktree.rglob("*"):
         if not path.is_file() or ".git" in path.parts:
             continue
-        files.append(path.relative_to(worktree).as_posix())
+        rel_path = path.relative_to(worktree).as_posix()
+        if _is_runtime_archive_path(rel_path):
+            continue
+        files.append(rel_path)
     return files
+
+
+def _is_runtime_archive_path(rel_path: str) -> bool:
+    return rel_path.startswith(".muxdev/provider_sessions/")
 
 
 def _parse_review_result(content: str) -> ReviewResult:
@@ -1530,13 +1584,14 @@ def _run_provider_stage_with_attempts(
     task: str,
     worktree: Path,
     skills: list[dict[str, object]],
+    session_dir: Path | None = None,
 ) -> tuple[ProviderStageOutput, int]:
     attempt = _next_provider_attempt(blackboard, run_id, stage_id, provider)
     max_attempt = attempt + PROVIDER_MAX_ATTEMPTS - 1
     while attempt <= max_attempt:
         blackboard.start_provider_attempt(run_id, stage_id, provider=provider, role=role, attempt=attempt)
         trace.write("provider_attempt_started", stage=stage_id, provider=provider, attempt=attempt)
-        output = _run_provider_stage(provider_impl, stage_id=stage_id, task=task, worktree=worktree, skills=skills)
+        output = _run_provider_stage(provider_impl, stage_id=stage_id, task=task, worktree=worktree, skills=skills, session_dir=session_dir)
         failure_kind = _provider_failure_kind(output)
         has_action = bool(_provider_actions_from_output(output))
         if output.returncode != 0 and not has_action and failure_kind in TRANSIENT_RETRY_FAILURES and attempt < max_attempt:
@@ -1780,10 +1835,41 @@ def _run_provider_stage(
     task: str,
     worktree: Path,
     skills: list[dict[str, object]],
+    session_dir: Path | None = None,
 ):
+    kwargs = _provider_stage_kwargs(
+        provider_impl,
+        stage_id=stage_id,
+        task=task,
+        worktree=worktree,
+        skills=skills,
+        session_dir=session_dir,
+    )
+    return provider_impl.run_stage(**kwargs)
+
+
+def _provider_stage_kwargs(
+    provider_impl: ProviderAdapter,
+    *,
+    stage_id: str,
+    task: str,
+    worktree: Path,
+    skills: list[dict[str, object]],
+    session_dir: Path | None,
+) -> dict[str, object]:
+    kwargs: dict[str, object] = {"stage_id": stage_id, "task": task, "worktree": worktree}
     try:
-        return provider_impl.run_stage(stage_id=stage_id, task=task, worktree=worktree, skills=skills)
-    except TypeError as exc:
-        if "skills" not in str(exc):
-            raise
-        return provider_impl.run_stage(stage_id=stage_id, task=task, worktree=worktree)
+        signature = inspect.signature(provider_impl.run_stage)
+    except (TypeError, ValueError):
+        kwargs["skills"] = skills
+        if session_dir is not None:
+            kwargs["session_dir"] = session_dir
+        return kwargs
+
+    parameters = signature.parameters
+    accepts_extra = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+    if accepts_extra or "skills" in parameters:
+        kwargs["skills"] = skills
+    if session_dir is not None and (accepts_extra or "session_dir" in parameters):
+        kwargs["session_dir"] = session_dir
+    return kwargs

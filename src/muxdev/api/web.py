@@ -115,6 +115,7 @@ def render_dashboard_html(payload: dict[str, Any]) -> str:
       {_kv("Provider", run.get("provider", "-"))}
       {_kv("Worktree", run.get("worktree", "-"))}
     </section>
+    {_scorecard_section(payload)}
     {_summary_cards(summary)}
     <section class="panel span-8">
       <h2>Workflow Timeline</h2>
@@ -215,6 +216,25 @@ def write_dashboard(path: Path, payload: dict[str, Any]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(render_dashboard_html(payload), encoding="utf-8")
     return path
+
+
+def _scorecard_section(payload: dict[str, Any]) -> str:
+    scorecard = payload.get("evidence_scorecard")
+    if not isinstance(scorecard, dict):
+        return ""
+    reasons = "".join(f"<li>{_escape(reason)}</li>" for reason in scorecard.get("top_reasons", [])[:4])
+    missing = "".join(f"<li>{_escape(item)}</li>" for item in scorecard.get("missing_evidence", [])[:4]) or "<li>none</li>"
+    return f"""
+    <section class="panel span-12">
+      <h2>Delivery Scorecard</h2>
+      <div class="metric"><strong>{_escape(scorecard.get('score', 0))} / 100</strong><span class="status {_escape(scorecard.get('label', ''))}">{_escape(scorecard.get('label', '-'))}</span></div>
+      {_kv("Recommendation", scorecard.get("recommendation", "-"))}
+      <h3>Why</h3>
+      <ul>{reasons or "<li>No positive evidence recorded yet.</li>"}</ul>
+      <h3>Missing Evidence</h3>
+      <ul>{missing}</ul>
+    </section>
+    """
 
 
 def _summary_cards(summary: dict[str, Any]) -> str:
@@ -737,11 +757,13 @@ def render_live_dashboard_html(task_id: str | None = None) -> str:
           <button onclick="loadText('/tasks/${{encodeURIComponent(run.run_id)}}/diff','diff')">Diff</button>
           <button onclick="loadText('/tasks/${{encodeURIComponent(run.run_id)}}/report','content')">Report</button>
         </div>
+        ${{scorecardBlock(payload.evidence_scorecard)}}
         <h2>Timeline</h2>
         <table><thead><tr><th>Stage</th><th>Role</th><th>Status</th><th>Summary</th></tr></thead><tbody>
         ${{stages.map(row => `<tr><td>${{esc(row.stage_id)}}</td><td>${{esc(row.role)}}</td><td>${{esc(row.status)}}</td><td>${{esc(row.summary)}}</td></tr>`).join('')}}
         </tbody></table>
         ${{tableBlock('Evidence', payload.evidence_bundles || [], ['stage_id','bundle_hash','path'])}}
+        ${{tableBlock('Evidence Items', payload.evidence_items || [], ['evidence_id','kind','strength','claim','human_summary'])}}
         ${{tableBlock('Memory Context', payload.memory_context || [], ['id','kind','role','claim'])}}
         ${{tableBlock('Role Sessions', payload.session_capsules || [], ['stage_id','provider','kind','status','path'])}}
         ${{tableBlock('Feedback / CI Rescue', payload.feedback_events || [], ['feedback_id','kind','status','route_to','content'])}}
@@ -757,6 +779,16 @@ def render_live_dashboard_html(task_id: str | None = None) -> str:
     function tableBlock(title, rows, columns) {{
       if (!rows.length) return `<h2>${{esc(title)}}</h2><div class="meta">No records.</div>`;
       return `<h2>${{esc(title)}}</h2><table><thead><tr>${{columns.map(column => `<th>${{esc(column)}}</th>`).join('')}}</tr></thead><tbody>${{rows.map(row => `<tr>${{columns.map(column => `<td>${{esc(fmt(row[column]))}}</td>`).join('')}}</tr>`).join('')}}</tbody></table>`;
+    }}
+    function scorecardBlock(scorecard) {{
+      if (!scorecard) return '';
+      const reasons = (scorecard.top_reasons || []).slice(0, 4).map(item => `<li>${{esc(item)}}</li>`).join('') || '<li>No positive evidence recorded yet.</li>';
+      const missing = (scorecard.missing_evidence || []).slice(0, 4).map(item => `<li>${{esc(item)}}</li>`).join('') || '<li>none</li>';
+      return `<h2>Delivery Scorecard</h2>
+        <div><strong>${{esc(scorecard.score)}} / 100</strong> <span class="${{statusClass(scorecard.label)}}">${{esc(scorecard.label)}}</span></div>
+        <div class="meta">recommendation=${{esc(scorecard.recommendation)}} risk_penalty=${{esc(scorecard.risk_penalty)}}</div>
+        <h2>Why</h2><ul>${{reasons}}</ul>
+        <h2>Missing Evidence</h2><ul>${{missing}}</ul>`;
     }}
     function renderApprovals(rows) {{
       document.getElementById('approvals').innerHTML = rows.length ? `<table><thead><tr><th>ID</th><th>Task</th><th>Type</th><th>Action</th></tr></thead><tbody>${{rows.map(row => `<tr><td>${{esc(row.approval_id)}}</td><td>${{esc(row.run_id)}}</td><td>${{esc(row.type)}}</td><td><button class="primary" onclick="post('/approvals/${{encodeURIComponent(row.approval_id)}}/approve')">Approve</button> <button onclick="post('/approvals/${{encodeURIComponent(row.approval_id)}}/deny')">Deny</button></td></tr>`).join('')}}</tbody></table>` : '<div class="meta">No pending approvals.</div>';

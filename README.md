@@ -6,7 +6,7 @@ It coordinates provider CLIs such as Codex, Claude Code, Qwen, Kimi, Gemini-styl
 
 Unlike a single AI coding assistant, muxdev does not try to be the smartest coder by itself. It turns multiple AI coding agents into a verifiable, auditable, recoverable, governable, and continuously learning software delivery system.
 
-The goal is simple: make AI coding as easy to start as a CLI command, but as trustworthy as a local software delivery control plane.
+The goal is simple: make AI coding as easy to start as a CLI command, but as trustworthy as a local software delivery control plane. After an agent changes code, muxdev should tell you what changed, how it was verified, what risk remains, whether it can be merged, and how to roll back.
 
 Current scope: **P0-P4 implemented**.
 
@@ -22,7 +22,7 @@ Current scope: **P0-P4 implemented**.
 - **Role-aware provider routing**: assigns `plan`, `code`, `test`, `review`, `secure`, `docs`, `architect`, and memory roles to suitable providers.
 - **Design-first workflows**: `muxdev design` produces a Design Pack before implementation.
 - **Evidence-grounded memory**: stores project knowledge only with evidence, lifecycle, role scope, and approval state.
-- **Trusted delivery evidence**: stage contracts, role result contracts, evidence bundles, blind validator, semantic merge review, and hash ledger.
+- **Evidence Scorecard plus Audit Pack**: shows delivery confidence, risks, missing evidence, coverage, and next actions by default, while preserving stage contracts, role result contracts, evidence bundles, blind validator, semantic merge review, snapshots, and hash ledger for audit.
 - **Approval and provider-action handoff**: separates muxdev policy approvals from external provider CLI confirmations, auth, rate limits, and blocked sessions.
 - **Rollback and recovery**: isolated worktrees, stage snapshots, reports, traces, session capsules, and resumable runs.
 - **Dashboard/TUI/API**: local daemon, Web Dashboard, terminal UI, JSON output, and automation-friendly APIs.
@@ -36,8 +36,10 @@ python -m pip install -e ".[test]"
 muxdev setup --project --yes
 muxdev start
 muxdev provider detect
+muxdev "fix the failing login test"
 muxdev dev "add rate limiting and tests" --provider mock --json
 muxdev status latest
+muxdev evidence latest
 muxdev dashboard
 ```
 
@@ -55,7 +57,10 @@ muxdev serve --restart
 ## Common Commands
 
 ```powershell
+muxdev "fix the failing login test"
+muxdev doctor
 muxdev design "design persistent project memory"
+muxdev design --simple "design a small snake game"
 muxdev dev "add Redis rate limiting"
 muxdev dev --from-design latest
 muxdev fix "fix login tests"
@@ -63,11 +68,41 @@ muxdev refactor "split billing module" --parallel
 muxdev review
 muxdev test
 muxdev ci fix
+muxdev evidence latest
+muxdev evidence latest --audit
+muxdev evidence verify latest --json
 muxdev why latest
 muxdev report latest
 muxdev diff latest
 muxdev rollback latest --to-stage code
+muxdev undo latest --to-stage code
+muxdev ship latest --dry-run
 ```
+
+## Evidence Scorecard
+
+muxdev keeps the full Audit Pack, but the default delivery view is a human-readable Scorecard:
+
+```text
+Delivery Confidence: 84 / 100  reviewable
+Recommendation: merge_after_review
+
+why:
+- targeted tests passed
+- blind validator accepted the run
+- rollback snapshot available
+
+missing evidence:
+- full regression not run
+- negative-path test missing
+```
+
+Each completed run writes:
+
+- `evidence/scorecard.json`: weighted Delivery Confidence Score and recommendation.
+- `evidence/coverage_matrix.json`: acceptance criteria mapped to implementation, tests, and review.
+- `evidence/human_summary.md`: readable summary for handoff and review.
+- Audit Pack artifacts: contracts, evidence bundles, validator panel, semantic merge review, ledger, snapshots, trace, and session capsules.
 
 Useful waiting-state commands:
 
@@ -121,10 +156,10 @@ $env:PYTHONDONTWRITEBYTECODE = "1"
 python -m pytest -q
 ```
 
-Current full suite after P4:
+Current full suite:
 
 ```text
-116 passed
+127 passed
 ```
 
 Windows may emit pytest cache warnings if `.pytest_cache` cannot be written. These warnings do not affect the test result.

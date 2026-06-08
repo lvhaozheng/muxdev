@@ -47,6 +47,7 @@ from ..config.loader import config_sources, load_config, path_config, validate_c
 from ..services.rag import LocalRagIndex
 from ..services.reports import generate_final_report
 from ..services.evidence import verify_run_evidence
+from ..services.evidence_scorecard import load_scorecard_artifacts, render_scorecard_text, write_evidence_scorecard
 from ..services.plugin_manifest import validate_plugin_manifest
 from ..services.advanced_parallel import detect_parallel_conflicts, record_parallel_conflicts
 from ..services.dashboard import dashboard_path, write_run_dashboard
@@ -99,9 +100,34 @@ from .tui import (
 )
 
 
+REMOVED_TOP_LEVEL_ALIASES = {"run", "resume", "web", "account", "install"}
+
+
+class NaturalTaskGroup(typer.core.TyperGroup):
+    """Route unknown top-level text to the default dev command."""
+
+    def resolve_command(self, ctx: typer.Context, args: list[str]):
+        if args:
+            cmd_name = str(args[0])
+            command = super().get_command(ctx, cmd_name)
+            if command is None and ctx.token_normalize_func is not None:
+                command = super().get_command(ctx, ctx.token_normalize_func(cmd_name))
+            if command is None and cmd_name not in REMOVED_TOP_LEVEL_ALIASES and not cmd_name.startswith("-"):
+                dev_command = super().get_command(ctx, "dev")
+                if dev_command is not None:
+                    return "dev", dev_command, args
+        return super().resolve_command(ctx, args)
+
+
 # The root app uses invoke_without_command so plain `muxdev` can open the TUI
 # instead of printing help. Automation should call explicit subcommands.
-app = typer.Typer(help="muxdev local AI Coding CLI control plane", invoke_without_command=True, no_args_is_help=False)
+app = typer.Typer(
+    help="muxdev local AI Coding CLI control plane",
+    cls=NaturalTaskGroup,
+    invoke_without_command=True,
+    no_args_is_help=False,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
 policy_app = typer.Typer(help="Safety policy tools")
 trace_app = typer.Typer(help="Trace inspection tools")
 skill_app = typer.Typer(help="Skill registry tools")
@@ -150,6 +176,43 @@ app.add_typer(cache_app, name="cache")
 console = Console(width=320)
 
 
+@evidence_app.callback()
+def evidence_group() -> None:
+    """Evidence Scorecard and Audit Pack tools."""
+
+
+@evidence_app.command("latest")
+def evidence_latest(
+    audit: Annotated[bool, typer.Option("--audit", help="Include Audit Pack counts.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Show the latest run's Evidence Scorecard."""
+    _show_evidence_scorecard("latest", audit=audit, json_output=json_output)
+
+
+@evidence_app.command("show")
+def evidence_show(
+    run_id: Annotated[str, typer.Argument(help="Run id, or 'latest'.")] = "latest",
+    audit: Annotated[bool, typer.Option("--audit", help="Include Audit Pack counts.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Show one run's Evidence Scorecard."""
+    _show_evidence_scorecard(run_id, audit=audit, json_output=json_output)
+
+
+def _show_evidence_scorecard(run_id: str, *, audit: bool, json_output: bool) -> None:
+    resolved, run_dir = _resolve_evidence_run(run_id)
+    with _evidence_blackboard(run_dir) as blackboard:
+        payload = load_scorecard_artifacts(run_dir, resolved, blackboard)
+        if not payload.get("scorecard"):
+            write_evidence_scorecard(run_dir, resolved, blackboard)
+            payload = load_scorecard_artifacts(run_dir, resolved, blackboard)
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(render_scorecard_text(payload, audit=audit), title="muxdev evidence"))
+
+
 @app.callback()
 def main(
     ctx: typer.Context,
@@ -163,6 +226,28 @@ def main(
         typer.echo(f"muxdev {__version__}")
         raise typer.Exit()
     if ctx.invoked_subcommand is None:
+        task = " ".join(str(arg) for arg in ctx.args).strip()
+        if task:
+            if task in REMOVED_TOP_LEVEL_ALIASES:
+                raise typer.BadParameter(f"unknown command: {task}")
+            _submit_main_task(
+                "dev",
+                task=task,
+                profile=None,
+                gate=None,
+                role=None,
+                skill=None,
+                task_file=None,
+                provider=None,
+                workflow=None,
+                require_approval="",
+                max_cost_usd=0.5,
+                host=DEFAULT_HOST,
+                port=DEFAULT_API_PORT,
+                json_output=False,
+                title="muxdev dev",
+            )
+            raise typer.Exit()
         _start_daemon_tui("latest", host=DEFAULT_HOST, port=DEFAULT_API_PORT)
         raise typer.Exit()
 
@@ -254,6 +339,29 @@ def setup(
         f"written: {payload['written']}",
     ]
     console.print(Panel("\n".join(lines), title="muxdev setup"))
+
+
+@app.command()
+def doctor(
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Check muxdev project configuration and local control-plane readiness."""
+    payload = runtime_config_check(Path.cwd())
+    if json_output:
+        _print_json(payload)
+        return
+    lines = [
+        f"valid: {payload['valid']}",
+        f"errors: {len(payload.get('errors', []))}",
+        f"warnings: {len(payload.get('warnings', []))}",
+        f"profile: {payload.get('effective', {}).get('profile', '-')}",
+        f"gate: {payload.get('effective', {}).get('gate', '-')}",
+    ]
+    for error in payload.get("errors", []):
+        lines.append(f"error: {error}")
+    for warning in payload.get("warnings", []):
+        lines.append(f"warning: {warning}")
+    console.print(Panel("\n".join(lines), title="muxdev doctor"))
 
 
 @app.command()
@@ -359,6 +467,9 @@ def design(
     task: Annotated[str | None, typer.Argument(help="Design task to submit.")] = None,
     profile: Annotated[str | None, typer.Option("-p", "--profile", help="Profile: auto, solo, pair, squad, ci.")] = None,
     gate: Annotated[str | None, typer.Option("-g", "--gate", help="Gate: auto, safe, strict, ci.")] = None,
+    simple: Annotated[bool, typer.Option("--simple", help="Force simple auto flow depth.")] = False,
+    safe_depth: Annotated[bool, typer.Option("--safe", help="Force safe auto flow depth.")] = False,
+    deep: Annotated[bool, typer.Option("--deep", help="Force deep auto flow depth.")] = False,
     role: Annotated[list[str] | None, typer.Option("--role", help="Role provider override.")] = None,
     skill: Annotated[list[str] | None, typer.Option("-s", "--skill", help="Skill activation.")] = None,
     task_file: Annotated[Path | None, typer.Option("-f", "--file", help="Task TOML file.")] = None,
@@ -369,7 +480,24 @@ def design(
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     """Submit a design-only task that produces a design pack."""
-    _submit_main_task("design", task=task, profile=profile, gate=gate or "auto", role=role, skill=skill, task_file=task_file, provider=provider, workflow="design", require_approval="", max_cost_usd=max_cost_usd, host=host, port=port, json_output=json_output, title="muxdev design", depth="deep")
+    _submit_main_task(
+        "design",
+        task=task,
+        profile=profile,
+        gate=gate or "auto",
+        role=role,
+        skill=skill,
+        task_file=task_file,
+        provider=provider,
+        workflow=None,
+        require_approval="",
+        max_cost_usd=max_cost_usd,
+        host=host,
+        port=port,
+        json_output=json_output,
+        title="muxdev design",
+        depth=_depth_override(simple=simple, safe=safe_depth, deep=deep, parallel=False),
+    )
 
 
 @app.command()
@@ -773,6 +901,8 @@ def evidence_verify(
         f"ledger events: {payload['ledger']['events']}",
         f"contracts: {payload['contracts']}",
         f"evidence bundles: {payload['evidence_bundles']}",
+        f"evidence items: {payload.get('evidence_items', 0)}",
+        f"scorecards: {payload.get('scorecards', 0)}",
         f"validators: {payload['validators']}",
     ]
     for error in payload.get("errors", []):
@@ -934,6 +1064,23 @@ def merge(
 
 
 @app.command()
+def ship(
+    run_id: Annotated[str, typer.Argument(help="Run id, or 'latest'.")] = "latest",
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Preview files without copying them into the workspace.")] = False,
+    gate_command: Annotated[str | None, typer.Option("--gate-command", help="Command to run in the run worktree before shipping.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Ship a run worktree back into the current workspace."""
+    resolved = _resolve_run_id(run_id)
+    payload = _merge_run(resolved, execute=not dry_run, gate_command=gate_command)
+    payload["command"] = "ship"
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel("\n".join(f"{key}: {value}" for key, value in payload.items()), title="Ship"))
+
+
+@app.command()
 def report(
     run_id: Annotated[str, typer.Argument(help="Run id, or 'latest'.")] = "latest",
     host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
@@ -978,6 +1125,23 @@ def rollback(
         _print_json(payload)
         return
     console.print(Panel("\n".join(f"{key}: {value}" for key, value in payload.items()), title="Rollback"))
+
+
+@app.command()
+def undo(
+    run_id: Annotated[str, typer.Argument(help="Run id, or 'latest'.")] = "latest",
+    to_stage: Annotated[str | None, typer.Option("--to-stage", help="Restore the task worktree to the snapshot captured before this stage.")] = None,
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Undo a daemon task worktree back to a rollback snapshot."""
+    payload = _daemon_client(host, port).rollback(run_id, to_stage=to_stage)
+    payload["command"] = "undo"
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel("\n".join(f"{key}: {value}" for key, value in payload.items()), title="Undo"))
 
 
 @app.command()

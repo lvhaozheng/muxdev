@@ -200,7 +200,9 @@ providers:
 
     assert isinstance(adapter, HeadlessCliProviderAdapter)
     assert adapter.command == ["C:/bin/fake.exe", "--machine"]
-    assert adapter._prompt("plan", "ship") == "Do plan: ship"
+    prompt = adapter._prompt("plan", "ship")
+    assert prompt.startswith("Do plan: ship")
+    assert "muxdev Evidence Contract" in prompt
 
 
 def _workspace_temp() -> Path:

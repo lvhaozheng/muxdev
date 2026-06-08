@@ -719,11 +719,11 @@ def app_payload(workspace: Path) -> dict[str, Any]:
 
 
 def status_panel(payload: dict[str, Any]) -> Group:
-    return Group(
-        _overview_panel(payload),
-        _work_panel(payload),
-        _trace_panel(payload),
-    )
+    panels = [_overview_panel(payload)]
+    if payload.get("evidence_scorecard"):
+        panels.append(_scorecard_panel(payload))
+    panels.extend([_work_panel(payload), _trace_panel(payload)])
+    return Group(*panels)
 
 
 def _overview_panel(payload: dict[str, Any]) -> Panel:
@@ -848,6 +848,21 @@ def _work_panel(payload: dict[str, Any]) -> Panel:
     for row in payload["stages"]:
         stage_table.add_row(row["stage_id"], str(_status_text(row["status"])), _clip(row["summary"] or "", 64))
     return Panel(Group(meta, Text(""), stage_table), title="Work Board", box=box.ASCII, border_style="bright_black")
+
+
+def _scorecard_panel(payload: dict[str, Any]) -> Panel:
+    scorecard = payload.get("evidence_scorecard") if isinstance(payload.get("evidence_scorecard"), dict) else {}
+    table = Table.grid(expand=True)
+    table.add_column(ratio=1, style="bold")
+    table.add_column(ratio=4)
+    table.add_row("confidence", f"{scorecard.get('score', 0)} / 100  {scorecard.get('label', '-')}")
+    table.add_row("recommendation", str(scorecard.get("recommendation", "-")))
+    table.add_row("risk penalty", str(scorecard.get("risk_penalty", 0)))
+    reasons = scorecard.get("top_reasons", []) if isinstance(scorecard.get("top_reasons"), list) else []
+    missing = scorecard.get("missing_evidence", []) if isinstance(scorecard.get("missing_evidence"), list) else []
+    table.add_row("why", "; ".join(str(item) for item in reasons[:3]) or "-")
+    table.add_row("missing", "; ".join(str(item) for item in missing[:3]) or "none")
+    return Panel(table, title="Delivery Scorecard", box=box.ASCII, border_style="green")
 
 
 def _trace_panel(payload: dict[str, Any]) -> Panel:

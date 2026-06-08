@@ -47,6 +47,14 @@ workflows:
         role: memory_curator
         deps: [final_design_review]
         read_only: true
+  design-lite:
+    name: design-lite
+    max_parallel: 1
+    stages:
+      - id: design_brief
+        role: architect
+        deps: []
+        read_only: true
   dev:
     name: dev
     max_parallel: 1

@@ -21,6 +21,7 @@ def generate_final_report(run_dir: Path, run_id: str, blackboard: Blackboard) ->
     ledger_events = blackboard.table_rows("ledger_events")
     snapshots = blackboard.table_rows("snapshots")
     validators = blackboard.table_rows("validator_panels")
+    scorecards = blackboard.table_rows("evidence_scorecards", run_id=run_id)
     lines = [
         f"# muxdev final report: {run_id}",
         "",
@@ -30,8 +31,21 @@ def generate_final_report(run_dir: Path, run_id: str, blackboard: Blackboard) ->
         f"- Status: {run['status']}",
         f"- Worktree: {run['worktree']}",
         "",
-        "## Stage Timeline",
     ]
+    if scorecards:
+        scorecard = scorecards[-1]
+        lines.extend(
+            [
+                "## Evidence Scorecard",
+                f"- Delivery Confidence: {scorecard['score']} / 100",
+                f"- Label: {scorecard['label']}",
+                f"- Recommendation: {scorecard['recommendation']}",
+                f"- Risk penalty: {scorecard['risk_penalty']}",
+                "- Missing evidence: " + (", ".join(str(item) for item in scorecard.get("missing_evidence", [])) or "none"),
+                "",
+            ]
+        )
+    lines.append("## Stage Timeline")
     for stage in stages:
         lines.append(f"- {stage['stage_id']}: {stage['status']} - {stage['summary'] or ''}")
     lines.extend(["", "## Test Results"])

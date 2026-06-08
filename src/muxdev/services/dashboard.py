@@ -51,6 +51,9 @@ def startup_dashboard_payload(workspace: Path) -> dict[str, Any]:
         "usage": [],
         "stage_contracts": [],
         "evidence_bundles": [],
+        "evidence_items": [],
+        "evidence_scorecard": None,
+        "evidence_scorecards": [],
         "ledger_events": [],
         "snapshots": [],
         "validator_panels": [],
@@ -81,6 +84,7 @@ def build_run_dashboard_payload(workspace: Path, run_dir: Path, run_id: str, bla
     usage = blackboard.table_rows("usage_records", run_id=run_id)
     blockers = blackboard.table_rows("review_blockers", run_id=run_id)
     errors = blackboard.table_rows("error_details", run_id=run_id)
+    scorecards = blackboard.table_rows("evidence_scorecards", run_id=run_id)
     return {
         "app": _app_payload(workspace),
         "run": run,
@@ -109,6 +113,9 @@ def build_run_dashboard_payload(workspace: Path, run_dir: Path, run_id: str, bla
         "usage": usage,
         "stage_contracts": blackboard.table_rows("stage_contracts", run_id=run_id),
         "evidence_bundles": blackboard.table_rows("evidence_bundles", run_id=run_id),
+        "evidence_items": blackboard.table_rows("evidence_items", run_id=run_id),
+        "evidence_scorecard": scorecards[-1] if scorecards else None,
+        "evidence_scorecards": scorecards,
         "ledger_events": blackboard.table_rows("ledger_events", run_id=run_id),
         "snapshots": blackboard.table_rows("snapshots", run_id=run_id),
         "validator_panels": blackboard.table_rows("validator_panels", run_id=run_id),

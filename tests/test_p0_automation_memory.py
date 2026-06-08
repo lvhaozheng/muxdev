@@ -43,6 +43,28 @@ def test_auto_request_compiles_sensitive_dev_to_deep_squad(monkeypatch) -> None:
     assert list(request["runtime_roles"]) == ["plan", "code", "test", "review"]
 
 
+def test_auto_design_snake_routes_to_lite_solo(monkeypatch) -> None:
+    workspace = _workspace_temp("design_simple")
+    monkeypatch.setattr(runtime_config, "detect_providers", lambda: [_probe("mock", ProviderStatus.READY)])
+    try:
+        request = resolve_task_request(
+            workspace=workspace,
+            task="设计一个简单的贪吃蛇游戏",
+            command_workflow="design",
+            provider="mock",
+            gate="auto",
+        )
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    assert request["workflow"] == "design-lite"
+    assert request["depth"] == "simple"
+    assert request["topology"] == "solo"
+    assert request["automation"]["intent"] == "design"
+    assert request["automation"]["roles"] == ["architect"]
+    assert request["runtime_roles"] == {"architect": "auto"}
+
+
 def test_cli_design_submits_automation_payload(monkeypatch) -> None:
     submitted: list[dict[str, object]] = []
 
@@ -61,6 +83,26 @@ def test_cli_design_submits_automation_payload(monkeypatch) -> None:
     assert payload["depth"] == "deep"
     assert payload["automation"]["intent"] == "design"
     assert "architect" in payload["automation"]["roles"]
+
+
+def test_cli_design_simple_override_submits_lite_payload(monkeypatch) -> None:
+    submitted: list[dict[str, object]] = []
+
+    class FakeClient:
+        def submit_task(self, payload: dict[str, object]) -> dict[str, object]:
+            submitted.append(payload)
+            return {"task_id": "run_design", "run_id": "run_design", "status": "created"}
+
+    monkeypatch.setattr("muxdev.cli.main._daemon_client", lambda *_args, **_kwargs: FakeClient())
+
+    result = runner.invoke(app, ["design", "snake game", "--simple", "--provider", "mock", "--json"])
+
+    assert result.exit_code == 0
+    payload = submitted[0]
+    assert payload["workflow"] == "design-lite"
+    assert payload["depth"] == "simple"
+    assert payload["topology"] == "solo"
+    assert payload["automation"]["roles"] == ["architect"]
 
 
 def test_design_runtime_writes_pack_and_memory_proposal() -> None:
@@ -93,6 +135,36 @@ def test_design_runtime_writes_pack_and_memory_proposal() -> None:
     assert json.loads(contract.read_text(encoding="utf-8"))["contract_version"] == "muxdev.design_contract.v1"
     assert json.loads(proposals.read_text(encoding="utf-8"))[0]["status"] == "proposed"
     assert status["counts"]["proposed"] >= 1
+
+
+def test_design_lite_runtime_writes_design_pack_metadata() -> None:
+    workspace = _workspace_temp("design_lite_runtime")
+    try:
+        result = SupervisorRuntime(workspace).run(
+            "design a simple snake game",
+            provider="mock",
+            workflow_name="design-lite",
+            require_approval=set(),
+            profile="solo",
+            gate="auto",
+            depth="simple",
+            topology="solo",
+            automation={
+                "intent": "design",
+                "depth": "simple",
+                "topology": "solo",
+                "roles": ["architect"],
+            },
+        )
+        contract = json.loads((result.run_dir / "design" / "design_contract.json").read_text(encoding="utf-8"))
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    assert result.status == RunStatus.COMPLETED
+    assert contract["workflow"] == "design-lite"
+    assert contract["depth"] == "simple"
+    assert contract["topology"] == "solo"
+    assert contract["roles"] == ["architect"]
 
 
 def _probe(name: str, status: ProviderStatus) -> ProviderProbe:

@@ -16,13 +16,16 @@ def verify_run_evidence(run_dir: Path, run_id: str, blackboard: Blackboard | Non
         contract_errors = _verify_rows(board.table_rows("stage_contracts", run_id=run_id), "path", "contract_hash")
         evidence_errors = _verify_rows(board.table_rows("evidence_bundles", run_id=run_id), "path", "bundle_hash")
         validator_errors = _verify_rows(board.table_rows("validator_panels", run_id=run_id), "path", "validator_hash")
-        errors = [*ledger["errors"], *contract_errors, *evidence_errors, *validator_errors]
+        scorecard_errors = _verify_rows(board.table_rows("evidence_scorecards", run_id=run_id), "path", "scorecard_hash")
+        errors = [*ledger["errors"], *contract_errors, *evidence_errors, *validator_errors, *scorecard_errors]
         return {
             "run_id": run_id,
             "valid": bool(ledger["valid"]) and not errors,
             "ledger": ledger,
             "contracts": len(board.table_rows("stage_contracts", run_id=run_id)),
             "evidence_bundles": len(board.table_rows("evidence_bundles", run_id=run_id)),
+            "evidence_items": len(board.table_rows("evidence_items", run_id=run_id)),
+            "scorecards": len(board.table_rows("evidence_scorecards", run_id=run_id)),
             "validators": len(board.table_rows("validator_panels", run_id=run_id)),
             "errors": errors,
         }

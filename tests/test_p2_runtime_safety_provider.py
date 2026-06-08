@@ -56,6 +56,84 @@ stages:
         shutil.rmtree(workspace, ignore_errors=True)
 
 
+def test_read_only_stage_allows_provider_session_archives_outside_worktree(monkeypatch) -> None:
+    workspace = _workspace_temp("p2-readonly-session")
+    workflow = workspace / "readonly_session.yaml"
+    workflow.write_text(
+        """
+name: readonly-session-smoke
+max_parallel: 1
+stages:
+  - id: inspect
+    role: review
+    deps: []
+    read_only: true
+""",
+        encoding="utf-8",
+    )
+
+    class SessionArchivingProvider:
+        def run_stage(
+            self,
+            *,
+            stage_id: str,
+            task: str,
+            worktree: Path,
+            skills=None,
+            session_dir: Path | None = None,
+        ) -> ProviderStageOutput:
+            assert session_dir is not None
+            session_dir.mkdir(parents=True, exist_ok=True)
+            (session_dir / f"{stage_id}.log").write_text("session archive only\n", encoding="utf-8")
+            return ProviderStageOutput("inspect.md", "inspected", "inspected")
+
+    monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: SessionArchivingProvider())
+
+    try:
+        result = SupervisorRuntime(workspace).run("read only session archive", provider="mock", workflow_name=str(workflow))
+
+        assert result.status == RunStatus.COMPLETED
+        assert (result.run_dir / "provider_sessions" / "inspect.log").exists()
+        assert not (result.run_dir / "worktree" / ".muxdev" / "provider_sessions").exists()
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_read_only_stage_ignores_legacy_worktree_provider_session_archives(monkeypatch) -> None:
+    workspace = _workspace_temp("p2-readonly-legacy-session")
+    workflow = workspace / "readonly_legacy_session.yaml"
+    workflow.write_text(
+        """
+name: readonly-legacy-session-smoke
+max_parallel: 1
+stages:
+  - id: inspect
+    role: review
+    deps: []
+    read_only: true
+""",
+        encoding="utf-8",
+    )
+
+    class LegacySessionArchivingProvider:
+        def run_stage(self, *, stage_id: str, task: str, worktree: Path, skills=None) -> ProviderStageOutput:
+            archive_dir = worktree / ".muxdev" / "provider_sessions"
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            (archive_dir / f"{stage_id}.log").write_text("legacy session archive only\n", encoding="utf-8")
+            return ProviderStageOutput("inspect.md", "inspected", "inspected")
+
+    monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: LegacySessionArchivingProvider())
+
+    try:
+        result = SupervisorRuntime(workspace).run("read only legacy session archive", provider="mock", workflow_name=str(workflow))
+        diff = (result.run_dir / "diff.patch").read_text(encoding="utf-8")
+
+        assert result.status == RunStatus.COMPLETED
+        assert "provider_sessions" not in diff
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
 def test_transient_provider_exit_retries_and_records_attempts(monkeypatch) -> None:
     workspace = _workspace_temp("p2-retry")
     workflow = workspace / "retry.yaml"
