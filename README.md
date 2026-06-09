@@ -132,9 +132,19 @@ muxdev dashboard
 muxdev tui
 ```
 
-The Dashboard shows tasks, timelines, approvals, provider actions, provider attempts, evidence, memory context, semantic merge reviews, provider learning, artifacts, reports, diffs, and trace events.
+The Dashboard opens as a task cockpit: Action Center first, Current Focus for the selected task, then task timeline, evidence, report, diff, and advanced inspection tables. Provider actions explain why muxdev paused, where to handle the external CLI prompt, and provide a `Handled + continue` action after you finish in the provider session.
 
-The TUI is for quick local supervision. It does not type `yes/no` into provider CLIs; for Provider Actions, handle the provider CLI/session first, then mark the action handled and continue.
+The TUI accepts natural-language tasks by default: type `fix the failing login test` and muxdev submits the default dev flow. Slash commands remain available for expert actions. It does not type `yes/no` into provider CLIs; for Provider Actions, handle the provider CLI/session first, then mark the action handled and continue.
+
+UX-focused API endpoints:
+
+```text
+GET  /api/ux/overview
+GET  /api/tasks/{run_id}/ux
+POST /api/tasks/{run_id}/actions/{action_id}/handled-and-continue
+GET  /api/setup/status
+GET  /api/providers/health
+```
 
 ## Documentation
 
@@ -159,7 +169,7 @@ python -m pytest -q
 Current full suite:
 
 ```text
-127 passed
+129 passed
 ```
 
 Windows may emit pytest cache warnings if `.pytest_cache` cannot be written. These warnings do not affect the test result.

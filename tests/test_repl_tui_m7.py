@@ -145,6 +145,7 @@ def test_daemon_tui_command_results_use_chat_format(monkeypatch) -> None:
 
     tasks, _ = cli_app_module._handle_daemon_tui_command("/tasks", "latest", host="127.0.0.1", port=8788, commands={})
     dev, dev_selected = cli_app_module._handle_daemon_tui_command("/dev --provider mock --simple chat tui", "latest", host="127.0.0.1", port=8788, commands={})
+    natural, natural_selected = cli_app_module._handle_daemon_tui_command("fix navbar copy", "latest", host="127.0.0.1", port=8788, commands={})
     design, design_selected = cli_app_module._handle_daemon_tui_command("/design --provider mock design tui", "latest", host="127.0.0.1", port=8788, commands={})
     status, selected = cli_app_module._handle_daemon_tui_command("/status run_1", "latest", host="127.0.0.1", port=8788, commands={})
     report, report_selected = cli_app_module._handle_daemon_tui_command("/report run_1", "latest", host="127.0.0.1", port=8788, commands={})
@@ -156,6 +157,8 @@ def test_daemon_tui_command_results_use_chat_format(monkeypatch) -> None:
     assert "workflow=dev" in dev
     assert "depth=simple" in dev
     assert dev_selected == "run_submit"
+    assert "workflow=dev" in natural
+    assert natural_selected == "run_submit"
     assert "workflow=design" in design
     assert design_selected == "run_submit"
     assert "Recent events" in status

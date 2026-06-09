@@ -32,6 +32,15 @@ class DaemonClient:
     def daemon_status(self) -> dict[str, Any]:
         return self._request("GET", "/api/daemon/status")
 
+    def ux_overview(self) -> dict[str, Any]:
+        return self._request("GET", "/api/ux/overview")
+
+    def setup_status(self) -> dict[str, Any]:
+        return self._request("GET", "/api/setup/status")
+
+    def providers_health(self) -> dict[str, Any]:
+        return self._request("GET", "/api/providers/health")
+
     def submit_task(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", "/api/tasks", json=payload)
 
@@ -40,6 +49,9 @@ class DaemonClient:
 
     def task(self, task_id: str) -> dict[str, Any]:
         return self._request("GET", f"/api/tasks/{task_id}")
+
+    def task_ux(self, task_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/tasks/{task_id}/ux")
 
     def continue_task(self, task_id: str = "latest", *, max_cost_usd: float = 0.5) -> dict[str, Any]:
         return self._request("POST", f"/api/tasks/{task_id}/continue", json={"max_cost_usd": max_cost_usd})
@@ -106,6 +118,9 @@ class DaemonClient:
 
     def provider_action_handled(self, action_id: str) -> dict[str, Any]:
         return self._request("POST", f"/api/provider-actions/{action_id}/handled")
+
+    def provider_action_handled_and_continue(self, task_id: str, action_id: str, *, max_cost_usd: float = 0.5) -> dict[str, Any]:
+        return self._request("POST", f"/api/tasks/{task_id}/actions/{action_id}/handled-and-continue", json={"max_cost_usd": max_cost_usd})
 
     def provider_action_dismiss(self, action_id: str) -> dict[str, Any]:
         return self._request("POST", f"/api/provider-actions/{action_id}/dismiss")

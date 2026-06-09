@@ -204,6 +204,20 @@ def _handle_daemon_tui_command(
             payload, description = _submit_tui_task(client, submit)
             task_id = str(payload["task_id"])
             return f"submitted {task_id}\n{description}\nUse /status {task_id} or open /dashboard.", task_id
+        if text and not text.startswith("/"):
+            payload, description = _submit_tui_task(
+                client,
+                {
+                    "command_workflow": "dev",
+                    "task": text,
+                    "role": [],
+                    "skill": [],
+                    "require_approval": set(),
+                    "max_cost_usd": 0.5,
+                },
+            )
+            task_id = str(payload["task_id"])
+            return f"submitted {task_id}\n{description}\nUse /status {task_id} or open /dashboard.", task_id
         if text == "/status" or text.startswith("/status "):
             task_id = text.split(maxsplit=1)[1] if " " in text else current_task
             payload = client.task(task_id)

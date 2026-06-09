@@ -12,7 +12,9 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from ..models import ApprovalStatus, ProviderActionStatus
+from ..providers import detect_providers
 from ..services.multirepo import plan_multi_repo_orchestration
+from ..services.ux import build_provider_health, build_setup_status, build_task_ux_summary, build_ux_overview
 from ..storage import MemoryStore
 
 
@@ -115,6 +117,7 @@ def render_dashboard_html(payload: dict[str, Any]) -> str:
       {_kv("Provider", run.get("provider", "-"))}
       {_kv("Worktree", run.get("worktree", "-"))}
     </section>
+    {_ux_section(payload)}
     {_scorecard_section(payload)}
     {_summary_cards(summary)}
     <section class="panel span-8">
@@ -216,6 +219,39 @@ def write_dashboard(path: Path, payload: dict[str, Any]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(render_dashboard_html(payload), encoding="utf-8")
     return path
+
+
+def _ux_section(payload: dict[str, Any]) -> str:
+    ux = payload.get("ux") if isinstance(payload.get("ux"), dict) else {}
+    if not ux:
+        return ""
+    actions = "".join(
+        f"<li><strong>{_escape(action.get('label', '-'))}</strong>: {_escape(action.get('description', ''))}"
+        + (f"<br><code>{_escape(action.get('command'))}</code>" if action.get("command") else "")
+        + (f"<br><span class=\"muted\">{_escape(action.get('endpoint'))}</span>" if action.get("endpoint") else "")
+        + "</li>"
+        for action in ux.get("next_actions", [])[:5]
+        if isinstance(action, dict)
+    )
+    deliverables = "".join(
+        f"<li>{_escape(item.get('label', item.get('kind', '-')))}"
+        + (f" <span class=\"muted\">{_escape(item.get('path'))}</span>" if item.get("path") else "")
+        + "</li>"
+        for item in ux.get("deliverables", [])[:5]
+        if isinstance(item, dict)
+    )
+    return f"""
+    <section class="panel span-12">
+      <h2>Current Focus</h2>
+      <p><span class="status {_escape(ux.get('user_state', ''))}">{_escape(ux.get('user_state', '-'))}</span></p>
+      <h3>{_escape(ux.get('headline', '-'))}</h3>
+      <p>{_escape(ux.get('why', ''))}</p>
+      <h3>Next Actions</h3>
+      <ul>{actions or "<li>No immediate action required.</li>"}</ul>
+      <h3>Deliverables</h3>
+      <ul>{deliverables or "<li>No deliverables yet.</li>"}</ul>
+    </section>
+    """
 
 
 def _scorecard_section(payload: dict[str, Any]) -> str:
@@ -432,6 +468,31 @@ def create_app(*, task_manager: object | None = None, paths: object | None = Non
     def daemon_status() -> dict[str, object]:
         return manager.daemon_status()
 
+    @app.get("/api/ux/overview")
+    def ux_overview() -> dict[str, object]:
+        tasks = manager.list_tasks()
+        approvals = manager.approvals(status=str(ApprovalStatus.PENDING))
+        actions = manager.provider_actions(status=str(ProviderActionStatus.PENDING))
+        return build_ux_overview(
+            daemon=manager.daemon_status(),
+            tasks=tasks,
+            approvals=approvals,
+            provider_actions=actions,
+            selected_task=tasks[0] if tasks else None,
+        )
+
+    @app.get("/api/setup/status")
+    def setup_status() -> dict[str, object]:
+        return build_setup_status(
+            workspace=str(Path.cwd()),
+            daemon={**manager.daemon_status(), "status": "ok"},
+            provider_health=_provider_health_payload(),
+        )
+
+    @app.get("/api/providers/health")
+    def providers_health() -> dict[str, object]:
+        return _provider_health_payload()
+
     @app.post("/api/tasks")
     def create_task(request: TaskCreateRequest) -> dict[str, object]:
         workspace = Path(request.workspace or Path.cwd()).resolve()
@@ -460,6 +521,15 @@ def create_app(*, task_manager: object | None = None, paths: object | None = Non
     def task_detail(task_id: str) -> dict[str, object]:
         try:
             return manager.task_detail(task_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/tasks/{task_id}/ux")
+    def task_ux(task_id: str) -> dict[str, object]:
+        try:
+            return build_task_ux_summary(manager.task_detail(task_id))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except FileNotFoundError as exc:
@@ -603,6 +673,21 @@ def create_app(*, task_manager: object | None = None, paths: object | None = Non
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @app.post("/api/tasks/{task_id}/actions/{action_id}/handled-and-continue")
+    def provider_action_handled_and_continue(task_id: str, action_id: str, request: ContinueRequest | None = None) -> dict[str, object]:
+        try:
+            handled = manager.update_provider_action(action_id, ProviderActionStatus.HANDLED)
+            continued = manager.continue_task(task_id, max_cost_usd=(request.max_cost_usd if request else 0.5))
+            return {
+                "task_id": task_id,
+                "run_id": task_id,
+                "action": handled,
+                "continue": continued,
+                "status": continued.get("status"),
+            }
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     @app.post("/api/provider-actions/{action_id}/dismiss")
     def provider_action_dismiss(action_id: str) -> dict[str, object]:
         try:
@@ -640,6 +725,10 @@ def create_app(*, task_manager: object | None = None, paths: object | None = Non
     app.websocket("/events")(_events)
     app.websocket("/api/events")(_events)
     return app
+
+
+def _provider_health_payload() -> dict[str, object]:
+    return build_provider_health([probe.to_dict() for probe in detect_providers()])
 
 
 def render_live_dashboard_html(task_id: str | None = None) -> str:
@@ -688,6 +777,13 @@ def render_live_dashboard_html(task_id: str | None = None) -> str:
     th {{ color: var(--muted); font-size: 12px; }}
     pre {{ background: #0f172a; color: #e2e8f0; border-radius: 8px; padding: 12px; overflow: auto; max-height: 340px; }}
     .actions {{ display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }}
+    .callout {{ border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 8px; padding: 12px; margin-bottom: 12px; background: #f8fafc; }}
+    .callout.needs_action, .callout.needs_approval {{ border-left-color: var(--warn); background: #fffbeb; }}
+    .callout.failed {{ border-left-color: var(--bad); background: #fef2f2; }}
+    .callout.deliverable {{ border-left-color: var(--good); background: #f0fdf4; }}
+    .action-card {{ border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin-bottom: 8px; background: #fff; }}
+    .deliverables {{ display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }}
+    .deliverables span {{ border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; background: #fff; }}
     @media (max-width: 860px) {{ main {{ grid-template-columns: 1fr; padding: 14px; }} header {{ padding: 14px; align-items: flex-start; flex-direction: column; }} }}
   </style>
 </head>
@@ -704,6 +800,7 @@ def render_live_dashboard_html(task_id: str | None = None) -> str:
       <div class="panel"><h2>Tasks</h2><div id="tasks" class="stack"></div></div>
     </section>
     <section class="stack">
+      <div class="panel"><h2>Action Center</h2><div id="action-center" class="meta">Loading.</div></div>
       <div class="panel"><h2>Task Detail</h2><div id="detail" class="meta">Select a task.</div></div>
       <div class="panel"><h2>Provider Actions</h2><div id="provider-actions"></div></div>
       <div class="panel"><h2>Approvals</h2><div id="approvals"></div></div>
@@ -726,6 +823,8 @@ def render_live_dashboard_html(task_id: str | None = None) -> str:
     async function refresh() {{
       const health = await api('/health');
       document.getElementById('daemon-status').textContent = `tasks=${{health.tasks}} running=${{health.running_tasks}} queue=${{health.queue_length}}`;
+      const overview = await optionalApi('/ux/overview', {{ action_center: [], counts: {{}} }});
+      renderActionCenter(overview.action_center || []);
       const tasks = await api('/tasks');
       if (!state.taskId && tasks.length) state.taskId = tasks[0].task_id;
       renderTasks(tasks);
@@ -746,7 +845,9 @@ def render_live_dashboard_html(task_id: str | None = None) -> str:
       const run = payload.run || {{}};
       const stages = payload.stages || [];
       const context = payload.context || {{}};
+      const ux = payload.ux || {{}};
       document.getElementById('detail').innerHTML = `
+        ${{uxBlock(ux)}}
         <div><strong>${{esc(run.run_id)}}</strong> <span class="${{statusClass(run.status)}}">${{esc(run.status)}}</span></div>
         <div>${{esc(run.task || '')}}</div>
         <div class="meta">workspace=${{esc(run.workspace || '')}}</div>
@@ -776,6 +877,35 @@ def render_live_dashboard_html(task_id: str | None = None) -> str:
         ${{tableBlock('Provider Learning', payload.provider_learning || [], ['provider','role','attempts','successes','failures','human_actions','score'])}}
         ${{tableBlock('Multi-Repo Orchestration', payload.multi_repo_orchestrations || [], ['orchestration_id','mode','status','task','plan_path'])}}`;
     }}
+    function renderActionCenter(rows) {{
+      document.getElementById('action-center').innerHTML = rows.length ? rows.map(row => `
+        <div class="action-card">
+          <strong>${{esc(row.headline)}}</strong>
+          <div>${{esc(row.why || '')}}</div>
+          ${{row.command ? `<code>${{esc(row.command)}}</code>` : ''}}
+          <div class="actions">
+            ${{row.endpoint ? `<button class="primary" onclick="post('${{esc(row.endpoint).replace('/api','')}}')">Take action</button>` : ''}}
+          </div>
+        </div>`).join('') : '<div class="meta">Nothing needs your attention. Running tasks will appear here if they pause.</div>';
+    }}
+    function uxBlock(ux) {{
+      if (!ux || !ux.headline) return '';
+      const actions = (ux.next_actions || []).map(action => actionButton(action)).join('');
+      const deliverables = (ux.deliverables || []).map(item => `<span>${{esc(item.label || item.kind)}}</span>`).join('') || '<span>none yet</span>';
+      return `<div class="callout ${{esc(ux.user_state || '')}}">
+        <div><span class="${{statusClass(ux.user_state)}}">${{esc(ux.user_state || '-')}}</span> risk=${{esc(ux.risk || '-')}}</div>
+        <h2>${{esc(ux.headline)}}</h2>
+        <div>${{esc(ux.why || '')}}</div>
+        <div class="actions">${{actions || '<span class="meta">No immediate action.</span>'}}</div>
+        <div class="deliverables">${{deliverables}}</div>
+      </div>`;
+    }}
+    function actionButton(action) {{
+      const cls = action.danger ? '' : 'primary';
+      if (action.endpoint) return `<button class="${{cls}}" onclick="post('${{esc(action.endpoint).replace('/api','')}}')">${{esc(action.label)}}</button>`;
+      if (action.command) return `<code>${{esc(action.command)}}</code>`;
+      return `<span class="meta">${{esc(action.label || action.kind)}}</span>`;
+    }}
     function tableBlock(title, rows, columns) {{
       if (!rows.length) return `<h2>${{esc(title)}}</h2><div class="meta">No records.</div>`;
       return `<h2>${{esc(title)}}</h2><table><thead><tr>${{columns.map(column => `<th>${{esc(column)}}</th>`).join('')}}</tr></thead><tbody>${{rows.map(row => `<tr>${{columns.map(column => `<td>${{esc(fmt(row[column]))}}</td>`).join('')}}</tr>`).join('')}}</tbody></table>`;
@@ -802,7 +932,8 @@ def render_live_dashboard_html(task_id: str | None = None) -> str:
           <td>
             <code>${{esc(row.attach_command || row.transcript_path || '-')}}</code>
             <div class="actions">
-              <button class="primary" onclick="post('/provider-actions/${{encodeURIComponent(row.action_id)}}/handled')">Mark handled</button>
+              <button class="primary" onclick="post('/tasks/${{encodeURIComponent(row.run_id)}}/actions/${{encodeURIComponent(row.action_id)}}/handled-and-continue')">Handled + continue</button>
+              <button onclick="post('/provider-actions/${{encodeURIComponent(row.action_id)}}/handled')">Mark handled</button>
               <button onclick="post('/provider-actions/${{encodeURIComponent(row.action_id)}}/dismiss')">Dismiss</button>
               <button onclick="post('/tasks/${{encodeURIComponent(row.run_id)}}/stop')">Stop task</button>
             </div>

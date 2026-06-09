@@ -15,6 +15,7 @@ from .skill_lock import write_skill_lock
 from .skills import SkillRegistry
 from .flows import FlowDefinition, FlowRegistry
 from .orchestration import deep_agent_task_pack, workflow_to_langgraph
+from .ux import build_provider_health, build_setup_status, build_task_ux_summary, build_ux_overview
 from .workflow_plugins import WorkflowPlugin, get_workflow_plugin, list_workflow_plugins, render_plugin_command
 
 __all__ = [
@@ -24,8 +25,12 @@ __all__ = [
     "LocalRagIndex",
     "SkillRegistry",
     "WorkflowPlugin",
-    "build_run_dashboard_payload",
     "build_evidence_scorecard",
+    "build_provider_health",
+    "build_run_dashboard_payload",
+    "build_setup_status",
+    "build_task_ux_summary",
+    "build_ux_overview",
     "dashboard_path",
     "deep_agent_task_pack",
     "detect_parallel_conflicts",

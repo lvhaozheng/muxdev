@@ -11,6 +11,7 @@ from ..api.web import write_dashboard
 from ..config.runtime import load_runtime_config, provider_cache_path
 from ..models import ApprovalStatus, ProviderActionStatus
 from ..storage import Blackboard, compact_trace, read_trace
+from .ux import build_task_ux_summary
 
 
 TERMINAL_RUN_STATES = {"completed", "blocked", "aborted"}
@@ -23,7 +24,7 @@ def dashboard_path(run_dir: Path) -> Path:
 
 def startup_dashboard_payload(workspace: Path) -> dict[str, Any]:
     """Build a dashboard payload for a workspace that has no run yet."""
-    return {
+    payload = {
         "app": _app_payload(workspace),
         "run": None,
         "stages": [],
@@ -72,6 +73,8 @@ def startup_dashboard_payload(workspace: Path) -> dict[str, Any]:
             "terminal": False,
         },
     }
+    payload["ux"] = build_task_ux_summary(payload)
+    return payload
 
 
 def build_run_dashboard_payload(workspace: Path, run_dir: Path, run_id: str, blackboard: Blackboard) -> dict[str, Any]:
@@ -85,7 +88,7 @@ def build_run_dashboard_payload(workspace: Path, run_dir: Path, run_id: str, bla
     blockers = blackboard.table_rows("review_blockers", run_id=run_id)
     errors = blackboard.table_rows("error_details", run_id=run_id)
     scorecards = blackboard.table_rows("evidence_scorecards", run_id=run_id)
-    return {
+    payload = {
         "app": _app_payload(workspace),
         "run": run,
         "stages": stages,
@@ -122,6 +125,8 @@ def build_run_dashboard_payload(workspace: Path, run_dir: Path, run_id: str, bla
         "trace": compact_trace(read_trace(run_dir))[-50:],
         "summary": _summary(stages, approvals, provider_actions, usage, blockers, errors, run),
     }
+    payload["ux"] = build_task_ux_summary(payload)
+    return payload
 
 
 def write_run_dashboard(

@@ -167,7 +167,7 @@ def test_daemon_approvals_and_continue() -> None:
     assert continued["status"] == "continue_requested"
 
 
-def test_daemon_provider_actions_api_and_continue_wait() -> None:
+def test_daemon_provider_actions_api_and_continue_wait(monkeypatch) -> None:
     workspace = _workspace_temp("provider-action")
     try:
         manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())
@@ -194,19 +194,27 @@ def test_daemon_provider_actions_api_and_continue_wait() -> None:
                 chunks_path="chunks.jsonl",
                 attach_command="muxdev attach run_provider_action --agent designer",
             )
+        monkeypatch.setattr(manager, "_resume_task", lambda *_args, **_kwargs: None)
         client = TestClient(create_app(task_manager=manager))
 
         listed = client.get("/api/provider-actions?status=pending").json()
         task_listed = client.get("/api/tasks/run_provider_action/provider-actions?status=pending").json()
+        detail = client.get("/api/tasks/run_provider_action").json()
+        task_ux = client.get("/api/tasks/run_provider_action/ux").json()
+        overview = client.get("/api/ux/overview").json()
         continued = client.post("/api/tasks/run_provider_action/continue").json()
-        handled = client.post(f"/api/provider-actions/{action_id}/handled").json()
+        handled = client.post(f"/api/tasks/run_provider_action/actions/{action_id}/handled-and-continue").json()
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 
     assert listed[0]["action_id"] == action_id
     assert task_listed[0]["options"][0]["label"] == "Yes"
+    assert detail["ux"]["user_state"] == "needs_action"
+    assert task_ux["next_actions"][1]["kind"] == "mark_handled_continue"
+    assert overview["action_center"][0]["kind"] == "provider_action"
     assert continued["status"] == "awaiting_provider_action"
-    assert handled["status"] == str(ProviderActionStatus.HANDLED)
+    assert handled["action"]["status"] == str(ProviderActionStatus.HANDLED)
+    assert handled["continue"]["status"] == "continue_requested"
 
 
 def test_daemon_continue_does_not_start_duplicate_worker(monkeypatch) -> None:

@@ -186,7 +186,7 @@ def daemon_chat_view(
         ),
         _daemon_focus_panel(task_payload=task_payload, tasks=tasks or [], approvals=approvals or [], provider_actions=provider_actions or []),
         _daemon_result_panel(command, message) if message else Text(""),
-        Text("muxdev > /dev <task>   /design <task>   /parallel   /learning   /actions   /help   /quit", style="dim"),
+        Text('muxdev > describe a task, or use /dev <task>   /design <task>   /actions   /help   /quit', style="dim"),
     )
 
 
@@ -269,6 +269,7 @@ def daemon_task_detail_text(payload: dict[str, Any]) -> str:
         return "No selected task."
     context = payload.get("context", {}) if isinstance(payload.get("context"), dict) else {}
     summary = payload.get("summary", {}) if isinstance(payload.get("summary"), dict) else {}
+    ux = payload.get("ux", {}) if isinstance(payload.get("ux"), dict) else {}
     skills = _skill_names(context.get("skills", []))
     lines = [
         f"{run.get('run_id') or payload.get('task_id')}: {run.get('status', '-')}",
@@ -277,6 +278,17 @@ def daemon_task_detail_text(payload: dict[str, Any]) -> str:
         f"stage={_current_stage(payload)} approvals={summary.get('pending_approvals', 0)} provider_actions={summary.get('pending_provider_actions', 0)} usage={summary.get('tokens', 0)} tokens ${float(summary.get('cost_usd') or 0):.4f}",
         f"skills={', '.join(skills) if skills else '-'}",
     ]
+    if ux:
+        lines.extend(
+            [
+                "",
+                f"Next: {ux.get('headline', '-')}",
+                f"Why: {_clip(ux.get('why') or '', 110)}",
+            ]
+        )
+        first_action = next((row for row in ux.get("next_actions", []) if isinstance(row, dict)), None)
+        if first_action:
+            lines.append(f"Action: {first_action.get('label', '-')} {first_action.get('command') or first_action.get('endpoint') or ''}")
     actions = [row for row in payload.get("provider_actions", []) if isinstance(row, dict) and row.get("status") == "pending"]
     if actions:
         lines.append("")
@@ -360,6 +372,7 @@ def _daemon_focus_panel(
     run = task_payload.get("run") or {}
     context = task_payload.get("context", {}) if isinstance(task_payload.get("context"), dict) else {}
     summary = task_payload.get("summary", {}) if isinstance(task_payload.get("summary"), dict) else {}
+    ux = task_payload.get("ux", {}) if isinstance(task_payload.get("ux"), dict) else {}
     skills = _skill_names(context.get("skills", []))
     run_id = str(run.get("run_id") or task_payload.get("task_id") or "")
     pending_actions = [
@@ -373,6 +386,9 @@ def _daemon_focus_panel(
     grid.add_row("task", _clip(run.get("task") or "", 104))
     grid.add_row("id", str(run.get("run_id") or task_payload.get("task_id") or "-"))
     grid.add_row("status", _status_text(str(run.get("status") or "-")))
+    if ux:
+        grid.add_row("next", _clip(ux.get("headline") or "-", 104))
+        grid.add_row("why", _clip(ux.get("why") or "", 104))
     grid.add_row("stage", _current_stage(task_payload))
     grid.add_row("profile/gate", f"{context.get('profile') or '-'} / {context.get('gate') or '-'}")
     grid.add_row("usage", f"{summary.get('tokens', 0)} tokens  ${float(summary.get('cost_usd') or 0):.4f}")
@@ -393,6 +409,10 @@ def _daemon_focus_panel(
         grid.add_row("options", _option_labels(first) or "-")
         grid.add_row("attach", _clip(first.get("attach_command") or first.get("transcript_path") or "-", 104))
         grid.add_row("after attach", f"/action handled {first.get('action_id')}  then  /continue {run_id or 'latest'}")
+    elif ux:
+        first_action = next((row for row in ux.get("next_actions", []) if isinstance(row, dict)), None)
+        if first_action:
+            grid.add_row("action", f"{first_action.get('label', '-')}  {first_action.get('command') or first_action.get('endpoint') or ''}")
     grid.add_row("skills", ", ".join(skills) if skills else "-")
     events = _recent_event_lines(task_payload.get("trace", []), limit=5)
     if events:
@@ -458,10 +478,12 @@ def _status_border(status: str) -> str:
         return "green"
     if status in {"running", "created"}:
         return "cyan"
-    if status in {"awaiting_approval", "awaiting_provider_action", "paused_budget"}:
+    if status in {"awaiting_approval", "awaiting_provider_action", "paused_budget", "needs_action", "needs_approval"}:
         return "yellow"
     if status in {"blocked", "aborted", "failed"}:
         return "red"
+    if status == "deliverable":
+        return "green"
     return "bright_black"
 
 
@@ -720,6 +742,8 @@ def app_payload(workspace: Path) -> dict[str, Any]:
 
 def status_panel(payload: dict[str, Any]) -> Group:
     panels = [_overview_panel(payload)]
+    if payload.get("ux"):
+        panels.append(_ux_panel(payload))
     if payload.get("evidence_scorecard"):
         panels.append(_scorecard_panel(payload))
     panels.extend([_work_panel(payload), _trace_panel(payload)])
@@ -850,6 +874,23 @@ def _work_panel(payload: dict[str, Any]) -> Panel:
     return Panel(Group(meta, Text(""), stage_table), title="Work Board", box=box.ASCII, border_style="bright_black")
 
 
+def _ux_panel(payload: dict[str, Any]) -> Panel:
+    ux = payload.get("ux") if isinstance(payload.get("ux"), dict) else {}
+    table = Table.grid(expand=True)
+    table.add_column(ratio=1, style="bold")
+    table.add_column(ratio=4)
+    table.add_row("state", str(_status_text(str(ux.get("user_state") or "-"))))
+    table.add_row("next", _clip(ux.get("headline") or "-", 104))
+    table.add_row("why", _clip(ux.get("why") or "", 120))
+    table.add_row("risk", str(ux.get("risk") or "-"))
+    actions = [row for row in ux.get("next_actions", []) if isinstance(row, dict)]
+    if actions:
+        table.add_row("action", _clip(actions[0].get("command") or actions[0].get("endpoint") or actions[0].get("label") or "-", 104))
+    deliverables = [str(row.get("label") or row.get("kind")) for row in ux.get("deliverables", []) if isinstance(row, dict)]
+    table.add_row("deliverables", ", ".join(deliverables[:5]) or "none yet")
+    return Panel(table, title="Current Focus", box=box.ASCII, border_style=_status_border(str(ux.get("user_state") or "")))
+
+
 def _scorecard_panel(payload: dict[str, Any]) -> Panel:
     scorecard = payload.get("evidence_scorecard") if isinstance(payload.get("evidence_scorecard"), dict) else {}
     table = Table.grid(expand=True)
@@ -886,9 +927,12 @@ def _status_text(status: str) -> Text:
         "running": "bold cyan",
         "awaiting_approval": "bold yellow",
         "awaiting_provider_action": "bold yellow",
+        "needs_action": "bold yellow",
+        "needs_approval": "bold yellow",
         "paused_budget": "bold yellow",
         "blocked": "bold red",
         "failed": "bold red",
+        "deliverable": "bold green",
         "skipped": "dim",
     }
     return Text(status, style=styles.get(status, "white"))
