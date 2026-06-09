@@ -46,3 +46,8 @@ def test_ux_overview_collects_action_center_items() -> None:
     assert overview["counts"]["needs_attention"] == 1
     assert [item["kind"] for item in overview["action_center"]] == ["provider_action", "approval"]
     assert overview["headline"] == "2 item(s) need your attention"
+    assert overview["current_status"]["waiting_provider_action"] == 1
+    assert {column["id"] for column in overview["task_board"]} == {"todo", "running", "waiting", "needs_review", "done", "failed"}
+    assert overview["task_board"][2]["tasks"][0]["task_id"] == "run_ux"
+    assert "provider" in overview["filters"]
+    assert "final_report" in overview["artifact_center"]["kinds"]

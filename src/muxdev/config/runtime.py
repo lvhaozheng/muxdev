@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import shutil
+import subprocess
+import tempfile
 import tomllib
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..daemon.paths import DEFAULT_API_PORT, DEFAULT_HOST, DEFAULT_UI_PORT
 from ..providers.registry import ProviderProbe, detect_providers
+from ..storage import MemoryStore
 from .loader import ConfigSource, deep_merge, load_config
 
 
@@ -383,8 +388,8 @@ def setup_muxdev(
 ) -> dict[str, Any]:
     env = os.environ if env is None else env
     probes = detect_providers()
-    cache = provider_cache_path(env)
     target = project_config_path(workspace) if project else global_config_path(env)
+    cache = (workspace / ".muxdev" / "cache" / "providers.json") if project else provider_cache_path(env)
     config = recommended_config(probes)
     payload: dict[str, Any] = {
         "status": "checked" if check else "configured",
@@ -406,6 +411,12 @@ def setup_muxdev(
     merged = deep_merge(existing, config)
     target.write_text(dumps_toml(merged), encoding="utf-8")
     payload["written"] = True
+    if project:
+        from ..services.product_experience import build_provider_setup_wizard, write_project_context
+
+        provider_setup = build_provider_setup_wizard(workspace, probes=probes)
+        payload["project_context"] = write_project_context(workspace, config=merged, provider_health=provider_setup["provider_health"])
+        payload["provider_setup"] = provider_setup
     if full:
         payload["presets"] = write_full_presets(workspace)
     return payload
@@ -442,7 +453,13 @@ def set_runtime_config_value(workspace: Path, dotted_key: str, value: str, *, pr
     return {"path": str(path), "key": dotted_key, "value": target[parts[-1]]}
 
 
-def config_check(workspace: Path) -> dict[str, Any]:
+def config_check(
+    workspace: Path,
+    *,
+    host: str = DEFAULT_HOST,
+    api_port: int = DEFAULT_API_PORT,
+    ui_port: int = DEFAULT_UI_PORT,
+) -> dict[str, Any]:
     effective = load_runtime_config(workspace)
     warnings: list[str] = []
     errors: list[str] = []
@@ -453,7 +470,208 @@ def config_check(workspace: Path) -> dict[str, Any]:
     legacy = load_config(workspace)
     if "mock" not in legacy.get("providers", {}):
         errors.append("legacy provider config is missing mock")
-    return {"valid": not errors, "errors": errors, "warnings": warnings, "effective": effective}
+
+    checks = first_use_checks(workspace, host=host, api_port=api_port, ui_port=ui_port)
+    for check in checks:
+        status = str(check["status"])
+        message = str(check["summary"])
+        if status == "fail":
+            errors.append(message)
+        elif status == "warn":
+            warnings.append(message)
+    return {"valid": not errors, "errors": errors, "warnings": warnings, "effective": effective, "checks": checks}
+
+
+def first_use_checks(
+    workspace: Path,
+    *,
+    host: str = DEFAULT_HOST,
+    api_port: int = DEFAULT_API_PORT,
+    ui_port: int = DEFAULT_UI_PORT,
+    probes: list[ProviderProbe] | None = None,
+) -> list[dict[str, object]]:
+    """Return the guided first-use health checklist used by `muxdev doctor`."""
+    workspace = workspace.resolve()
+    probes = detect_providers() if probes is None else probes
+    checks = [
+        _daemon_check(host=host, api_port=api_port),
+        _provider_check(probes),
+        _git_check(workspace),
+        _port_check("api_port", "API port", host=host, port=api_port, expect_muxdev=True),
+        _port_check("dashboard_port", "Dashboard port", host=host, port=ui_port, expect_muxdev=False),
+        _memory_check(workspace),
+        _worktree_check(workspace),
+        _mock_provider_check(),
+    ]
+    return checks
+
+
+def _check(check_id: str, label: str, status: str, summary: str, fix: str = "", details: dict[str, object] | None = None) -> dict[str, object]:
+    return {
+        "id": check_id,
+        "label": label,
+        "status": status,
+        "summary": summary,
+        "fix": fix,
+        "details": details or {},
+    }
+
+
+def _daemon_check(*, host: str, api_port: int) -> dict[str, object]:
+    from ..daemon.process import daemon_health, daemon_status
+
+    status = daemon_status()
+    health = daemon_health(host=host, api_port=api_port)
+    if health.get("ok"):
+        return _check(
+            "daemon",
+            "Daemon",
+            "pass",
+            f"daemon is reachable at {health.get('url')}",
+            details={"process": status, "health": health},
+        )
+    if status.get("running"):
+        return _check(
+            "daemon",
+            "Daemon",
+            "warn",
+            f"daemon pid {status.get('pid')} exists but API is not healthy",
+            "Run `muxdev serve --restart`.",
+            {"process": status, "health": health},
+        )
+    return _check(
+        "daemon",
+        "Daemon",
+        "warn",
+        "daemon is not running",
+        "Run `muxdev start` before submitting real daemon tasks.",
+        {"process": status, "health": health},
+    )
+
+
+def _provider_check(probes: list[ProviderProbe]) -> dict[str, object]:
+    external = [probe for probe in probes if probe.provider != "mock"]
+    ready = [probe.provider for probe in external if str(probe.status) == "ready"]
+    installed = [probe.provider for probe in external if probe.installed]
+    if ready:
+        return _check(
+            "providers",
+            "Providers",
+            "pass",
+            f"ready external providers: {', '.join(ready)}",
+            details={"providers": [probe.to_dict() for probe in probes]},
+        )
+    if installed:
+        return _check(
+            "providers",
+            "Providers",
+            "warn",
+            f"installed providers need setup: {', '.join(installed)}",
+            "Run `muxdev provider detect` and `muxdev provider account <provider>`.",
+            {"providers": [probe.to_dict() for probe in probes]},
+        )
+    return _check(
+        "providers",
+        "Providers",
+        "warn",
+        "no external provider CLI is ready; mock provider is still available for demos",
+        "Run `muxdev demo --mock` now, then `muxdev provider install codex` or another provider later.",
+        {"providers": [probe.to_dict() for probe in probes]},
+    )
+
+
+def _git_check(workspace: Path) -> dict[str, object]:
+    if shutil.which("git") is None:
+        return _check("git", "Git repo", "fail", "git is not installed or not on PATH", "Install Git and reopen the terminal.")
+    result = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if result.returncode != 0 or result.stdout.strip() != "true":
+        return _check(
+            "git",
+            "Git repo",
+            "warn",
+            "workspace is not a Git work tree; demo mode can still run in a temporary repo",
+            "Run `git init` or open muxdev from an existing repository.",
+            {"workspace": str(workspace), "stderr": result.stderr.strip()},
+        )
+    branch = subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    return _check("git", "Git repo", "pass", f"workspace is a Git repo on {branch.stdout.strip() or 'detached HEAD'}")
+
+
+def _port_check(check_id: str, label: str, *, host: str, port: int, expect_muxdev: bool) -> dict[str, object]:
+    is_open = _tcp_port_open(host, port)
+    if not is_open:
+        return _check(check_id, label, "pass", f"{host}:{port} is available", details={"host": host, "port": port, "open": False})
+    if expect_muxdev:
+        from ..daemon.process import daemon_health
+
+        health = daemon_health(host=host, api_port=port)
+        if health.get("ok"):
+            return _check(check_id, label, "pass", f"{host}:{port} is serving muxdev", details=health)
+        return _check(
+            check_id,
+            label,
+            "fail",
+            f"{host}:{port} is occupied by something other than muxdev",
+            "Stop the other process or choose another `--api-port`.",
+            {"health": health},
+        )
+    return _check(check_id, label, "pass", f"{host}:{port} is already open; dashboard may be running", details={"host": host, "port": port, "open": True})
+
+
+def _tcp_port_open(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=0.25):
+            return True
+    except OSError:
+        return False
+
+
+def _memory_check(workspace: Path) -> dict[str, object]:
+    try:
+        with MemoryStore(workspace) as store:
+            status = store.status()
+        return _check("memory", "Memory DB", "pass", f"memory DB is readable and writable at {status['path']}", details=status)
+    except Exception as exc:
+        return _check("memory", "Memory DB", "fail", f"memory DB is not usable: {exc}", "Check permissions for `.muxdev/`.", {"error": str(exc)})
+
+
+def _worktree_check(workspace: Path) -> dict[str, object]:
+    root = workspace / ".muxdev" / "worktrees"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        probe = root / ".doctor_write_probe"
+        probe.write_text("ok\n", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return _check("worktree", "Worktrees", "pass", f"worktree root is writable at {root}")
+    except Exception as exc:
+        return _check("worktree", "Worktrees", "fail", f"worktree root is not writable: {exc}", "Check permissions for `.muxdev/worktrees`.", {"error": str(exc)})
+
+
+def _mock_provider_check() -> dict[str, object]:
+    from ..providers.mock import MockProvider
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="muxdev-doctor-") as temp:
+            output = MockProvider().run_stage(stage_id="implement", task="doctor mock smoke", worktree=Path(temp))
+        return _check("mock_provider", "Mock provider", "pass", f"mock provider completed: {output.summary}")
+    except Exception as exc:
+        return _check("mock_provider", "Mock provider", "fail", f"mock provider failed: {exc}", "Reinstall muxdev or run the test suite.", {"error": str(exc)})
 
 
 def _read_toml(path: Path) -> dict[str, Any]:

@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from ..models import ApprovalStatus, ProviderActionStatus
 from ..providers import detect_providers
 from ..services.multirepo import plan_multi_repo_orchestration
+from ..services.product_experience import build_product_experience
 from ..services.ux import build_provider_health, build_setup_status, build_task_ux_summary, build_ux_overview
 from ..storage import MemoryStore
 
@@ -31,7 +32,7 @@ def render_dashboard_html(payload: dict[str, Any]) -> str:
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="refresh" content="5">
-  <title>muxdev task dashboard</title>
+  <title>muxdev Mission Control task detail</title>
   <style>
     :root {{
       color-scheme: light;
@@ -101,7 +102,7 @@ def render_dashboard_html(payload: dict[str, Any]) -> str:
 </head>
 <body>
   <header>
-    <h1>muxdev task dashboard <span class="status {title_status}">{title_status}</span></h1>
+    <h1>muxdev Mission Control <span class="status {title_status}">{title_status}</span></h1>
     <div class="subhead">{_escape(app.get("workspace", ""))}</div>
   </header>
   <main class="layout">
@@ -121,7 +122,7 @@ def render_dashboard_html(payload: dict[str, Any]) -> str:
     {_scorecard_section(payload)}
     {_summary_cards(summary)}
     <section class="panel span-8">
-      <h2>Workflow Timeline</h2>
+      <h2>Task Timeline</h2>
       {_table(payload.get("stages", []), ["stage_id", "role", "status", "started_at", "completed_at", "summary"])}
     </section>
     <section class="panel span-4">
@@ -131,11 +132,11 @@ def render_dashboard_html(payload: dict[str, Any]) -> str:
       {_provider_health(app)}
     </section>
     <section class="panel span-6">
-      <h2>Approvals</h2>
+      <h2>Approval Risk Review</h2>
       {_table(payload.get("approvals", []), ["approval_id", "stage_id", "type", "status", "reason", "decided_at"])}
     </section>
     <section class="panel span-6">
-      <h2>Provider Actions</h2>
+      <h2>Provider Action Wizard</h2>
       {_table(_provider_action_rows(payload.get("provider_actions", [])), ["action_id", "stage_id", "provider", "kind", "status", "prompt", "options", "attach"])}
     </section>
     <section class="panel span-6">
@@ -166,7 +167,7 @@ def render_dashboard_html(payload: dict[str, Any]) -> str:
     <section class="panel span-6">
       <h2>Memory / Guardrails</h2>
       <h3>Memory Context</h3>
-      {_table(payload.get("memory_context", []), ["id", "kind", "role", "claim"])}
+      {_table(payload.get("memory_context", []), ["layer", "scope_id", "id", "kind", "role", "promotion_state", "claim"])}
       <h3>Guardrail Events</h3>
       {_table(payload.get("guardrail_events", []), ["event_id", "tool", "decision", "reason", "created_at"])}
     </section>
@@ -185,7 +186,7 @@ def render_dashboard_html(payload: dict[str, Any]) -> str:
       {_table(payload.get("multi_repo_orchestrations", []), ["orchestration_id", "mode", "status", "task", "plan_path"])}
     </section>
     <section class="panel span-6">
-      <h2>Action Hints</h2>
+      <h2>Next Actions</h2>
       {_action_hints(payload)}
     </section>
     <section class="panel span-6">
@@ -198,7 +199,7 @@ def render_dashboard_html(payload: dict[str, Any]) -> str:
       {_table(payload.get("errors", []), ["stage_id", "type", "message", "created_at"])}
     </section>
     <section class="panel span-6">
-      <h2>Artifacts</h2>
+      <h2>Evidence / Artifacts Center</h2>
       {_table(payload.get("artifacts", []), ["name", "kind", "stage_id", "path", "created_at"])}
     </section>
     <section class="panel span-6">
@@ -483,15 +484,22 @@ def create_app(*, task_manager: object | None = None, paths: object | None = Non
 
     @app.get("/api/setup/status")
     def setup_status() -> dict[str, object]:
-        return build_setup_status(
+        payload = build_setup_status(
             workspace=str(Path.cwd()),
             daemon={**manager.daemon_status(), "status": "ok"},
             provider_health=_provider_health_payload(),
         )
+        payload["product_experience"] = build_product_experience(Path.cwd(), tasks=manager.list_tasks(), provider_health=payload["provider_health"])
+        return payload
 
     @app.get("/api/providers/health")
     def providers_health() -> dict[str, object]:
         return _provider_health_payload()
+
+    @app.get("/api/product/experience")
+    def product_experience(workspace: str | None = None) -> dict[str, object]:
+        root = Path(workspace or Path.cwd()).resolve()
+        return build_product_experience(root, tasks=manager.list_tasks(), provider_health=_provider_health_payload())
 
     @app.post("/api/tasks")
     def create_task(request: TaskCreateRequest) -> dict[str, object]:
@@ -660,6 +668,19 @@ def create_app(*, task_manager: object | None = None, paths: object | None = Non
                 store.detect_contradictions()
             return store.list_contradictions(status=status)
 
+    @app.get("/api/memory/inbox")
+    def memory_inbox(workspace: str | None = None, limit: int = 50) -> dict[str, object]:
+        with MemoryStore(Path(workspace or Path.cwd()).resolve()) as store:
+            return store.inbox(limit=limit)
+
+    @app.post("/api/memory/{memory_id}/promote")
+    def memory_promote(memory_id: str, workspace: str | None = None, layer: str = "project", scope_id: str | None = None) -> dict[str, object]:
+        try:
+            with MemoryStore(Path(workspace or Path.cwd()).resolve()) as store:
+                return store.promote(memory_id, layer=layer, scope_id=scope_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     @app.post("/api/memory/quarantine-auto")
     def memory_quarantine_auto(workspace: str | None = None) -> list[dict[str, object]]:
         with MemoryStore(Path(workspace or Path.cwd()).resolve()) as store:
@@ -732,14 +753,14 @@ def _provider_health_payload() -> dict[str, object]:
 
 
 def render_live_dashboard_html(task_id: str | None = None) -> str:
-    """Render the daemon-backed live task board."""
+    """Render the daemon-backed Mission Control dashboard."""
     initial_hash = f"data-task-id=\"{_escape(task_id)}\"" if task_id else ""
     return f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>muxdev dashboard</title>
+  <title>muxdev Mission Control</title>
   <style>
     :root {{
       color-scheme: light;
@@ -758,12 +779,20 @@ def render_live_dashboard_html(task_id: str | None = None) -> str:
     header {{ padding: 16px 24px; border-bottom: 1px solid var(--line); background: var(--panel); display: flex; gap: 16px; align-items: center; justify-content: space-between; }}
     h1 {{ margin: 0; font-size: 22px; letter-spacing: 0; }}
     h2 {{ margin: 0 0 10px; font-size: 15px; letter-spacing: 0; }}
+    h3 {{ margin: 0 0 8px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0; }}
     button {{ border: 1px solid var(--line); background: #fff; color: var(--ink); border-radius: 6px; padding: 6px 10px; cursor: pointer; }}
     button.primary {{ background: var(--accent); border-color: var(--accent); color: #fff; }}
-    main {{ padding: 18px 24px 28px; display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 16px; }}
+    main {{ padding: 18px 24px 28px; display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 14px; }}
     section {{ min-width: 0; }}
-    .panel, .task {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }}
+    .panel, .task, .card {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }}
+    .span-12 {{ grid-column: span 12; }}
+    .span-8 {{ grid-column: span 8; }}
+    .span-6 {{ grid-column: span 6; }}
+    .span-4 {{ grid-column: span 4; }}
+    .span-3 {{ grid-column: span 3; }}
     .stack {{ display: grid; gap: 10px; }}
+    .metrics {{ display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; }}
+    .metric strong {{ display: block; font-size: 22px; }}
     .task {{ cursor: pointer; }}
     .task.active {{ border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }}
     .meta {{ color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }}
@@ -782,29 +811,75 @@ def render_live_dashboard_html(task_id: str | None = None) -> str:
     .callout.failed {{ border-left-color: var(--bad); background: #fef2f2; }}
     .callout.deliverable {{ border-left-color: var(--good); background: #f0fdf4; }}
     .action-card {{ border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin-bottom: 8px; background: #fff; }}
+    .risk-high {{ border-left: 4px solid var(--bad); }}
+    .risk-medium {{ border-left: 4px solid var(--warn); }}
+    .risk-low {{ border-left: 4px solid var(--accent); }}
+    .board {{ display: grid; grid-template-columns: repeat(6, minmax(190px, 1fr)); gap: 10px; overflow-x: auto; }}
+    .column {{ min-width: 190px; background: #f8fafc; border: 1px solid var(--line); border-radius: 8px; padding: 10px; }}
+    .column h3 {{ display: flex; justify-content: space-between; align-items: center; }}
+    .filter-row {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+    .filter-row span {{ border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; background: #fff; }}
+    .timeline {{ display: grid; gap: 8px; }}
+    .timeline-step {{ display: grid; grid-template-columns: 160px minmax(0,1fr); gap: 10px; align-items: start; border-bottom: 1px solid #edf1f7; padding-bottom: 8px; }}
+    .timeline-step:last-child {{ border-bottom: 0; }}
     .deliverables {{ display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }}
     .deliverables span {{ border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; background: #fff; }}
-    @media (max-width: 860px) {{ main {{ grid-template-columns: 1fr; padding: 14px; }} header {{ padding: 14px; align-items: flex-start; flex-direction: column; }} }}
+    @media (max-width: 1100px) {{ .span-8, .span-6, .span-4, .span-3 {{ grid-column: span 12; }} .metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} }}
+    @media (max-width: 860px) {{ main {{ grid-template-columns: 1fr; padding: 14px; }} header {{ padding: 14px; align-items: flex-start; flex-direction: column; }} .span-12, .span-8, .span-6, .span-4, .span-3 {{ grid-column: span 1; }} .metrics {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
 <body {initial_hash}>
   <header>
     <div>
-      <h1>muxdev dashboard</h1>
-      <div class="meta">local daemon task control plane</div>
+      <h1>muxdev Mission Control</h1>
+      <div class="meta">current status | next actions | task board | timeline | evidence</div>
     </div>
     <div class="meta" id="daemon-status">connecting</div>
   </header>
   <main>
-    <section class="stack">
-      <div class="panel"><h2>Tasks</h2><div id="tasks" class="stack"></div></div>
+    <section class="panel span-12">
+      <h2>Current Status</h2>
+      <div id="current-status" class="metrics"></div>
     </section>
-    <section class="stack">
-      <div class="panel"><h2>Action Center</h2><div id="action-center" class="meta">Loading.</div></div>
-      <div class="panel"><h2>Task Detail</h2><div id="detail" class="meta">Select a task.</div></div>
-      <div class="panel"><h2>Provider Actions</h2><div id="provider-actions"></div></div>
-      <div class="panel"><h2>Approvals</h2><div id="approvals"></div></div>
-      <div class="panel"><h2>Recent Events</h2><pre id="events"></pre></div>
+    <section class="panel span-8">
+      <h2>Action Center</h2>
+      <div id="action-center" class="meta">Loading.</div>
+    </section>
+    <section class="panel span-4">
+      <h2>Filters</h2>
+      <div id="filters" class="stack"></div>
+    </section>
+    <section class="panel span-12">
+      <h2>Product Experience</h2>
+      <div id="product-experience" class="stack"></div>
+    </section>
+    <section class="panel span-12">
+      <h2>Task Board</h2>
+      <div id="task-board" class="board"></div>
+    </section>
+    <section class="panel span-8">
+      <h2>Task Timeline</h2>
+      <div id="timeline" class="timeline meta">Select a task.</div>
+    </section>
+    <section class="panel span-4">
+      <h2>Task Detail</h2>
+      <div id="detail" class="meta">Select a task.</div>
+    </section>
+    <section class="panel span-12">
+      <h2>Evidence / Artifacts Center</h2>
+      <div id="artifacts-center" class="stack"></div>
+    </section>
+    <section class="panel span-6">
+      <h2>Provider Action Wizard</h2>
+      <div id="provider-actions"></div>
+    </section>
+    <section class="panel span-6">
+      <h2>Approval Risk Review</h2>
+      <div id="approvals"></div>
+    </section>
+    <section class="panel span-12">
+      <h2>Recent Events</h2>
+      <pre id="events"></pre>
     </section>
   </main>
   <script>
@@ -824,22 +899,93 @@ def render_live_dashboard_html(task_id: str | None = None) -> str:
       const health = await api('/health');
       document.getElementById('daemon-status').textContent = `tasks=${{health.tasks}} running=${{health.running_tasks}} queue=${{health.queue_length}}`;
       const overview = await optionalApi('/ux/overview', {{ action_center: [], counts: {{}} }});
+      renderCurrentStatus(overview.current_status || {{}}, overview.counts || {{}});
       renderActionCenter(overview.action_center || []);
+      renderFilters(overview.filters || {{}});
+      renderTaskBoard(overview.task_board || []);
+      renderProductExperience(await optionalApi('/product/experience', null));
       const tasks = await api('/tasks');
       if (!state.taskId && tasks.length) state.taskId = tasks[0].task_id;
-      renderTasks(tasks);
       renderProviderActions(await optionalApi('/provider-actions?status=pending', []));
       renderApprovals(await api('/approvals?status=pending'));
-      if (state.taskId) renderDetail(await api('/tasks/' + encodeURIComponent(state.taskId)));
+      if (state.taskId) {{
+        const detail = await api('/tasks/' + encodeURIComponent(state.taskId));
+        renderDetail(detail);
+        renderTimeline(detail);
+        renderArtifactsCenter(detail, overview.artifact_center || {{}});
+      }} else {{
+        renderArtifactsCenter({{}}, overview.artifact_center || {{}});
+      }}
     }}
-    function renderTasks(tasks) {{
-      document.getElementById('tasks').innerHTML = tasks.map(task => `
-        <div class="task ${{task.task_id === state.taskId ? 'active' : ''}}" onclick="state.taskId='${{esc(task.task_id)}}'; refresh()">
-          <strong>${{esc(task.task_id)}}</strong> <span class="${{statusClass(task.status)}}">${{esc(task.status)}}</span>
-          <div>${{esc(task.task)}}</div>
-          <div class="meta">profile=${{esc(task.profile || '-')}} gate=${{esc(task.gate || '-')}} stage=${{esc(task.current_stage || '-')}} approvals=${{task.pending_approvals}} provider_actions=${{task.pending_provider_actions || 0}} tokens=${{task.tokens}}</div>
-          <div class="meta">skills=${{esc((task.skills || []).join(', ') || '-')}}</div>
-        </div>`).join('') || '<div class="meta">No tasks yet.</div>';
+    function renderCurrentStatus(status, counts) {{
+      const cards = [
+        ['Running', status.running ?? counts.active ?? 0, 'active tasks'],
+        ['Stuck', status.stuck ?? 0, 'blocked or errored'],
+        ['Provider Actions', status.waiting_provider_action ?? status.pending_provider_actions ?? 0, 'external CLI waits'],
+        ['muxdev Approvals', status.waiting_muxdev_approval ?? status.pending_approvals ?? 0, 'policy gates'],
+        ['Done', (status.recent_completed || []).length, 'recent deliverables']
+      ];
+      document.getElementById('current-status').innerHTML = cards.map(([label, value, hint]) => `
+        <div class="card metric">
+          <h3>${{esc(label)}}</h3>
+          <strong>${{esc(value)}}</strong>
+          <span class="meta">${{esc(hint)}}</span>
+        </div>`).join('');
+    }}
+    function renderFilters(filters) {{
+      const labels = ['provider', 'workflow', 'status', 'branch', 'risk', 'cost'];
+      document.getElementById('filters').innerHTML = labels.map(label => {{
+        const values = filters[label] || [];
+        return `<div><h3>${{esc(label)}}</h3><div class="filter-row">${{values.length ? values.map(value => `<span>${{esc(value)}}</span>`).join('') : '<span>-</span>'}}</div></div>`;
+      }}).join('');
+    }}
+    function renderTaskBoard(columns) {{
+      document.getElementById('task-board').innerHTML = columns.length ? columns.map(column => `
+        <div class="column">
+          <h3><span>${{esc(column.label)}}</span><span>${{(column.tasks || []).length}}</span></h3>
+          <div class="stack">
+            ${{(column.tasks || []).map(task => taskCard(task)).join('') || '<div class="meta">No tasks.</div>'}}
+          </div>
+        </div>`).join('') : '<div class="meta">No tasks yet.</div>';
+    }}
+    function renderProductExperience(payload) {{
+      if (!payload) {{
+        document.getElementById('product-experience').innerHTML = '<div class="meta">Product surface unavailable.</div>';
+        return;
+      }}
+      const setup = payload.provider_setup || {{}};
+      const health = payload.provider_health || {{}};
+      const budget = payload.budget || {{}};
+      const git = payload.git_safety || {{}};
+      const rules = payload.rules_skills || {{}};
+      const context = payload.project_context || {{}};
+      document.getElementById('product-experience').innerHTML = `
+        <div class="metrics">
+          <div class="card metric"><h3>Install</h3><strong>${{esc(payload.quickstart?.one_line_install || '-')}}</strong><span class="meta">${{esc((payload.quickstart?.first_run || []).join(' -> '))}}</span></div>
+          <div class="card metric"><h3>Budget</h3><strong>$${{esc(budget.total_cost_usd ?? 0)}}</strong><span class="meta">${{esc(budget.total_tokens ?? 0)}} tokens, default $${{esc(budget.default_task_budget_usd ?? 0.5)}}</span></div>
+          <div class="card metric"><h3>Providers</h3><strong>${{esc((health.ready || []).join(', ') || 'mock')}}</strong><span class="meta">partial=${{esc((health.partial || []).length || 0)}} unavailable=${{esc((health.unavailable || []).length || 0)}}</span></div>
+          <div class="card metric"><h3>Git Safety</h3><strong>${{esc(git.status || '-')}}</strong><span class="meta">${{esc(git.branch || git.warning || '')}}</span></div>
+          <div class="card metric"><h3>Rules / Skills</h3><strong>${{esc(rules.gate || '-')}}</strong><span class="meta">${{esc((rules.skills || []).length)}} skills, profile=${{esc(rules.profile || '-')}}</span></div>
+        </div>
+        <div class="deliverables">
+          <span>MUXDEV.md: ${{context.exists ? 'ready' : 'missing'}}</span>
+          <span>${{esc(context.command || 'muxdev context --write')}}</span>
+          <span>Kanban filters: provider / workflow / status / branch / risk / cost</span>
+          <span>IDE/Web: ${{esc(payload.web_ui?.ide_plugin || 'optional')}}</span>
+        </div>
+        ${{tableBlock('Provider Setup Steps', setup.steps || [], ['provider','status','installed','action'])}}
+        ${{tableBlock('Git Commands', (git.commands || []).map(command => ({{command}})), ['command'])}}
+        ${{tableBlock('Rules And Skills Commands', (rules.commands || []).map(command => ({{command}})), ['command'])}}
+      `;
+    }}
+    function taskCard(task) {{
+      const id = task.task_id || task.run_id || '';
+      return `<div class="task risk-${{esc(task.risk || 'low')}} ${{id === state.taskId ? 'active' : ''}}" onclick="state.taskId='${{esc(id)}}'; refresh()">
+        <strong>${{esc(id)}}</strong> <span class="${{statusClass(task.status)}}">${{esc(task.status || '-')}}</span>
+        <div>${{esc(task.task || '')}}</div>
+        <div class="meta">provider=${{esc(task.provider || '-')}} workflow=${{esc(task.workflow || '-')}} stage=${{esc(task.current_stage || '-')}}</div>
+        <div class="meta">risk=${{esc(task.risk || '-')}} cost=${{esc(task.cost_usd || 0)}} tokens=${{esc(task.tokens || 0)}} approvals=${{esc(task.pending_approvals || 0)}} actions=${{esc(task.pending_provider_actions || 0)}}</div>
+      </div>`;
     }}
     function renderDetail(payload) {{
       const run = payload.run || {{}};
@@ -857,25 +1003,53 @@ def render_live_dashboard_html(task_id: str | None = None) -> str:
           <button onclick="post('/tasks/${{encodeURIComponent(run.run_id)}}/stop')">Stop</button>
           <button onclick="loadText('/tasks/${{encodeURIComponent(run.run_id)}}/diff','diff')">Diff</button>
           <button onclick="loadText('/tasks/${{encodeURIComponent(run.run_id)}}/report','content')">Report</button>
+          <button onclick="post('/tasks/${{encodeURIComponent(run.run_id)}}/rollback')">Rollback point</button>
         </div>
         ${{scorecardBlock(payload.evidence_scorecard)}}
-        <h2>Timeline</h2>
-        <table><thead><tr><th>Stage</th><th>Role</th><th>Status</th><th>Summary</th></tr></thead><tbody>
-        ${{stages.map(row => `<tr><td>${{esc(row.stage_id)}}</td><td>${{esc(row.role)}}</td><td>${{esc(row.status)}}</td><td>${{esc(row.summary)}}</td></tr>`).join('')}}
-        </tbody></table>
-        ${{tableBlock('Evidence', payload.evidence_bundles || [], ['stage_id','bundle_hash','path'])}}
-        ${{tableBlock('Evidence Items', payload.evidence_items || [], ['evidence_id','kind','strength','claim','human_summary'])}}
-        ${{tableBlock('Memory Context', payload.memory_context || [], ['id','kind','role','claim'])}}
+        ${{tableBlock('Memory Context', payload.memory_context || [], ['layer','scope_id','id','kind','role','promotion_state','claim'])}}
+        ${{tableBlock('Provider Attempts', payload.provider_attempts || [], ['stage_id','role','provider','attempt','status','failure_kind','summary'])}}
         ${{tableBlock('Role Sessions', payload.session_capsules || [], ['stage_id','provider','kind','status','path'])}}
-        ${{tableBlock('Feedback / CI Rescue', payload.feedback_events || [], ['feedback_id','kind','status','route_to','content'])}}
+        ${{tableBlock('Feedback Router', payload.feedback_events || [], ['feedback_id','kind','status','route_to','content'])}}
+        ${{tableBlock('CI Rescue', payload.ci_rescues || [], ['rescue_id','feedback_id','rescue_run_id','route_to','status','summary'])}}
         ${{tableBlock('CAS Cache', payload.cache_entries || [], ['cache_key','kind','path','value_hash'])}}
         ${{tableBlock('Skill Lock', payload.skill_locks || [], ['skill_name','skill_hash','status','path'])}}
-        ${{tableBlock('Plugin Manifests', payload.plugin_manifests || [], ['plugin_name','trust','status','manifest_hash'])}}
-        ${{tableBlock('Guardrails', payload.guardrail_events || [], ['tool','decision','reason','created_at'])}}
+        ${{tableBlock('Plugin Manifest', payload.plugin_manifests || [], ['plugin_name','trust','status','manifest_hash'])}}
+        ${{tableBlock('Guardrail Events', payload.guardrail_events || [], ['tool','decision','reason','created_at'])}}
         ${{tableBlock('Parallel Conflicts', payload.parallel_conflicts || [], ['conflict_id','severity','status','stages','files'])}}
         ${{tableBlock('Semantic Merge Reviews', payload.semantic_merge_reviews || [], ['review_id','decision','patch_hash','path'])}}
         ${{tableBlock('Provider Learning', payload.provider_learning || [], ['provider','role','attempts','successes','failures','human_actions','score'])}}
-        ${{tableBlock('Multi-Repo Orchestration', payload.multi_repo_orchestrations || [], ['orchestration_id','mode','status','task','plan_path'])}}`;
+        ${{tableBlock('Multi-Repo Orchestration', payload.multi_repo_orchestrations || [], ['orchestration_id','mode','status','task','plan_path'])}}
+        ${{tableBlock('Rollback Snapshots', payload.snapshots || [], ['stage_id','snapshot_id','path','created_at'])}}`;
+    }}
+    function renderTimeline(payload) {{
+      const stages = payload.stages || [];
+      document.getElementById('timeline').innerHTML = stages.length ? stages.map(row => `
+        <div class="timeline-step">
+          <div><strong>${{esc(row.stage_id)}}</strong><div class="meta">${{esc(row.role || '-')}}</div></div>
+          <div><span class="${{statusClass(row.status)}}">${{esc(row.status || '-')}}</span><div>${{esc(row.summary || '')}}</div><div class="meta">${{esc(row.started_at || '')}} ${{esc(row.completed_at || '')}}</div></div>
+        </div>`).join('') : '<div class="meta">No timeline yet.</div>';
+    }}
+    function renderArtifactsCenter(payload, overviewCenter) {{
+      const recent = (overviewCenter.recent_completed || []).map(item => `
+        <div class="action-card">
+          <strong>${{esc(item.task_id)}}</strong>
+          <div>${{esc(item.task || '')}}</div>
+          <div class="actions">
+            <button onclick="loadText('${{esc(item.report_endpoint || '')}}'.replace('/api',''),'content')">Report</button>
+            <button onclick="loadText('${{esc(item.diff_endpoint || '')}}'.replace('/api',''),'diff')">Diff</button>
+          </div>
+        </div>`).join('');
+      const parts = [
+        tableBlock('Final Reports / Artifacts', payload.artifacts || [], ['name','kind','stage_id','path','created_at']),
+        tableBlock('Test Output', payload.test_results || [], ['stage_id','passed','command','summary']),
+        tableBlock('Provider Transcript', payload.session_capsules || [], ['stage_id','provider','kind','status','path']),
+        tableBlock('Stage Contracts', payload.stage_contracts || [], ['stage_id','contract_hash','path']),
+        tableBlock('Evidence Bundles', payload.evidence_bundles || [], ['stage_id','bundle_hash','path']),
+        tableBlock('Evidence Items', payload.evidence_items || [], ['evidence_id','kind','strength','claim','human_summary']),
+        tableBlock('Semantic Merge Result', payload.semantic_merge_reviews || [], ['review_id','decision','patch_hash','path']),
+        tableBlock('Rollback Points', payload.snapshots || [], ['stage_id','snapshot_id','path','created_at'])
+      ];
+      document.getElementById('artifacts-center').innerHTML = `${{recent ? `<h3>Recently Completed</h3>${{recent}}` : ''}}${{parts.join('')}}`;
     }}
     function renderActionCenter(rows) {{
       document.getElementById('action-center').innerHTML = rows.length ? rows.map(row => `
@@ -921,27 +1095,54 @@ def render_live_dashboard_html(task_id: str | None = None) -> str:
         <h2>Missing Evidence</h2><ul>${{missing}}</ul>`;
     }}
     function renderApprovals(rows) {{
-      document.getElementById('approvals').innerHTML = rows.length ? `<table><thead><tr><th>ID</th><th>Task</th><th>Type</th><th>Action</th></tr></thead><tbody>${{rows.map(row => `<tr><td>${{esc(row.approval_id)}}</td><td>${{esc(row.run_id)}}</td><td>${{esc(row.type)}}</td><td><button class="primary" onclick="post('/approvals/${{encodeURIComponent(row.approval_id)}}/approve')">Approve</button> <button onclick="post('/approvals/${{encodeURIComponent(row.approval_id)}}/deny')">Deny</button></td></tr>`).join('')}}</tbody></table>` : '<div class="meta">No pending approvals.</div>';
+      document.getElementById('approvals').innerHTML = rows.length ? rows.map(row => `
+        <div class="action-card risk-medium">
+          <h3>Approval Required</h3>
+          <strong>${{esc(row.type || 'policy gate')}}</strong>
+          <div>${{esc(row.reason || 'A muxdev policy gate needs a decision.')}}</div>
+          <div class="meta">Task=${{esc(row.run_id || row.task_id || '-')}} Stage=${{esc(row.stage_id || '-')}} Approval=${{esc(row.approval_id)}}</div>
+          <ul>
+            <li>Files: ${{esc(row.files || row.files_json || 'review diff/evidence')}}</li>
+            <li>Shell: ${{esc(row.shell || row.command || 'unknown')}}</li>
+            <li>Network: ${{esc(row.network || 'unknown')}} Dependencies: ${{esc(row.dependencies || 'unknown')}}</li>
+            <li>Delete/secret/database/deploy risk: ${{esc(row.risk || row.subject_hash || 'check evidence')}}</li>
+            <li>Rollback point: ${{esc(row.rollback || 'available from task snapshots when recorded')}}</li>
+          </ul>
+          <div class="actions">
+            <button class="primary" onclick="post('/approvals/${{encodeURIComponent(row.approval_id)}}/approve')">Approve</button>
+            <button onclick="post('/approvals/${{encodeURIComponent(row.approval_id)}}/deny')">Deny</button>
+            <button onclick="loadText('/tasks/${{encodeURIComponent(row.run_id || row.task_id)}}/diff','diff')">View diff</button>
+            <button onclick="state.taskId='${{esc(row.run_id || row.task_id || '')}}'; refresh()">View evidence</button>
+          </div>
+        </div>`).join('') : '<div class="meta">No pending approvals.</div>';
     }}
     function renderProviderActions(rows) {{
-      document.getElementById('provider-actions').innerHTML = rows.length ? `<table><thead><tr><th>ID</th><th>Task</th><th>Prompt</th><th>Attach / Actions</th></tr></thead><tbody>${{rows.map(row => `
-        <tr>
-          <td>${{esc(row.action_id)}}<div class="meta">${{esc(row.kind)}} / ${{esc(row.provider)}} / ${{esc(row.stage_id || '-')}}</div></td>
-          <td>${{esc(row.run_id)}}</td>
-          <td>${{esc(row.prompt_text)}}<div class="meta">options=${{esc((row.options || []).map(option => option.label || option.value).join(', ') || '-')}}</div></td>
-          <td>
-            <code>${{esc(row.attach_command || row.transcript_path || '-')}}</code>
-            <div class="actions">
-              <button class="primary" onclick="post('/tasks/${{encodeURIComponent(row.run_id)}}/actions/${{encodeURIComponent(row.action_id)}}/handled-and-continue')">Handled + continue</button>
-              <button onclick="post('/provider-actions/${{encodeURIComponent(row.action_id)}}/handled')">Mark handled</button>
-              <button onclick="post('/provider-actions/${{encodeURIComponent(row.action_id)}}/dismiss')">Dismiss</button>
-              <button onclick="post('/tasks/${{encodeURIComponent(row.run_id)}}/stop')">Stop task</button>
-            </div>
-          </td>
-        </tr>`).join('')}}</tbody></table>` : '<div class="meta">No pending provider actions.</div>';
+      document.getElementById('provider-actions').innerHTML = rows.length ? rows.map(row => {{
+        const attach = row.attach_command || row.transcript_path || '';
+        const options = (row.options || []).map(option => option.label || option.value).join(', ') || '-';
+        return `<div class="action-card risk-medium">
+          <h3>Provider Action Required</h3>
+          <strong>${{esc(row.provider || 'provider')}}</strong>
+          <div class="meta">Reason=${{esc(row.kind || 'provider prompt')}} Task=${{esc(row.run_id || '-')}} Stage=${{esc(row.stage_id || '-')}}</div>
+          <p>${{esc(row.prompt_text || '')}}</p>
+          <div class="meta">Options: ${{esc(options)}}</div>
+          <ol>
+            <li>Open provider session <code>${{esc(attach || '-')}}</code></li>
+            <li>Handle the prompt in the provider CLI.</li>
+            <li>Return here and continue.</li>
+          </ol>
+          <div class="actions">
+            <button onclick="copyText('${{esc(attach)}}')">Copy attach command</button>
+            <button class="primary" onclick="post('/tasks/${{encodeURIComponent(row.run_id)}}/actions/${{encodeURIComponent(row.action_id)}}/handled-and-continue')">Mark handled and continue</button>
+            <button onclick="post('/provider-actions/${{encodeURIComponent(row.action_id)}}/dismiss')">Dismiss</button>
+            <button onclick="post('/tasks/${{encodeURIComponent(row.run_id)}}/stop')">Stop task</button>
+          </div>
+        </div>`;
+      }}).join('') : '<div class="meta">No pending provider actions.</div>';
     }}
     async function post(path) {{ await api(path, {{ method: 'POST' }}); await refresh(); }}
     async function loadText(path, key) {{ const payload = await api(path); document.getElementById('events').textContent = payload[key] || ''; }}
+    async function copyText(value) {{ if (navigator.clipboard && value) await navigator.clipboard.writeText(value); }}
     function connectEvents() {{
       const socket = new WebSocket(`${{location.protocol === 'https:' ? 'wss' : 'ws'}}://${{location.host}}/events`);
       socket.onmessage = event => {{ state.events.push(event.data); state.events = state.events.slice(-20); document.getElementById('events').textContent = state.events.join('\\n'); refresh().catch(() => {{}}); }};

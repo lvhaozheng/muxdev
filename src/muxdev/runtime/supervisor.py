@@ -464,6 +464,20 @@ class SupervisorRuntime:
                 stage_skills = _skills_for_stage(skills, role=stage.role, stage_id=stage.id)
                 if stage_skills:
                     trace.write("skills_activated", stage=stage.id, role=stage.role, skills=[skill.get("name") for skill in stage_skills])
+                context_packet_path, context_packet_hash = _write_context_packet(
+                    blackboard,
+                    run_dir=run_dir,
+                    run_id=run_id,
+                    stage_id=stage.id,
+                    role=stage.role,
+                    provider=stage_provider,
+                    workflow=workflow.name,
+                    task=task,
+                    worktree=worktree,
+                    skills=stage_skills,
+                    automation=automation,
+                    trace=trace,
+                )
                 output, attempt = _run_provider_stage_with_attempts(
                     blackboard,
                     trace,
@@ -472,7 +486,7 @@ class SupervisorRuntime:
                     role=stage.role,
                     provider=stage_provider,
                     provider_impl=provider_impl,
-                    task=bound_task,
+                    task=_task_with_context_packet(bound_task, context_packet_path, context_packet_hash),
                     worktree=worktree,
                     skills=stage_skills,
                     session_dir=run_dir / "provider_sessions",
@@ -853,6 +867,20 @@ class SupervisorRuntime:
                     stage_skills = _skills_for_stage(skills, role=stage.role, stage_id=stage.id)
                     if stage_skills:
                         trace.write("skills_activated", stage=stage.id, role=stage.role, skills=[skill.get("name") for skill in stage_skills])
+                    context_packet_path, context_packet_hash = _write_context_packet(
+                        blackboard,
+                        run_dir=run_dir,
+                        run_id=run_id,
+                        stage_id=stage.id,
+                        role=stage.role,
+                        provider=stage_provider,
+                        workflow=workflow.name,
+                        task=task,
+                        worktree=worktree,
+                        skills=stage_skills,
+                        automation=automation,
+                        trace=trace,
+                    )
                     attempt = _next_provider_attempt(blackboard, run_id, stage.id, stage_provider)
                     blackboard.start_provider_attempt(run_id, stage.id, provider=stage_provider, role=stage.role, attempt=attempt)
                     trace.write("provider_attempt_started", stage=stage.id, provider=stage_provider, attempt=attempt)
@@ -860,7 +888,7 @@ class SupervisorRuntime:
                         _run_provider_stage,
                         provider_impl,
                         stage_id=stage.id,
-                        task=bound_task,
+                        task=_task_with_context_packet(bound_task, context_packet_path, context_packet_hash),
                         worktree=worktree,
                         skills=stage_skills,
                         session_dir=run_dir / "provider_sessions",
@@ -1447,8 +1475,170 @@ def _task_with_memory_context(task: str, automation: dict[str, object]) -> str:
     for item in memory_items:
         if not isinstance(item, dict):
             continue
-        lines.append(f"- {item.get('id', 'memory')}: {item.get('claim', '')}")
+        if str(item.get("status") or "").lower() == "quarantined" or str(item.get("promotion_state") or "").lower() == "quarantined":
+            continue
+        layer = item.get("layer") or item.get("scope") or "project"
+        scope_id = item.get("scope_id") or "global"
+        lines.append(f"- [{layer}:{scope_id}] {item.get('id', 'memory')}: {item.get('claim', '')}")
     return "\n".join(lines)
+
+
+def _task_with_context_packet(task: str, packet_path: Path, packet_hash: str) -> str:
+    return "\n".join(
+        [
+            task,
+            "",
+            "# muxdev Context Packet",
+            f"- path: {packet_path}",
+            f"- hash: {packet_hash}",
+        ]
+    )
+
+
+def _write_context_packet(
+    blackboard: Blackboard,
+    *,
+    run_dir: Path,
+    run_id: str,
+    stage_id: str,
+    role: str | None,
+    provider: str,
+    workflow: str,
+    task: str,
+    worktree: Path,
+    skills: list[dict[str, object]],
+    automation: dict[str, object],
+    trace: TraceWriter,
+) -> tuple[Path, str]:
+    packet = _build_context_packet(
+        run_id=run_id,
+        stage_id=stage_id,
+        role=role,
+        provider=provider,
+        workflow=workflow,
+        task=task,
+        worktree=worktree,
+        skills=skills,
+        automation=automation,
+        provider_attempts=[
+            row
+            for row in blackboard.table_rows("provider_attempts", run_id=run_id)
+            if row.get("stage_id") == stage_id
+        ],
+    )
+    body = redact(json.dumps(packet, ensure_ascii=False, indent=2, sort_keys=True))
+    digest = sha256_text(body)
+    packet["context_packet_hash"] = digest
+    packet["hash_algorithm"] = "sha256:redacted-json"
+    body = redact(json.dumps(packet, ensure_ascii=False, indent=2, sort_keys=True))
+    path = run_dir / "context_packets" / f"{stage_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body + "\n", encoding="utf-8")
+    blackboard.add_artifact(run_id, stage_id, path.name, path, "context_packet")
+    _record_ledger(
+        blackboard,
+        run_dir,
+        run_id,
+        "context_packet_written",
+        stage_id=stage_id,
+        payload={"context_packet_hash": digest, "path": str(path), "memory_refs": _memory_refs(automation)},
+    )
+    trace.write("context_packet_written", stage=stage_id, context_packet_hash=digest, path=str(path))
+    return path, digest
+
+
+def _build_context_packet(
+    *,
+    run_id: str,
+    stage_id: str,
+    role: str | None,
+    provider: str,
+    workflow: str,
+    task: str,
+    worktree: Path,
+    skills: list[dict[str, object]],
+    automation: dict[str, object],
+    provider_attempts: list[dict[str, object]],
+) -> dict[str, object]:
+    memory_items = _context_memory_items(automation)
+    grouped = _memory_by_layer(memory_items)
+    return {
+        "schema": "muxdev.context_packet.v1",
+        "session": {
+            "temporary_context": grouped.get("session", []),
+        },
+        "task": {
+            "task_id": run_id,
+            "workflow": workflow,
+            "current_stage": stage_id,
+            "role": role,
+            "provider": provider,
+            "task": task,
+            "worktree": str(worktree),
+            "previous_attempts": provider_attempts,
+            "skills": [skill.get("name") for skill in skills if isinstance(skill, dict)],
+        },
+        "run": {
+            "task_memory": grouped.get("run", []),
+        },
+        "branch": {
+            "feature_memory": grouped.get("branch", []),
+        },
+        "project": {
+            "long_term_memory": grouped.get("project", []),
+            "workspace_memory": grouped.get("workspace", []),
+            "review_required": [
+                item
+                for item in memory_items
+                if item.get("layer") in {"project", "workspace", "user"} and item.get("promotion_state") != "approved"
+            ],
+        },
+        "user_preferences": {
+            "memory": grouped.get("user", []),
+        },
+        "memory_policy": {
+            "excluded_statuses": ["quarantined"],
+            "promotion_required_for_project_context": True,
+            "temporary_layers": ["session", "run", "branch"],
+            "memory_refs": _memory_refs(automation),
+        },
+    }
+
+
+def _context_memory_items(automation: dict[str, object]) -> list[dict[str, object]]:
+    memory_items = automation.get("memory_context", []) if isinstance(automation, dict) else []
+    if not isinstance(memory_items, list):
+        return []
+    result: list[dict[str, object]] = []
+    for item in memory_items:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("status") or "").lower() == "quarantined":
+            continue
+        if str(item.get("promotion_state") or "").lower() == "quarantined":
+            continue
+        result.append(
+            {
+                "id": item.get("id"),
+                "layer": item.get("layer") or item.get("scope") or "project",
+                "scope_id": item.get("scope_id"),
+                "kind": item.get("kind"),
+                "role": item.get("role"),
+                "claim": item.get("claim"),
+                "promotion_state": item.get("promotion_state") or item.get("status"),
+                "source_type": item.get("source_type"),
+                "source_uri": item.get("source_uri"),
+                "evidence": item.get("evidence", []),
+            }
+        )
+    return result
+
+
+def _memory_by_layer(memory_items: list[dict[str, object]]) -> dict[str, list[dict[str, object]]]:
+    grouped: dict[str, list[dict[str, object]]] = {}
+    for item in memory_items:
+        grouped.setdefault(str(item.get("layer") or "project"), []).append(item)
+    return grouped
 
 
 def _record_design_pack(
@@ -1710,6 +1900,12 @@ def _memory_refs(automation: dict[str, object]) -> list[str]:
     refs: list[str] = []
     if isinstance(memory_items, list):
         for item in memory_items:
+            if not isinstance(item, dict) or not item.get("id"):
+                continue
+            if str(item.get("status") or "").lower() == "quarantined":
+                continue
+            if str(item.get("promotion_state") or "").lower() == "quarantined":
+                continue
             if isinstance(item, dict) and item.get("id"):
                 refs.append(str(item["id"]))
     return refs

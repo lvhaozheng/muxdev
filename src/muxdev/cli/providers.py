@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Annotated
 
 import typer
@@ -10,6 +11,7 @@ from rich.table import Table
 
 from ..daemon.paths import DEFAULT_API_PORT, DEFAULT_HOST
 from ..providers import detect_providers, probe_provider
+from ..services.product_experience import build_provider_setup_wizard
 from ..ui.render import provider_table
 from .common import _account_command, _daemon_client, _install_provider_command, _print_json
 
@@ -42,6 +44,27 @@ def provider_list(
 ) -> None:
     """List all known providers and their current status."""
     provider_detect(json_output=json_output)
+
+
+@provider_app.command("setup")
+def provider_setup(
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit machine-readable JSON."),
+    ] = False,
+) -> None:
+    """Show the provider setup wizard with install, login, and doctor steps."""
+    probes = detect_providers()
+    payload = build_provider_setup_wizard(Path.cwd(), probes=probes)
+    if json_output:
+        _print_json(payload)
+        return
+    table = Table(title="Provider Setup Wizard")
+    for column in ("provider", "status", "installed", "action"):
+        table.add_column(column)
+    for row in payload["steps"]:
+        table.add_row(str(row["provider"]), str(row["status"]), str(row["installed"]), str(row["action"]))
+    console.print(table)
 
 
 @provider_app.command("doctor")

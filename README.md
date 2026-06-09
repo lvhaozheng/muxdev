@@ -27,21 +27,49 @@ Current scope: **P0-P4 implemented**.
 - **Rollback and recovery**: isolated worktrees, stage snapshots, reports, traces, session capsules, and resumable runs.
 - **Dashboard/TUI/API**: local daemon, Web Dashboard, terminal UI, JSON output, and automation-friendly APIs.
 
-## Quick Start
+## 3-Minute Quick Start
+
+Start here even if you have no AI provider CLI installed yet. The built-in
+`mock` provider runs a deterministic offline workflow, so you can see the full
+task lifecycle, report, diff, evidence, and TUI before connecting Codex, Claude
+Code, Qwen, or another provider.
+
+```powershell
+pipx install muxdev
+# or: uv tool install muxdev
+
+muxdev setup --project
+muxdev provider setup
+muxdev demo --mock
+muxdev
+```
+
+When developing from this repository, use:
 
 ```powershell
 cd D:\jianzhi\lyuShao\muxdev
 python -m pip install -e ".[test]"
+muxdev setup --project
+```
 
-muxdev setup --project --yes
-muxdev start
-muxdev provider detect
+After setup:
+
+```powershell
 muxdev "fix the failing login test"
-muxdev dev "add rate limiting and tests" --provider mock --json
 muxdev status latest
 muxdev evidence latest
 muxdev dashboard
+muxdev experience
 ```
+
+What this does:
+
+- `muxdev setup --project` writes safe defaults and creates `MUXDEV.md` as the project context anchor.
+- `muxdev provider setup` shows install, login, and doctor steps for every provider.
+- `muxdev doctor` checks daemon health, provider CLIs, Git, API/Dashboard ports, memory DB, worktree writes, and the mock provider.
+- `muxdev demo --mock` runs a complete offline task without external accounts.
+- `muxdev` opens the guided daemon TUI. You can type a task in plain English or use slash commands such as `/doctor`, `/dev`, `/actions`, `/approvals`, and `/report`.
+- `muxdev experience` summarizes install, provider health, budget, Git safety, rules, skills, and web/IDE extension surfaces.
 
 Default local URLs:
 
@@ -54,11 +82,20 @@ If the CLI or TUI returns a daemon 404 after code changes, restart the local dae
 muxdev serve --restart
 ```
 
+### Provider Actions Vs muxdev Approvals
+
+These are intentionally different safety gates:
+
+- **Provider Action** means an external provider CLI is waiting for you, such as a permission prompt, login, rate-limit recovery, or blocked terminal session. muxdev shows the reason and attach command, but it does not type `yes/no` into provider CLIs. Handle the provider prompt yourself, then use `muxdev action handled <id>` or the Dashboard's handled-and-continue action.
+- **muxdev Approval** means muxdev itself is asking you to review risk before it proceeds, such as writing files, running shell commands, merging, using network access, installing dependencies, or touching sensitive areas. Review the evidence and diff, then approve or deny from the CLI, TUI, or Dashboard.
+
 ## Common Commands
 
 ```powershell
 muxdev "fix the failing login test"
+muxdev init --wizard
 muxdev doctor
+muxdev demo --mock
 muxdev design "design persistent project memory"
 muxdev design --simple "design a small snake game"
 muxdev dev "add Redis rate limiting"
@@ -112,6 +149,19 @@ muxdev actions --status pending --json
 muxdev continue latest
 ```
 
+## Memory Governance
+
+muxdev separates temporary context from long-term memory. Session, run, and branch memory stay scoped until reviewed; project, workspace, and user memory require explicit promotion before they become durable provider context.
+
+```powershell
+muxdev memory status
+muxdev memory inbox
+muxdev memory query "pytest" --layers project,workspace,user
+muxdev memory promote mem_123 --layer project
+```
+
+Before each provider stage, muxdev writes a context packet to `context_packets/<stage>.json`, records the packet hash in the ledger, and excludes quarantined or contradictory memory from the provider task.
+
 ## Providers
 
 muxdev uses provider CLIs as execution backends while keeping workflow state, approvals, evidence, and recovery in muxdev. The built-in `mock` provider is deterministic and useful for smoke tests.
@@ -132,7 +182,15 @@ muxdev dashboard
 muxdev tui
 ```
 
-The Dashboard opens as a task cockpit: Action Center first, Current Focus for the selected task, then task timeline, evidence, report, diff, and advanced inspection tables. Provider actions explain why muxdev paused, where to handle the external CLI prompt, and provide a `Handled + continue` action after you finish in the provider session.
+The Dashboard opens as **muxdev Mission Control**, not just a task list. The first screen is organized around:
+
+- **Current Status**: running tasks, stuck tasks, provider actions, muxdev approvals, and recent completed deliverables.
+- **Action Center**: the next concrete action translated from daemon/provider state.
+- **Task Board**: Todo / Running / Waiting / Needs Review / Done / Failed with provider, workflow, status, branch, risk, and cost filters.
+- **Task Timeline**: stage lifecycle plus current stage, provider attempts, memory context, rollback snapshots, and advanced state.
+- **Evidence / Artifacts Center**: final reports, diffs, test output, provider transcripts, stage contracts, evidence bundles, snapshots, rollback points, and semantic merge results.
+
+Provider actions are rendered as a card-style wizard: copy the attach command, handle the external provider CLI prompt yourself, then click `Mark handled and continue`. muxdev approvals are rendered as risk-review cards with approve/deny, diff, and evidence actions.
 
 The TUI accepts natural-language tasks by default: type `fix the failing login test` and muxdev submits the default dev flow. Slash commands remain available for expert actions. It does not type `yes/no` into provider CLIs; for Provider Actions, handle the provider CLI/session first, then mark the action handled and continue.
 
@@ -157,6 +215,7 @@ GET  /api/providers/health
 - [P1 Acceptance](docs/p1_trusted_delivery_ready.md): trusted delivery loop.
 - [P2 Acceptance](docs/p2_runtime_safety_provider_ready.md): runtime safety and provider handoff.
 - [P3 Acceptance](docs/p3_ecosystem_automation_ready.md): feedback, cache, skill, plugin, and guardrail loop.
+- [P4 Product Experience Acceptance](docs/p4_product_experience_ready.md): one-line setup, provider wizard, MUXDEV.md, budget, Git safety, rules, skills, and web UI surface.
 - [P4 Acceptance](docs/p4_advanced_parallel_learning_ready.md): parallel, semantic merge, learning, memory quarantine, and multi-repo planning.
 
 ## Development

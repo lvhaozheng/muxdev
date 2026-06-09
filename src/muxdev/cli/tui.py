@@ -12,6 +12,7 @@ from rich.panel import Panel
 
 from .. import __version__
 from ..clients.daemon import DaemonClient, DaemonConnectionError
+from ..config.runtime import config_check as runtime_config_check
 from ..config.runtime import resolve_task_request
 from ..daemon.paths import DEFAULT_API_PORT, DEFAULT_HOST, DEFAULT_UI_PORT
 from ..daemon.process import start_daemon
@@ -92,6 +93,7 @@ def _start_daemon_tui(run_id: str = "latest", *, host: str = DEFAULT_HOST, port:
         "/report": "Show report: /report [task-id]",
         "/diff": "Show diff: /diff [task-id]",
         "/dashboard": "Print Dashboard URL",
+        "/doctor": "Run first-use readiness checks",
         "/start": "Start daemon in the background",
         "/quit": "Exit TUI",
     }
@@ -191,6 +193,19 @@ def _handle_daemon_tui_command(
     if text == "/start":
         payload = start_daemon(host=host, api_port=port, ui_port=DEFAULT_UI_PORT)
         return "\n".join(f"{key}: {value}" for key, value in payload.items()), None
+    if text == "/doctor":
+        payload = runtime_config_check(Path.cwd(), host=host, api_port=port, ui_port=DEFAULT_UI_PORT)
+        rows = payload.get("checks", [])
+        if not isinstance(rows, list):
+            rows = []
+        lines = [f"valid: {payload.get('valid')}"]
+        lines.extend(
+            f"{str(row.get('status', '-')).upper():<5} {row.get('label', row.get('id', '-'))}: {row.get('summary', '-')}"
+            for row in rows
+            if isinstance(row, dict)
+        )
+        lines.append("Fast path: muxdev demo --mock")
+        return "\n".join(lines), None
     if text == "/dashboard":
         return f"Dashboard: http://{host}:{DEFAULT_UI_PORT}\nAPI: http://{host}:{port}", None
 
@@ -281,7 +296,7 @@ def _handle_daemon_tui_command(
 
 def _daemon_error_hint(exc: DaemonConnectionError) -> str:
     if getattr(exc, "suggest_start", False):
-        return "Run `muxdev start` to launch the local service."
+        return "Run `muxdev doctor` to check setup, or `muxdev start` to launch the local service."
     if _provider_actions_api_missing(exc):
         return _provider_actions_restart_hint()
     return "The daemon answered but the request failed. Check `muxdev serve --status` and the daemon log."

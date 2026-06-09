@@ -66,8 +66,25 @@ def test_daemon_api_task_lifecycle_and_websocket() -> None:
     assert "daemon api smoke" in report["content"]
     assert attach["handoff"]["command"]
     assert rollback["status"] in {"rolled_back", "failed"}
-    assert "<title>muxdev dashboard</title>" in page
+    assert "<title>muxdev Mission Control</title>" in page
     assert hello["type"] == "hello"
+
+
+def test_live_dashboard_renders_mission_control_sections() -> None:
+    from muxdev.api.web import render_live_dashboard_html
+
+    html = render_live_dashboard_html("run_demo")
+
+    assert "muxdev Mission Control" in html
+    assert "Current Status" in html
+    assert "Action Center" in html
+    assert "Task Board" in html
+    assert "Task Timeline" in html
+    assert "Provider Action Wizard" in html
+    assert "Approval Risk Review" in html
+    assert "Evidence / Artifacts Center" in html
+    assert "Copy attach command" in html
+    assert "Mark handled and continue" in html
 
 
 def test_dashboard_provider_health_uses_cache_without_probe(monkeypatch) -> None:

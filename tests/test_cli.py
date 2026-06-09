@@ -141,7 +141,48 @@ def test_doctor_json_reports_runtime_config() -> None:
 
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
-    assert {"valid", "errors", "warnings", "effective"} <= set(payload)
+    assert {"valid", "errors", "warnings", "effective", "checks"} <= set(payload)
+    assert {
+        "daemon",
+        "providers",
+        "git",
+        "api_port",
+        "dashboard_port",
+        "memory",
+        "worktree",
+        "mock_provider",
+    } <= {item["id"] for item in payload["checks"]}
+
+
+def test_demo_mock_runs_complete_offline() -> None:
+    temp_dir = _workspace_temp()
+    try:
+        with _chdir(temp_dir):
+            result = runner.invoke(app, ["demo", "--mock", "--json"])
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["provider"] == "mock"
+    assert payload["status"] == "completed"
+    assert payload["report"]
+
+
+def test_init_wizard_writes_project_config_and_next_steps() -> None:
+    temp_dir = _workspace_temp()
+    try:
+        with _chdir(temp_dir):
+            result = runner.invoke(app, ["init", "--wizard", "--json"])
+            config_exists = Path(".muxdev/config.toml").exists()
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["setup"]["scope"] == "project"
+    assert config_exists
+    assert "muxdev demo --mock" in payload["next"]
 
 
 def test_dev_submits_daemon_task_with_resolved_main_path_options(monkeypatch) -> None:

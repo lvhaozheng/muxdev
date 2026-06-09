@@ -77,6 +77,7 @@ DAEMON_COMMAND_GROUPS: dict[str, list[tuple[str, str]]] = {
     "System": [
         ("/refresh", "refresh daemon summary"),
         ("/start", "start daemon"),
+        ("/doctor", "run first-use readiness checks"),
         ("/help", "show this menu"),
         ("/quit", "exit TUI"),
     ],

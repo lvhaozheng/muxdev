@@ -12,6 +12,17 @@ from typing import Any
 
 
 TERMINAL_STATUSES = {"completed", "blocked", "aborted"}
+WAITING_STATUSES = {"awaiting_approval", "awaiting_provider_action", "paused_budget"}
+FAILED_STATUSES = {"blocked", "aborted", "failed"}
+DONE_STATUSES = {"completed"}
+BOARD_COLUMNS = {
+    "todo": "Todo",
+    "running": "Running",
+    "waiting": "Waiting",
+    "needs_review": "Needs Review",
+    "done": "Done",
+    "failed": "Failed",
+}
 
 
 @dataclass(frozen=True)
@@ -291,9 +302,11 @@ def build_ux_overview(
     needs_attention = [task for task in tasks if int(task.get("pending_approvals") or 0) or int(task.get("pending_provider_actions") or 0) or int(task.get("errors") or 0)]
     active = [task for task in tasks if str(task.get("status")) not in TERMINAL_STATUSES]
     latest = selected_task or (tasks[0] if tasks else None)
+    task_board = _task_board(tasks)
     return {
         "headline": _overview_headline(action_items, active),
         "daemon": daemon,
+        "current_status": _current_status(tasks, approvals, provider_actions, daemon),
         "counts": {
             "tasks": len(tasks),
             "active": len(active),
@@ -302,6 +315,9 @@ def build_ux_overview(
             "provider_actions": len(provider_actions),
         },
         "action_center": action_items,
+        "task_board": task_board,
+        "filters": _task_filters(tasks),
+        "artifact_center": _overview_artifact_center(tasks),
         "tasks": tasks,
         "selected_task": latest,
     }
@@ -408,3 +424,121 @@ def _overview_headline(action_items: list[dict[str, Any]], active: list[dict[str
     if active:
         return f"{len(active)} task(s) are running"
     return "Ready for a new task"
+
+
+def _current_status(
+    tasks: list[dict[str, Any]],
+    approvals: list[dict[str, Any]],
+    provider_actions: list[dict[str, Any]],
+    daemon: dict[str, Any],
+) -> dict[str, Any]:
+    running = [task for task in tasks if str(task.get("status")) == "running"]
+    waiting_provider = [task for task in tasks if int(task.get("pending_provider_actions") or 0) > 0 or str(task.get("status")) == "awaiting_provider_action"]
+    waiting_approval = [task for task in tasks if int(task.get("pending_approvals") or 0) > 0 or str(task.get("status")) == "awaiting_approval"]
+    stuck = [task for task in tasks if str(task.get("status")) in FAILED_STATUSES or int(task.get("errors") or 0) > 0]
+    completed = [task for task in tasks if str(task.get("status")) in DONE_STATUSES]
+    latest_completed = completed[:5]
+    return {
+        "daemon": daemon,
+        "running": len(running),
+        "stuck": len(stuck),
+        "waiting_provider_action": len(waiting_provider),
+        "waiting_muxdev_approval": len(waiting_approval),
+        "pending_provider_actions": len(provider_actions),
+        "pending_approvals": len(approvals),
+        "recent_completed": [
+            {
+                "task_id": task.get("task_id") or task.get("run_id"),
+                "task": task.get("task"),
+                "provider": task.get("provider"),
+                "workflow": task.get("workflow"),
+                "cost_usd": task.get("cost_usd", 0),
+                "tokens": task.get("tokens", 0),
+            }
+            for task in latest_completed
+        ],
+    }
+
+
+def _task_board(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    buckets = {key: [] for key in BOARD_COLUMNS}
+    for task in tasks:
+        buckets[_board_column(task)].append(_board_task(task))
+    return [{"id": key, "label": label, "tasks": buckets[key]} for key, label in BOARD_COLUMNS.items()]
+
+
+def _board_column(task: dict[str, Any]) -> str:
+    status = str(task.get("status") or "")
+    if status in DONE_STATUSES:
+        return "done"
+    if status in FAILED_STATUSES or int(task.get("errors") or 0) > 0:
+        return "failed"
+    if status in WAITING_STATUSES or int(task.get("pending_approvals") or 0) or int(task.get("pending_provider_actions") or 0):
+        return "waiting"
+    if status in {"needs_review", "review"} or str(task.get("current_stage") or "") == "review":
+        return "needs_review"
+    if status in {"created", "queued", "pending"}:
+        return "todo"
+    return "running" if status else "todo"
+
+
+def _board_task(task: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "task_id": task.get("task_id") or task.get("run_id"),
+        "task": task.get("task"),
+        "status": task.get("status"),
+        "provider": task.get("provider"),
+        "workflow": task.get("workflow"),
+        "branch": task.get("branch") or task.get("worktree"),
+        "risk": task.get("risk") or _task_risk(task),
+        "cost_usd": task.get("cost_usd", 0),
+        "tokens": task.get("tokens", 0),
+        "pending_approvals": task.get("pending_approvals", 0),
+        "pending_provider_actions": task.get("pending_provider_actions", 0),
+        "current_stage": task.get("current_stage"),
+    }
+
+
+def _task_filters(tasks: list[dict[str, Any]]) -> dict[str, list[str]]:
+    return {
+        "provider": _unique(task.get("provider") for task in tasks),
+        "workflow": _unique(task.get("workflow") for task in tasks),
+        "status": _unique(task.get("status") for task in tasks),
+        "branch": _unique(task.get("branch") or task.get("worktree") for task in tasks),
+        "risk": _unique(_task_risk(task) for task in tasks),
+        "cost": ["0", "0-0.50", "0.50+"],
+    }
+
+
+def _overview_artifact_center(tasks: list[dict[str, Any]]) -> dict[str, Any]:
+    completed = [task for task in tasks if str(task.get("status")) in DONE_STATUSES]
+    return {
+        "recent_completed": [
+            {
+                "task_id": task.get("task_id") or task.get("run_id"),
+                "task": task.get("task"),
+                "report_endpoint": f"/api/tasks/{task.get('task_id') or task.get('run_id')}/report",
+                "diff_endpoint": f"/api/tasks/{task.get('task_id') or task.get('run_id')}/diff",
+                "tokens": task.get("tokens", 0),
+                "cost_usd": task.get("cost_usd", 0),
+            }
+            for task in completed[:8]
+        ],
+        "kinds": ["final_report", "diff", "test_result", "provider_transcript", "stage_contract", "snapshot", "rollback_point", "semantic_merge_result"],
+    }
+
+
+def _task_risk(task: dict[str, Any]) -> str:
+    status = str(task.get("status") or "")
+    if status in FAILED_STATUSES or int(task.get("errors") or 0) > 0:
+        return "high"
+    if int(task.get("pending_approvals") or 0) or int(task.get("pending_provider_actions") or 0):
+        return "medium"
+    if float(task.get("cost_usd") or 0) > 0.5:
+        return "medium"
+    return "low"
+
+
+def _unique(values: object) -> list[str]:
+    result = sorted({str(value) for value in values if value not in {None, ""}})
+    return result

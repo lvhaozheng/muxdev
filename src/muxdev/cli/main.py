@@ -19,6 +19,7 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from .. import __version__
 from ..clients.daemon import DaemonConnectionError
@@ -54,6 +55,7 @@ from ..services.dashboard import dashboard_path, write_run_dashboard
 from ..services.flows import FlowRegistry
 from ..services.multirepo import plan_multi_repo_orchestration
 from ..services.provider_learning import refresh_provider_learning
+from ..services.product_experience import build_product_experience, write_project_context
 from ..services.workflow_plugins import get_workflow_plugin, list_workflow_plugins, render_plugin_command
 from ..services.skill_engine import (
     add_skill,
@@ -338,29 +340,206 @@ def setup(
         f"providers cache: {payload['providers_cache']}",
         f"written: {payload['written']}",
     ]
+    context = payload.get("project_context")
+    if isinstance(context, dict):
+        lines.append(f"project context: {context.get('path')} ({'written' if context.get('written') else 'kept'})")
+    provider_setup = payload.get("provider_setup")
+    if isinstance(provider_setup, dict):
+        steps = provider_setup.get("steps", [])
+        if isinstance(steps, list):
+            lines.append(f"provider setup steps: {len(steps)}")
     console.print(Panel("\n".join(lines), title="muxdev setup"))
 
 
-@app.command()
-def doctor(
+@app.command("init")
+def init_wizard(
+    wizard: Annotated[bool, typer.Option("--wizard", help="Run the guided first-use setup flow.")] = True,
+    global_scope: Annotated[bool, typer.Option("--global", help="Write ~/.muxdev/config.toml instead of project config.")] = False,
+    full: Annotated[bool, typer.Option("--full", help="Also materialize advanced preset files.")] = False,
+    host: Annotated[str, typer.Option("--host", help="Daemon API host for checks.")] = DEFAULT_HOST,
+    api_port: Annotated[int, typer.Option("--api-port", help="Daemon API port for checks.")] = DEFAULT_API_PORT,
+    ui_port: Annotated[int, typer.Option("--ui-port", help="Dashboard port for checks.")] = DEFAULT_UI_PORT,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
-    """Check muxdev project configuration and local control-plane readiness."""
-    payload = runtime_config_check(Path.cwd())
+    """Guided first-use setup for a workspace."""
+    setup_payload = setup_muxdev(Path.cwd(), global_config=global_scope, project=not global_scope, yes=True, full=full)
+    doctor_payload = runtime_config_check(Path.cwd(), host=host, api_port=api_port, ui_port=ui_port)
+    payload = {
+        "status": "ready" if doctor_payload["valid"] else "needs_attention",
+        "wizard": wizard,
+        "setup": setup_payload,
+        "doctor": doctor_payload,
+        "next": [
+            "muxdev demo --mock",
+            "muxdev start",
+            'muxdev dev "describe your first task"',
+        ],
+    }
     if json_output:
         _print_json(payload)
         return
     lines = [
+        "Guided setup complete.",
+        f"config: {setup_payload['target']}",
+        f"status: {payload['status']}",
+        "",
+        "Next:",
+        "  1. muxdev demo --mock",
+        "  2. muxdev start",
+        '  3. muxdev dev "describe your first task"',
+    ]
+    console.print(Panel("\n".join(lines), title="muxdev init"))
+    _print_doctor_checks(doctor_payload)
+
+
+@app.command()
+def doctor(
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    api_port: Annotated[int, typer.Option("--api-port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    ui_port: Annotated[int, typer.Option("--ui-port", help="Dashboard port.")] = DEFAULT_UI_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Check first-use readiness for daemon, providers, Git, memory, ports, and mock demo."""
+    payload = runtime_config_check(Path.cwd(), host=host, api_port=api_port, ui_port=ui_port)
+    if json_output:
+        _print_json(payload)
+        return
+    _print_doctor_checks(payload)
+
+
+@app.command()
+def demo(
+    mock: Annotated[bool, typer.Option("--mock/--no-mock", help="Use the deterministic offline mock provider.")] = True,
+    task: Annotated[str, typer.Option("--task", help="Demo task text.")] = "run the first muxdev mock task",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Run a complete offline demo so new users can see muxdev without provider setup."""
+    if not mock:
+        raise typer.BadParameter("demo currently supports the deterministic `--mock` path")
+    provider = "mock"
+    result = SupervisorRuntime(Path.cwd()).run(
+        task,
+        provider=provider,
+        workflow_name="dev",
+        require_approval=set(),
+        profile="solo",
+        gate="auto",
+        depth="simple",
+        topology="solo",
+        automation={"intent": "dev", "depth": "simple", "topology": "solo", "roles": ["code", "test", "review"]},
+    )
+    payload = {
+        "run_id": result.run_id,
+        "status": str(result.status),
+        "provider": provider,
+        "run_dir": str(result.run_dir),
+        "report": str(result.report_path) if result.report_path else None,
+        "next": [
+            f"muxdev report {result.run_id}",
+            f"muxdev diff {result.run_id}",
+            "muxdev start",
+        ],
+    }
+    if json_output:
+        _print_json(payload)
+        return
+    lines = [
+        f"Demo run: {result.run_id}",
+        f"status: {result.status}",
+        f"provider: {provider}",
+        f"run dir: {result.run_dir}",
+    ]
+    if result.report_path:
+        lines.append(f"report: {result.report_path}")
+    lines.extend(
+        [
+            "",
+            "Next:",
+            f"  muxdev report {result.run_id}",
+            f"  muxdev diff {result.run_id}",
+            "  muxdev start",
+        ]
+    )
+    console.print(Panel("\n".join(lines), title="muxdev demo"))
+
+
+@app.command("context")
+def context_file(
+    write: Annotated[bool, typer.Option("--write", help="Create or update MUXDEV.md.")] = False,
+    overwrite: Annotated[bool, typer.Option("--overwrite", help="Overwrite an existing MUXDEV.md.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Show or create the project context file used by muxdev."""
+    if write or overwrite:
+        payload = write_project_context(Path.cwd(), overwrite=overwrite)
+    else:
+        payload = build_product_experience(Path.cwd())["project_context"]
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel("\n".join(f"{key}: {value}" for key, value in payload.items() if key != "preview"), title="MUXDEV.md"))
+
+
+@app.command("experience")
+def product_experience(
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Show the polished product surface: install, setup, budget, safety, skills, and providers."""
+    payload = build_product_experience(Path.cwd())
+    if json_output:
+        _print_json(payload)
+        return
+    quickstart = payload["quickstart"]
+    budget = payload["budget"]
+    git = payload["git_safety"]
+    lines = [
+        f"install: {quickstart['one_line_install']}",
+        f"first run: {' -> '.join(quickstart['first_run'])}",
+        f"budget: ${budget['total_cost_usd']} / {budget['total_tokens']} tokens",
+        f"git: {git['status']}",
+        f"context: {payload['project_context']['path']}",
+        "",
+        "Next:",
+        "  muxdev setup --project",
+        "  muxdev provider setup",
+        "  muxdev dashboard",
+    ]
+    console.print(Panel("\n".join(lines), title="muxdev product experience"))
+
+
+def _print_doctor_checks(payload: dict[str, object]) -> None:
+    checks = payload.get("checks", [])
+    table = Table(title="First-use readiness")
+    table.add_column("Status")
+    table.add_column("Check")
+    table.add_column("Result")
+    table.add_column("Fix")
+    for row in checks if isinstance(checks, list) else []:
+        if not isinstance(row, dict):
+            continue
+        status = str(row.get("status") or "-")
+        style = {"pass": "green", "warn": "yellow", "fail": "red"}.get(status, "white")
+        table.add_row(
+            Text(status.upper(), style=style),
+            str(row.get("label") or row.get("id") or "-"),
+            str(row.get("summary") or "-"),
+            str(row.get("fix") or ""),
+        )
+    console.print(table)
+    lines = [
         f"valid: {payload['valid']}",
         f"errors: {len(payload.get('errors', []))}",
         f"warnings: {len(payload.get('warnings', []))}",
-        f"profile: {payload.get('effective', {}).get('profile', '-')}",
-        f"gate: {payload.get('effective', {}).get('gate', '-')}",
+        f"profile: {payload.get('effective', {}).get('profile', '-') if isinstance(payload.get('effective'), dict) else '-'}",
+        f"gate: {payload.get('effective', {}).get('gate', '-') if isinstance(payload.get('effective'), dict) else '-'}",
     ]
-    for error in payload.get("errors", []):
-        lines.append(f"error: {error}")
-    for warning in payload.get("warnings", []):
-        lines.append(f"warning: {warning}")
+    if payload.get("errors"):
+        lines.append("")
+        lines.extend(f"error: {error}" for error in payload.get("errors", []) if error)
+    if payload.get("warnings"):
+        lines.append("")
+        lines.extend(f"warning: {warning}" for warning in payload.get("warnings", []) if warning)
+    lines.extend(["", "Fast path: `muxdev demo --mock` works without external providers."])
     console.print(Panel("\n".join(lines), title="muxdev doctor"))
 
 
@@ -670,6 +849,12 @@ def memory_status(
     counts = payload.get("counts", {})
     if isinstance(counts, dict):
         lines.extend(f"{key}: {value}" for key, value in sorted(counts.items()))
+    layers = payload.get("layers", {})
+    if isinstance(layers, dict) and layers:
+        lines.append("layers: " + ", ".join(f"{key}={value}" for key, value in sorted(layers.items())))
+    inbox = payload.get("inbox", {})
+    if isinstance(inbox, dict) and inbox:
+        lines.append("inbox: " + ", ".join(f"{key}={value}" for key, value in sorted(inbox.items())))
     console.print(Panel("\n".join(lines), title="muxdev memory status"))
 
 
@@ -677,20 +862,22 @@ def memory_status(
 def memory_query(
     query: Annotated[str, typer.Argument(help="Text to search in active project memory.")] = "",
     status: Annotated[str, typer.Option("--status", help="Memory status to search.")] = "active",
+    layers: Annotated[str | None, typer.Option("--layers", help="Comma-separated memory layers to include.")] = None,
+    scope_ids: Annotated[str | None, typer.Option("--scope-ids", help="Comma-separated scope ids to include.")] = None,
     limit: Annotated[int, typer.Option("--limit", help="Maximum rows to return.")] = 8,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     """Search evidence-grounded project memory."""
     with MemoryStore(Path.cwd()) as store:
-        rows = store.query(query, status=status, limit=limit)
+        rows = store.query(query, status=status, layers=_csv_values(layers), scope_ids=_csv_values(scope_ids), limit=limit)
     if json_output:
         _print_json(rows)
         return
     table = Table(title="muxdev memory query")
-    for column in ("id", "status", "kind", "role", "claim"):
+    for column in ("layer", "scope_id", "id", "status", "promotion_state", "kind", "role", "claim"):
         table.add_column(column)
     for row in rows:
-        table.add_row(*(str(row.get(column) or "") for column in ("id", "status", "kind", "role", "claim")))
+        table.add_row(*(str(row.get(column) or "") for column in ("layer", "scope_id", "id", "status", "promotion_state", "kind", "role", "claim")))
     console.print(table)
 
 
@@ -708,6 +895,48 @@ def memory_propose(
         _print_json(rows)
         return
     console.print(Panel("\n".join(f"{row['id']}: {row['claim']}" for row in rows), title="muxdev memory propose"))
+
+
+@memory_app.command("inbox")
+def memory_inbox(
+    limit: Annotated[int, typer.Option("--limit", help="Maximum rows per inbox bucket.")] = 50,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Review proposed, promotable, contradictory, quarantined, and expired memory."""
+    with MemoryStore(Path.cwd()) as store:
+        payload = store.inbox(limit=limit)
+    if json_output:
+        _print_json(payload)
+        return
+    lines: list[str] = []
+    for key, value in payload.items():
+        if isinstance(value, list):
+            lines.append(f"{key}: {len(value)}")
+            for row in value[:5]:
+                if isinstance(row, dict):
+                    ident = row.get("id") or row.get("contradiction_id") or "item"
+                    label = row.get("claim") or row.get("reason") or row.get("status") or ""
+                    lines.append(f"  {ident}: {label}")
+    console.print(Panel("\n".join(lines) or "empty", title="muxdev memory inbox"))
+
+
+@memory_app.command("promote")
+def memory_promote(
+    memory_id: Annotated[str, typer.Argument(help="Memory item id.")],
+    layer: Annotated[str, typer.Option("--layer", help="Target layer: project/workspace/user.")] = "project",
+    scope_id: Annotated[str | None, typer.Option("--scope-id", help="Optional target scope id.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Promote reviewed session/run/branch memory into a long-term layer."""
+    try:
+        with MemoryStore(Path.cwd()) as store:
+            payload = store.promote(memory_id, layer=layer, scope_id=scope_id)
+    except KeyError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(f"{payload['id']}: {payload['layer']} / {payload['status']}", title="muxdev memory promote"))
 
 
 @memory_app.command("approve")
@@ -2616,6 +2845,13 @@ def _resolve_run_id(run_id: str) -> str:
     if not latest:
         raise typer.BadParameter("no muxdev runs found")
     return latest
+
+
+def _csv_values(value: str | None) -> list[str] | None:
+    if not value:
+        return None
+    items = [item.strip() for item in value.split(",") if item.strip()]
+    return items or None
 
 
 def _resolve_evidence_run(run_id: str) -> tuple[str, Path]:
