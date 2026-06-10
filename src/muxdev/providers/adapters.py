@@ -18,6 +18,7 @@ from typing import Any
 from ..config.loader import load_config, path_config
 from ..core.redaction import redact
 from ..clients.sessions import HeadlessSubprocessBackend
+from .contracts import ProviderCapabilities, ProviderDescriptor, ProviderRuntimeKind
 from .mock import MockProvider
 
 
@@ -54,6 +55,7 @@ class ProviderAdapter:
     """Minimal interface implemented by mock and headless CLI providers."""
 
     id = "provider"
+    descriptor = ProviderDescriptor(id="provider")
 
     def run_stage(
         self,
@@ -69,6 +71,13 @@ class ProviderAdapter:
 
 class MockProviderAdapter(ProviderAdapter):
     id = "mock"
+    descriptor = ProviderDescriptor(
+        id="mock",
+        runtime_kind=ProviderRuntimeKind.MOCK,
+        roles=frozenset({"design", "code", "test", "review"}),
+        capabilities=ProviderCapabilities(),
+        metadata={"builtin": True},
+    )
 
     def __init__(self) -> None:
         self._mock = MockProvider()
@@ -110,6 +119,12 @@ class HeadlessCliProviderAdapter(ProviderAdapter):
         self.timeout = timeout
         self.prompt_template = prompt_template
         self.backend = HeadlessSubprocessBackend()
+        self.descriptor = ProviderDescriptor(
+            id=provider_id,
+            commands=tuple(command),
+            runtime_kind=ProviderRuntimeKind.HEADLESS_CLI,
+            metadata={"timeout": timeout},
+        )
 
     def run_stage(
         self,

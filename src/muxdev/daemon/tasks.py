@@ -11,16 +11,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..application import TaskRuntimeService
 from ..clients.sessions import TmuxBackend
 from ..core.platforms import follow_file_command, hidden_subprocess_kwargs
+from ..domain import RunSpec
 from ..models import ApprovalStatus, ProviderActionStatus, RunStatus
 from ..runtime import SupervisorRuntime, new_run_id
 from ..services.dashboard import build_run_dashboard_payload, startup_dashboard_payload
 from ..services.feedback import route_feedback
 from ..services.provider_learning import refresh_provider_learning
 from ..services.provider_scores import build_provider_scores
-from ..storage import Blackboard, compact_trace, read_trace
+from ..storage import Blackboard
+from ..storage.repositories import ProviderActionsRepository, RunsRepository
+from ..storage.read_models import DashboardReadModel
+from .event_bus import EventBus
 from .paths import DaemonPaths, default_daemon_paths
+from .queue import TaskQueue
 
 
 TERMINAL_STATUSES = {str(RunStatus.COMPLETED), str(RunStatus.BLOCKED), str(RunStatus.ABORTED)}
@@ -34,8 +40,12 @@ class TaskManager:
     lock: threading.RLock = field(default_factory=threading.RLock)
     workers: dict[str, threading.Thread] = field(default_factory=dict)
     subscribers: set[asyncio.Queue[dict[str, Any]]] = field(default_factory=set)
+    queue: TaskQueue = field(init=False)
+    events: EventBus = field(init=False)
 
     def __post_init__(self) -> None:
+        self.queue = TaskQueue(lock=self.lock, workers=self.workers)
+        self.events = EventBus(subscribers=self.subscribers)
         self.paths.ensure()
         with self.board() as board:
             board.list_runs()
@@ -61,70 +71,51 @@ class TaskManager:
         topology: str | None = None,
         automation: dict[str, object] | None = None,
     ) -> dict[str, Any]:
-        task_id = new_run_id()
+        spec = RunSpec.from_submit_payload(
+            task=task,
+            workspace=workspace,
+            provider=provider,
+            workflow=workflow,
+            run_id=new_run_id(),
+            profile=profile,
+            gate=gate,
+            require_approval=require_approval,
+            max_cost_usd=max_cost_usd,
+            role_providers=role_providers,
+            skills=skills,
+            ci_block_on_approval=ci_block_on_approval,
+            depth=depth,
+            topology=topology,
+            automation=automation,
+        )
+        task_id = spec.run_id
         run_dir = self.paths.runs_dir / task_id
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "task_context.json").write_text(
-            json.dumps(
-                {
-                    "profile": profile,
-                    "gate": gate,
-                    "skills": skills or [],
-                    "role_providers": role_providers or {},
-                    "ci_block_on_approval": ci_block_on_approval,
-                    "depth": depth,
-                    "topology": topology,
-                    "automation": automation or {},
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
+            json.dumps(spec.task_context(), ensure_ascii=False, indent=2)
             + "\n",
             encoding="utf-8",
         )
         with self.board() as board:
-            board.create_run(
-                run_id=task_id,
-                task=task,
-                workflow=workflow,
-                provider=provider,
-                workspace=workspace,
-                worktree=run_dir / "worktree",
-            )
+            RunsRepository(board).create(spec, worktree=run_dir / "worktree")
         thread = threading.Thread(
             target=self._run_task,
-            args=(task_id, workspace, task),
-            kwargs={
-                "provider": provider,
-                "workflow": workflow,
-                "profile": profile,
-                "gate": gate,
-                "require_approval": require_approval or set(),
-                "max_cost_usd": max_cost_usd,
-                "role_providers": role_providers or {},
-                "skills": skills or [],
-                "ci_block_on_approval": ci_block_on_approval,
-                "depth": depth,
-                "topology": topology,
-                "automation": automation or {},
-            },
+            args=(spec,),
             name=f"muxdev-task-{task_id}",
             daemon=True,
         )
-        with self.lock:
-            self.workers[task_id] = thread
-        thread.start()
+        self.queue.start(task_id, thread)
         self.broadcast({"type": "task_submitted", "task_id": task_id})
         return {
             "task_id": task_id,
             "run_id": task_id,
             "status": str(RunStatus.CREATED),
             "dashboard_url": f"/tasks/{task_id}",
-            "profile": profile,
-            "gate": gate,
-            "depth": depth,
-            "topology": topology,
-            "skills": [skill.get("name") for skill in skills or [] if isinstance(skill, dict)],
+            "profile": spec.profile,
+            "gate": spec.gate,
+            "depth": spec.depth,
+            "topology": spec.topology,
+            "skills": [skill.name for skill in spec.skills],
         }
 
     def continue_task(self, task_id: str | None = None, *, max_cost_usd: float = 0.5) -> dict[str, Any]:
@@ -132,7 +123,7 @@ class TaskManager:
         run = self.get_run(resolved)
         workspace = Path(run["workspace"])
         with self.board() as board:
-            pending_actions = board.list_provider_actions(status=str(ProviderActionStatus.PENDING), run_id=resolved)
+            pending_actions = ProviderActionsRepository(board).list_pending(resolved)
             if pending_actions:
                 board.set_run_status(resolved, RunStatus.AWAITING_PROVIDER_ACTION)
                 return {
@@ -148,12 +139,8 @@ class TaskManager:
             name=f"muxdev-continue-{resolved}",
             daemon=True,
         )
-        with self.lock:
-            existing = self.workers.get(resolved)
-            if existing and existing.is_alive():
-                return {"task_id": resolved, "run_id": resolved, "status": "already_running"}
-            self.workers[resolved] = thread
-        thread.start()
+        if not self.queue.start_if_idle(resolved, thread):
+            return {"task_id": resolved, "run_id": resolved, "status": "already_running"}
         self.broadcast({"type": "task_continue_requested", "task_id": resolved})
         return {"task_id": resolved, "run_id": resolved, "status": "continue_requested"}
 
@@ -172,12 +159,15 @@ class TaskManager:
         resolved = self.resolve_task_id(task_id)
         run_dir = self.paths.runs_dir / resolved
         with self.board() as board:
-            payload = build_run_dashboard_payload(Path(board.get_run(resolved)["workspace"]), run_dir, resolved, board)
-        payload["task_id"] = resolved
-        payload["run_id"] = resolved
-        payload["trace"] = compact_trace(read_trace(run_dir))[-50:] if run_dir.exists() else []
-        payload["context"] = self._task_context(resolved)
-        return payload
+            workspace = Path(board.get_run(resolved)["workspace"])
+            return DashboardReadModel(
+                workspace,
+                run_dir,
+                resolved,
+                board,
+                build_run_dashboard_payload,
+                context=self._task_context(resolved),
+            ).load()
 
     def approvals(self, *, status: str | None = None) -> list[dict[str, Any]]:
         with self.board() as board:
@@ -186,7 +176,7 @@ class TaskManager:
     def provider_actions(self, *, status: str | None = None, task_id: str | None = None) -> list[dict[str, Any]]:
         run_id = self.resolve_task_id(task_id) if task_id else None
         with self.board() as board:
-            return board.list_provider_actions(status=status, run_id=run_id)
+            return ProviderActionsRepository(board).list(status=status, run_id=run_id)
 
     def provider_scores(self, *, role: str | None = None) -> list[dict[str, Any]]:
         with self.board() as board:
@@ -292,16 +282,7 @@ class TaskManager:
 
     def update_provider_action(self, action_id: str, status: ProviderActionStatus) -> dict[str, Any]:
         with self.board() as board:
-            match: dict[str, Any] | None = None
-            for row in board.table_rows("provider_actions"):
-                if row["action_id"] == action_id:
-                    match = row
-                    break
-            if match is None:
-                raise KeyError(f"provider action not found: {action_id}")
-            board.update_provider_action_status(action_id, status)
-            match["status"] = str(status)
-            match["updated"] = True
+            match = ProviderActionsRepository(board).mark(action_id, status)
         self.broadcast({"type": "provider_action_updated", "action_id": action_id, "status": str(status)})
         return match
 
@@ -435,75 +416,22 @@ class TaskManager:
             return board.get_run(self.resolve_task_id(task_id))
 
     async def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
-        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        queue.put_nowait({"type": "hello", "message": "muxdev events connected"})
-        self.subscribers.add(queue)
-        return queue
+        return await self.events.subscribe()
 
     def unsubscribe(self, queue: asyncio.Queue[dict[str, Any]]) -> None:
-        self.subscribers.discard(queue)
+        self.events.unsubscribe(queue)
 
     def broadcast(self, event: dict[str, Any]) -> None:
-        for queue in list(self.subscribers):
-            try:
-                queue.put_nowait(event)
-            except Exception:
-                self.subscribers.discard(queue)
+        self.events.publish(event)
 
-    def _run_task(
-        self,
-        task_id: str,
-        workspace: Path,
-        task: str,
-        *,
-        provider: str,
-        workflow: str,
-        profile: str | None,
-        gate: str | None,
-        require_approval: set[str],
-        max_cost_usd: float,
-        role_providers: dict[str, str],
-        skills: list[dict[str, object]],
-        ci_block_on_approval: bool,
-        depth: str | None,
-        topology: str | None,
-        automation: dict[str, object],
-    ) -> None:
-        try:
-            runtime = self._runtime(workspace)
-            result = runtime.run(
-                task,
-                provider=provider,
-                workflow_name=workflow,
-                require_approval=require_approval,
-                max_cost_usd=max_cost_usd,
-                role_providers=role_providers,
-                run_id=task_id,
-                profile=profile,
-                gate=gate,
-                skills=skills,
-                ci_block_on_approval=ci_block_on_approval,
-                depth=depth,
-                topology=topology,
-                automation=automation,
-            )
-            self.broadcast({"type": "task_updated", "task_id": result.run_id, "status": str(result.status)})
-        except Exception as exc:
-            with self.board() as board:
-                board.set_run_status(task_id, RunStatus.BLOCKED)
-                board.add_error(task_id, None, "worker_exception", str(exc))
-            self.broadcast({"type": "task_updated", "task_id": task_id, "status": str(RunStatus.BLOCKED)})
+    def _run_task(self, spec: RunSpec) -> None:
+        self._runtime_service().run(spec)
 
     def _resume_task(self, task_id: str, workspace: Path, *, max_cost_usd: float) -> None:
-        try:
-            runtime = self._runtime(workspace)
-            result = runtime.resume(task_id, max_cost_usd=max_cost_usd)
-            self.broadcast({"type": "task_updated", "task_id": result.run_id, "status": str(result.status)})
-        except Exception as exc:
-            with self.board() as board:
-                board.set_run_status(task_id, RunStatus.BLOCKED)
-                board.add_error(task_id, None, "worker_exception", str(exc))
-            self.broadcast({"type": "task_updated", "task_id": task_id, "status": str(RunStatus.BLOCKED)})
+        self._runtime_service().resume(task_id, workspace, max_cost_usd=max_cost_usd)
+
+    def _runtime_service(self) -> TaskRuntimeService:
+        return TaskRuntimeService(runtime_factory=self._runtime, board_factory=self.board, publish=self.broadcast)
 
     def _runtime(self, workspace: Path) -> SupervisorRuntime:
         return SupervisorRuntime(

@@ -10,7 +10,7 @@ from pathlib import Path
 
 import uvicorn
 
-from ..api.web import create_app
+from ..api.app import create_app
 from .paths import DEFAULT_API_PORT, DEFAULT_HOST, DEFAULT_UI_PORT, default_daemon_paths
 
 
