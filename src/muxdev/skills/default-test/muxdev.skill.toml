@@ -1,0 +1,15 @@
+version = 1
+
+[activation]
+roles = ["test", "tester"]
+auto = true
+
+[permissions]
+read_workspace = true
+write_workspace = false
+shell = true
+network = false
+secrets = false
+
+[trust]
+risk_level = "medium"

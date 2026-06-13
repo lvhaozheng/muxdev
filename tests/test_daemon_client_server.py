@@ -57,17 +57,57 @@ def test_daemon_api_task_lifecycle_and_websocket() -> None:
         page = client.get("/").text
         with client.websocket_connect("/events") as ws:
             hello = ws.receive_json()
+        project_run_dir = workspace / ".muxdev" / "runs" / task_id
+        project_task_context_exists = (project_run_dir / "task_context.json").exists()
+        legacy_global_run_exists = (manager.paths.runs_dir / task_id).exists()
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 
     assert status == "completed"
+    assert project_task_context_exists
+    assert not legacy_global_run_exists
     assert detail["run"]["run_id"] == task_id
+    assert detail["run"]["worktree"].startswith(str(workspace / ".muxdev"))
     assert diff["diff"]
+    assert diff["path"].startswith(str(project_run_dir))
     assert "daemon api smoke" in report["content"]
+    assert report["path"].startswith(str(project_run_dir))
     assert attach["handoff"]["command"]
     assert rollback["status"] in {"rolled_back", "failed"}
     assert "<title>muxdev Mission Control</title>" in page
     assert hello["type"] == "hello"
+
+
+def test_daemon_legacy_global_run_remains_readable() -> None:
+    workspace = _workspace_temp("legacy-global")
+    try:
+        manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())
+        run_dir = manager.paths.runs_dir / "run_legacy_global"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "task_context.json").write_text(json.dumps({"profile": "legacy"}), encoding="utf-8")
+        (run_dir / "diff.patch").write_text("legacy diff", encoding="utf-8")
+        (run_dir / "final_report.md").write_text("legacy report", encoding="utf-8")
+        with manager.board() as board:
+            board.create_run(
+                run_id="run_legacy_global",
+                task="legacy global run",
+                workflow="software-dev",
+                provider="mock",
+                workspace=workspace,
+                worktree=run_dir / "worktree",
+            )
+
+        detail = manager.task_detail("run_legacy_global")
+        diff = manager.diff("run_legacy_global")
+        report = manager.report("run_legacy_global")
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    assert detail["run"]["run_id"] == "run_legacy_global"
+    assert diff["path"] == str(run_dir / "diff.patch")
+    assert diff["diff"] == "legacy diff"
+    assert report["path"] == str(run_dir / "final_report.md")
+    assert report["content"] == "legacy report"
 
 
 def test_live_dashboard_renders_mission_control_sections() -> None:
@@ -76,19 +116,132 @@ def test_live_dashboard_renders_mission_control_sections() -> None:
     html = render_live_dashboard_html("run_demo")
 
     assert "muxdev Mission Control" in html
+    assert "Projects" in html
+    assert "Global Config" in html
+    assert "Workflows" in html
+    assert "Tasks" in html
+    assert "Activity" in html
+    assert "Artifacts" in html
+    assert "Config" in html
     assert "Current Status" in html
     assert "Action Center" in html
+    assert "MCP" in html
+    assert "local stdio" in html
+    assert "tools" in html
+    assert "guarded writes" in html
+    assert "tab-mcp" not in html
     assert "Task Board" in html
     assert "Task Timeline" in html
     assert "Provider Action Wizard" in html
     assert "Approval Risk Review" in html
     assert "Evidence / Artifacts Center" in html
+    assert "project-name" in html
+    assert "project-path" in html
+    assert "project-hide" in html
+    assert "hover-detail" in html
+    assert "/dashboard/overview" in html
     assert "Copy attach command" in html
     assert "Mark handled and continue" in html
 
 
+def test_dashboard_overview_groups_projects_workflows_roles(monkeypatch) -> None:
+    workspace = _workspace_temp("dashboard-overview")
+    try:
+        import muxdev.api.web as web_module
+
+        project = workspace / "project-a"
+        project.mkdir(parents=True)
+        manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())
+        for run_id, task in (("run_dash_1", "ship dashboard"), ("run_dash_2", "polish dashboard")):
+            run_dir = manager.paths.runs_dir / run_id
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "task_context.json").write_text(
+                json.dumps({"profile": "squad", "gate": "safe", "role_providers": {"code": "mock"}, "skills": [{"name": "docs-update", "role": "docs"}]}),
+                encoding="utf-8",
+            )
+            with manager.board() as board:
+                board.create_run(run_id=run_id, task=task, workflow="dev", provider="mock", workspace=project, worktree=project / ".muxdev" / run_id)
+                board.set_run_status(run_id, "running")
+                board.upsert_stage(run_id, "code", role="code", status="running", summary="coding")
+
+        monkeypatch.setattr(web_module, "_provider_health_payload", lambda: {"ready": ["mock"], "partial": [], "unavailable": [], "total": 1, "providers": []})
+        client = TestClient(create_app(task_manager=manager))
+        payload = client.get("/api/dashboard/overview", params={"workspace": str(project)}).json()
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    assert payload["selected_project_id"] == payload["projects"][0]["id"]
+    assert payload["projects"][0]["path"] == str(project.resolve())
+    workflow = payload["projects"][0]["workflows"][0]
+    assert workflow["id"] == "dev"
+    code_group = next(group for group in workflow["role_groups"] if group["role"] == "code")
+    assert {task["task_id"] for task in code_group["tasks"]} == {"run_dash_1", "run_dash_2"}
+    first = next(task for task in code_group["tasks"] if task["task_id"] == "run_dash_1")
+    assert first["diff_endpoint"] == "/api/tasks/run_dash_1/diff"
+    assert payload["global_config"]["role_templates"]
+    assert "plugin_market" not in payload["global_config"]
+    assert payload["global_config"]["workflow_templates"]["templates"]
+    assert "catalog" in payload["global_config"]["skills_catalog"]
+    mcp = payload["global_config"]["mcp"]
+    assert mcp["status"] == "enabled"
+    assert mcp["mode"] == "local stdio"
+    assert mcp["tools_count"] > 0
+    assert mcp["resources_count"] > 0
+    assert mcp["prompts_count"] > 0
+    assert mcp["write_policy"] == "guarded"
+    assert len(mcp["recent_guardrails"]) <= 3
+
+
+def test_dashboard_project_hide_and_restore(monkeypatch) -> None:
+    workspace = _workspace_temp("dashboard-hide")
+    try:
+        import muxdev.api.web as web_module
+
+        project_a = workspace / "project-a"
+        project_b = workspace / "project-b"
+        project_a.mkdir(parents=True)
+        project_b.mkdir(parents=True)
+        manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())
+        with manager.board() as board:
+            board.create_run(run_id="run_project_a", task="project a", workflow="dev", provider="mock", workspace=project_a, worktree=project_a / ".muxdev" / "run")
+            board.create_run(run_id="run_project_b", task="project b", workflow="dev", provider="mock", workspace=project_b, worktree=project_b / ".muxdev" / "run")
+            board.create_approval("run_project_a", "code", "plan", "approve project a")
+            board.create_provider_action(
+                run_id="run_project_a",
+                stage_id="code",
+                provider="mock",
+                role="code",
+                kind="cli_confirmation",
+                prompt_text="Continue project a?",
+                options=[],
+            )
+
+        monkeypatch.setattr(web_module, "_provider_health_payload", lambda: {"ready": ["mock"], "partial": [], "unavailable": [], "total": 1, "providers": []})
+        client = TestClient(create_app(task_manager=manager))
+        before = client.get("/api/dashboard/overview", params={"workspace": str(project_a)}).json()
+        project_id = next(project["id"] for project in before["projects"] if project["path"] == str(project_a.resolve()))
+        assert before["pending_approvals"]
+        assert before["pending_provider_actions"]
+        hidden = client.delete(f"/api/dashboard/projects/{project_id}").json()
+        after = client.get("/api/dashboard/overview", params={"workspace": str(project_a)}).json()
+        with_hidden = client.get("/api/dashboard/overview", params={"workspace": str(project_a), "include_hidden": "true"}).json()
+        restored = client.post(f"/api/dashboard/projects/{project_id}/restore").json()
+        final = client.get("/api/dashboard/overview", params={"workspace": str(project_a)}).json()
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    assert hidden["hidden"] is True
+    assert project_id not in {project["id"] for project in after["projects"]}
+    assert after["pending_approvals"] == []
+    assert after["pending_provider_actions"] == []
+    hidden_row = next(project for project in with_hidden["projects"] if project["id"] == project_id)
+    assert hidden_row["hidden"] is True
+    assert restored["hidden"] is False
+    assert project_id in {project["id"] for project in final["projects"]}
+
+
 def test_dashboard_provider_health_uses_cache_without_probe(monkeypatch) -> None:
-    import muxdev.services.dashboard as dashboard_module
+    import muxdev.services.dashboard_run as dashboard_module
 
     workspace = _workspace_temp("dashboard-cache")
     cache = workspace / "home" / "cache" / "providers.json"
@@ -128,7 +281,7 @@ def test_dashboard_provider_health_uses_cache_without_probe(monkeypatch) -> None
 
 
 def test_dashboard_provider_health_falls_back_to_config_without_probe(monkeypatch) -> None:
-    import muxdev.services.dashboard as dashboard_module
+    import muxdev.services.dashboard_run as dashboard_module
 
     workspace = _workspace_temp("dashboard-config")
 

@@ -37,7 +37,6 @@ def startup_dashboard_payload(workspace: Path) -> dict[str, Any]:
         "ci_rescues": [],
         "cache_entries": [],
         "skill_locks": [],
-        "plugin_manifests": [],
         "guardrail_events": [],
         "parallel_conflicts": [],
         "semantic_merge_reviews": [],
@@ -50,11 +49,11 @@ def startup_dashboard_payload(workspace: Path) -> dict[str, Any]:
         "checkpoints": [],
         "errors": [],
         "usage": [],
-        "stage_contracts": [],
-        "evidence_bundles": [],
-        "evidence_items": [],
-        "evidence_scorecard": None,
-        "evidence_scorecards": [],
+        "evidence_events": [],
+        "evidence_manifest": None,
+        "evidence_manifests": [],
+        "evidence_evaluation": None,
+        "evidence_evaluations": [],
         "ledger_events": [],
         "snapshots": [],
         "validator_panels": [],
@@ -87,7 +86,9 @@ def build_run_dashboard_payload(workspace: Path, run_dir: Path, run_id: str, bla
     usage = blackboard.table_rows("usage_records", run_id=run_id)
     blockers = blackboard.table_rows("review_blockers", run_id=run_id)
     errors = blackboard.table_rows("error_details", run_id=run_id)
-    scorecards = blackboard.table_rows("evidence_scorecards", run_id=run_id)
+    manifests = blackboard.table_rows("evidence_manifests", run_id=run_id)
+    evaluations = blackboard.table_rows("evidence_evaluations", run_id=run_id)
+    artifacts = _artifact_rows(blackboard.table_rows("artifacts", run_id=run_id), workspace=workspace)
     payload = {
         "app": _app_payload(workspace),
         "run": run,
@@ -101,24 +102,23 @@ def build_run_dashboard_payload(workspace: Path, run_dir: Path, run_id: str, bla
         "ci_rescues": blackboard.table_rows("ci_rescues", run_id=run_id),
         "cache_entries": blackboard.table_rows("cache_entries", run_id=run_id),
         "skill_locks": blackboard.table_rows("skill_locks", run_id=run_id),
-        "plugin_manifests": blackboard.table_rows("plugin_manifests", run_id=run_id),
         "guardrail_events": blackboard.table_rows("guardrail_events", run_id=run_id),
         "parallel_conflicts": blackboard.list_parallel_conflicts(run_id=run_id),
         "semantic_merge_reviews": blackboard.list_semantic_merge_reviews(run_id=run_id),
         "provider_learning": blackboard.list_provider_learning(),
         "multi_repo_orchestrations": blackboard.list_multi_repo_orchestrations(),
         "memory_context": _memory_context(run_dir),
-        "artifacts": blackboard.table_rows("artifacts", run_id=run_id),
+        "artifacts": artifacts,
         "test_results": blackboard.table_rows("test_results", run_id=run_id),
         "review_blockers": blockers,
         "checkpoints": blackboard.table_rows("checkpoints", run_id=run_id),
         "errors": errors,
         "usage": usage,
-        "stage_contracts": blackboard.table_rows("stage_contracts", run_id=run_id),
-        "evidence_bundles": blackboard.table_rows("evidence_bundles", run_id=run_id),
-        "evidence_items": blackboard.table_rows("evidence_items", run_id=run_id),
-        "evidence_scorecard": scorecards[-1] if scorecards else None,
-        "evidence_scorecards": scorecards,
+        "evidence_events": blackboard.table_rows("evidence_events", run_id=run_id),
+        "evidence_manifest": manifests[-1] if manifests else None,
+        "evidence_manifests": manifests,
+        "evidence_evaluation": evaluations[-1] if evaluations else None,
+        "evidence_evaluations": evaluations,
         "ledger_events": blackboard.table_rows("ledger_events", run_id=run_id),
         "snapshots": blackboard.table_rows("snapshots", run_id=run_id),
         "validator_panels": blackboard.table_rows("validator_panels", run_id=run_id),
@@ -261,3 +261,39 @@ def _summary(
 def _has_dashboard_artifact(blackboard: Blackboard, path: Path) -> bool:
     target = str(path)
     return any(row.get("kind") == "dashboard" and row.get("path") == target for row in blackboard.table_rows("artifacts"))
+
+
+def _artifact_rows(rows: list[dict[str, Any]], *, workspace: Path) -> list[dict[str, Any]]:
+    return [_with_artifact_display(row, workspace=workspace) for row in sorted(rows, key=_artifact_sort_key)]
+
+
+def _with_artifact_display(row: dict[str, Any], *, workspace: Path) -> dict[str, Any]:
+    result = dict(row)
+    path_text = str(row.get("path") or "")
+    result["path_display"] = _display_path(path_text, workspace=workspace)
+    result["path_title"] = path_text
+    return result
+
+
+def _display_path(path_text: str, *, workspace: Path) -> str:
+    if not path_text:
+        return ""
+    path = Path(path_text)
+    try:
+        return str(path.resolve().relative_to(workspace.resolve()))
+    except (OSError, ValueError):
+        return path_text
+
+
+def _artifact_sort_key(row: dict[str, Any]) -> tuple[int, str, str]:
+    priority = {
+        "project_design_doc": 0,
+        "report": 1,
+        "diff": 2,
+        "stage_output": 3,
+        "task": 90,
+        "context": 91,
+    }
+    kind = str(row.get("kind") or "")
+    name = str(row.get("name") or "")
+    return (priority.get(kind, 50), kind, name)

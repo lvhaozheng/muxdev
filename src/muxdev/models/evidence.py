@@ -1,4 +1,4 @@
-"""Evidence scorecard domain models."""
+"""Evidence v2 domain models."""
 
 from __future__ import annotations
 
@@ -9,65 +9,86 @@ from pydantic import BaseModel, Field
 from . import utc_now
 
 
+EvidenceLayer = Literal["core", "approval", "evaluation", "learning"]
 EvidenceKind = Literal[
-    "requirement_evidence",
-    "change_evidence",
-    "test_evidence",
-    "review_evidence",
-    "security_evidence",
-    "runtime_evidence",
-    "human_evidence",
+    "task",
+    "stage",
+    "change",
+    "test",
+    "review",
+    "security",
+    "runtime",
+    "approval",
+    "artifact",
+    "learning",
+    "policy",
 ]
+EvidenceStatus = Literal["observed", "passed", "failed", "missing", "approved", "rejected", "blocked"]
 EvidenceStrength = Literal["A", "B", "C", "D", "E", "X"]
-ScorecardLabel = Literal["ready", "reviewable", "risky", "blocked"]
+EvaluationLabel = Literal["ready", "reviewable", "risky", "blocked"]
 
 
 class ArtifactRef(BaseModel):
+    """Content-addressed artifact reference used by evidence events."""
+
     path: str
     sha256: str | None = None
+    media_type: str | None = None
+    producer: str | None = None
 
 
-class EvidenceItem(BaseModel):
-    """One normalized claim-to-artifact evidence item."""
+class EvidenceEvent(BaseModel):
+    """One append-only evidence event.
+
+    Evidence events are the fact source. Manifests and evaluations are derived
+    views over this stream and can be regenerated from it.
+    """
 
     id: str
+    run_id: str
+    stage_id: str | None = None
+    layer: EvidenceLayer = "core"
     kind: EvidenceKind
-    strength: EvidenceStrength
     claim: str
-    supports: list[str] = Field(default_factory=list)
-    command: str | None = None
-    exit_code: int | None = None
-    summary: str = ""
-    relevance: float | None = None
-    confidence: float | None = None
+    status: EvidenceStatus = "observed"
+    strength: EvidenceStrength = "C"
+    subject_hash: str | None = None
+    prev_hash: str | None = None
+    event_hash: str | None = None
     artifact_refs: list[ArtifactRef] = Field(default_factory=list)
-    human_summary: str = ""
+    metrics: dict[str, object] = Field(default_factory=dict)
+    tags: list[str] = Field(default_factory=list)
+    source: str = "muxdev"
     created_at: str = Field(default_factory=utc_now)
 
 
-class CoverageRow(BaseModel):
-    acceptance_id: str
-    criterion: str
-    implementation: str
-    tests: str
-    review: str
-    evidence_refs: list[str] = Field(default_factory=list)
-    missing: list[str] = Field(default_factory=list)
+class EvidenceManifest(BaseModel):
+    """Lightweight run evidence manifest."""
 
-
-class EvidenceScorecard(BaseModel):
-    """Default human-facing delivery confidence summary for a run."""
-
-    contract_version: str = "muxdev.evidence_scorecard.v1"
+    contract_version: str = "muxdev.evidence.v2"
     run_id: str
-    score: int
-    label: ScorecardLabel
-    recommendation: str
-    components: dict[str, int]
-    risk_penalty: int
-    top_reasons: list[str] = Field(default_factory=list)
+    event_count: int
+    artifact_count: int
+    layers: dict[str, int] = Field(default_factory=dict)
+    kinds: dict[str, int] = Field(default_factory=dict)
+    required_matrix: dict[str, bool] = Field(default_factory=dict)
+    missing_required: list[str] = Field(default_factory=list)
+    head_hash: str | None = None
+    events_path: str
+    manifest_path: str
+    created_at: str = Field(default_factory=utc_now)
+
+
+class EvidenceEvaluation(BaseModel):
+    """Gate-first delivery evaluation derived from Evidence v2 events."""
+
+    contract_version: str = "muxdev.evidence_evaluation.v2"
+    run_id: str
+    label: EvaluationLabel
+    confidence: float
+    gates: dict[str, str] = Field(default_factory=dict)
+    components: dict[str, float] = Field(default_factory=dict)
+    reasons: list[str] = Field(default_factory=list)
     missing_evidence: list[str] = Field(default_factory=list)
-    evidence_counts: dict[str, int] = Field(default_factory=dict)
-    coverage_summary: dict[str, int] = Field(default_factory=dict)
     next_actions: list[dict[str, str]] = Field(default_factory=list)
     created_at: str = Field(default_factory=utc_now)

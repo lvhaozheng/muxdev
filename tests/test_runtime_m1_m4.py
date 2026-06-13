@@ -27,11 +27,15 @@ def test_mock_run_creates_m1_artifacts(workspace: Path) -> None:
     result = SupervisorRuntime(workspace).run("add rate limiting", provider="mock")
 
     assert result.status == RunStatus.COMPLETED
+    assert result.run_dir.parent == workspace / ".muxdev" / "runs"
     assert (result.run_dir / "blackboard.sqlite").exists()
     assert (result.run_dir / "trace.jsonl").exists()
     assert (result.run_dir / "final_report.md").exists()
     assert (result.run_dir / "diff.patch").read_text(encoding="utf-8")
     assert (result.run_dir / "worktree" / ".git" / "config").exists()
+    design_doc = result.run_dir / "worktree" / "docs" / "design" / f"{result.run_id}-design.md"
+    assert design_doc.exists()
+    assert "Design Document" in design_doc.read_text(encoding="utf-8")
 
     trace_types = [
         json.loads(line)["type"]
@@ -40,7 +44,41 @@ def test_mock_run_creates_m1_artifacts(workspace: Path) -> None:
     assert "run_started" in trace_types
     assert "stage_started" in trace_types
     assert "stage_completed" in trace_types
+    assert "project_design_doc_written" in trace_types
     assert "run_completed" in trace_types
+
+    blackboard = Blackboard(result.run_dir)
+    try:
+        design_artifacts = [row for row in blackboard.table_rows("artifacts") if row["kind"] == "project_design_doc"]
+    finally:
+        blackboard.close()
+    assert design_artifacts[0]["name"] == "Design Document"
+    design_artifact_path = Path(design_artifacts[0]["path"])
+    assert design_artifact_path.name == f"{result.run_id}-design.md"
+    assert design_artifact_path.parent.name == "design"
+    assert design_artifact_path.parent.parent.name == "docs"
+    assert "## Design Deliverables" in (result.run_dir / "final_report.md").read_text(encoding="utf-8")
+
+
+def test_software_dev_blocks_when_design_document_cannot_be_written(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
+    def fail_design_doc(*_args, **_kwargs):
+        raise OSError("cannot write design doc")
+
+    monkeypatch.setattr("muxdev.runtime.supervisor._record_project_design_doc", fail_design_doc)
+
+    result = SupervisorRuntime(workspace).run("design doc failure", provider="mock")
+
+    assert result.status == RunStatus.BLOCKED
+    blackboard = Blackboard(result.run_dir)
+    try:
+        stages = {row["stage_id"]: row for row in blackboard.table_rows("stages")}
+        errors = blackboard.table_rows("error_details")
+        artifacts = blackboard.table_rows("artifacts")
+    finally:
+        blackboard.close()
+    assert stages["design"]["status"] == "failed"
+    assert errors[0]["type"] == "missing_design_document"
+    assert not [row for row in artifacts if row["kind"] == "project_design_doc"]
 
 
 def test_blackboard_schema_records_run_stage_approval_and_results(workspace: Path) -> None:

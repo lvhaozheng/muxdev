@@ -23,24 +23,26 @@ from ..context import memory_refs as _memory_refs
 from ..context import task_with_context_packet as _task_with_context_packet
 from ..context import task_with_memory_context as _task_with_memory_context
 from ..context import write_context_packet as _write_context_packet
+from ..config.runtime import normalize_role
 from ..domain import new_run_id
 from ..providers.adapters import ProviderAdapter, ProviderStageOutput, extract_json_object, get_runtime_provider
 from ..providers.planner import ProviderPlanner
-from ..services.dashboard import write_run_dashboard
+from ..services.dashboard_run import write_run_dashboard
 from ..services.design import write_design_pack
 from ..services.advanced_parallel import planned_stage_writes_from_automation, record_parallel_conflicts, write_parallel_conflict_report
 from ..services.provider_learning import refresh_provider_learning
 from ..services.provider_scores import recommend_provider
-from ..services.evidence_scorecard import write_evidence_scorecard
+from ..services.prompt_templates import render_stage_prompt
+from ..services.evidence import write_evidence_run
 from ..services.reports import generate_final_report
 from ..services.semantic_merge import review_semantic_merge
 from ..services.session_capsules import write_session_capsule
+from ..services.skills import resolve_active_skills
 from ..core.safety import SafetyPolicy, SafetyPolicyEngine
 from ..storage import Blackboard, RunStore, TraceWriter, append_ledger_event, canonical_hash, sha256_file, sha256_text
 from ..storage.contracts import (
     artifact_descriptor,
     write_blind_validator_panel,
-    write_evidence_bundle,
     write_role_result_contract,
     write_stage_contract,
 )
@@ -116,7 +118,10 @@ class SupervisorRuntime:
         # Role-specific providers are optional overrides. The default provider
         # remains the fallback for any workflow role that has no explicit choice.
         role_providers = {key: value for key, value in (role_providers or {}).items() if value}
-        skills = skills or []
+        skills = _merge_skill_payloads(
+            skills or [],
+            _resolve_workflow_role_skills(self.workspace, task=task, workflow=workflow, provider=provider),
+        )
         provider_impls = {provider: get_runtime_provider(provider)}
         for role_provider in role_providers.values():
             provider_impls.setdefault(role_provider, get_runtime_provider(role_provider))
@@ -486,7 +491,11 @@ class SupervisorRuntime:
                     role=stage.role,
                     provider=stage_provider,
                     provider_impl=provider_impl,
-                    task=_task_with_context_packet(bound_task, context_packet_path, context_packet_hash),
+                    task=_task_with_context_packet(
+                        _render_stage_task(bound_task, workflow_name=workflow.name, stage=stage, trace=trace),
+                        context_packet_path,
+                        context_packet_hash,
+                    ),
                     worktree=worktree,
                     skills=stage_skills,
                     session_dir=run_dir / "provider_sessions",
@@ -662,6 +671,23 @@ class SupervisorRuntime:
                     blackboard.set_run_status(run_id, RunStatus.BLOCKED)
                     trace.write("stage_failed", stage=stage.id, reason="read_only_write_violation")
                     return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
+                if workflow.name == "software-dev" and stage.id == "design":
+                    try:
+                        design_doc = _record_project_design_doc(
+                            blackboard,
+                            run_id=run_id,
+                            stage_id=stage.id,
+                            worktree=worktree,
+                            content=output.content,
+                        )
+                    except Exception as exc:
+                        message = f"required design document was not created: {exc}"
+                        blackboard.upsert_stage(run_id, stage.id, role=stage.role, status=StageStatus.FAILED, output_path=str(artifact_path), summary=message)
+                        blackboard.add_error(run_id, stage.id, "missing_design_document", message)
+                        blackboard.set_run_status(run_id, RunStatus.BLOCKED)
+                        trace.write("stage_failed", stage=stage.id, reason="missing_design_document", error=redact(str(exc)))
+                        return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
+                    trace.write("project_design_doc_written", stage=stage.id, path=str(design_doc))
                 findings: list[dict[str, object]] = []
                 decision_text = "accept"
                 if stage.id == "test":
@@ -734,7 +760,7 @@ class SupervisorRuntime:
                 _refresh_provider_learning(blackboard, run_id)
                 blackboard.set_run_status(run_id, RunStatus.BLOCKED)
                 blackboard.add_error(run_id, None, "semantic_merge_reject", "semantic merge reviewer rejected the patch")
-                _record_evidence_scorecard(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
+                _record_evidence_run(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
                 trace.write("run_blocked", reason="semantic merge reviewer rejected the patch", semantic_review_hash=semantic.get("review_hash"))
                 return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
             validator = _record_blind_validator(blackboard, run_dir=run_dir, run_id=run_id, task_hash=task_hash, patch_hash=sha256_file(diff_path))
@@ -742,7 +768,7 @@ class SupervisorRuntime:
                 _refresh_provider_learning(blackboard, run_id)
                 blackboard.set_run_status(run_id, RunStatus.BLOCKED)
                 blackboard.add_error(run_id, None, "blind_validator_reject", "blind validator rejected the patch")
-                _record_evidence_scorecard(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
+                _record_evidence_run(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
                 trace.write("run_blocked", reason="blind validator rejected the patch", validator_hash=validator.get("validator_hash"))
                 return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
             if self._approval_gate(
@@ -766,8 +792,8 @@ class SupervisorRuntime:
                 return RunResult(run_id, _approval_wait_status(ci_block_on_approval), run_dir, None)
             blackboard.set_run_status(run_id, RunStatus.COMPLETED)
             if workflow.name in {"design", "design-lite"}:
-                _record_design_pack(blackboard, workspace=self.workspace, run_dir=run_dir, run_id=run_id, task=task, workflow=workflow.name, automation=automation)
-            _record_evidence_scorecard(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
+                _record_design_pack(blackboard, run_dir=run_dir, run_id=run_id, task=task, workflow=workflow.name, automation=automation)
+            _record_evidence_run(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
             report_path = generate_final_report(run_dir, run_id, blackboard)
             _refresh_provider_learning(blackboard, run_id)
             _record_ledger(blackboard, run_dir, run_id, "run_completed", payload={"report": str(report_path), "patch_hash": sha256_file(diff_path)})
@@ -888,7 +914,11 @@ class SupervisorRuntime:
                         _run_provider_stage,
                         provider_impl,
                         stage_id=stage.id,
-                        task=_task_with_context_packet(bound_task, context_packet_path, context_packet_hash),
+                        task=_task_with_context_packet(
+                            _render_stage_task(bound_task, workflow_name=workflow.name, stage=stage, trace=trace),
+                            context_packet_path,
+                            context_packet_hash,
+                        ),
                         worktree=worktree,
                         skills=stage_skills,
                         session_dir=run_dir / "provider_sessions",
@@ -1104,7 +1134,7 @@ class SupervisorRuntime:
             _refresh_provider_learning(blackboard, run_id)
             blackboard.set_run_status(run_id, RunStatus.BLOCKED)
             blackboard.add_error(run_id, None, "semantic_merge_reject", "semantic merge reviewer rejected the patch")
-            _record_evidence_scorecard(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
+            _record_evidence_run(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
             trace.write("run_blocked", reason="semantic merge reviewer rejected the patch", semantic_review_hash=semantic.get("review_hash"))
             return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
         validator = _record_blind_validator(blackboard, run_dir=run_dir, run_id=run_id, task_hash=task_hash, patch_hash=sha256_file(diff_path))
@@ -1112,7 +1142,7 @@ class SupervisorRuntime:
             _refresh_provider_learning(blackboard, run_id)
             blackboard.set_run_status(run_id, RunStatus.BLOCKED)
             blackboard.add_error(run_id, None, "blind_validator_reject", "blind validator rejected the patch")
-            _record_evidence_scorecard(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
+            _record_evidence_run(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
             trace.write("run_blocked", reason="blind validator rejected the patch", validator_hash=validator.get("validator_hash"))
             return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
         if self._approval_gate(
@@ -1136,8 +1166,8 @@ class SupervisorRuntime:
             return RunResult(run_id, _approval_wait_status(ci_block_on_approval), run_dir, None)
         blackboard.set_run_status(run_id, RunStatus.COMPLETED)
         if workflow.name in {"design", "design-lite"}:
-            _record_design_pack(blackboard, workspace=self.workspace, run_dir=run_dir, run_id=run_id, task=task, workflow=workflow.name, automation=automation)
-        _record_evidence_scorecard(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
+            _record_design_pack(blackboard, run_dir=run_dir, run_id=run_id, task=task, workflow=workflow.name, automation=automation)
+        _record_evidence_run(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
         report_path = generate_final_report(run_dir, run_id, blackboard)
         _refresh_provider_learning(blackboard, run_id)
         _record_ledger(blackboard, run_dir, run_id, "run_completed", payload={"report": str(report_path), "patch_hash": sha256_file(diff_path)})
@@ -1295,16 +1325,8 @@ def _record_role_result(
     snapshot_ref: str | None,
 ) -> dict[str, object]:
     patch_hash = _worktree_patch_hash(worktree)
-    evidence_path, evidence_hash, evidence_payload = write_evidence_bundle(
-        run_dir,
-        run_id=run_id,
-        stage_id=stage_id,
-        artifacts=[artifact_descriptor(artifact_path, kind="stage_output")],
-        patch_hash=patch_hash,
-        snapshot_ref=snapshot_ref,
-    )
-    blackboard.add_evidence_bundle(run_id, stage_id, path=evidence_path, bundle_hash=evidence_hash)
-    blackboard.add_artifact(run_id, stage_id, evidence_path.name, evidence_path, "evidence_bundle")
+    evidence_refs = [artifact_descriptor(artifact_path, kind="stage_output")]
+    evidence_hash = canonical_hash({"artifacts": evidence_refs, "patch_hash": patch_hash, "snapshot_ref": snapshot_ref})
     contract_path, contract_hash, contract_payload = write_role_result_contract(
         run_dir,
         run_id=run_id,
@@ -1314,7 +1336,7 @@ def _record_role_result(
         decision=decision,
         summary=summary,
         findings=findings,
-        evidence=evidence_payload["artifacts"],
+        evidence=evidence_refs,
         evidence_hash=evidence_hash,
         patch_hash=patch_hash,
     )
@@ -1437,6 +1459,40 @@ def _approval_subject(
     }
 
 
+def _record_project_design_doc(
+    blackboard: Blackboard,
+    *,
+    run_id: str,
+    stage_id: str,
+    worktree: Path,
+    content: str,
+) -> Path:
+    design_dir = worktree / "docs" / "design"
+    design_dir.mkdir(parents=True, exist_ok=True)
+    path = design_dir / f"{run_id}-design.md"
+    body = redact(content).strip()
+    if not body:
+        raise ValueError("design stage output was empty")
+    path.write_text(
+        "\n".join(
+            [
+                "# Design Document",
+                "",
+                f"- Run: {run_id}",
+                f"- Stage: {stage_id}",
+                "",
+                body,
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    if not path.exists() or path.stat().st_size == 0:
+        raise OSError(f"design document missing after write: {path}")
+    blackboard.add_artifact(run_id, stage_id, "Design Document", path, "project_design_doc")
+    return path
+
+
 def _latest_planning_hash(blackboard: Blackboard, run_id: str) -> str | None:
     planning_stages = {"plan", "design", "problem_statement", "requirements", "architecture_options", "system_design"}
     artifacts = [
@@ -1470,7 +1526,6 @@ def _untracked_file_diff(worktree: Path, rel_path: str) -> str:
 def _record_design_pack(
     blackboard: Blackboard,
     *,
-    workspace: Path,
     run_dir: Path,
     run_id: str,
     task: str,
@@ -1482,16 +1537,9 @@ def _record_design_pack(
     blackboard.add_artifact(run_id, None, "memory_proposals.json", Path(str(manifest["memory_proposals"])), "memory_proposals")
     for path in manifest.get("files", []):
         blackboard.add_artifact(run_id, None, Path(str(path)).name, Path(str(path)), "design_pack")
-    try:
-        from ..storage.memory import MemoryStore
-
-        with MemoryStore(workspace) as store:
-            store.propose_from_run(run_dir, run_id)
-    except Exception:
-        pass
 
 
-def _record_evidence_scorecard(
+def _record_evidence_run(
     blackboard: Blackboard,
     *,
     run_dir: Path,
@@ -1499,26 +1547,28 @@ def _record_evidence_scorecard(
     trace: TraceWriter,
 ) -> None:
     try:
-        manifest = write_evidence_scorecard(run_dir, run_id, blackboard)
+        payload = write_evidence_run(run_dir, run_id, blackboard)
     except Exception as exc:
-        blackboard.add_error(run_id, None, "evidence_scorecard_failed", str(exc))
-        trace.write("evidence_scorecard_failed", error=redact(str(exc)))
+        blackboard.add_error(run_id, None, "evidence_v2_failed", str(exc))
+        trace.write("evidence_v2_failed", error=redact(str(exc)))
         return
-    artifacts = manifest.get("artifacts", {}) if isinstance(manifest.get("artifacts"), dict) else {}
-    scorecard = manifest.get("scorecard", {}) if isinstance(manifest.get("scorecard"), dict) else {}
+    artifacts = payload.get("artifacts", {}) if isinstance(payload.get("artifacts"), dict) else {}
+    evaluation = payload.get("evaluation", {}) if isinstance(payload.get("evaluation"), dict) else {}
+    manifest = payload.get("manifest", {}) if isinstance(payload.get("manifest"), dict) else {}
     _record_ledger(
         blackboard,
         run_dir,
         run_id,
-        "evidence_scorecard_written",
+        "evidence_v2_written",
         payload={
-            "score": scorecard.get("score"),
-            "label": scorecard.get("label"),
-            "scorecard_hash": artifacts.get("scorecard_hash"),
-            "coverage_hash": artifacts.get("coverage_hash"),
+            "label": evaluation.get("label"),
+            "confidence": evaluation.get("confidence"),
+            "head_hash": manifest.get("head_hash"),
+            "manifest_hash": artifacts.get("manifest_hash"),
+            "evaluation_hash": artifacts.get("evaluation_hash"),
         },
     )
-    trace.write("evidence_scorecard_written", score=scorecard.get("score"), label=scorecard.get("label"))
+    trace.write("evidence_v2_written", label=evaluation.get("label"), confidence=evaluation.get("confidence"), head_hash=manifest.get("head_hash"))
 
 
 def _iter_untracked_files(worktree: Path) -> list[str]:
@@ -1612,11 +1662,7 @@ def _record_session_capsule(
 ) -> Path:
     patch_text = _worktree_diff_text(worktree)
     patch_hash = sha256_text(patch_text)
-    evidence_refs = [
-        str(row.get("path"))
-        for row in blackboard.table_rows("evidence_bundles", run_id=run_id)
-        if row.get("path")
-    ]
+    evidence_refs = [str(row.get("event_id") or row.get("id")) for row in blackboard.table_rows("evidence_events", run_id=run_id) if row.get("event_id") or row.get("id")]
     open_findings = blackboard.table_rows("error_details", run_id=run_id) + _current_review_blockers(blackboard, run_id)
     path, digest, payload = write_session_capsule(
         run_dir,
@@ -1719,13 +1765,67 @@ def _approval_wait_status(ci_block_on_approval: bool) -> RunStatus:
 
 def _skills_for_stage(skills: list[dict[str, object]], *, role: str | None, stage_id: str) -> list[dict[str, object]]:
     selected: list[dict[str, object]] = []
+    normalized_role = normalize_role(role or "") if role else None
     for skill in skills:
         if not isinstance(skill, dict):
             continue
         skill_role = skill.get("role")
-        if skill_role in {None, "", role, stage_id}:
+        normalized_skill_role = normalize_role(str(skill_role)) if skill_role else None
+        if skill_role in {None, "", role, stage_id} or normalized_skill_role in {normalized_role, stage_id}:
             selected.append(skill)
     return selected
+
+
+def _render_stage_task(task: str, *, workflow_name: str, stage, trace: TraceWriter) -> str:
+    prompt = render_stage_prompt(task, workflow=workflow_name, stage=stage)
+    trace.write("stage_prompt_rendered", stage=stage.id, role=stage.role, role_key=prompt.role_key, sections=list(prompt.sections))
+    return prompt.text
+
+
+def _resolve_workflow_role_skills(
+    workspace: Path,
+    *,
+    task: str,
+    workflow,
+    provider: str,
+) -> list[dict[str, object]]:
+    roles = sorted({role for stage in workflow.stages for role in _stage_skill_roles(stage)})
+    if not roles:
+        return []
+    try:
+        return resolve_active_skills(workspace, task=task, roles=roles, provider=provider, include_content=True)
+    except Exception:
+        return []
+
+
+def _stage_skill_roles(stage) -> set[str]:
+    roles: set[str] = set()
+    if stage.role:
+        roles.add(str(stage.role))
+        roles.add(normalize_role(str(stage.role)))
+    for skill_spec in getattr(stage, "default_skills", []) or []:
+        if isinstance(skill_spec, str) and "=" in skill_spec:
+            roles.add(normalize_role(skill_spec.split("=", 1)[0]))
+    return {role for role in roles if role}
+
+
+def _merge_skill_payloads(*groups: list[dict[str, object]]) -> list[dict[str, object]]:
+    merged: list[dict[str, object]] = []
+    seen: set[tuple[str, str | None, str | None]] = set()
+    for group in groups:
+        for skill in group:
+            if not isinstance(skill, dict):
+                continue
+            key = (
+                str(skill.get("name") or ""),
+                str(skill.get("role")) if skill.get("role") else None,
+                str(skill.get("stage")) if skill.get("stage") else None,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(skill)
+    return merged
 
 
 def _read_task_context(run_dir: Path) -> dict[str, object]:

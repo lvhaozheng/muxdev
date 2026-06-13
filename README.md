@@ -2,13 +2,13 @@
 
 `muxdev` is a local-first Agentic SDLC Kernel for the multi-AI-coding-agent era.
 
-It coordinates provider CLIs such as Codex, Claude Code, Qwen, Kimi, Gemini-style tools, OpenCode-style tools, Trae, Cursor-style tools, and the built-in `mock` provider through role-aware workflows, evidence-grounded memory, approval-bound delivery, rollback, reports, and local governance.
+It coordinates provider CLIs such as Codex, Claude Code, Qwen, Kimi, Gemini-style tools, OpenCode-style tools, Trae, Cursor-style tools, and the built-in `mock` provider through role-aware workflows, explicit memory, approval-bound delivery, rollback, reports, evidence, and local governance.
 
 Unlike a single AI coding assistant, muxdev does not try to be the smartest coder by itself. It turns multiple AI coding agents into a verifiable, auditable, recoverable, governable, and continuously learning software delivery system.
 
 The goal is simple: make AI coding as easy to start as a CLI command, but as trustworthy as a local software delivery control plane. After an agent changes code, muxdev should tell you what changed, how it was verified, what risk remains, whether it can be merged, and how to roll back.
 
-Current scope: **P0-P4 implemented**.
+Current scope: **automation, trusted delivery, runtime safety, ecosystem automation, advanced parallel learning, and product experience are implemented**.
 
 ## Why muxdev
 
@@ -21,8 +21,8 @@ Current scope: **P0-P4 implemented**.
 - **Auto flow selection**: chooses `simple`, `safe`, `deep`, `parallel`, or `ci` based on intent, risk, repo signals, and memory.
 - **Role-aware provider routing**: assigns `plan`, `code`, `test`, `review`, `secure`, `docs`, `architect`, and memory roles to suitable providers.
 - **Design-first workflows**: `muxdev design` produces a Design Pack before implementation.
-- **Evidence-grounded memory**: stores project knowledge only with evidence, lifecycle, role scope, and approval state.
-- **Evidence Scorecard plus Audit Pack**: shows delivery confidence, risks, missing evidence, coverage, and next actions by default, while preserving stage contracts, role result contracts, evidence bundles, blind validator, semantic merge review, snapshots, and hash ledger for audit.
+- **Evidence-aware memory**: project knowledge can reference evidence ids, but memory is promoted explicitly and stays separate from evidence recording.
+- **Evidence v2**: records a lightweight event stream, manifest, and gate-first evaluation instead of legacy heavyweight evidence artifacts.
 - **Approval and provider-action handoff**: separates muxdev policy approvals from external provider CLI confirmations, auth, rate limits, and blocked sessions.
 - **Rollback and recovery**: isolated worktrees, stage snapshots, reports, traces, session capsules, and resumable runs.
 - **Dashboard/TUI/API**: local daemon, Web Dashboard, terminal UI, JSON output, and automation-friendly APIs.
@@ -106,7 +106,7 @@ muxdev review
 muxdev test
 muxdev ci fix
 muxdev evidence latest
-muxdev evidence latest --audit
+muxdev evidence latest --events
 muxdev evidence verify latest --json
 muxdev why latest
 muxdev report latest
@@ -116,30 +116,31 @@ muxdev undo latest --to-stage code
 muxdev ship latest --dry-run
 ```
 
-## Evidence Scorecard
+## Evidence v2
 
-muxdev keeps the full Audit Pack, but the default delivery view is a human-readable Scorecard:
+muxdev records evidence as a lightweight event stream plus derived manifest and evaluation:
 
 ```text
-Delivery Confidence: 84 / 100  reviewable
-Recommendation: merge_after_review
+label: reviewable
+confidence: 0.83
+events: 24
+head_hash: sha256:...
 
-why:
+reasons:
 - targeted tests passed
 - blind validator accepted the run
 - rollback snapshot available
 
 missing evidence:
-- full regression not run
-- negative-path test missing
+- none
 ```
 
 Each completed run writes:
 
-- `evidence/scorecard.json`: weighted Delivery Confidence Score and recommendation.
-- `evidence/coverage_matrix.json`: acceptance criteria mapped to implementation, tests, and review.
-- `evidence/human_summary.md`: readable summary for handoff and review.
-- Audit Pack artifacts: contracts, evidence bundles, validator panel, semantic merge review, ledger, snapshots, trace, and session capsules.
+- `evidence/events.jsonl`: append-only Evidence v2 events with artifact refs and hash chaining.
+- `evidence/manifest.json`: counts, required evidence matrix, missing required evidence, and head hash.
+- `evidence/evaluation.json`: gate-first label, confidence, reasons, missing evidence, and next actions.
+- Existing runtime artifacts such as role contracts, validator panel, semantic merge review, ledger, snapshots, trace, and session capsules remain available, but legacy heavyweight evidence artifacts are no longer generated.
 
 Useful waiting-state commands:
 
@@ -184,11 +185,12 @@ muxdev tui
 
 The Dashboard opens as **muxdev Mission Control**, not just a task list. The first screen is organized around:
 
-- **Current Status**: running tasks, stuck tasks, provider actions, muxdev approvals, and recent completed deliverables.
-- **Action Center**: the next concrete action translated from daemon/provider state.
-- **Task Board**: Todo / Running / Waiting / Needs Review / Done / Failed with provider, workflow, status, branch, risk, and cost filters.
-- **Task Timeline**: stage lifecycle plus current stage, provider attempts, memory context, rollback snapshots, and advanced state.
-- **Evidence / Artifacts Center**: final reports, diffs, test output, provider transcripts, stage contracts, evidence bundles, snapshots, rollback points, and semantic merge results.
+- **Projects**: the default tab. Tasks are grouped by their execution `workspace`, so the directory where a task runs becomes its project.
+- **Workflows / Tasks / Activity / Artifacts / Config**: project detail uses tabs instead of stacking every dashboard surface on one long page. Workflow remains the default view; Activity contains timeline, provider actions, approvals, and events; Artifacts contains evidence, reports, tests, transcripts, rollback, and semantic merge output.
+- **Project Hide**: project cards can be hidden from Mission Control. This only archives the dashboard entry; it does not delete the workspace, runs, evidence, or files. Hidden projects can be restored through `POST /api/dashboard/projects/{project_id}/restore`.
+- **Global Config**: role templates, provider health, budget, safety gates, Skills Catalog, Workflow Templates, and a compact MCP status strip are collected outside project task flow.
+- **Action Center**: the next concrete action translated from daemon/provider state remains visible above the project shell.
+- **Task Timeline** and **Evidence / Artifacts Center**: selecting a card opens stage lifecycle, provider attempts, memory context, rollback snapshots, final reports, diffs, tests, transcripts, Evidence v2 evaluation, and semantic merge results.
 
 Provider actions are rendered as a card-style wizard: copy the attach command, handle the external provider CLI prompt yourself, then click `Mark handled and continue`. muxdev approvals are rendered as risk-review cards with approve/deny, diff, and evidence actions.
 
@@ -198,6 +200,7 @@ UX-focused API endpoints:
 
 ```text
 GET  /api/ux/overview
+GET  /api/dashboard/overview
 GET  /api/tasks/{run_id}/ux
 POST /api/tasks/{run_id}/actions/{action_id}/handled-and-continue
 GET  /api/setup/status
@@ -211,24 +214,18 @@ GET  /api/providers/health
 - [Configuration](docs/configuration.md): TOML runtime config, profiles, gates, roles, providers, memory, skills, and troubleshooting.
 - [Best Practices](docs/best_practices.md): daily workflows, provider actions, approvals, memory, evidence, dashboard, and testing.
 - [Source Walkthrough](docs/source_walkthrough.md): code-level map for contributors.
-- [P0 Acceptance](docs/p0_acceptance_ready.md): auto + role + design + memory.
-- [P1 Acceptance](docs/p1_trusted_delivery_ready.md): trusted delivery loop.
-- [P2 Acceptance](docs/p2_runtime_safety_provider_ready.md): runtime safety and provider handoff.
-- [P3 Acceptance](docs/p3_ecosystem_automation_ready.md): feedback, cache, skill, plugin, and guardrail loop.
-- [P4 Product Experience Acceptance](docs/p4_product_experience_ready.md): one-line setup, provider wizard, MUXDEV.md, budget, Git safety, rules, skills, and web UI surface.
-- [P4 Acceptance](docs/p4_advanced_parallel_learning_ready.md): parallel, semantic merge, learning, memory quarantine, and multi-repo planning.
+- [Automation, Design, And Memory](docs/automation_design_memory.md): auto flow selection, role topology, Design Pack, and explicit memory.
+- [Trusted Delivery](docs/trusted_delivery.md): Evidence v2, contracts, ledger, approvals, validator, and rollback.
+- [Runtime Safety And Provider Stability](docs/runtime_safety_provider.md): provider attempts, provider actions, session capsules, read-only gates, and provider scores.
+- [Ecosystem And Automation](docs/ecosystem_automation.md): feedback, CI rescue, cache, skill governance, and lightweight MCP guardrails.
+- [Advanced Parallel And Learning](docs/advanced_parallel_learning.md): parallel conflicts, semantic merge, provider learning, memory quarantine, and multi-repo planning.
+- [Product Experience](docs/product_experience.md): one-line setup, provider wizard, MUXDEV.md, budget, Git safety, rules, skills, and web UI surface.
 
 ## Development
 
 ```powershell
 $env:PYTHONDONTWRITEBYTECODE = "1"
 python -m pytest -q
-```
-
-Current full suite:
-
-```text
-129 passed
 ```
 
 Windows may emit pytest cache warnings if `.pytest_cache` cannot be written. These warnings do not affect the test result.

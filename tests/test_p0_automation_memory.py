@@ -105,7 +105,7 @@ def test_cli_design_simple_override_submits_lite_payload(monkeypatch) -> None:
     assert payload["automation"]["roles"] == ["architect"]
 
 
-def test_design_runtime_writes_pack_and_memory_proposal() -> None:
+def test_design_runtime_writes_pack_and_memory_proposal_file_without_auto_memory() -> None:
     workspace = _workspace_temp("design")
     try:
         result = SupervisorRuntime(workspace).run(
@@ -134,7 +134,7 @@ def test_design_runtime_writes_pack_and_memory_proposal() -> None:
     assert result.status == RunStatus.COMPLETED
     assert json.loads(contract.read_text(encoding="utf-8"))["contract_version"] == "muxdev.design_contract.v1"
     assert json.loads(proposals.read_text(encoding="utf-8"))[0]["status"] == "proposed"
-    assert status["counts"]["proposed"] >= 1
+    assert status["counts"].get("proposed", 0) == 0
 
 
 def test_design_lite_runtime_writes_design_pack_metadata() -> None:

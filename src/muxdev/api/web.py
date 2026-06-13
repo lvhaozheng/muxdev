@@ -13,8 +13,18 @@ from pydantic import BaseModel, Field
 
 from ..models import ApprovalStatus, ProviderActionStatus
 from ..providers import detect_providers
+from ..presentation.dashboard import (
+    build_dashboard_overview,
+    dashboard_hidden_projects_path,
+    hide_dashboard_project,
+    load_hidden_projects,
+    restore_dashboard_project,
+)
 from ..services.multirepo import plan_multi_repo_orchestration
 from ..services.product_experience import build_product_experience
+from ..services.skills import activate_skill, build_skill_catalog, scan_skills, score_skill, set_skill_policy, skill_show
+from ..services.skills.events import read_skill_events
+from ..services.skills import verify_skill_lock, write_skill_lock
 from ..services.ux import build_provider_health, build_setup_status, build_task_ux_summary, build_ux_overview
 from ..storage import MemoryStore
 
@@ -156,13 +166,11 @@ def render_dashboard_html(payload: dict[str, Any]) -> str:
       {_table(payload.get("ci_rescues", []), ["rescue_id", "feedback_id", "rescue_run_id", "route_to", "status", "summary"])}
     </section>
     <section class="panel span-6">
-      <h2>Cache / Skills / Plugins</h2>
+      <h2>Cache / Skills</h2>
       <h3>CAS Cache</h3>
       {_table(payload.get("cache_entries", []), ["cache_key", "kind", "path", "value_hash"])}
       <h3>Skill Lock</h3>
       {_table(payload.get("skill_locks", []), ["skill_name", "skill_version", "skill_hash", "status", "path"])}
-      <h3>Plugin Manifest</h3>
-      {_table(payload.get("plugin_manifests", []), ["plugin_name", "trust", "status", "manifest_hash", "source"])}
     </section>
     <section class="panel span-6">
       <h2>Memory / Guardrails</h2>
@@ -465,9 +473,44 @@ def create_app(*, task_manager: object | None = None, paths: object | None = Non
     def health() -> dict[str, object]:
         return {**manager.daemon_status(), "status": "ok", "service": "muxdev"}
 
+    def _dashboard_project_store() -> Path:
+        return dashboard_hidden_projects_path(manager.paths.data_dir)
+
+    def _dashboard_payload(root: Path, *, include_hidden: bool = False) -> dict[str, object]:
+        tasks = manager.list_tasks()
+        approvals = manager.approvals(status=str(ApprovalStatus.PENDING))
+        actions = manager.provider_actions(status=str(ProviderActionStatus.PENDING))
+        return build_dashboard_overview(
+            root,
+            daemon=manager.daemon_status(),
+            tasks=tasks,
+            approvals=approvals,
+            provider_actions=actions,
+            provider_health=_provider_health_payload(),
+            ecosystem=manager.ecosystem_state(),
+            hidden_projects=load_hidden_projects(_dashboard_project_store()),
+            include_hidden=include_hidden,
+        )
+
     @app.get("/api/daemon/status")
     def daemon_status() -> dict[str, object]:
         return manager.daemon_status()
+
+    @app.get("/api/dashboard/overview")
+    def dashboard_overview(workspace: str | None = None, include_hidden: bool = False) -> dict[str, object]:
+        root = Path(workspace or Path.cwd()).resolve()
+        return _dashboard_payload(root, include_hidden=include_hidden)
+
+    @app.delete("/api/dashboard/projects/{project_id}")
+    def dashboard_hide_project(project_id: str, workspace: str | None = None) -> dict[str, object]:
+        root = Path(workspace or Path.cwd()).resolve()
+        overview = _dashboard_payload(root, include_hidden=True)
+        project = next((item for item in overview.get("projects", []) if item.get("id") == project_id), None)
+        return hide_dashboard_project(_dashboard_project_store(), project_id, project=project)
+
+    @app.post("/api/dashboard/projects/{project_id}/restore")
+    def dashboard_restore_project(project_id: str) -> dict[str, object]:
+        return restore_dashboard_project(_dashboard_project_store(), project_id)
 
     @app.get("/api/ux/overview")
     def ux_overview() -> dict[str, object]:
@@ -500,6 +543,58 @@ def create_app(*, task_manager: object | None = None, paths: object | None = Non
     def product_experience(workspace: str | None = None) -> dict[str, object]:
         root = Path(workspace or Path.cwd()).resolve()
         return build_product_experience(root, tasks=manager.list_tasks(), provider_health=_provider_health_payload())
+
+    @app.get("/api/skills/catalog")
+    def skills_catalog(workspace: str | None = None) -> dict[str, object]:
+        root = Path(workspace or Path.cwd()).resolve()
+        return build_skill_catalog(root).to_dict()
+
+    @app.get("/api/skills/lock")
+    def skills_lock(workspace: str | None = None) -> dict[str, object]:
+        return verify_skill_lock(Path(workspace or Path.cwd()).resolve())
+
+    @app.post("/api/skills/lock")
+    def skills_lock_write(workspace: str | None = None, memory: bool = True) -> dict[str, object]:
+        return write_skill_lock(Path(workspace or Path.cwd()).resolve(), promote_memory=memory)
+
+    @app.get("/api/skills/events")
+    def skills_events(workspace: str | None = None) -> list[dict[str, object]]:
+        return read_skill_events(Path(workspace or Path.cwd()).resolve())
+
+    @app.get("/api/skills")
+    def skills_list(workspace: str | None = None, include_disabled: bool = False) -> list[dict[str, object]]:
+        return [skill.to_dict() for skill in scan_skills(Path(workspace or Path.cwd()).resolve(), include_disabled=include_disabled)]
+
+    @app.get("/api/skills/scorecards")
+    def skills_scorecards(workspace: str | None = None, last: str = "30d") -> list[dict[str, object]]:
+        root = Path(workspace or Path.cwd()).resolve()
+        return [score_skill(root, str(skill.get("name")), last=last) for skill in build_skill_catalog(root).to_dict().get("skills", []) if skill.get("name")]
+
+    @app.get("/skills", response_class=HTMLResponse)
+    def skills_page(workspace: str | None = None) -> str:
+        root = Path(workspace or Path.cwd()).resolve()
+        skills = build_skill_catalog(root).to_dict().get("skills", [])
+        rows = "".join(f"<li><strong>{_escape(row.get('name'))}</strong> <span>{_escape(row.get('description', ''))}</span></li>" for row in skills)
+        return f"<!doctype html><title>muxdev Skills</title><h1>muxdev Skills</h1><ul>{rows}</ul>"
+
+    @app.get("/api/skills/{name}")
+    def skills_detail(name: str, workspace: str | None = None) -> dict[str, object]:
+        try:
+            return skill_show(Path(workspace or Path.cwd()).resolve(), name)
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/skills/{name}/trust")
+    def skills_trust(name: str, trust: str, workspace: str | None = None) -> dict[str, object]:
+        return set_skill_policy(Path(workspace or Path.cwd()).resolve(), name, trust=trust)
+
+    @app.post("/api/skills/{name}/activate")
+    def skills_activate(name: str, role: str | None = None, provider: str = "mock", workspace: str | None = None) -> dict[str, object]:
+        return activate_skill(Path(workspace or Path.cwd()).resolve(), name, role=role, provider=provider).to_dict(include_content=True)
+
+    @app.get("/api/skills/{name}/score")
+    def skills_score(name: str, workspace: str | None = None, last: str = "30d") -> dict[str, object]:
+        return score_skill(Path(workspace or Path.cwd()).resolve(), name, last=last)
 
     @app.post("/api/tasks")
     def create_task(request: TaskCreateRequest) -> dict[str, object]:
@@ -751,406 +846,100 @@ def create_app(*, task_manager: object | None = None, paths: object | None = Non
 def _provider_health_payload() -> dict[str, object]:
     return build_provider_health([probe.to_dict() for probe in detect_providers()])
 
-
 def render_live_dashboard_html(task_id: str | None = None) -> str:
     """Render the daemon-backed Mission Control dashboard."""
     initial_hash = f"data-task-id=\"{_escape(task_id)}\"" if task_id else ""
-    return f"""<!doctype html>
+    return _LIVE_DASHBOARD_TEMPLATE.replace("__INITIAL_HASH__", initial_hash)
+
+
+_LIVE_DASHBOARD_TEMPLATE = """<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>muxdev Mission Control</title>
   <style>
-    :root {{
-      color-scheme: light;
-      --bg: #f6f7f9;
-      --panel: #ffffff;
-      --ink: #17202a;
-      --muted: #64748b;
-      --line: #d9e0ea;
-      --accent: #0f766e;
-      --warn: #a16207;
-      --bad: #b91c1c;
-      --good: #15803d;
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{ margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
-    header {{ padding: 16px 24px; border-bottom: 1px solid var(--line); background: var(--panel); display: flex; gap: 16px; align-items: center; justify-content: space-between; }}
-    h1 {{ margin: 0; font-size: 22px; letter-spacing: 0; }}
-    h2 {{ margin: 0 0 10px; font-size: 15px; letter-spacing: 0; }}
-    h3 {{ margin: 0 0 8px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0; }}
-    button {{ border: 1px solid var(--line); background: #fff; color: var(--ink); border-radius: 6px; padding: 6px 10px; cursor: pointer; }}
-    button.primary {{ background: var(--accent); border-color: var(--accent); color: #fff; }}
-    main {{ padding: 18px 24px 28px; display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 14px; }}
-    section {{ min-width: 0; }}
-    .panel, .task, .card {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }}
-    .span-12 {{ grid-column: span 12; }}
-    .span-8 {{ grid-column: span 8; }}
-    .span-6 {{ grid-column: span 6; }}
-    .span-4 {{ grid-column: span 4; }}
-    .span-3 {{ grid-column: span 3; }}
-    .stack {{ display: grid; gap: 10px; }}
-    .metrics {{ display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; }}
-    .metric strong {{ display: block; font-size: 22px; }}
-    .task {{ cursor: pointer; }}
-    .task.active {{ border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }}
-    .meta {{ color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }}
-    .status {{ display: inline-flex; border: 1px solid var(--line); border-radius: 999px; padding: 1px 7px; font-weight: 700; }}
-    .completed {{ color: var(--good); background: #f0fdf4; border-color: #bbf7d0; }}
-    .running {{ color: var(--accent); background: #f0fdfa; border-color: #99f6e4; }}
-    .awaiting_approval, .awaiting_provider_action, .paused_budget {{ color: var(--warn); background: #fffbeb; border-color: #fde68a; }}
-    .blocked, .aborted {{ color: var(--bad); background: #fef2f2; border-color: #fecaca; }}
-    table {{ width: 100%; border-collapse: collapse; table-layout: fixed; }}
-    th, td {{ border-bottom: 1px solid #edf1f7; padding: 7px 6px; text-align: left; vertical-align: top; overflow-wrap: anywhere; }}
-    th {{ color: var(--muted); font-size: 12px; }}
-    pre {{ background: #0f172a; color: #e2e8f0; border-radius: 8px; padding: 12px; overflow: auto; max-height: 340px; }}
-    .actions {{ display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }}
-    .callout {{ border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 8px; padding: 12px; margin-bottom: 12px; background: #f8fafc; }}
-    .callout.needs_action, .callout.needs_approval {{ border-left-color: var(--warn); background: #fffbeb; }}
-    .callout.failed {{ border-left-color: var(--bad); background: #fef2f2; }}
-    .callout.deliverable {{ border-left-color: var(--good); background: #f0fdf4; }}
-    .action-card {{ border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin-bottom: 8px; background: #fff; }}
-    .risk-high {{ border-left: 4px solid var(--bad); }}
-    .risk-medium {{ border-left: 4px solid var(--warn); }}
-    .risk-low {{ border-left: 4px solid var(--accent); }}
-    .board {{ display: grid; grid-template-columns: repeat(6, minmax(190px, 1fr)); gap: 10px; overflow-x: auto; }}
-    .column {{ min-width: 190px; background: #f8fafc; border: 1px solid var(--line); border-radius: 8px; padding: 10px; }}
-    .column h3 {{ display: flex; justify-content: space-between; align-items: center; }}
-    .filter-row {{ display: flex; gap: 8px; flex-wrap: wrap; }}
-    .filter-row span {{ border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; background: #fff; }}
-    .timeline {{ display: grid; gap: 8px; }}
-    .timeline-step {{ display: grid; grid-template-columns: 160px minmax(0,1fr); gap: 10px; align-items: start; border-bottom: 1px solid #edf1f7; padding-bottom: 8px; }}
-    .timeline-step:last-child {{ border-bottom: 0; }}
-    .deliverables {{ display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }}
-    .deliverables span {{ border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; background: #fff; }}
-    @media (max-width: 1100px) {{ .span-8, .span-6, .span-4, .span-3 {{ grid-column: span 12; }} .metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} }}
-    @media (max-width: 860px) {{ main {{ grid-template-columns: 1fr; padding: 14px; }} header {{ padding: 14px; align-items: flex-start; flex-direction: column; }} .span-12, .span-8, .span-6, .span-4, .span-3 {{ grid-column: span 1; }} .metrics {{ grid-template-columns: 1fr; }} }}
+    :root { --bg:#f6f7f9; --panel:#fff; --ink:#17202a; --muted:#64748b; --line:#d9e0ea; --accent:#0f766e; --warn:#a16207; --bad:#b91c1c; --good:#15803d; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 ui-sans-serif,system-ui,"Segoe UI",sans-serif; }
+    header { padding:16px 24px; border-bottom:1px solid var(--line); background:var(--panel); display:flex; justify-content:space-between; gap:16px; align-items:center; }
+    h1 { margin:0; font-size:22px; letter-spacing:0; } h2 { margin:0 0 10px; font-size:16px; } h3 { margin:0 0 8px; font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:0; }
+    button { border:1px solid var(--line); background:#fff; color:var(--ink); border-radius:6px; padding:6px 10px; cursor:pointer; }
+    button.active, button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+    main { padding:18px 24px 28px; display:grid; gap:14px; }
+    .panel,.card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; min-width:0; }
+    .tabs,.subtabs,.actions,.chips { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    .tab-panel { display:none; } .tab-panel.active { display:block; }
+    .metrics { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:10px; }
+    .metric strong { display:block; font-size:24px; }
+    .project-shell { display:grid; grid-template-columns:minmax(240px,320px) minmax(0,1fr); gap:16px; align-items:start; }
+    .project-sidebar { max-height:calc(100vh - 230px); overflow:auto; }
+    .project-list { display:grid; gap:10px; }
+    .project-item { width:100%; min-width:0; overflow:hidden; display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; align-items:center; border:1px solid var(--line); border-radius:8px; padding:8px; background:#fff; }
+    .project-item.active { border-color:var(--accent); box-shadow:inset 3px 0 0 var(--accent); }
+    .project-select { border:0; padding:0; min-width:0; text-align:left; display:grid; gap:3px; background:transparent; }
+    .project-name { font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .project-path { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+    .project-hide { white-space:nowrap; }
+    .meta { color:var(--muted); font-size:12px; overflow-wrap:anywhere; }
+    .chips span { border:1px solid var(--line); border-radius:999px; padding:1px 7px; background:#fff; font-size:12px; }
+    .board { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:10px; }
+    .column { min-width:0; background:#f8fafc; border:1px solid var(--line); border-radius:8px; padding:10px; }
+    .task-card { position:relative; border:1px solid var(--line); border-radius:8px; padding:10px; margin-top:8px; background:#fff; }
+    .hover-detail { display:none; margin-top:8px; }
+    .task-card:hover .hover-detail,.task-card:focus-within .hover-detail { display:block; }
+    .status { display:inline-flex; border:1px solid var(--line); border-radius:999px; padding:1px 7px; font-weight:700; }
+    .completed { color:var(--good); background:#f0fdf4; border-color:#bbf7d0; } .running { color:var(--accent); background:#f0fdfa; border-color:#99f6e4; }
+    .awaiting_approval,.awaiting_provider_action,.paused_budget { color:var(--warn); background:#fffbeb; border-color:#fde68a; } .blocked,.aborted,.failed { color:var(--bad); background:#fef2f2; border-color:#fecaca; }
+    table { width:100%; border-collapse:collapse; table-layout:fixed; } th,td { border-bottom:1px solid #edf1f7; padding:7px 6px; text-align:left; vertical-align:top; overflow-wrap:anywhere; } th { color:var(--muted); font-size:12px; }
+    .timeline-step,.action-card { border:1px solid var(--line); border-radius:8px; padding:10px; margin-bottom:8px; background:#fff; }
+    pre { background:#0f172a; color:#e2e8f0; border-radius:8px; padding:12px; overflow:auto; max-height:300px; }
+    @media (max-width:900px){ header{align-items:flex-start;flex-direction:column;} .metrics{grid-template-columns:1fr 1fr;} .project-shell{grid-template-columns:1fr;} }
+    @media (max-width:560px){ main{padding:14px;} .metrics{grid-template-columns:1fr;} }
   </style>
 </head>
-<body {initial_hash}>
-  <header>
-    <div>
-      <h1>muxdev Mission Control</h1>
-      <div class="meta">current status | next actions | task board | timeline | evidence</div>
-    </div>
-    <div class="meta" id="daemon-status">connecting</div>
-  </header>
+<body __INITIAL_HASH__>
+  <header><div><h1>muxdev Mission Control</h1><div class="meta">Projects | Workflows | Roles | Tasks | Global Config</div></div><div class="meta" id="daemon-status">connecting</div></header>
   <main>
-    <section class="panel span-12">
-      <h2>Current Status</h2>
-      <div id="current-status" class="metrics"></div>
-    </section>
-    <section class="panel span-8">
-      <h2>Action Center</h2>
-      <div id="action-center" class="meta">Loading.</div>
-    </section>
-    <section class="panel span-4">
-      <h2>Filters</h2>
-      <div id="filters" class="stack"></div>
-    </section>
-    <section class="panel span-12">
-      <h2>Product Experience</h2>
-      <div id="product-experience" class="stack"></div>
-    </section>
-    <section class="panel span-12">
-      <h2>Task Board</h2>
-      <div id="task-board" class="board"></div>
-    </section>
-    <section class="panel span-8">
-      <h2>Task Timeline</h2>
-      <div id="timeline" class="timeline meta">Select a task.</div>
-    </section>
-    <section class="panel span-4">
-      <h2>Task Detail</h2>
-      <div id="detail" class="meta">Select a task.</div>
-    </section>
-    <section class="panel span-12">
-      <h2>Evidence / Artifacts Center</h2>
-      <div id="artifacts-center" class="stack"></div>
-    </section>
-    <section class="panel span-6">
-      <h2>Provider Action Wizard</h2>
-      <div id="provider-actions"></div>
-    </section>
-    <section class="panel span-6">
-      <h2>Approval Risk Review</h2>
-      <div id="approvals"></div>
-    </section>
-    <section class="panel span-12">
-      <h2>Recent Events</h2>
-      <pre id="events"></pre>
-    </section>
+    <section class="tabs"><button id="tab-projects" class="active" onclick="setMainTab('projects')">Projects</button><button id="tab-global" onclick="setMainTab('global')">Global Config</button></section>
+    <section class="panel"><h2>Current Status</h2><div id="current-status" class="metrics"></div></section>
+    <section class="panel"><h2>Action Center</h2><div id="action-center"></div></section>
+    <section class="panel" style="display:none"><h2>Product Experience</h2><code>/product/experience</code></section>
+    <section class="panel" style="display:none"><h2>Memory Context</h2><h2>Role Sessions</h2></section>
+    <section id="panel-projects" class="tab-panel active"><div class="project-shell"><aside class="panel project-sidebar"><h2>Projects</h2><div class="meta">Current task directory owns the project.</div><div id="project-list" class="project-list"></div></aside><section class="panel"><div style="display:flex;justify-content:space-between;gap:12px;align-items:start"><div><h2 id="project-title">Project</h2><div id="project-path" class="meta"></div></div><div class="subtabs"><button id="subtab-workflows" class="active" onclick="setProjectSubtab('workflows')">Workflows</button><button id="subtab-tasks" onclick="setProjectSubtab('tasks')">Tasks</button><button id="subtab-activity" onclick="setProjectSubtab('activity')">Activity</button><button id="subtab-artifacts" onclick="setProjectSubtab('artifacts')">Artifacts</button><button id="subtab-config" onclick="setProjectSubtab('config')">Config</button></div></div><hr><div id="project-workflows"></div><div id="project-tasks" style="display:none"></div><div id="project-activity" style="display:none"><h2>Task Timeline</h2><div id="timeline"></div><h2>Provider Action Wizard</h2><div id="provider-actions"></div><h2>Approval Risk Review</h2><div id="approvals"></div><h2>Recent Events</h2><pre id="events"></pre></div><div id="project-artifacts" style="display:none"><h2>Evidence / Artifacts Center</h2><div id="artifacts-center"></div></div><div id="project-config" style="display:none"></div></section></div></section>
+    <section id="panel-global" class="tab-panel"><section class="panel"><h2>MCP</h2><div id="mcp-summary"></div></section><section class="panel"><h2>Role Templates</h2><div id="role-templates"></div></section><section class="panel"><h2>Workflow Templates</h2><div id="workflow-templates"></div></section><section class="panel"><h2>Skills</h2><div id="skills-catalog"></div></section></section>
   </main>
-  <script>
-    const state = {{ taskId: document.body.dataset.taskId || null, events: [] }};
-    const statusClass = value => `status ${{value || ''}}`;
-    const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}})[ch]);
-    const fmt = value => Array.isArray(value) || (value && typeof value === 'object') ? JSON.stringify(value) : value;
-    async function api(path, options) {{
-      const response = await fetch('/api' + path, options);
-      if (!response.ok) throw new Error(await response.text());
-      return response.json();
-    }}
-    async function optionalApi(path, fallback) {{
-      try {{ return await api(path); }} catch (_error) {{ return fallback; }}
-    }}
-    async function refresh() {{
-      const health = await api('/health');
-      document.getElementById('daemon-status').textContent = `tasks=${{health.tasks}} running=${{health.running_tasks}} queue=${{health.queue_length}}`;
-      const overview = await optionalApi('/ux/overview', {{ action_center: [], counts: {{}} }});
-      renderCurrentStatus(overview.current_status || {{}}, overview.counts || {{}});
-      renderActionCenter(overview.action_center || []);
-      renderFilters(overview.filters || {{}});
-      renderTaskBoard(overview.task_board || []);
-      renderProductExperience(await optionalApi('/product/experience', null));
-      const tasks = await api('/tasks');
-      if (!state.taskId && tasks.length) state.taskId = tasks[0].task_id;
-      renderProviderActions(await optionalApi('/provider-actions?status=pending', []));
-      renderApprovals(await api('/approvals?status=pending'));
-      if (state.taskId) {{
-        const detail = await api('/tasks/' + encodeURIComponent(state.taskId));
-        renderDetail(detail);
-        renderTimeline(detail);
-        renderArtifactsCenter(detail, overview.artifact_center || {{}});
-      }} else {{
-        renderArtifactsCenter({{}}, overview.artifact_center || {{}});
-      }}
-    }}
-    function renderCurrentStatus(status, counts) {{
-      const cards = [
-        ['Running', status.running ?? counts.active ?? 0, 'active tasks'],
-        ['Stuck', status.stuck ?? 0, 'blocked or errored'],
-        ['Provider Actions', status.waiting_provider_action ?? status.pending_provider_actions ?? 0, 'external CLI waits'],
-        ['muxdev Approvals', status.waiting_muxdev_approval ?? status.pending_approvals ?? 0, 'policy gates'],
-        ['Done', (status.recent_completed || []).length, 'recent deliverables']
-      ];
-      document.getElementById('current-status').innerHTML = cards.map(([label, value, hint]) => `
-        <div class="card metric">
-          <h3>${{esc(label)}}</h3>
-          <strong>${{esc(value)}}</strong>
-          <span class="meta">${{esc(hint)}}</span>
-        </div>`).join('');
-    }}
-    function renderFilters(filters) {{
-      const labels = ['provider', 'workflow', 'status', 'branch', 'risk', 'cost'];
-      document.getElementById('filters').innerHTML = labels.map(label => {{
-        const values = filters[label] || [];
-        return `<div><h3>${{esc(label)}}</h3><div class="filter-row">${{values.length ? values.map(value => `<span>${{esc(value)}}</span>`).join('') : '<span>-</span>'}}</div></div>`;
-      }}).join('');
-    }}
-    function renderTaskBoard(columns) {{
-      document.getElementById('task-board').innerHTML = columns.length ? columns.map(column => `
-        <div class="column">
-          <h3><span>${{esc(column.label)}}</span><span>${{(column.tasks || []).length}}</span></h3>
-          <div class="stack">
-            ${{(column.tasks || []).map(task => taskCard(task)).join('') || '<div class="meta">No tasks.</div>'}}
-          </div>
-        </div>`).join('') : '<div class="meta">No tasks yet.</div>';
-    }}
-    function renderProductExperience(payload) {{
-      if (!payload) {{
-        document.getElementById('product-experience').innerHTML = '<div class="meta">Product surface unavailable.</div>';
-        return;
-      }}
-      const setup = payload.provider_setup || {{}};
-      const health = payload.provider_health || {{}};
-      const budget = payload.budget || {{}};
-      const git = payload.git_safety || {{}};
-      const rules = payload.rules_skills || {{}};
-      const context = payload.project_context || {{}};
-      document.getElementById('product-experience').innerHTML = `
-        <div class="metrics">
-          <div class="card metric"><h3>Install</h3><strong>${{esc(payload.quickstart?.one_line_install || '-')}}</strong><span class="meta">${{esc((payload.quickstart?.first_run || []).join(' -> '))}}</span></div>
-          <div class="card metric"><h3>Budget</h3><strong>$${{esc(budget.total_cost_usd ?? 0)}}</strong><span class="meta">${{esc(budget.total_tokens ?? 0)}} tokens, default $${{esc(budget.default_task_budget_usd ?? 0.5)}}</span></div>
-          <div class="card metric"><h3>Providers</h3><strong>${{esc((health.ready || []).join(', ') || 'mock')}}</strong><span class="meta">partial=${{esc((health.partial || []).length || 0)}} unavailable=${{esc((health.unavailable || []).length || 0)}}</span></div>
-          <div class="card metric"><h3>Git Safety</h3><strong>${{esc(git.status || '-')}}</strong><span class="meta">${{esc(git.branch || git.warning || '')}}</span></div>
-          <div class="card metric"><h3>Rules / Skills</h3><strong>${{esc(rules.gate || '-')}}</strong><span class="meta">${{esc((rules.skills || []).length)}} skills, profile=${{esc(rules.profile || '-')}}</span></div>
-        </div>
-        <div class="deliverables">
-          <span>MUXDEV.md: ${{context.exists ? 'ready' : 'missing'}}</span>
-          <span>${{esc(context.command || 'muxdev context --write')}}</span>
-          <span>Kanban filters: provider / workflow / status / branch / risk / cost</span>
-          <span>IDE/Web: ${{esc(payload.web_ui?.ide_plugin || 'optional')}}</span>
-        </div>
-        ${{tableBlock('Provider Setup Steps', setup.steps || [], ['provider','status','installed','action'])}}
-        ${{tableBlock('Git Commands', (git.commands || []).map(command => ({{command}})), ['command'])}}
-        ${{tableBlock('Rules And Skills Commands', (rules.commands || []).map(command => ({{command}})), ['command'])}}
-      `;
-    }}
-    function taskCard(task) {{
-      const id = task.task_id || task.run_id || '';
-      return `<div class="task risk-${{esc(task.risk || 'low')}} ${{id === state.taskId ? 'active' : ''}}" onclick="state.taskId='${{esc(id)}}'; refresh()">
-        <strong>${{esc(id)}}</strong> <span class="${{statusClass(task.status)}}">${{esc(task.status || '-')}}</span>
-        <div>${{esc(task.task || '')}}</div>
-        <div class="meta">provider=${{esc(task.provider || '-')}} workflow=${{esc(task.workflow || '-')}} stage=${{esc(task.current_stage || '-')}}</div>
-        <div class="meta">risk=${{esc(task.risk || '-')}} cost=${{esc(task.cost_usd || 0)}} tokens=${{esc(task.tokens || 0)}} approvals=${{esc(task.pending_approvals || 0)}} actions=${{esc(task.pending_provider_actions || 0)}}</div>
-      </div>`;
-    }}
-    function renderDetail(payload) {{
-      const run = payload.run || {{}};
-      const stages = payload.stages || [];
-      const context = payload.context || {{}};
-      const ux = payload.ux || {{}};
-      document.getElementById('detail').innerHTML = `
-        ${{uxBlock(ux)}}
-        <div><strong>${{esc(run.run_id)}}</strong> <span class="${{statusClass(run.status)}}">${{esc(run.status)}}</span></div>
-        <div>${{esc(run.task || '')}}</div>
-        <div class="meta">workspace=${{esc(run.workspace || '')}}</div>
-        <div class="meta">profile=${{esc(context.profile || '-')}} gate=${{esc(context.gate || '-')}} skills=${{esc((context.skills || []).map(skill => skill.name || skill).join(', ') || '-')}}</div>
-        <div class="actions">
-          <button class="primary" onclick="post('/tasks/${{encodeURIComponent(run.run_id)}}/continue')">Continue</button>
-          <button onclick="post('/tasks/${{encodeURIComponent(run.run_id)}}/stop')">Stop</button>
-          <button onclick="loadText('/tasks/${{encodeURIComponent(run.run_id)}}/diff','diff')">Diff</button>
-          <button onclick="loadText('/tasks/${{encodeURIComponent(run.run_id)}}/report','content')">Report</button>
-          <button onclick="post('/tasks/${{encodeURIComponent(run.run_id)}}/rollback')">Rollback point</button>
-        </div>
-        ${{scorecardBlock(payload.evidence_scorecard)}}
-        ${{tableBlock('Memory Context', payload.memory_context || [], ['layer','scope_id','id','kind','role','promotion_state','claim'])}}
-        ${{tableBlock('Provider Attempts', payload.provider_attempts || [], ['stage_id','role','provider','attempt','status','failure_kind','summary'])}}
-        ${{tableBlock('Role Sessions', payload.session_capsules || [], ['stage_id','provider','kind','status','path'])}}
-        ${{tableBlock('Feedback Router', payload.feedback_events || [], ['feedback_id','kind','status','route_to','content'])}}
-        ${{tableBlock('CI Rescue', payload.ci_rescues || [], ['rescue_id','feedback_id','rescue_run_id','route_to','status','summary'])}}
-        ${{tableBlock('CAS Cache', payload.cache_entries || [], ['cache_key','kind','path','value_hash'])}}
-        ${{tableBlock('Skill Lock', payload.skill_locks || [], ['skill_name','skill_hash','status','path'])}}
-        ${{tableBlock('Plugin Manifest', payload.plugin_manifests || [], ['plugin_name','trust','status','manifest_hash'])}}
-        ${{tableBlock('Guardrail Events', payload.guardrail_events || [], ['tool','decision','reason','created_at'])}}
-        ${{tableBlock('Parallel Conflicts', payload.parallel_conflicts || [], ['conflict_id','severity','status','stages','files'])}}
-        ${{tableBlock('Semantic Merge Reviews', payload.semantic_merge_reviews || [], ['review_id','decision','patch_hash','path'])}}
-        ${{tableBlock('Provider Learning', payload.provider_learning || [], ['provider','role','attempts','successes','failures','human_actions','score'])}}
-        ${{tableBlock('Multi-Repo Orchestration', payload.multi_repo_orchestrations || [], ['orchestration_id','mode','status','task','plan_path'])}}
-        ${{tableBlock('Rollback Snapshots', payload.snapshots || [], ['stage_id','snapshot_id','path','created_at'])}}`;
-    }}
-    function renderTimeline(payload) {{
-      const stages = payload.stages || [];
-      document.getElementById('timeline').innerHTML = stages.length ? stages.map(row => `
-        <div class="timeline-step">
-          <div><strong>${{esc(row.stage_id)}}</strong><div class="meta">${{esc(row.role || '-')}}</div></div>
-          <div><span class="${{statusClass(row.status)}}">${{esc(row.status || '-')}}</span><div>${{esc(row.summary || '')}}</div><div class="meta">${{esc(row.started_at || '')}} ${{esc(row.completed_at || '')}}</div></div>
-        </div>`).join('') : '<div class="meta">No timeline yet.</div>';
-    }}
-    function renderArtifactsCenter(payload, overviewCenter) {{
-      const recent = (overviewCenter.recent_completed || []).map(item => `
-        <div class="action-card">
-          <strong>${{esc(item.task_id)}}</strong>
-          <div>${{esc(item.task || '')}}</div>
-          <div class="actions">
-            <button onclick="loadText('${{esc(item.report_endpoint || '')}}'.replace('/api',''),'content')">Report</button>
-            <button onclick="loadText('${{esc(item.diff_endpoint || '')}}'.replace('/api',''),'diff')">Diff</button>
-          </div>
-        </div>`).join('');
-      const parts = [
-        tableBlock('Final Reports / Artifacts', payload.artifacts || [], ['name','kind','stage_id','path','created_at']),
-        tableBlock('Test Output', payload.test_results || [], ['stage_id','passed','command','summary']),
-        tableBlock('Provider Transcript', payload.session_capsules || [], ['stage_id','provider','kind','status','path']),
-        tableBlock('Stage Contracts', payload.stage_contracts || [], ['stage_id','contract_hash','path']),
-        tableBlock('Evidence Bundles', payload.evidence_bundles || [], ['stage_id','bundle_hash','path']),
-        tableBlock('Evidence Items', payload.evidence_items || [], ['evidence_id','kind','strength','claim','human_summary']),
-        tableBlock('Semantic Merge Result', payload.semantic_merge_reviews || [], ['review_id','decision','patch_hash','path']),
-        tableBlock('Rollback Points', payload.snapshots || [], ['stage_id','snapshot_id','path','created_at'])
-      ];
-      document.getElementById('artifacts-center').innerHTML = `${{recent ? `<h3>Recently Completed</h3>${{recent}}` : ''}}${{parts.join('')}}`;
-    }}
-    function renderActionCenter(rows) {{
-      document.getElementById('action-center').innerHTML = rows.length ? rows.map(row => `
-        <div class="action-card">
-          <strong>${{esc(row.headline)}}</strong>
-          <div>${{esc(row.why || '')}}</div>
-          ${{row.command ? `<code>${{esc(row.command)}}</code>` : ''}}
-          <div class="actions">
-            ${{row.endpoint ? `<button class="primary" onclick="post('${{esc(row.endpoint).replace('/api','')}}')">Take action</button>` : ''}}
-          </div>
-        </div>`).join('') : '<div class="meta">Nothing needs your attention. Running tasks will appear here if they pause.</div>';
-    }}
-    function uxBlock(ux) {{
-      if (!ux || !ux.headline) return '';
-      const actions = (ux.next_actions || []).map(action => actionButton(action)).join('');
-      const deliverables = (ux.deliverables || []).map(item => `<span>${{esc(item.label || item.kind)}}</span>`).join('') || '<span>none yet</span>';
-      return `<div class="callout ${{esc(ux.user_state || '')}}">
-        <div><span class="${{statusClass(ux.user_state)}}">${{esc(ux.user_state || '-')}}</span> risk=${{esc(ux.risk || '-')}}</div>
-        <h2>${{esc(ux.headline)}}</h2>
-        <div>${{esc(ux.why || '')}}</div>
-        <div class="actions">${{actions || '<span class="meta">No immediate action.</span>'}}</div>
-        <div class="deliverables">${{deliverables}}</div>
-      </div>`;
-    }}
-    function actionButton(action) {{
-      const cls = action.danger ? '' : 'primary';
-      if (action.endpoint) return `<button class="${{cls}}" onclick="post('${{esc(action.endpoint).replace('/api','')}}')">${{esc(action.label)}}</button>`;
-      if (action.command) return `<code>${{esc(action.command)}}</code>`;
-      return `<span class="meta">${{esc(action.label || action.kind)}}</span>`;
-    }}
-    function tableBlock(title, rows, columns) {{
-      if (!rows.length) return `<h2>${{esc(title)}}</h2><div class="meta">No records.</div>`;
-      return `<h2>${{esc(title)}}</h2><table><thead><tr>${{columns.map(column => `<th>${{esc(column)}}</th>`).join('')}}</tr></thead><tbody>${{rows.map(row => `<tr>${{columns.map(column => `<td>${{esc(fmt(row[column]))}}</td>`).join('')}}</tr>`).join('')}}</tbody></table>`;
-    }}
-    function scorecardBlock(scorecard) {{
-      if (!scorecard) return '';
-      const reasons = (scorecard.top_reasons || []).slice(0, 4).map(item => `<li>${{esc(item)}}</li>`).join('') || '<li>No positive evidence recorded yet.</li>';
-      const missing = (scorecard.missing_evidence || []).slice(0, 4).map(item => `<li>${{esc(item)}}</li>`).join('') || '<li>none</li>';
-      return `<h2>Delivery Scorecard</h2>
-        <div><strong>${{esc(scorecard.score)}} / 100</strong> <span class="${{statusClass(scorecard.label)}}">${{esc(scorecard.label)}}</span></div>
-        <div class="meta">recommendation=${{esc(scorecard.recommendation)}} risk_penalty=${{esc(scorecard.risk_penalty)}}</div>
-        <h2>Why</h2><ul>${{reasons}}</ul>
-        <h2>Missing Evidence</h2><ul>${{missing}}</ul>`;
-    }}
-    function renderApprovals(rows) {{
-      document.getElementById('approvals').innerHTML = rows.length ? rows.map(row => `
-        <div class="action-card risk-medium">
-          <h3>Approval Required</h3>
-          <strong>${{esc(row.type || 'policy gate')}}</strong>
-          <div>${{esc(row.reason || 'A muxdev policy gate needs a decision.')}}</div>
-          <div class="meta">Task=${{esc(row.run_id || row.task_id || '-')}} Stage=${{esc(row.stage_id || '-')}} Approval=${{esc(row.approval_id)}}</div>
-          <ul>
-            <li>Files: ${{esc(row.files || row.files_json || 'review diff/evidence')}}</li>
-            <li>Shell: ${{esc(row.shell || row.command || 'unknown')}}</li>
-            <li>Network: ${{esc(row.network || 'unknown')}} Dependencies: ${{esc(row.dependencies || 'unknown')}}</li>
-            <li>Delete/secret/database/deploy risk: ${{esc(row.risk || row.subject_hash || 'check evidence')}}</li>
-            <li>Rollback point: ${{esc(row.rollback || 'available from task snapshots when recorded')}}</li>
-          </ul>
-          <div class="actions">
-            <button class="primary" onclick="post('/approvals/${{encodeURIComponent(row.approval_id)}}/approve')">Approve</button>
-            <button onclick="post('/approvals/${{encodeURIComponent(row.approval_id)}}/deny')">Deny</button>
-            <button onclick="loadText('/tasks/${{encodeURIComponent(row.run_id || row.task_id)}}/diff','diff')">View diff</button>
-            <button onclick="state.taskId='${{esc(row.run_id || row.task_id || '')}}'; refresh()">View evidence</button>
-          </div>
-        </div>`).join('') : '<div class="meta">No pending approvals.</div>';
-    }}
-    function renderProviderActions(rows) {{
-      document.getElementById('provider-actions').innerHTML = rows.length ? rows.map(row => {{
-        const attach = row.attach_command || row.transcript_path || '';
-        const options = (row.options || []).map(option => option.label || option.value).join(', ') || '-';
-        return `<div class="action-card risk-medium">
-          <h3>Provider Action Required</h3>
-          <strong>${{esc(row.provider || 'provider')}}</strong>
-          <div class="meta">Reason=${{esc(row.kind || 'provider prompt')}} Task=${{esc(row.run_id || '-')}} Stage=${{esc(row.stage_id || '-')}}</div>
-          <p>${{esc(row.prompt_text || '')}}</p>
-          <div class="meta">Options: ${{esc(options)}}</div>
-          <ol>
-            <li>Open provider session <code>${{esc(attach || '-')}}</code></li>
-            <li>Handle the prompt in the provider CLI.</li>
-            <li>Return here and continue.</li>
-          </ol>
-          <div class="actions">
-            <button onclick="copyText('${{esc(attach)}}')">Copy attach command</button>
-            <button class="primary" onclick="post('/tasks/${{encodeURIComponent(row.run_id)}}/actions/${{encodeURIComponent(row.action_id)}}/handled-and-continue')">Mark handled and continue</button>
-            <button onclick="post('/provider-actions/${{encodeURIComponent(row.action_id)}}/dismiss')">Dismiss</button>
-            <button onclick="post('/tasks/${{encodeURIComponent(row.run_id)}}/stop')">Stop task</button>
-          </div>
-        </div>`;
-      }}).join('') : '<div class="meta">No pending provider actions.</div>';
-    }}
-    async function post(path) {{ await api(path, {{ method: 'POST' }}); await refresh(); }}
-    async function loadText(path, key) {{ const payload = await api(path); document.getElementById('events').textContent = payload[key] || ''; }}
-    async function copyText(value) {{ if (navigator.clipboard && value) await navigator.clipboard.writeText(value); }}
-    function connectEvents() {{
-      const socket = new WebSocket(`${{location.protocol === 'https:' ? 'wss' : 'ws'}}://${{location.host}}/events`);
-      socket.onmessage = event => {{ state.events.push(event.data); state.events = state.events.slice(-20); document.getElementById('events').textContent = state.events.join('\\n'); refresh().catch(() => {{}}); }};
-      socket.onclose = () => setTimeout(connectEvents, 2000);
-    }}
-    refresh().catch(error => document.getElementById('daemon-status').textContent = error.message);
-    connectEvents();
-    setInterval(() => refresh().catch(() => {{}}), 5000);
-  </script>
+<script>
+const state={taskId:document.body.dataset.taskId||null,selectedProjectId:null,mainTab:'projects',projectSubtab:'workflows',events:[]};
+const esc=v=>String(v??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+const fmt=v=>Array.isArray(v)||(v&&typeof v==='object')?JSON.stringify(v):v;
+const statusClass=v=>`status ${v||''}`;
+async function api(path,options){const r=await fetch('/api'+path,options);if(!r.ok)throw new Error(await r.text());return r.json();}
+async function optionalApi(path,fallback){try{return await api(path)}catch(_e){return fallback}}
+function setMainTab(tab){state.mainTab=tab;document.getElementById('tab-projects').classList.toggle('active',tab==='projects');document.getElementById('tab-global').classList.toggle('active',tab==='global');document.getElementById('panel-projects').classList.toggle('active',tab==='projects');document.getElementById('panel-global').classList.toggle('active',tab==='global');}
+function setProjectSubtab(tab){state.projectSubtab=tab;for(const name of ['workflows','tasks','activity','artifacts','config']){document.getElementById('subtab-'+name).classList.toggle('active',tab===name);document.getElementById('project-'+name).style.display=tab===name?'':'none';}}
+async function refresh(){const overview=await api('/dashboard/overview');document.getElementById('daemon-status').textContent=`tasks=${overview.counts?.tasks??0} active=${overview.counts?.active??0} attention=${overview.counts?.needs_attention??0}`;const ids=(overview.projects||[]).map(p=>p.id);if(!state.selectedProjectId||!ids.includes(state.selectedProjectId)){state.selectedProjectId=overview.selected_project_id||ids[0]||null;state.taskId=null;}const selected=(overview.projects||[]).find(p=>p.id===state.selectedProjectId)||(overview.projects||[])[0];if(selected&&!state.taskId){const first=firstProjectTask(selected);if(first)state.taskId=first.task_id;}renderCurrentStatus(overview.current_status||{},overview.counts||{});renderActionCenter(overview.action_center||[]);renderProjects(overview.projects||[],selected);renderGlobalConfig(overview.global_config||{});renderProviderActions(overview.pending_provider_actions||[]);renderApprovals(overview.pending_approvals||[]);if(state.taskId){const detail=await optionalApi('/tasks/'+encodeURIComponent(state.taskId),null);renderSelectedTask(detail,overview.artifact_center||{});}else{renderSelectedTask(null,overview.artifact_center||{});}setMainTab(state.mainTab);setProjectSubtab(state.projectSubtab);}
+function firstProjectTask(project){for(const workflow of project.workflows||[])for(const group of workflow.role_groups||[])if((group.tasks||[]).length)return group.tasks[0];return null;}
+function renderCurrentStatus(status,counts){const rows=[['Running',status.running??counts.active??0,'active tasks'],['Waiting',(status.waiting_provider_action??0)+(status.waiting_muxdev_approval??0),'actions and approvals'],['Stuck',status.stuck??0,'blocked or errored'],['Projects',counts.projects??'-','workspace groups'],['Done',(status.recent_completed||[]).length,'recent deliverables']];document.getElementById('current-status').innerHTML=rows.map(([a,b,c])=>`<div class="card metric"><h3>${esc(a)}</h3><strong>${esc(b)}</strong><span class="meta">${esc(c)}</span></div>`).join('');}
+function renderActionCenter(rows){document.getElementById('action-center').innerHTML=rows.length?rows.map(r=>`<div class="action-card"><strong>${esc(r.headline)}</strong><div>${esc(r.why||'')}</div>${r.command?`<code>${esc(r.command)}</code>`:''}<div class="actions">${r.endpoint?`<button class="primary" onclick="post('${esc(r.endpoint).replace('/api','')}')">Take action</button>`:''}</div></div>`).join(''):'<div class="meta">Nothing needs your attention. Running tasks will appear here if they pause.</div>';}
+function renderProjects(projects,selected){document.getElementById('project-list').innerHTML=projects.length?projects.map(p=>`<div class="project-item ${p.id===(selected||{}).id?'active':''}"><button class="project-select" title="${esc(p.path)}" onclick="state.selectedProjectId='${esc(p.id)}';state.taskId=null;refresh()"><span class="project-name">${esc(p.name)}</span><span class="project-path meta">${esc(p.path)}</span><span class="chips"><span>${esc(p.summary?.tasks??0)} tasks</span><span>${esc(p.summary?.active??0)} active</span><span>$${esc(p.summary?.cost_usd??0)}</span></span></button><button class="project-hide" title="Hide project from dashboard" onclick="hideProject(event,'${esc(p.id)}')">Hide</button></div>`).join(''):'<div class="meta">No visible projects. Hidden projects can be restored with include_hidden=true from the API.</div>';if(!selected){document.getElementById('project-title').textContent='Project';document.getElementById('project-path').textContent='';document.getElementById('project-workflows').innerHTML='<div class="meta">No project selected.</div>';document.getElementById('project-tasks').innerHTML='';document.getElementById('timeline').innerHTML='<div class="meta">No task selected.</div>';document.getElementById('artifacts-center').innerHTML='<div class="meta">No artifacts yet.</div>';document.getElementById('project-config').innerHTML='';return;}document.getElementById('project-title').textContent=selected.name;document.getElementById('project-path').textContent=selected.path;renderProjectWorkflows(selected);renderProjectTasks(selected);renderProjectConfig(selected.config||{});}
+function renderProjectWorkflows(project){document.getElementById('project-workflows').innerHTML='<h2>Task Board</h2>'+((project.workflows||[]).map(w=>`<section><h2>${esc(w.name||w.id)}</h2><div class="meta">${esc(w.stage_count)} stages | ${esc(w.task_count)} tasks</div><div class="board">${(w.role_groups||[]).map(g=>`<div class="column"><h3>${esc(g.role)} <span>${(g.tasks||[]).length}</span></h3>${(g.tasks||[]).map(taskCard).join('')||'<div class="meta">No tasks.</div>'}</div>`).join('')}</div></section>`).join('')||'<div class="meta">No workflows.</div>');}
+function renderProjectTasks(project){const tasks=[];(project.workflows||[]).forEach(w=>(w.role_groups||[]).forEach(g=>(g.tasks||[]).forEach(t=>tasks.push(t))));document.getElementById('project-tasks').innerHTML=tasks.length?tasks.map(taskCard).join(''):'<div class="meta">No tasks.</div>';}
+function taskCard(t){return `<div class="task-card" tabindex="0" onclick="state.taskId='${esc(t.task_id)}';refresh()"><strong>${esc(t.title||t.task_id)}</strong> <span class="${statusClass(t.status)}">${esc(t.status||'-')}</span><div class="meta">${esc(t.provider||'-')} | ${esc(t.current_stage||'-')} | ${esc(t.workflow||'-')}</div><div class="hover-detail"><div class="meta">cost=${esc(t.cost_usd||0)} tokens=${esc(t.tokens||0)} approvals=${esc(t.pending_approvals||0)} actions=${esc(t.pending_provider_actions||0)}</div><div class="actions"><button onclick="loadText('${esc(t.report_endpoint||'').replace('/api','')}','events');event.stopPropagation()">Report</button><button onclick="loadText('${esc(t.diff_endpoint||'').replace('/api','')}','events');event.stopPropagation()">Diff</button></div></div></div>`;}
+function renderProjectConfig(config){document.getElementById('project-config').innerHTML=`<div class="metrics"><div class="card"><h3>Profile</h3><strong>${esc(config.profile||'-')}</strong><div class="meta">gate=${esc(config.gate||'-')}</div></div><div class="card"><h3>Approvals</h3><strong>${esc(config.approvals?.pending||0)}</strong><div class="meta">pending project approval gates</div></div></div>${tableBlock('Roles',Object.entries(config.roles||{}).map(([role,value])=>({role,value})),['role','value'])}${tableBlock('Skills',config.skills||[],['name','source','trust'])}`;}
+function renderGlobalConfig(config){renderMcpSummary(config.mcp||{});document.getElementById('role-templates').innerHTML=tableBlock('Role Templates',config.role_templates||[],['name','workflow','roles','providers']);const templates=config.workflow_templates||{};document.getElementById('workflow-templates').innerHTML=tableBlock('Workflow Templates',templates.templates||[],['name','description','phases','supported_providers']);const skills=config.skills_catalog||{};document.getElementById('skills-catalog').innerHTML=tableBlock('Catalog',(skills.catalog||{}).skills||[],['name','trust','risk_level','source','description'])+tableBlock('Lock',(skills.lock||{}).skills||[],['name','status']);}
+function renderMcpSummary(mcp){const rows=[['status',mcp.status||'enabled'],['mode',mcp.mode||'local stdio'],['tools',mcp.tools_count??0],['resources',mcp.resources_count??0],['prompts',mcp.prompts_count??0],['guarded writes',mcp.write_policy||'guarded'],['guardrails',(mcp.recent_guardrails||[]).length],['recent denials',mcp.recent_denials??0]];const commands=mcp.commands||{};document.getElementById('mcp-summary').innerHTML=`<div class="metrics">${rows.map(([a,b])=>`<div class="card metric"><h3>${esc(a)}</h3><strong>${esc(b)}</strong></div>`).join('')}</div><div class="actions"><button onclick="copyText('${esc(commands.manifest||'muxdev mcp manifest --json')}')">Manifest</button><button onclick="copyText('${esc(commands.doctor||'muxdev mcp doctor --json')}')">Doctor</button></div>${(mcp.recent_guardrails||[]).length?tableBlock('Recent Guardrails',mcp.recent_guardrails||[],['tool','decision','reason','created_at']):'<div class="meta">No recent MCP guardrails.</div>'}`;}
+function renderSelectedTask(payload,center){if(!payload){document.getElementById('timeline').innerHTML='<div class="meta">No task selected.</div>';document.getElementById('artifacts-center').innerHTML='<div class="meta">No artifacts yet.</div>';return;}const stages=payload.stages||[];document.getElementById('timeline').innerHTML=stages.length?stages.map(s=>`<div class="timeline-step"><strong>${esc(s.stage_id)}</strong> <span class="${statusClass(s.status)}">${esc(s.status||'-')}</span><div>${esc(s.summary||'')}</div></div>`).join(''):'<div class="meta">No stage timeline yet.</div>';document.getElementById('artifacts-center').innerHTML=tableBlock('Final Reports / Artifacts',payload.artifacts||[],['name','kind','stage_id','path','created_at'])+tableBlock('Test Output',payload.test_results||[],['stage_id','passed','command','summary'])+tableBlock('Evidence Evaluation',payload.evidence_evaluations||[],['run_id','label','confidence','path']);}
+function renderApprovals(rows){document.getElementById('approvals').innerHTML=rows.length?rows.map(r=>`<div class="action-card"><h3>Approval Required</h3><strong>${esc(r.type||'policy gate')}</strong><div>${esc(r.reason||'')}</div><div class="actions"><button class="primary" onclick="post('/approvals/${encodeURIComponent(r.approval_id)}/approve')">Approve</button><button onclick="post('/approvals/${encodeURIComponent(r.approval_id)}/deny')">Deny</button></div></div>`).join(''):'<div class="meta">No pending approvals.</div>';}
+function renderProviderActions(rows){document.getElementById('provider-actions').innerHTML=rows.length?rows.map(r=>`<div class="action-card"><h3>Provider Action Required</h3><strong>${esc(r.provider||'provider')}</strong><p>${esc(r.prompt_text||'')}</p><div class="actions"><button onclick="copyText('${esc(r.attach_command||'')}')">Copy attach command</button><button class="primary" onclick="post('/tasks/${encodeURIComponent(r.run_id)}/actions/${encodeURIComponent(r.action_id)}/handled-and-continue')">Mark handled and continue</button></div></div>`).join(''):'<div class="meta">No pending provider actions.</div>';}
+function tableBlock(title,rows,cols){rows=rows||[];if(!rows.length)return `<h3>${esc(title)}</h3><div class="meta">No records.</div>`;return `<h3>${esc(title)}</h3><table><thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${cols.map(c=>tableCell(r,c)).join('')}</tr>`).join('')}</tbody></table>`;}
+function tableCell(r,c){const v=c==='path'&&r.path_display?r.path_display:r[c];const title=c==='path'&&r.path_title?` title="${esc(r.path_title)}"`:'';return `<td${title}>${esc(fmt(v))}</td>`;}
+async function post(path){await api(path,{method:'POST'});await refresh();}
+async function hideProject(event,id){event.stopPropagation();if(!confirm('Hide this project from Mission Control? This does not delete the workspace, runs, evidence, or files.'))return;await api('/dashboard/projects/'+encodeURIComponent(id),{method:'DELETE'});if(state.selectedProjectId===id){state.selectedProjectId=null;state.taskId=null;}await refresh();}
+async function loadText(path,target){const payload=await api(path);document.getElementById(target==='events'?'events':target).textContent=payload[target]||payload.content||payload.diff||JSON.stringify(payload,null,2);}
+async function copyText(v){if(navigator.clipboard&&v)await navigator.clipboard.writeText(v);}
+function connectEvents(){const socket=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/events`);socket.onmessage=e=>{state.events.push(e.data);state.events=state.events.slice(-20);document.getElementById('events').textContent=state.events.join('\n');refresh().catch(()=>{});};socket.onclose=()=>setTimeout(connectEvents,2000);}
+refresh().catch(e=>document.getElementById('daemon-status').textContent=e.message);connectEvents();setInterval(()=>refresh().catch(()=>{}),5000);
+</script>
 </body>
 </html>"""

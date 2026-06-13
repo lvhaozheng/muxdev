@@ -8,13 +8,12 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
-from muxdev.api.mcp import handle_jsonrpc, server_manifest
+from muxdev.api.mcp import handle_jsonrpc, mcp_doctor, server_manifest
 from muxdev.api.web import create_app, render_dashboard_html, render_live_dashboard_html
 from muxdev.cli import app
 from muxdev.daemon.paths import default_daemon_paths
 from muxdev.daemon.tasks import TaskManager
-from muxdev.services.plugin_manifest import validate_plugin_manifest
-from muxdev.services.skill_lock import write_skill_lock
+from muxdev.services.skills import write_skill_lock
 from muxdev.storage import Blackboard
 
 
@@ -71,31 +70,33 @@ def test_skill_lock_writes_lock_and_optional_skill_memory() -> None:
         shutil.rmtree(workspace, ignore_errors=True)
 
 
-def test_safe_plugin_manifest_flags_sensitive_permissions() -> None:
-    workspace = _workspace_temp("p3-plugin")
-    try:
-        plugin_dir = workspace / "plugin"
-        manifest_dir = plugin_dir / ".codex-plugin"
-        manifest_dir.mkdir(parents=True)
-        (manifest_dir / "plugin.json").write_text(
-            json.dumps({"name": "danger-plugin", "permissions": ["read", "shell", "network:api"]}),
-            encoding="utf-8",
-        )
-
-        payload = validate_plugin_manifest(str(plugin_dir))
-
-        assert payload["name"] == "danger-plugin"
-        assert payload["status"] == "needs_review"
-        assert payload["warnings"]
-        assert "shell" in ", ".join(payload["warnings"])
-    finally:
-        shutil.rmtree(workspace, ignore_errors=True)
-
-
 def test_mcp_guardrail_tools_record_events() -> None:
     workspace = _workspace_temp("p3-mcp")
     try:
-        assert "muxdev.check_policy" in {tool["name"] for tool in server_manifest()["tools"]}
+        initialized = handle_jsonrpc({"jsonrpc": "2.0", "id": 0, "method": "initialize"}, workspace)
+        assert initialized["result"]["capabilities"]["resources"] == {}
+        assert initialized["result"]["capabilities"]["prompts"] == {}
+        tool_names = {tool["name"] for tool in server_manifest()["tools"]}
+        assert "muxdev.check_policy" in tool_names
+        assert "workflow.templates" in tool_names
+        assert "workflow.plugins" in tool_names
+        assert "muxdev.submit_task" in tool_names
+        templates = handle_jsonrpc(
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "workflow.templates", "arguments": {}}},
+            workspace,
+        )
+        assert templates["result"]["content"][0]["json"]
+        resources = handle_jsonrpc({"jsonrpc": "2.0", "id": 3, "method": "resources/list"}, workspace)
+        assert "muxdev://workspace/summary" in {row["uri"] for row in resources["result"]["resources"]}
+        resource = handle_jsonrpc({"jsonrpc": "2.0", "id": 4, "method": "resources/read", "params": {"uri": "muxdev://workspace/summary"}}, workspace)
+        assert "workspace" in resource["result"]["contents"][0]["text"]
+        prompts = handle_jsonrpc({"jsonrpc": "2.0", "id": 5, "method": "prompts/list"}, workspace)
+        assert "muxdev.workflow.design" in {row["name"] for row in prompts["result"]["prompts"]}
+        prompt = handle_jsonrpc({"jsonrpc": "2.0", "id": 6, "method": "prompts/get", "params": {"name": "muxdev.workflow.design", "arguments": {"task": "ship it"}}}, workspace)
+        assert "ship it" in prompt["result"]["messages"][0]["content"]["text"]
+        disabled = handle_jsonrpc({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "muxdev.submit_task", "arguments": {"task": "x"}}}, workspace)
+        assert disabled["error"]["code"] == -32000
+        assert "disabled" in disabled["error"]["message"]
         response = handle_jsonrpc(
             {
                 "jsonrpc": "2.0",
@@ -112,19 +113,67 @@ def test_mcp_guardrail_tools_record_events() -> None:
             events = board.table_rows("guardrail_events")
         assert events[0]["tool"] == "muxdev.check_policy"
         assert events[0]["decision"] == "deny"
+        doctor = mcp_doctor(workspace)
+        assert doctor["tools_count"] > 0
+        assert doctor["resources_count"] > 0
+        assert doctor["prompts_count"] > 0
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 
 
-def test_cli_skill_lock_and_plugin_validate() -> None:
+def test_mcp_allowlist_filters_and_rejects_tools() -> None:
+    workspace = _workspace_temp("p3-mcp-allowlist")
+    try:
+        config_dir = workspace / ".muxdev"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.toml").write_text(
+            '[mcp]\nallowed_tools = ["workflow.templates"]\nallowed_resources = ["muxdev://workspace/summary"]\n',
+            encoding="utf-8",
+        )
+        listed = handle_jsonrpc({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, workspace)
+        assert {row["name"] for row in listed["result"]["tools"]} == {"workflow.templates"}
+        denied = handle_jsonrpc(
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "muxdev.check_policy", "arguments": {"command": "rm -rf /"}}},
+            workspace,
+        )
+        assert "not allowed" in denied["error"]["message"]
+        resources = handle_jsonrpc({"jsonrpc": "2.0", "id": 3, "method": "resources/list"}, workspace)
+        assert {row["uri"] for row in resources["result"]["resources"]} == {"muxdev://workspace/summary"}
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_mcp_disabled_hides_surface_and_rejects_calls() -> None:
+    workspace = _workspace_temp("p3-mcp-disabled")
+    try:
+        config_dir = workspace / ".muxdev"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.toml").write_text("[mcp]\nenabled = false\n", encoding="utf-8")
+
+        manifest = server_manifest(workspace)
+        assert manifest["tools"] == []
+        assert manifest["resources"] == []
+        assert manifest["prompts"] == []
+
+        listed = handle_jsonrpc({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, workspace)
+        assert listed["result"]["tools"] == []
+        resources = handle_jsonrpc({"jsonrpc": "2.0", "id": 2, "method": "resources/list"}, workspace)
+        assert resources["result"]["resources"] == []
+        denied = handle_jsonrpc(
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "workflow.templates", "arguments": {}}},
+            workspace,
+        )
+        assert "MCP is disabled" in denied["error"]["message"]
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_cli_skill_lock_and_removed_plugin_command() -> None:
     workspace = _workspace_temp("p3-cli")
     try:
         skill_dir = workspace / "skills" / "docs"
         skill_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text("---\nname: docs\nversion: 0.1\n---\n# Docs\n", encoding="utf-8")
-        plugin_dir = workspace / "plugin"
-        (plugin_dir / ".codex-plugin").mkdir(parents=True)
-        (plugin_dir / ".codex-plugin" / "plugin.json").write_text(json.dumps({"name": "docs-plugin", "permissions": ["read"]}), encoding="utf-8")
 
         import os
 
@@ -132,13 +181,13 @@ def test_cli_skill_lock_and_plugin_validate() -> None:
         os.chdir(workspace)
         try:
             locked = runner.invoke(app, ["skill", "lock", "--no-memory", "--json"])
-            validated = runner.invoke(app, ["plugin", "validate", str(plugin_dir), "--json"])
+            removed = runner.invoke(app, ["plugin", "validate", "anything", "--json"])
         finally:
             os.chdir(previous)
 
         assert locked.exit_code == 0
-        assert validated.exit_code == 0
-        assert json.loads(validated.stdout)["status"] == "trusted"
+        assert removed.exit_code != 0
+        assert json.loads(removed.stdout)["status"] == "removed"
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 
@@ -159,7 +208,6 @@ def test_dashboard_renders_p3_ecosystem_sections() -> None:
             "ci_rescues": [{"rescue_id": "cires_1", "status": "submitted"}],
             "cache_entries": [{"cache_key": "sha256:abc", "kind": "feedback_event"}],
             "skill_locks": [{"skill_name": "reviewer", "status": "locked"}],
-            "plugin_manifests": [{"plugin_name": "plugin", "status": "trusted"}],
             "memory_context": [{"id": "mem_1", "claim": "use pytest"}],
             "guardrail_events": [{"event_id": "guard_1", "decision": "deny"}],
             "test_results": [],
@@ -176,9 +224,10 @@ def test_dashboard_renders_p3_ecosystem_sections() -> None:
     assert "CI Rescue" in html
     assert "CAS Cache" in html
     assert "Skill Lock" in html
-    assert "Plugin Manifest" in html
+    assert "Plugin Manifest" not in html
     assert "Memory Context" in live
     assert "Role Sessions" in live
+    assert "Workflow Templates" in live
 
 
 def _workspace_temp(prefix: str) -> Path:

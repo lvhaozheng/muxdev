@@ -15,8 +15,11 @@ workflow_plugins:
     supported_providers: [mock, codex, claude-code, qwen, kimi, trae, antigravity]
     commands:
       running: "{task}"
+    prompts:
+      running: |
+        Run the task directly while respecting muxdev safety, evidence, and workspace boundaries.
     artifacts: {}
-    notes: Inspired by agtx's void plugin for full human control.
+    notes: Inspired by agtx's void workflow template for full human control.
   muxdev:
     description: Default muxdev design, approve, implement, test, review workflow.
     phases: [design, implement, test, review, fix]
@@ -27,12 +30,23 @@ workflow_plugins:
       test: "/muxdev:test {task}"
       review: "/muxdev:review {task}"
       fix: "/muxdev:fix {task}"
+    prompts:
+      design: |
+        Produce the design brief, acceptance criteria, risks, and implementation plan for: {task}
+      implement: |
+        Implement the approved plan for: {task}
+      test: |
+        Verify the implementation with targeted tests and report evidence for: {task}
+      review: |
+        Review the delivered change for blockers, regressions, and missing tests for: {task}
+      fix: |
+        Fix review blockers and preserve existing behavior for: {task}
     artifacts:
       design: plan.md
       test: test.log
       review: review.md
       fix: diff.patch
-    notes: Maps muxdev's built-in DAG to an agtx-style phase catalog.
+    notes: Maps muxdev's built-in DAG to a reusable phase catalog.
   spec-lite:
     description: Small spec-driven workflow for projects that want planning artifacts before implementation.
     phases: [research, planning, running, review]
@@ -42,18 +56,30 @@ workflow_plugins:
       planning: "/spec-lite:plan {task}"
       running: "/spec-lite:execute {task}"
       review: "/spec-lite:review {task}"
+    prompts:
+      research: |
+        Gather repository facts, constraints, and unknowns before planning: {task}
+      planning: |
+        Convert research into a concise implementation plan with acceptance criteria: {task}
+      running: |
+        Execute the plan in scoped steps and keep evidence for each claim: {task}
+      review: |
+        Review the implementation against the spec, tests, and residual risks: {task}
     artifacts:
       research: .muxdev/spec/research.md
       planning: .muxdev/spec/plan.md
       running: .muxdev/spec/summary.md
       review: .muxdev/spec/review.md
-    notes: A compact local analogue to agtx spec-driven plugins such as spec-kit/OpenSpec.
+    notes: A compact local analogue to spec-driven workflow templates such as spec-kit/OpenSpec.
   review-only:
     description: Read-only review workflow for parallel reviewer agents.
     phases: [review]
     supported_providers: [codex, claude-code, qwen, kimi]
     commands:
       review: "/muxdev:review {task}"
+    prompts:
+      review: |
+        Perform a read-only review and lead with actionable blockers for: {task}
     artifacts:
       review: review.md
     notes: Useful for CAO-style parallel review fan-out.

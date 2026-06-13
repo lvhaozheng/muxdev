@@ -1,0 +1,15 @@
+version = 1
+
+[activation]
+roles = ["code", "implementer"]
+auto = true
+
+[permissions]
+read_workspace = true
+write_workspace = true
+shell = false
+network = false
+secrets = false
+
+[trust]
+risk_level = "medium"

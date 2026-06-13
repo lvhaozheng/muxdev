@@ -26,7 +26,7 @@ from ..models import ApprovalStatus, ProviderActionStatus
 from ..providers import detect_providers
 from ..providers import probe_provider
 from ..services.reports import generate_final_report
-from ..services.dashboard import build_run_dashboard_payload, startup_dashboard_payload
+from ..services.dashboard_run import build_run_dashboard_payload, startup_dashboard_payload
 from ..runtime import SupervisorRuntime
 from ..core.safety import SafetyPolicyEngine
 from ..services.skills import SkillRegistry
@@ -745,8 +745,8 @@ def status_panel(payload: dict[str, Any]) -> Group:
     panels = [_overview_panel(payload)]
     if payload.get("ux"):
         panels.append(_ux_panel(payload))
-    if payload.get("evidence_scorecard"):
-        panels.append(_scorecard_panel(payload))
+    if payload.get("evidence_evaluation"):
+        panels.append(_evidence_panel(payload))
     panels.extend([_work_panel(payload), _trace_panel(payload)])
     return Group(*panels)
 
@@ -892,19 +892,20 @@ def _ux_panel(payload: dict[str, Any]) -> Panel:
     return Panel(table, title="Current Focus", box=box.ASCII, border_style=_status_border(str(ux.get("user_state") or "")))
 
 
-def _scorecard_panel(payload: dict[str, Any]) -> Panel:
-    scorecard = payload.get("evidence_scorecard") if isinstance(payload.get("evidence_scorecard"), dict) else {}
+def _evidence_panel(payload: dict[str, Any]) -> Panel:
+    evaluation = payload.get("evidence_evaluation") if isinstance(payload.get("evidence_evaluation"), dict) else {}
+    manifest = payload.get("evidence_manifest") if isinstance(payload.get("evidence_manifest"), dict) else {}
     table = Table.grid(expand=True)
     table.add_column(ratio=1, style="bold")
     table.add_column(ratio=4)
-    table.add_row("confidence", f"{scorecard.get('score', 0)} / 100  {scorecard.get('label', '-')}")
-    table.add_row("recommendation", str(scorecard.get("recommendation", "-")))
-    table.add_row("risk penalty", str(scorecard.get("risk_penalty", 0)))
-    reasons = scorecard.get("top_reasons", []) if isinstance(scorecard.get("top_reasons"), list) else []
-    missing = scorecard.get("missing_evidence", []) if isinstance(scorecard.get("missing_evidence"), list) else []
+    table.add_row("confidence", f"{evaluation.get('confidence', 0)}  {evaluation.get('label', '-')}")
+    table.add_row("events", str(manifest.get("event_count", 0)))
+    table.add_row("head hash", str(manifest.get("head_hash") or "-"))
+    reasons = evaluation.get("reasons", []) if isinstance(evaluation.get("reasons"), list) else []
+    missing = evaluation.get("missing_evidence", []) if isinstance(evaluation.get("missing_evidence"), list) else []
     table.add_row("why", "; ".join(str(item) for item in reasons[:3]) or "-")
     table.add_row("missing", "; ".join(str(item) for item in missing[:3]) or "none")
-    return Panel(table, title="Delivery Scorecard", box=box.ASCII, border_style="green")
+    return Panel(table, title="Evidence Evaluation", box=box.ASCII, border_style="green")
 
 
 def _trace_panel(payload: dict[str, Any]) -> Panel:

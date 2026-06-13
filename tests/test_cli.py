@@ -366,6 +366,9 @@ def test_session_start_list_stop_and_rag_query() -> None:
 def test_graph_mcp_workflow_and_flow_smoke() -> None:
     graph = runner.invoke(app, ["graph", "export", "--json"])
     manifest = runner.invoke(app, ["mcp", "manifest", "--json"])
+    doctor = runner.invoke(app, ["mcp", "doctor", "--json"])
+    request = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "resources/list"})
+    served = runner.invoke(app, ["mcp", "serve", "--request", request])
     plugin = runner.invoke(app, ["workflow", "plugin", "spec-lite", "--json"])
     command = runner.invoke(
         app,
@@ -384,7 +387,14 @@ def test_graph_mcp_workflow_and_flow_smoke() -> None:
     assert graph.exit_code == 0
     assert json.loads(graph.stdout)["name"] == "software-dev"
     assert manifest.exit_code == 0
-    assert "provider.detect" in {tool["name"] for tool in json.loads(manifest.stdout)["tools"]}
+    manifest_payload = json.loads(manifest.stdout)
+    assert "provider.detect" in {tool["name"] for tool in manifest_payload["tools"]}
+    assert manifest_payload["resources"]
+    assert manifest_payload["prompts"]
+    assert doctor.exit_code == 0
+    assert json.loads(doctor.stdout)["write_policy"] == "guarded"
+    assert served.exit_code == 0
+    assert json.loads(served.stdout)["result"]["resources"]
     assert plugin.exit_code == 0
     assert json.loads(plugin.stdout)["artifacts"]["planning"] == ".muxdev/spec/plan.md"
     assert command.exit_code == 0

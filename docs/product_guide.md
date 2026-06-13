@@ -53,7 +53,7 @@ muxdev 不直接相信任何 Agent 的自然语言结论，而是相信结构化
 
 - StageContract
 - RoleResultContract
-- EvidenceBundle
+- Evidence v2 events、manifest、evaluation
 - Hash-Chained Ledger
 - Blind Validator Panel
 - Semantic Merge Review
@@ -177,9 +177,9 @@ muxdev dev "高风险支付变更" `
 
 小修复可以只用一个 code agent；涉及认证、支付、权限、迁移、依赖升级等高风险任务时，muxdev 会自动启用 plan、code、test、review、secure 等角色，并在必要时要求审批。
 
-### Evidence-Grounded Persistent Memory
+### Evidence-Aware Persistent Memory
 
-Memory 存储项目架构决策、代码约定、测试命令、模块边界、安全规则、provider 表现、skill 成功率等内容。
+Memory 存储项目架构决策、代码约定、测试命令、模块边界、安全规则、provider 表现、skill 成功率等内容。它可以引用 evidence id，但不会和 evidence 记录混成同一种对象。
 
 常用命令：
 
@@ -206,7 +206,7 @@ muxdev memory quarantine-auto --json
 - 审批绑定了什么对象？
 - 是否可以回滚？
 
-muxdev 通过 contracts、evidence bundle、ledger、validator 和 report 记录这些信息。
+muxdev 通过 contracts、Evidence v2 event stream、manifest、evaluation、ledger、validator 和 report 记录这些信息。
 
 ### Approval Integrity
 
@@ -280,7 +280,7 @@ muxdev 的生态治理能力包括：
 
 - CAS Cache：缓存反馈、测试、构建、RAG、provider conformance 等可复用信息。
 - Skill Lock：记录 skill hash、version、compatible roles 和 failure modes。
-- Safe Plugin Manifest：校验插件权限，不默认执行插件代码。
+- Skills are the maintained extension unit; muxdev does not expose a local plugin registry unless a future runtime can package skills, hooks, MCP servers, and commands together.
 - MCP Guardrail：让外部 MCP 工具复用 muxdev 的审批、记忆、证据链和安全策略。
 
 ## Typical Workflows
@@ -369,7 +369,7 @@ Dashboard/TUI 不会替用户向 provider CLI 输入 yes/no。用户先进入对
 muxdev evidence verify latest --json
 ```
 
-用于校验 ledger、contracts、evidence bundle 和 validator panel。
+用于校验 Evidence v2 manifest、事件链、artifact hash 和 validator panel。
 
 ### Rollback
 
@@ -395,7 +395,7 @@ muxdev multirepo plan "coordinate auth API change" --repo repo-a --repo repo-b -
 muxdev multirepo dev "coordinate auth API change" --repo repo-a --repo repo-b --json
 ```
 
-P4 v1 生成可审计编排计划，不自动跨仓写代码。
+当前 multi-repo 生成可审计编排计划，不自动跨仓写代码。
 
 ## How muxdev differs from other AI coding tools
 

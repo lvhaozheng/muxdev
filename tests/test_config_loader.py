@@ -122,7 +122,7 @@ installers:
     assert by_name["fake"]["headless"] == "not_installed"
 
 
-def test_project_config_adds_dynamic_workflow_and_plugin(monkeypatch) -> None:
+def test_project_config_adds_dynamic_workflow_and_template(monkeypatch) -> None:
     temp_dir = _workspace_temp()
     try:
         monkeypatch.setenv("APPDATA", str(temp_dir / "user"))
@@ -140,7 +140,7 @@ workflows:
         deps: []
 workflow_plugins:
   custom:
-    description: Custom project plugin.
+    description: Custom project workflow template.
     phases: [planning]
     supported_providers: [codex]
     commands:
@@ -156,7 +156,9 @@ command_dialects:
         )
         with _chdir(temp_dir):
             graph = runner.invoke(app, ["graph", "export", "--workflow", "tiny", "--json"])
-            plugins = runner.invoke(app, ["workflow", "plugins", "--json"])
+            templates = runner.invoke(app, ["workflow", "templates", "--json"])
+            legacy_plugins = runner.invoke(app, ["workflow", "plugins", "--json"])
+            template = runner.invoke(app, ["workflow", "template", "custom", "--json"])
             rendered = runner.invoke(
                 app,
                 ["workflow", "render", "custom", "--phase", "planning", "--provider", "codex", "--task", "x", "--json"],
@@ -166,10 +168,29 @@ command_dialects:
 
     assert graph.exit_code == 0
     assert json.loads(graph.stdout)["name"] == "tiny"
-    assert plugins.exit_code == 0
-    assert "custom" in {row["name"] for row in json.loads(plugins.stdout)}
+    assert templates.exit_code == 0
+    assert legacy_plugins.exit_code == 0
+    assert template.exit_code == 0
+    assert "custom" in {row["name"] for row in json.loads(templates.stdout)}
+    assert json.loads(legacy_plugins.stdout) == json.loads(templates.stdout)
+    assert json.loads(template.stdout)["name"] == "custom"
     assert rendered.exit_code == 0
     assert json.loads(rendered.stdout)["command"] == "$custom-plan x"
+    assert json.loads(rendered.stdout)["prompt"] == ""
+
+
+def test_builtin_workflow_template_renders_phase_prompt(monkeypatch) -> None:
+    monkeypatch.delenv("MUXDEV_CONFIG", raising=False)
+
+    rendered = runner.invoke(
+        app,
+        ["workflow", "render", "muxdev", "--phase", "implement", "--provider", "codex", "--task", "ship it", "--json"],
+    )
+
+    assert rendered.exit_code == 0
+    payload = json.loads(rendered.stdout)
+    assert payload["command"] == "$muxdev-implement ship it"
+    assert "ship it" in payload["prompt"]
 
 
 def test_project_config_controls_runtime_adapter(monkeypatch) -> None:
@@ -202,7 +223,7 @@ providers:
     assert adapter.command == ["C:/bin/fake.exe", "--machine"]
     prompt = adapter._prompt("plan", "ship")
     assert prompt.startswith("Do plan: ship")
-    assert "muxdev Evidence Contract" in prompt
+    assert "muxdev Evidence v2 Contract" in prompt
 
 
 def _workspace_temp() -> Path:

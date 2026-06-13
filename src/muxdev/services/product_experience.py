@@ -236,7 +236,7 @@ def git_safety_panel(workspace: Path) -> dict[str, Any]:
 
 def rules_skills_panel(workspace: Path) -> dict[str, Any]:
     from ..config.runtime import GATES, PROFILES, load_runtime_config
-    from ..services.skill_engine import scan_skills
+    from ..services.skills import scan_skills
 
     config = load_runtime_config(workspace)
     try:

@@ -40,46 +40,51 @@ from ..config.runtime import (
 )
 from ..core.platforms import follow_file_command, hidden_subprocess_kwargs, split_command_line
 from ..models import ApprovalStatus
-from ..api.mcp import handle_jsonrpc, server_manifest
+from ..api.mcp import handle_jsonrpc, mcp_doctor, server_manifest
 from ..services.orchestration import deep_agent_task_pack, workflow_to_langgraph
 from ..services.automation import render_why
 from ..services.design import latest_design_contract
 from ..config.loader import config_sources, load_config, path_config, validate_config
 from ..services.rag import LocalRagIndex
 from ..services.reports import generate_final_report
-from ..services.evidence import verify_run_evidence
-from ..services.evidence_scorecard import load_scorecard_artifacts, render_scorecard_text, write_evidence_scorecard
-from ..services.plugin_manifest import validate_plugin_manifest
+from ..services.evidence import cleanup_legacy_evidence, load_evidence_artifacts, render_evidence_text, verify_run_evidence, write_evidence_run
 from ..services.advanced_parallel import detect_parallel_conflicts, record_parallel_conflicts
-from ..services.dashboard import dashboard_path, write_run_dashboard
+from ..services.dashboard_run import dashboard_path, write_run_dashboard
 from ..services.flows import FlowRegistry
 from ..services.multirepo import plan_multi_repo_orchestration
 from ..services.provider_learning import refresh_provider_learning
 from ..services.product_experience import build_product_experience, write_project_context
 from ..services.workflow_plugins import get_workflow_plugin, list_workflow_plugins, render_plugin_command
-from ..services.skill_engine import (
+from ..services.skills import (
+    abtest_skill,
+    activate_skill,
     add_skill,
     bind_skill,
+    build_skill_catalog,
+    eval_skill,
     export_skill,
     load_skills_config,
     remove_skill,
     resolve_active_skills,
     scan_skills,
+    score_skill,
+    select_skills,
     set_skill_policy,
+    SkillRegistry,
     skill_doctor,
     skill_show,
     sync_skills,
     unbind_skill,
     validate_skill_path,
+    verify_skill_lock,
+    write_skill_lock,
 )
-from ..services.skill_lock import write_skill_lock
 from ..runtime import SupervisorRuntime
 from ..core.safety import SafetyPolicyEngine
 from ..clients.sessions import SessionManager, TmuxBackend
 from ..daemon.paths import DEFAULT_API_PORT, DEFAULT_HOST, DEFAULT_UI_PORT, default_daemon_paths
 from ..daemon.process import daemon_status as daemon_process_status
 from ..daemon.process import start_daemon, stop_daemon
-from ..services.skills import SkillRegistry
 from ..storage import Blackboard, MemoryStore, RunStore, compact_trace, read_trace
 from ..ui.repl import start_repl
 from ..ui.tui import status_panel
@@ -133,22 +138,25 @@ app = typer.Typer(
 policy_app = typer.Typer(help="Safety policy tools")
 trace_app = typer.Typer(help="Trace inspection tools")
 skill_app = typer.Typer(help="Skill registry tools")
-plugin_app = typer.Typer(help="Plugin registry tools")
 preset_app = typer.Typer(help="Built-in profile, gate, and workflow presets")
 mcp_app = typer.Typer(help="MCP server tools")
 session_app = typer.Typer(help="Long-lived provider session tools")
 rag_app = typer.Typer(help="Local retrieval index tools")
 graph_app = typer.Typer(help="Workflow graph export tools")
 deep_agent_app = typer.Typer(help="Deep-agent integration tools")
-workflow_app = typer.Typer(help="Workflow plugin catalog tools")
+workflow_app = typer.Typer(help="Workflow template catalog tools")
+plugin_app = typer.Typer(
+    help="Deprecated plugin registry tools",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
 flow_app = typer.Typer(help="Scheduled flow tools")
 config_app = typer.Typer(help="Configuration inspection tools", invoke_without_command=True, no_args_is_help=False)
-memory_app = typer.Typer(help="Evidence-grounded project memory tools")
+memory_app = typer.Typer(help="Explicit project memory tools")
 parallel_app = typer.Typer(help="Advanced parallel-squad tools")
 learning_app = typer.Typer(help="Long-term learning tools")
 multirepo_app = typer.Typer(help="Multi-repo orchestration tools")
 ci_app = typer.Typer(help="CI rescue commands")
-evidence_app = typer.Typer(help="Evidence bundle and ledger tools")
+evidence_app = typer.Typer(help="Evidence v2 event, manifest, and evaluation tools")
 action_app = typer.Typer(help="Provider action handoff tools")
 feedback_app = typer.Typer(help="External feedback routing tools")
 cache_app = typer.Typer(help="Content-addressed cache tools")
@@ -180,39 +188,39 @@ console = Console(width=320)
 
 @evidence_app.callback()
 def evidence_group() -> None:
-    """Evidence Scorecard and Audit Pack tools."""
+    """Evidence v2 tools."""
 
 
 @evidence_app.command("latest")
 def evidence_latest(
-    audit: Annotated[bool, typer.Option("--audit", help="Include Audit Pack counts.")] = False,
+    events: Annotated[bool, typer.Option("--events", help="Include the first Evidence v2 events.")] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
-    """Show the latest run's Evidence Scorecard."""
-    _show_evidence_scorecard("latest", audit=audit, json_output=json_output)
+    """Show the latest run's Evidence v2 evaluation."""
+    _show_evidence("latest", include_events=events, json_output=json_output)
 
 
 @evidence_app.command("show")
 def evidence_show(
     run_id: Annotated[str, typer.Argument(help="Run id, or 'latest'.")] = "latest",
-    audit: Annotated[bool, typer.Option("--audit", help="Include Audit Pack counts.")] = False,
+    events: Annotated[bool, typer.Option("--events", help="Include the first Evidence v2 events.")] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
-    """Show one run's Evidence Scorecard."""
-    _show_evidence_scorecard(run_id, audit=audit, json_output=json_output)
+    """Show one run's Evidence v2 evaluation."""
+    _show_evidence(run_id, include_events=events, json_output=json_output)
 
 
-def _show_evidence_scorecard(run_id: str, *, audit: bool, json_output: bool) -> None:
+def _show_evidence(run_id: str, *, include_events: bool, json_output: bool) -> None:
     resolved, run_dir = _resolve_evidence_run(run_id)
     with _evidence_blackboard(run_dir) as blackboard:
-        payload = load_scorecard_artifacts(run_dir, resolved, blackboard)
-        if not payload.get("scorecard"):
-            write_evidence_scorecard(run_dir, resolved, blackboard)
-            payload = load_scorecard_artifacts(run_dir, resolved, blackboard)
+        payload = load_evidence_artifacts(run_dir, resolved, blackboard)
+        if not payload.get("evaluation") or not payload.get("manifest"):
+            write_evidence_run(run_dir, resolved, blackboard)
+            payload = load_evidence_artifacts(run_dir, resolved, blackboard)
     if json_output:
         _print_json(payload)
         return
-    console.print(Panel(render_scorecard_text(payload, audit=audit), title="muxdev evidence"))
+    console.print(Panel(render_evidence_text(payload, include_events=include_events), title="muxdev evidence"))
 
 
 @app.callback()
@@ -867,7 +875,7 @@ def memory_query(
     limit: Annotated[int, typer.Option("--limit", help="Maximum rows to return.")] = 8,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
-    """Search evidence-grounded project memory."""
+    """Search project memory."""
     with MemoryStore(Path.cwd()) as store:
         rows = store.query(query, status=status, layers=_csv_values(layers), scope_ids=_csv_values(scope_ids), limit=limit)
     if json_output:
@@ -887,7 +895,7 @@ def memory_propose(
     run_dir: Annotated[Path | None, typer.Option("--run-dir", help="Explicit run directory.")] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
-    """Propose memory items from a completed run's evidence."""
+    """Explicitly propose memory items from a completed run."""
     resolved_run_dir = run_dir or RunStore(Path.cwd()).find_run_dir(_resolve_run_id(run_id))
     with MemoryStore(Path.cwd()) as store:
         rows = store.propose_from_run(resolved_run_dir, resolved_run_dir.name)
@@ -1117,7 +1125,7 @@ def evidence_verify(
     run_id: Annotated[str, typer.Argument(help="Run id, or 'latest'.")] = "latest",
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
-    """Verify role contracts, evidence bundles, validators, and ledger chain."""
+    """Verify Evidence v2 manifest, event chain, and artifact hashes."""
     resolved, run_dir = _resolve_evidence_run(run_id)
     with _evidence_blackboard(run_dir) as blackboard:
         payload = verify_run_evidence(run_dir, resolved, blackboard)
@@ -1127,16 +1135,37 @@ def evidence_verify(
     lines = [
         f"run_id: {payload['run_id']}",
         f"valid: {payload['valid']}",
-        f"ledger events: {payload['ledger']['events']}",
-        f"contracts: {payload['contracts']}",
-        f"evidence bundles: {payload['evidence_bundles']}",
-        f"evidence items: {payload.get('evidence_items', 0)}",
-        f"scorecards: {payload.get('scorecards', 0)}",
-        f"validators: {payload['validators']}",
+        f"events: {payload.get('events', 0)}",
+        f"artifacts: {payload.get('artifacts', 0)}",
+        f"head_hash: {payload.get('head_hash') or '-'}",
     ]
     for error in payload.get("errors", []):
         lines.append(f"error: {error}")
     console.print(Panel("\n".join(lines), title="muxdev evidence verify"))
+
+
+@evidence_app.command("cleanup-legacy")
+def evidence_cleanup_legacy(
+    run_id: Annotated[str, typer.Argument(help="Run id, or 'latest'.")] = "latest",
+    yes: Annotated[bool, typer.Option("--yes", help="Confirm destructive legacy evidence cleanup.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Drop v1 evidence tables and remove v1 evidence artifacts for one run."""
+    if not yes:
+        raise typer.BadParameter("cleanup-legacy requires --yes")
+    resolved, run_dir = _resolve_evidence_run(run_id)
+    with _evidence_blackboard(run_dir) as blackboard:
+        payload = cleanup_legacy_evidence(run_dir, blackboard, yes=yes)
+    payload["run_id"] = resolved
+    if json_output:
+        _print_json(payload)
+        return
+    lines = [
+        f"run_id: {resolved}",
+        f"removed files: {len(payload.get('removed_files', []))}",
+        f"dropped tables: {', '.join(payload.get('dropped_tables', []))}",
+    ]
+    console.print(Panel("\n".join(lines), title="muxdev evidence cleanup"))
 
 
 @app.command()
@@ -1810,7 +1839,7 @@ def mcp_manifest(
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     """Print the muxdev MCP server manifest."""
-    payload = server_manifest()
+    payload = server_manifest(Path.cwd())
     if json_output:
         _print_json(payload)
         return
@@ -1821,15 +1850,39 @@ def mcp_manifest(
 def mcp_serve(
     request: Annotated[str | None, typer.Option("--request", help="Handle one JSON-RPC request string and exit.")] = None,
     once: Annotated[bool, typer.Option("--once", help="Read one JSON-RPC request from stdin and exit.")] = False,
+    stdio: Annotated[bool, typer.Option("--stdio", help="Run a line-delimited stdio JSON-RPC loop.")] = False,
 ) -> None:
     """Run a minimal stdio-compatible MCP JSON-RPC surface."""
     if request is None and once:
         request = sys.stdin.read()
+    if request is None and stdio:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = handle_jsonrpc(json.loads(line), Path.cwd())
+            except json.JSONDecodeError as exc:
+                payload = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}}
+            print(json.dumps(payload, ensure_ascii=False), flush=True)
+        return
     if request is None:
-        console.print("muxdev MCP stdio server is ready. Pass --once or --request for scripted use.")
+        console.print("muxdev MCP stdio server is ready. Pass --stdio, --once, or --request for scripted use.")
         return
     payload = handle_jsonrpc(json.loads(request), Path.cwd())
     _print_json(payload)
+
+
+@mcp_app.command("doctor")
+def mcp_doctor_command(
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Summarize the local muxdev MCP surface."""
+    payload = mcp_doctor(Path.cwd())
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="MCP Doctor"))
 
 
 @session_app.command("start")
@@ -1939,16 +1992,12 @@ def deep_agent_plan(
     console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Deep-Agent Task Pack"))
 
 
-@workflow_app.command("plugins")
-def workflow_plugins(
-    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
-) -> None:
-    """List built-in workflow plugins inspired by spec-driven agent boards."""
-    rows = [plugin.to_dict() for plugin in list_workflow_plugins()]
-    if json_output:
-        _print_json(rows)
-        return
-    table = Table(title="Workflow Plugins")
+def _workflow_template_rows() -> list[dict[str, object]]:
+    return [plugin.to_dict() for plugin in list_workflow_plugins()]
+
+
+def _print_workflow_templates(rows: list[dict[str, object]], *, deprecated: bool = False) -> None:
+    table = Table(title="Workflow Templates")
     for column in ("name", "phases", "supported_providers", "description"):
         table.add_column(column)
     for row in rows:
@@ -1958,15 +2007,41 @@ def workflow_plugins(
             ", ".join(row["supported_providers"]),
             str(row["description"]),
         )
+    if deprecated:
+        console.print("Deprecated: use 'muxdev workflow templates' instead.")
     console.print(table)
 
 
-@workflow_app.command("plugin")
-def workflow_plugin(
-    name: Annotated[str, typer.Argument(help="Workflow plugin name.")],
+@workflow_app.command("templates")
+def workflow_templates(
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
-    """Show a workflow plugin definition."""
+    """List built-in workflow templates."""
+    rows = _workflow_template_rows()
+    if json_output:
+        _print_json(rows)
+        return
+    _print_workflow_templates(rows)
+
+
+@workflow_app.command("plugins")
+def workflow_plugins(
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Deprecated alias for workflow templates."""
+    rows = _workflow_template_rows()
+    if json_output:
+        _print_json(rows)
+        return
+    _print_workflow_templates(rows, deprecated=True)
+
+
+@workflow_app.command("template")
+def workflow_template(
+    name: Annotated[str, typer.Argument(help="Workflow template name.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Show a workflow template definition."""
     try:
         payload = get_workflow_plugin(name).to_dict()
     except ValueError as exc:
@@ -1974,18 +2049,35 @@ def workflow_plugin(
     if json_output:
         _print_json(payload)
         return
-    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title=f"Workflow Plugin: {name}"))
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title=f"Workflow Template: {name}"))
+
+
+@workflow_app.command("plugin")
+def workflow_plugin(
+    name: Annotated[str, typer.Argument(help="Workflow template name.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Deprecated alias for workflow template."""
+    try:
+        payload = get_workflow_plugin(name).to_dict()
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        _print_json(payload)
+        return
+    console.print("Deprecated: use 'muxdev workflow template' instead.")
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title=f"Workflow Template: {name}"))
 
 
 @workflow_app.command("render")
 def workflow_render(
-    name: Annotated[str, typer.Argument(help="Workflow plugin name.")],
-    phase: Annotated[str, typer.Option("--phase", help="Plugin phase to render.")],
+    name: Annotated[str, typer.Argument(help="Workflow template name.")],
+    phase: Annotated[str, typer.Option("--phase", help="Template phase to render.")],
     provider: Annotated[str, typer.Option("--provider", help="Provider command dialect.")],
     task: Annotated[str, typer.Option("--task", help="Task text to inject into the command.")] = "",
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
-    """Render a plugin phase command for a provider dialect."""
+    """Render a workflow template phase command for a provider dialect."""
     try:
         payload = render_plugin_command(name, phase, provider, task)
     except ValueError as exc:
@@ -2155,6 +2247,71 @@ def skill_list(
     console.print(table)
 
 
+@skill_app.command("catalog")
+def skill_catalog(
+    role: Annotated[str | None, typer.Option("--role", help="Filter by compatible role.")] = None,
+    stage: Annotated[str | None, typer.Option("--stage", help="Filter by workflow stage.")] = None,
+    budget: Annotated[int | None, typer.Option("--budget", help="Maximum catalog metadata characters.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Build the progressive-disclosure skill catalog without SKILL.md content."""
+    payload = build_skill_catalog(Path.cwd(), role=role, stage=stage, budget=budget).to_dict()
+    if json_output:
+        _print_json(payload)
+        return
+    table = Table(title="Skill Catalog")
+    for column in ("name", "trust", "roles", "source", "description"):
+        table.add_column(column)
+    for row in payload["skills"]:
+        if isinstance(row, dict):
+            table.add_row(str(row["name"]), str(row.get("trust", "")), ",".join(str(item) for item in row.get("roles", [])), str(row.get("source", "")), str(row.get("description", "")))
+    console.print(table)
+
+
+@skill_app.command("explain")
+def skill_explain(
+    task: Annotated[str, typer.Option("--task", help="Task text to score against skills.")],
+    role: Annotated[list[str] | None, typer.Option("--role", help="Runtime role, repeatable.")] = None,
+    stage: Annotated[str | None, typer.Option("--stage", help="Workflow stage.")] = None,
+    changed_file: Annotated[list[str] | None, typer.Option("--changed-file", help="Changed file path, repeatable.")] = None,
+    provider: Annotated[str, typer.Option("--provider", help="Provider adapter name.")] = "mock",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Explain role/stage/file/trust scoring for a task."""
+    payload = select_skills(
+        Path.cwd(),
+        task=task,
+        roles=role or [],
+        stage=stage,
+        changed_files=changed_file or [],
+        provider=provider,
+    ).to_dict(include_content=False)
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Skill Explain"))
+
+
+@skill_app.command("activate")
+def skill_activate(
+    name: Annotated[str, typer.Argument(help="Skill name.")],
+    role: Annotated[str | None, typer.Option("--role", help="Activation role.")] = None,
+    stage: Annotated[str | None, typer.Option("--stage", help="Activation stage.")] = None,
+    provider: Annotated[str, typer.Option("--provider", help="Provider adapter name.")] = "mock",
+    include_resources: Annotated[bool, typer.Option("--resources", help="Include references/assets/scripts manifests.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Load a full SKILL.md payload on demand and record activation evidence."""
+    try:
+        payload = activate_skill(Path.cwd(), name, role=role, stage=stage, provider=provider, include_resources=include_resources).to_dict(include_content=True)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(str(payload.get("content", "")), title=f"Skill Activate {name}"))
+
+
 @skill_app.command("show")
 def skill_show_command(
     name: Annotated[str, typer.Argument(help="Skill name.")],
@@ -2258,6 +2415,22 @@ def skill_lock(
     console.print(Panel(json.dumps({"path": payload["path"], "skills": len(payload.get("skills", [])), "memory_proposals": len(payload.get("memory_proposals", []))}, ensure_ascii=False, indent=2), title="Skill Lock"))
 
 
+@skill_app.command("verify")
+def skill_verify(
+    name: Annotated[str | None, typer.Argument(help="Optional skill name.")] = None,
+    lock: Annotated[bool, typer.Option("--lock", help="Verify .muxdev/skill-lock.json.")] = True,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Verify skill integrity against skill-lock.v2."""
+    payload = verify_skill_lock(Path.cwd(), name=name) if lock else skill_doctor(Path.cwd())
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Skill Verify"))
+    if not payload.get("valid", False):
+        raise typer.Exit(code=1)
+
+
 @skill_app.command("doctor")
 def skill_doctor_command(
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
@@ -2315,14 +2488,30 @@ def skill_enable(
 @skill_app.command("trust")
 def skill_trust(
     name: Annotated[str, typer.Argument(help="Skill name.")],
-    level: Annotated[str, typer.Argument(help="Trust level, e.g. auto/manual/never.")],
+    level: Annotated[str, typer.Argument(help="Trust level, e.g. project_trusted/user_trusted/org_trusted/untrusted/needs_review/quarantined.")],
+    scope: Annotated[str, typer.Option("--scope", help="Trust scope: project or user.")] = "project",
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
-    payload = set_skill_policy(Path.cwd(), name, trust=level)
+    payload = set_skill_policy(Path.cwd(), name, trust=level, project=scope != "user")
     if json_output:
         _print_json(payload)
         return
     console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Skill Trust"))
+
+
+@skill_app.command("quarantine")
+def skill_quarantine(
+    name: Annotated[str, typer.Argument(help="Skill name.")],
+    reason: Annotated[str, typer.Option("--reason", help="Reason shown in policy output.")] = "",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    payload = set_skill_policy(Path.cwd(), name, trust="quarantined", auto=False)
+    if reason:
+        payload["reason"] = reason
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Skill Quarantine"))
 
 
 @skill_app.command("auto")
@@ -2349,6 +2538,20 @@ def skill_create(
         _print_json(payload)
         return
     console.print(Panel("\n".join(f"{key}: {value}" for key, value in payload.items()), title="Skill Create"))
+
+
+@skill_app.command("init")
+def skill_init(
+    name: Annotated[str, typer.Argument(help="New skill name.")],
+    global_scope: Annotated[bool, typer.Option("--global", help="Create under ~/.agents/skills.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Create a standard SKILL.md package."""
+    payload = add_skill(Path.cwd(), name, global_scope=global_scope).to_dict()
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel("\n".join(f"{key}: {value}" for key, value in payload.items()), title="Skill Init"))
 
 
 @skill_app.command("validate")
@@ -2397,102 +2600,127 @@ def skill_inject(
     console.print(content)
 
 
-@plugin_app.command("list")
-def plugin_list(
+@skill_app.command("eval")
+def skill_eval_command(
+    name: Annotated[str, typer.Argument(help="Skill name.")],
+    role: Annotated[str | None, typer.Option("--role", help="Role to evaluate.")] = None,
+    provider: Annotated[str, typer.Option("--provider", help="Provider name.")] = "mock",
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
-    """List locally registered muxdev plugins."""
-    payload = _plugin_registry_read()
-    rows = payload.get("plugins", [])
+    payload = eval_skill(Path.cwd(), name, role=role, provider=provider)
     if json_output:
-        _print_json(rows)
+        _print_json(payload)
         return
-    table = Table(title="Plugins")
-    for column in ("name", "source", "enabled", "status"):
-        table.add_column(column)
-    for row in rows:
-        table.add_row(str(row.get("name", "")), str(row.get("source", "")), str(row.get("enabled", "")), str(row.get("status", "")))
-    console.print(table)
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Skill Eval"))
+
+
+@skill_app.command("score")
+def skill_score_command(
+    name: Annotated[str, typer.Argument(help="Skill name.")],
+    last: Annotated[str, typer.Option("--last", help="Time window label.")] = "30d",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    payload = score_skill(Path.cwd(), name, last=last)
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Skill Score"))
+
+
+@skill_app.command("abtest")
+def skill_abtest_command(
+    name: Annotated[str, typer.Argument(help="Skill name.")],
+    versions: Annotated[str, typer.Option("--versions", help="Comma-separated versions to compare.")],
+    provider: Annotated[str, typer.Option("--provider", help="Provider name.")] = "mock",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    payload = abtest_skill(Path.cwd(), name, versions=[item.strip() for item in versions.split(",") if item.strip()], provider=provider)
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Skill A/B"))
+
+
+@plugin_app.callback(invoke_without_command=True)
+def plugin_deprecated(
+    ctx: typer.Context,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Explain the removed plugin registry surface."""
+    if ctx.invoked_subcommand:
+        return
+    payload = {
+        "status": "removed",
+        "message": "muxdev no longer manages plugins; use muxdev skill ... or MCP/provider config.",
+    }
+    if json_output:
+        _print_json(payload)
+        raise typer.Exit(2)
+    console.print(payload["message"])
+    raise typer.Exit(2)
+
+
+def _removed_plugin_command(json_output: bool) -> None:
+    payload = {
+        "status": "removed",
+        "message": "muxdev no longer manages plugins; use muxdev skill ... or MCP/provider config.",
+    }
+    if json_output:
+        _print_json(payload)
+        raise typer.Exit(2)
+    console.print(payload["message"])
+    raise typer.Exit(2)
+
+
+@plugin_app.command("list")
+def plugin_list_removed(json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False) -> None:
+    """Removed: muxdev no longer manages plugins."""
+    _removed_plugin_command(json_output)
 
 
 @plugin_app.command("add")
-def plugin_add(
-    source: Annotated[str, typer.Argument(help="Plugin path, URL, or registry name.")],
-    name: Annotated[str | None, typer.Option("--name", help="Plugin name override.")] = None,
-    enable: Annotated[bool, typer.Option("--enable", help="Mark plugin enabled after registration.")] = False,
+def plugin_add_removed(
+    source: Annotated[str, typer.Argument(help="Ignored plugin source.")],
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
-    """Register a plugin without executing plugin hooks or tools."""
-    payload = _plugin_registry_upsert(source, name=name, enabled=enable)
-    if json_output:
-        _print_json(payload)
-        return
-    console.print(Panel("\n".join(f"{key}: {value}" for key, value in payload.items()), title="Plugin Add"))
+    """Removed: muxdev no longer manages plugins."""
+    _removed_plugin_command(json_output)
 
 
 @plugin_app.command("validate")
-def plugin_validate(
-    source: Annotated[str, typer.Argument(help="Plugin path or manifest path.")],
-    name: Annotated[str | None, typer.Option("--name", help="Plugin name override.")] = None,
+def plugin_validate_removed(
+    source: Annotated[str, typer.Argument(help="Ignored plugin source.")],
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
-    """Validate a safe plugin manifest without executing plugin code."""
-    payload = validate_plugin_manifest(source, name=name)
-    with _ecosystem_blackboard(Path.cwd()) as board:
-        board.upsert_plugin_manifest(
-            plugin_name=str(payload["name"]),
-            run_id=None,
-            source=str(payload["source"]),
-            manifest_path=Path(str(payload["manifest_path"])) if payload.get("manifest_path") else None,
-            manifest_hash=str(payload["manifest_hash"]),
-            trust=str(payload["trust"]),
-            permissions=[str(item) for item in payload.get("permissions", [])],
-            status=str(payload["status"]),
-            warnings=[str(item) for item in payload.get("warnings", [])],
-        )
-    if json_output:
-        _print_json(payload)
-        return
-    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Plugin Validate"))
+    """Removed: muxdev no longer validates plugin manifests."""
+    _removed_plugin_command(json_output)
 
 
 @plugin_app.command("show")
-def plugin_show(
-    name: Annotated[str, typer.Argument(help="Plugin name.")],
+def plugin_show_removed(
+    name: Annotated[str, typer.Argument(help="Ignored plugin name.")],
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
-    """Show one locally registered plugin."""
-    payload = _plugin_registry_get(name)
-    if json_output:
-        _print_json(payload)
-        return
-    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title=f"Plugin {name}"))
+    """Removed: muxdev no longer manages plugins."""
+    _removed_plugin_command(json_output)
 
 
 @plugin_app.command("update")
-def plugin_update(
-    name: Annotated[str, typer.Argument(help="Plugin name.")],
+def plugin_update_removed(
+    name: Annotated[str, typer.Argument(help="Ignored plugin name.")],
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
-    """Mark a plugin as checked; network updates are intentionally deferred."""
-    payload = _plugin_registry_update(name)
-    if json_output:
-        _print_json(payload)
-        return
-    console.print(Panel("\n".join(f"{key}: {value}" for key, value in payload.items()), title="Plugin Update"))
+    """Removed: muxdev no longer manages plugins."""
+    _removed_plugin_command(json_output)
 
 
 @plugin_app.command("remove")
-def plugin_remove(
-    name: Annotated[str, typer.Argument(help="Plugin name.")],
+def plugin_remove_removed(
+    name: Annotated[str, typer.Argument(help="Ignored plugin name.")],
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
-    """Remove a plugin registration."""
-    payload = _plugin_registry_remove(name)
-    if json_output:
-        _print_json(payload)
-        return
-    console.print(Panel("\n".join(f"{key}: {value}" for key, value in payload.items()), title="Plugin Remove"))
+    """Removed: muxdev no longer manages plugins."""
+    _removed_plugin_command(json_output)
 
 
 @app.command()
@@ -2654,6 +2882,7 @@ def _submit_main_task(
             roles=list(request.get("runtime_roles", {}).keys()),
             provider=str(request["provider"]),
             explicit=list(request.get("skill_specs", [])),
+            include_content=True,
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -2714,112 +2943,10 @@ def _write_preset(kind: str, name: str) -> dict[str, object]:
     return {"kind": payload["kind"], "name": name, "path": str(path), "status": "written"}
 
 
-def _plugin_registry_path() -> Path:
-    return Path.cwd() / ".muxdev" / "plugins" / "plugins.json"
-
-
 def _ecosystem_blackboard(workspace: Path) -> Blackboard:
     root = workspace / ".muxdev"
     root.mkdir(parents=True, exist_ok=True)
     return Blackboard(root, db_path=root / "ecosystem.sqlite")
-
-
-def _plugin_registry_read() -> dict[str, object]:
-    path = _plugin_registry_path()
-    if not path.exists():
-        return {"version": 1, "plugins": []}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {"version": 1, "plugins": []}
-    if not isinstance(data, dict):
-        return {"version": 1, "plugins": []}
-    data.setdefault("version", 1)
-    data.setdefault("plugins", [])
-    return data
-
-
-def _plugin_registry_write(data: dict[str, object]) -> None:
-    path = _plugin_registry_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def _plugin_registry_upsert(source: str, *, name: str | None, enabled: bool) -> dict[str, object]:
-    data = _plugin_registry_read()
-    plugins = data.get("plugins", [])
-    if not isinstance(plugins, list):
-        plugins = []
-    manifest = validate_plugin_manifest(source, name=name)
-    plugin_name = str(manifest["name"])
-    row = {
-        "name": plugin_name,
-        "source": source,
-        "enabled": enabled,
-        "status": manifest["status"],
-        "manifest_hash": manifest["manifest_hash"],
-        "trust": manifest["trust"],
-        "warnings": manifest["warnings"],
-    }
-    plugins = [item for item in plugins if not (isinstance(item, dict) and item.get("name") == plugin_name)]
-    plugins.append(row)
-    data["plugins"] = sorted(plugins, key=lambda item: str(item.get("name", "")) if isinstance(item, dict) else "")
-    _plugin_registry_write(data)
-    with _ecosystem_blackboard(Path.cwd()) as board:
-        board.upsert_plugin_manifest(
-            plugin_name=plugin_name,
-            run_id=None,
-            source=source,
-            manifest_path=Path(str(manifest["manifest_path"])) if manifest.get("manifest_path") else None,
-            manifest_hash=str(manifest["manifest_hash"]),
-            trust=str(manifest["trust"]),
-            permissions=[str(item) for item in manifest.get("permissions", [])],
-            status=str(manifest["status"]),
-            warnings=[str(item) for item in manifest.get("warnings", [])],
-        )
-    return {**row, "path": str(_plugin_registry_path())}
-
-
-def _plugin_registry_get(name: str) -> dict[str, object]:
-    for item in _plugin_registry_read().get("plugins", []):
-        if isinstance(item, dict) and item.get("name") == name:
-            return item
-    raise typer.BadParameter(f"plugin not found: {name}")
-
-
-def _plugin_registry_update(name: str) -> dict[str, object]:
-    data = _plugin_registry_read()
-    plugins = data.get("plugins", [])
-    if not isinstance(plugins, list):
-        plugins = []
-    for item in plugins:
-        if isinstance(item, dict) and item.get("name") == name:
-            item["status"] = "checked"
-            item["note"] = "download/update execution is deferred to a future MCP/plugin runner"
-            _plugin_registry_write(data)
-            return {**item, "path": str(_plugin_registry_path())}
-    raise typer.BadParameter(f"plugin not found: {name}")
-
-
-def _plugin_registry_remove(name: str) -> dict[str, object]:
-    data = _plugin_registry_read()
-    plugins = data.get("plugins", [])
-    if not isinstance(plugins, list):
-        plugins = []
-    kept = [item for item in plugins if not (isinstance(item, dict) and item.get("name") == name)]
-    data["plugins"] = kept
-    _plugin_registry_write(data)
-    return {"name": name, "status": "removed", "path": str(_plugin_registry_path())}
-
-
-def _plugin_name_from_source(source: str) -> str:
-    text = source.rstrip("/\\")
-    if not text:
-        return "plugin"
-    name = Path(text).name
-    if name.endswith(".git"):
-        name = name[:-4]
-    return name or text.replace(":", "-")
 
 
 def _ensure_run_dashboard(run_id: str) -> Path:

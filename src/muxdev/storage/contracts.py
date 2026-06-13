@@ -1,4 +1,4 @@
-"""Structured contracts and evidence bundles for trusted delivery."""
+"""Structured contracts for trusted delivery."""
 
 from __future__ import annotations
 
@@ -56,31 +56,6 @@ def write_stage_contract(
     }
     path, digest = write_json_artifact(run_dir / "contracts" / f"{stage_id}.stage_contract.json", payload)
     payload["contract_hash"] = digest
-    path, digest = write_json_artifact(path, payload)
-    return path, digest, payload
-
-
-def write_evidence_bundle(
-    run_dir: Path,
-    *,
-    run_id: str,
-    stage_id: str | None,
-    artifacts: list[dict[str, Any]],
-    patch_hash: str,
-    snapshot_ref: str | None = None,
-) -> tuple[Path, str, dict[str, Any]]:
-    payload = {
-        "contract_version": "muxdev.evidence_bundle.v1",
-        "run_id": run_id,
-        "stage_id": stage_id,
-        "artifacts": artifacts,
-        "patch_hash": patch_hash,
-        "snapshot_ref": snapshot_ref,
-        "created_at": utc_now(),
-    }
-    name = stage_id or "run"
-    path, digest = write_json_artifact(run_dir / "evidence" / f"{name}.evidence.json", payload)
-    payload["evidence_hash"] = digest
     path, digest = write_json_artifact(path, payload)
     return path, digest, payload
 

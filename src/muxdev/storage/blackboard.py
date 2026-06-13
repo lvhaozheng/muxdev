@@ -75,9 +75,9 @@ class Blackboard:
         "checkpoints",
         "error_details",
         "stage_contracts",
-        "evidence_bundles",
-        "evidence_items",
-        "evidence_scorecards",
+        "evidence_events",
+        "evidence_manifests",
+        "evidence_evaluations",
         "ledger_events",
         "snapshots",
         "validator_panels",
@@ -367,38 +367,46 @@ class Blackboard:
               decision TEXT,
               created_at TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS evidence_bundles (
+            CREATE TABLE IF NOT EXISTS evidence_events (
+              event_id TEXT PRIMARY KEY,
               run_id TEXT NOT NULL,
               stage_id TEXT,
-              path TEXT NOT NULL,
-              bundle_hash TEXT NOT NULL,
-              created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS evidence_items (
-              evidence_id TEXT PRIMARY KEY,
-              run_id TEXT NOT NULL,
-              stage_id TEXT,
+              layer TEXT NOT NULL,
               kind TEXT NOT NULL,
-              strength TEXT NOT NULL,
               claim TEXT NOT NULL,
-              supports_json TEXT NOT NULL,
-              relevance REAL,
-              confidence REAL,
+              status TEXT NOT NULL,
+              strength TEXT NOT NULL,
+              subject_hash TEXT,
+              prev_hash TEXT,
+              event_hash TEXT NOT NULL,
               artifact_refs_json TEXT NOT NULL,
-              human_summary TEXT,
+              metrics_json TEXT NOT NULL,
+              tags_json TEXT NOT NULL,
+              source TEXT NOT NULL,
               created_at TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS evidence_scorecards (
+            CREATE TABLE IF NOT EXISTS evidence_manifests (
               run_id TEXT PRIMARY KEY,
-              score INTEGER NOT NULL,
-              label TEXT NOT NULL,
-              recommendation TEXT NOT NULL,
-              components_json TEXT NOT NULL,
-              risk_penalty INTEGER NOT NULL,
-              missing_evidence_json TEXT,
-              next_actions_json TEXT,
               path TEXT NOT NULL,
-              scorecard_hash TEXT NOT NULL,
+              manifest_hash TEXT NOT NULL,
+              head_hash TEXT,
+              event_count INTEGER NOT NULL,
+              artifact_count INTEGER NOT NULL,
+              required_matrix_json TEXT NOT NULL,
+              missing_required_json TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS evidence_evaluations (
+              run_id TEXT PRIMARY KEY,
+              label TEXT NOT NULL,
+              confidence REAL NOT NULL,
+              gates_json TEXT NOT NULL,
+              components_json TEXT NOT NULL,
+              reasons_json TEXT NOT NULL,
+              missing_evidence_json TEXT NOT NULL,
+              next_actions_json TEXT NOT NULL,
+              path TEXT NOT NULL,
+              evaluation_hash TEXT NOT NULL,
               created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS ledger_events (
@@ -883,34 +891,6 @@ class Blackboard:
         )
         self.conn.commit()
 
-    def upsert_plugin_manifest(
-        self,
-        *,
-        plugin_name: str,
-        run_id: str | None,
-        source: str,
-        manifest_path: Path | None,
-        manifest_hash: str,
-        trust: str,
-        permissions: list[str],
-        status: str,
-        warnings: list[str],
-    ) -> None:
-        self.conn.execute(
-            """
-            INSERT INTO plugin_manifests(plugin_name, run_id, source, manifest_path, manifest_hash, trust, permissions_json, status, warnings_json, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(plugin_name) DO UPDATE SET
-              run_id=excluded.run_id, source=excluded.source,
-              manifest_path=excluded.manifest_path, manifest_hash=excluded.manifest_hash,
-              trust=excluded.trust, permissions_json=excluded.permissions_json,
-              status=excluded.status, warnings_json=excluded.warnings_json,
-              updated_at=excluded.updated_at
-            """,
-            (plugin_name, run_id, source, str(manifest_path) if manifest_path else None, manifest_hash, trust, json.dumps(permissions, ensure_ascii=False), status, json.dumps(warnings, ensure_ascii=False), utc_now()),
-        )
-        self.conn.commit()
-
     def add_guardrail_event(
         self,
         *,
@@ -1154,101 +1134,91 @@ class Blackboard:
         )
         self.conn.commit()
 
-    def add_evidence_bundle(self, run_id: str, stage_id: str | None, *, path: Path, bundle_hash: str) -> None:
-        self.conn.execute(
-            "INSERT INTO evidence_bundles(run_id, stage_id, path, bundle_hash, created_at) VALUES (?, ?, ?, ?, ?)",
-            (run_id, stage_id, str(path), bundle_hash, utc_now()),
-        )
-        self.conn.commit()
-
-    def upsert_evidence_item(
+    def replace_evidence_v2(
         self,
         *,
         run_id: str,
-        evidence_id: str,
-        stage_id: str | None,
-        kind: str,
-        strength: str,
-        claim: str,
-        supports: list[str],
-        relevance: float | None,
-        confidence: float | None,
-        artifact_refs: list[dict[str, Any]],
-        human_summary: str,
+        events: list[dict[str, Any]],
+        manifest: dict[str, Any],
+        manifest_path: Path,
+        manifest_hash: str,
+        evaluation: dict[str, Any],
+        evaluation_path: Path,
+        evaluation_hash: str,
     ) -> None:
+        """Replace the derived Evidence v2 rows for one run."""
+        self.conn.execute("DELETE FROM evidence_events WHERE run_id = ?", (run_id,))
+        self.conn.execute("DELETE FROM evidence_manifests WHERE run_id = ?", (run_id,))
+        self.conn.execute("DELETE FROM evidence_evaluations WHERE run_id = ?", (run_id,))
+        for event in events:
+            self.conn.execute(
+                """
+                INSERT INTO evidence_events(
+                  event_id, run_id, stage_id, layer, kind, claim, status, strength,
+                  subject_hash, prev_hash, event_hash, artifact_refs_json,
+                  metrics_json, tags_json, source, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event["id"],
+                    run_id,
+                    event.get("stage_id"),
+                    event["layer"],
+                    event["kind"],
+                    redact(str(event.get("claim") or "")),
+                    event["status"],
+                    event["strength"],
+                    event.get("subject_hash"),
+                    event.get("prev_hash"),
+                    event["event_hash"],
+                    json.dumps(event.get("artifact_refs") or [], ensure_ascii=False, sort_keys=True),
+                    json.dumps(event.get("metrics") or {}, ensure_ascii=False, sort_keys=True),
+                    json.dumps(event.get("tags") or [], ensure_ascii=False),
+                    event.get("source") or "muxdev",
+                    event["created_at"],
+                ),
+            )
         self.conn.execute(
             """
-            INSERT INTO evidence_items(
-              evidence_id, run_id, stage_id, kind, strength, claim,
-              supports_json, relevance, confidence, artifact_refs_json,
-              human_summary, created_at
+            INSERT INTO evidence_manifests(
+              run_id, path, manifest_hash, head_hash, event_count, artifact_count,
+              required_matrix_json, missing_required_json, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(evidence_id) DO UPDATE SET
-              run_id=excluded.run_id, stage_id=excluded.stage_id, kind=excluded.kind,
-              strength=excluded.strength, claim=excluded.claim,
-              supports_json=excluded.supports_json, relevance=excluded.relevance,
-              confidence=excluded.confidence, artifact_refs_json=excluded.artifact_refs_json,
-              human_summary=excluded.human_summary, created_at=excluded.created_at
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                evidence_id,
                 run_id,
-                stage_id,
-                kind,
-                strength,
-                redact(claim),
-                json.dumps(supports, ensure_ascii=False),
-                relevance,
-                confidence,
-                json.dumps(artifact_refs, ensure_ascii=False, sort_keys=True),
-                redact(human_summary),
-                utc_now(),
+                str(manifest_path),
+                manifest_hash,
+                manifest.get("head_hash"),
+                int(manifest.get("event_count") or 0),
+                int(manifest.get("artifact_count") or 0),
+                json.dumps(manifest.get("required_matrix") or {}, ensure_ascii=False, sort_keys=True),
+                json.dumps(manifest.get("missing_required") or [], ensure_ascii=False),
+                manifest.get("created_at") or utc_now(),
             ),
         )
-        self.conn.commit()
-
-    def upsert_evidence_scorecard(
-        self,
-        *,
-        run_id: str,
-        score: int,
-        label: str,
-        recommendation: str,
-        components: dict[str, int],
-        risk_penalty: int,
-        missing_evidence: list[str],
-        next_actions: list[dict[str, Any]],
-        path: Path,
-        scorecard_hash: str,
-    ) -> None:
         self.conn.execute(
             """
-            INSERT INTO evidence_scorecards(
-              run_id, score, label, recommendation, components_json,
-              risk_penalty, missing_evidence_json, next_actions_json,
-              path, scorecard_hash, created_at
+            INSERT INTO evidence_evaluations(
+              run_id, label, confidence, gates_json, components_json, reasons_json,
+              missing_evidence_json, next_actions_json, path, evaluation_hash, created_at
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(run_id) DO UPDATE SET
-              score=excluded.score, label=excluded.label, recommendation=excluded.recommendation,
-              components_json=excluded.components_json, risk_penalty=excluded.risk_penalty,
-              missing_evidence_json=excluded.missing_evidence_json,
-              next_actions_json=excluded.next_actions_json, path=excluded.path,
-              scorecard_hash=excluded.scorecard_hash, created_at=excluded.created_at
             """,
             (
                 run_id,
-                int(score),
-                label,
-                recommendation,
-                json.dumps(components, ensure_ascii=False, sort_keys=True),
-                int(risk_penalty),
-                json.dumps(missing_evidence, ensure_ascii=False),
-                json.dumps(next_actions, ensure_ascii=False, sort_keys=True),
-                str(path),
-                scorecard_hash,
-                utc_now(),
+                evaluation.get("label") or "blocked",
+                float(evaluation.get("confidence") or 0),
+                json.dumps(evaluation.get("gates") or {}, ensure_ascii=False, sort_keys=True),
+                json.dumps(evaluation.get("components") or {}, ensure_ascii=False, sort_keys=True),
+                json.dumps(evaluation.get("reasons") or [], ensure_ascii=False),
+                json.dumps(evaluation.get("missing_evidence") or [], ensure_ascii=False),
+                json.dumps(evaluation.get("next_actions") or [], ensure_ascii=False, sort_keys=True),
+                str(evaluation_path),
+                evaluation_hash,
+                evaluation.get("created_at") or utc_now(),
             ),
         )
         self.conn.commit()
@@ -1412,13 +1382,21 @@ class Blackboard:
             rows = [dict(row) for row in self.conn.execute(f"SELECT * FROM {table} WHERE run_id = ?", (run_id,))]
         else:
             rows = [dict(row) for row in self.conn.execute(f"SELECT * FROM {table}")]
-        if table == "evidence_items":
+        if table == "evidence_events":
             for row in rows:
-                row["supports"] = _json_list(row.get("supports_json"))
                 row["artifact_refs"] = _json_list(row.get("artifact_refs_json"))
-        if table == "evidence_scorecards":
+                row["metrics"] = _json_dict(row.get("metrics_json"))
+                row["tags"] = _json_list(row.get("tags_json"))
+                row["id"] = row.get("event_id")
+        if table == "evidence_manifests":
             for row in rows:
+                row["required_matrix"] = _json_dict(row.get("required_matrix_json"))
+                row["missing_required"] = _json_list(row.get("missing_required_json"))
+        if table == "evidence_evaluations":
+            for row in rows:
+                row["gates"] = _json_dict(row.get("gates_json"))
                 row["components"] = _json_dict(row.get("components_json"))
+                row["reasons"] = _json_list(row.get("reasons_json"))
                 row["missing_evidence"] = _json_list(row.get("missing_evidence_json"))
                 row["next_actions"] = _json_list(row.get("next_actions_json"))
         return rows

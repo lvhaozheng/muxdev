@@ -1,0 +1,15 @@
+version = 1
+
+[activation]
+roles = ["architect", "plan"]
+auto = true
+
+[permissions]
+read_workspace = true
+write_workspace = false
+shell = false
+network = false
+secrets = false
+
+[trust]
+risk_level = "low"

@@ -22,15 +22,15 @@ from .contracts import ProviderCapabilities, ProviderDescriptor, ProviderRuntime
 from .mock import MockProvider
 
 
-EVIDENCE_PROMPT_BLOCK = """# muxdev Evidence Contract
+EVIDENCE_PROMPT_BLOCK = """# muxdev Evidence v2 Contract
 Return structured evidence whenever this stage makes a delivery claim. Do not only say "done", "tests passed", or "looks good".
-Each conclusion must be tied to an evidence item. If you did not run tests, list that in missing_evidence. Model-only judgments must use strength "D".
+Each conclusion should be expressible as an event with a layer, kind, status, strength, and artifact reference. If you did not run tests, list that in missing_evidence. Model-only judgments must use strength "D".
 
 Use this JSON shape when possible:
 {
   "summary": "...",
   "claims": [{"id": "claim-1", "text": "...", "supports_acceptance": ["AC-1"]}],
-  "evidence": [{"claim_id": "claim-1", "kind": "change_evidence", "strength": "B", "files": ["path"], "human_summary": "..."}],
+  "evidence": [{"claim_id": "claim-1", "layer": "core", "kind": "change", "status": "observed", "strength": "B", "files": ["path"], "summary": "..."}],
   "tests": [{"command": "pytest -q", "exit_code": 0, "relevance": "targeted", "summary": "..."}],
   "missing_evidence": ["..."],
   "risks": [{"severity": "medium", "reason": "..."}]

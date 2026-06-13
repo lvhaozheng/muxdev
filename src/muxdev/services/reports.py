@@ -9,19 +9,18 @@ from ..storage import Blackboard
 
 def generate_final_report(run_dir: Path, run_id: str, blackboard: Blackboard) -> Path:
     run = blackboard.get_run(run_id)
-    stages = blackboard.table_rows("stages")
-    approvals = blackboard.table_rows("approvals")
-    tests = blackboard.table_rows("test_results")
-    blockers = blackboard.table_rows("review_blockers")
-    artifacts = blackboard.table_rows("artifacts")
-    checkpoints = blackboard.table_rows("checkpoints")
-    errors = blackboard.table_rows("error_details")
-    stage_contracts = blackboard.table_rows("stage_contracts")
-    evidence_bundles = blackboard.table_rows("evidence_bundles")
-    ledger_events = blackboard.table_rows("ledger_events")
-    snapshots = blackboard.table_rows("snapshots")
-    validators = blackboard.table_rows("validator_panels")
-    scorecards = blackboard.table_rows("evidence_scorecards", run_id=run_id)
+    stages = blackboard.table_rows("stages", run_id=run_id)
+    approvals = blackboard.table_rows("approvals", run_id=run_id)
+    tests = blackboard.table_rows("test_results", run_id=run_id)
+    blockers = blackboard.table_rows("review_blockers", run_id=run_id)
+    artifacts = sorted(blackboard.table_rows("artifacts", run_id=run_id), key=_artifact_sort_key)
+    checkpoints = blackboard.table_rows("checkpoints", run_id=run_id)
+    errors = blackboard.table_rows("error_details", run_id=run_id)
+    ledger_events = blackboard.table_rows("ledger_events", run_id=run_id)
+    snapshots = blackboard.table_rows("snapshots", run_id=run_id)
+    validators = blackboard.table_rows("validator_panels", run_id=run_id)
+    manifests = blackboard.table_rows("evidence_manifests", run_id=run_id)
+    evaluations = blackboard.table_rows("evidence_evaluations", run_id=run_id)
     lines = [
         f"# muxdev final report: {run_id}",
         "",
@@ -32,20 +31,30 @@ def generate_final_report(run_dir: Path, run_id: str, blackboard: Blackboard) ->
         f"- Worktree: {run['worktree']}",
         "",
     ]
-    if scorecards:
-        scorecard = scorecards[-1]
+    if evaluations:
+        evaluation = evaluations[-1]
+        manifest = manifests[-1] if manifests else {}
         lines.extend(
             [
-                "## Evidence Scorecard",
-                f"- Delivery Confidence: {scorecard['score']} / 100",
-                f"- Label: {scorecard['label']}",
-                f"- Recommendation: {scorecard['recommendation']}",
-                f"- Risk penalty: {scorecard['risk_penalty']}",
-                "- Missing evidence: " + (", ".join(str(item) for item in scorecard.get("missing_evidence", [])) or "none"),
+                "## Evidence Evaluation",
+                f"- Label: {evaluation['label']}",
+                f"- Confidence: {evaluation['confidence']}",
+                f"- Events: {manifest.get('event_count', 0)}",
+                f"- Head hash: {manifest.get('head_hash') or '-'}",
+                "- Missing evidence: " + (", ".join(str(item) for item in evaluation.get("missing_evidence", [])) or "none"),
                 "",
             ]
         )
-    lines.append("## Stage Timeline")
+    lines.extend(["## Design Deliverables"])
+    design_artifacts = [artifact for artifact in artifacts if artifact.get("kind") == "project_design_doc"]
+    if design_artifacts:
+        for artifact in design_artifacts:
+            lines.append(f"- {artifact['name']}: {artifact['path']}")
+    elif run.get("workflow") == "software-dev":
+        lines.append("- missing: software-dev requires a project design document")
+    else:
+        lines.append("- none")
+    lines.extend(["", "## Stage Timeline"])
     for stage in stages:
         lines.append(f"- {stage['stage_id']}: {stage['status']} - {stage['summary'] or ''}")
     lines.extend(["", "## Test Results"])
@@ -79,9 +88,8 @@ def generate_final_report(run_dir: Path, run_id: str, blackboard: Blackboard) ->
     lines.extend(["", "## Artifacts"])
     for artifact in artifacts:
         lines.append(f"- {artifact['name']}: {artifact['path']}")
-    lines.extend(["", "## Trusted Delivery Evidence"])
-    lines.append(f"- stage contracts: {len(stage_contracts)}")
-    lines.append(f"- evidence bundles: {len(evidence_bundles)}")
+    lines.extend(["", "## Evidence v2 Integrity"])
+    lines.append(f"- events: {manifests[-1].get('event_count', 0) if manifests else 0}")
     lines.append(f"- ledger events: {len(ledger_events)}")
     lines.append(f"- snapshots: {len(snapshots)}")
     if validators:
@@ -93,3 +101,17 @@ def generate_final_report(run_dir: Path, run_id: str, blackboard: Blackboard) ->
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     blackboard.add_artifact(run_id, None, "final_report.md", path, "report")
     return path
+
+
+def _artifact_sort_key(row: dict[str, object]) -> tuple[int, str, str]:
+    priority = {
+        "project_design_doc": 0,
+        "report": 1,
+        "diff": 2,
+        "stage_output": 3,
+        "task": 90,
+        "context": 91,
+    }
+    kind = str(row.get("kind") or "")
+    name = str(row.get("name") or "")
+    return (priority.get(kind, 50), kind, name)

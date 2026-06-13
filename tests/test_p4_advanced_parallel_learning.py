@@ -190,7 +190,6 @@ def test_p4_api_and_dashboards_expose_advanced_state() -> None:
                 "ci_rescues": [],
                 "cache_entries": [],
                 "skill_locks": [],
-                "plugin_manifests": [],
                 "guardrail_events": [],
                 "parallel_conflicts": [{"conflict_id": "pcf_1", "severity": "high"}],
                 "semantic_merge_reviews": [{"review_id": "smr_1", "decision": "accept"}],

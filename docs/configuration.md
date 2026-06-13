@@ -1,6 +1,6 @@
 # muxdev 配置指南
 
-本文说明当前 muxdev 的 TOML-first 配置体系、任务解析优先级、角色/provider 路由、自动化、记忆、安全门禁，以及 P0-P4 新能力对配置和命令面的影响。
+本文说明当前 muxdev 的 TOML-first 配置体系、任务解析优先级、角色/provider 路由、自动化、记忆、安全门禁，以及最新能力面如何影响配置和命令。
 
 ## 配置文件
 
@@ -192,7 +192,7 @@ muxdev dev "task" -g strict
 muxdev dev "task" --require-approval plan --json
 ```
 
-## P0: 自动化、设计、记忆
+## 自动化、设计、记忆
 
 Auto Flow Selector 会根据命令、任务文本、仓库信号、敏感路径、memory context 决定：
 
@@ -226,13 +226,15 @@ muxdev memory propose latest
 muxdev memory approve mem_xxxxx
 ```
 
-## P1: 可信交付
+## 可信交付
 
-P1 不需要额外配置文件，runtime 默认写入：
+可信交付不需要额外配置文件，runtime 默认写入：
 
 - `contracts/*.stage_contract.json`
 - `contracts/*.role_result.json`
-- `evidence/*.evidence.json`
+- `evidence/events.jsonl`
+- `evidence/manifest.json`
+- `evidence/evaluation.json`
 - `ledger.jsonl`
 - `snapshots/*.patch`
 - `validation/blind_validator_panel.json`
@@ -246,7 +248,7 @@ muxdev evidence verify latest --json
 muxdev rollback latest --to-stage implement --json
 ```
 
-## P2: 运行时安全和 Provider 稳定性
+## 运行时安全和 Provider 稳定性
 
 Provider Action 与 muxdev approval 分离：
 
@@ -265,13 +267,13 @@ muxdev provider score --json
 muxdev provider score --role code --json
 ```
 
-P2 相关黑板表：
+相关 blackboard 表：
 
 - `provider_actions`
 - `provider_attempts`
 - `session_capsules`
 
-## P3: 生态与自动化
+## 生态与自动化
 
 Feedback Router 和 CI Rescue：
 
@@ -287,37 +289,46 @@ CAS cache：
 muxdev cache list --json
 ```
 
-Skill Lock：
+Skill governance：
 
 ```powershell
+muxdev skill catalog --role review --json
+muxdev skill explain --task "review auth changes" --role review --json
+muxdev skill trust secure-review project_trusted --scope project
 muxdev skill lock --json
 muxdev skill lock --no-memory --json
+muxdev skill verify --lock --json
 ```
 
-Safe Plugin Manifest：
+Extension model：
 
 ```powershell
-muxdev plugin validate path\to\plugin --json
-muxdev plugin add path\to\plugin --json
+muxdev skill catalog --json
+muxdev skill doctor --json
 ```
+
+Skills are the maintained extension unit. muxdev no longer manages a local plugin registry; use MCP or provider config for external tool surfaces.
 
 MCP Guardrail：
 
 ```powershell
 muxdev mcp manifest --json
+muxdev mcp doctor --json
+muxdev mcp serve --stdio
 muxdev mcp serve --request '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+muxdev mcp serve --request '{"jsonrpc":"2.0","id":2,"method":"resources/list"}'
+muxdev mcp serve --request '{"jsonrpc":"2.0","id":3,"method":"prompts/list"}'
 ```
 
-P3 相关黑板表：
+相关 blackboard 表：
 
 - `feedback_events`
 - `ci_rescues`
 - `cache_entries`
 - `skill_locks`
-- `plugin_manifests`
 - `guardrail_events`
 
-## P4: 高级并行与长期学习
+## 高级并行与长期学习
 
 Conflict-aware parallel-squad：
 
@@ -352,9 +363,9 @@ muxdev multirepo plan "coordinate API change" --repo repo-a --repo repo-b --mode
 muxdev multirepo dev "coordinate API change" --repo repo-a --repo repo-b --json
 ```
 
-P4 v1 生成可审计计划，不自动跨仓提交修改。
+Multi-repo 当前生成可审计计划，不自动跨仓提交修改。
 
-P4 相关黑板表：
+相关 blackboard 表：
 
 - `parallel_conflicts`
 - `semantic_merge_reviews`
@@ -478,9 +489,25 @@ review = ["api-review", "security-review"]
 code = ["repo-style"]
 
 [skill.security-review]
-trust = "trusted"
+trust = "project_trusted"
 disabled = false
 auto = true
+```
+
+单个 skill 包可以额外放 `muxdev.skill.toml` 描述策略：
+
+```toml
+[activation]
+roles = ["review", "secure"]
+stages = ["review"]
+file_patterns = ["src/auth/**"]
+
+[permissions]
+read_workspace = true
+write_workspace = false
+shell = false
+network = false
+secrets = false
 ```
 
 常用命令：
@@ -488,10 +515,14 @@ auto = true
 ```powershell
 muxdev skill add .\.agents\skills\api-review
 muxdev skill list --json
+muxdev skill catalog --role review --json
+muxdev skill explain --task "review auth changes" --role review --json
 muxdev skill show api-review
 muxdev skill bind review api-review --project
-muxdev skill doctor
+muxdev skill trust api-review project_trusted --scope project
+muxdev skill doctor --json
 muxdev skill lock --json
+muxdev skill verify --lock --json
 ```
 
 ## 配置排障

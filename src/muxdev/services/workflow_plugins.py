@@ -1,6 +1,6 @@
-"""Workflow plugin catalog and provider command translation.
+"""Workflow template catalog and provider command translation.
 
-Plugins are lightweight, configuration-defined command templates inspired by
+Templates are lightweight, configuration-defined command templates inspired by
 agent workflow systems. They let a project describe phase-specific slash
 commands once, then translate the command dialect for providers such as Codex.
 """
@@ -13,13 +13,14 @@ from ..config.loader import load_config
 
 @dataclass(frozen=True)
 class WorkflowPlugin:
-    """Configuration-backed workflow plugin definition."""
+    """Configuration-backed workflow template definition."""
 
     name: str
     description: str
     phases: tuple[str, ...]
     supported_providers: tuple[str, ...] = field(default_factory=tuple)
     commands: dict[str, str] = field(default_factory=dict)
+    prompts: dict[str, str] = field(default_factory=dict)
     artifacts: dict[str, str] = field(default_factory=dict)
     notes: str = ""
 
@@ -34,7 +35,7 @@ BUILTIN_WORKFLOW_PLUGINS: dict[str, WorkflowPlugin] = {}
 
 
 def list_workflow_plugins() -> list[WorkflowPlugin]:
-    """Return plugins from merged configuration in config order."""
+    """Return templates from merged configuration in config order."""
     plugins = load_config().get("workflow_plugins", {})
     return [_plugin_from_config(name, data) for name, data in plugins.items() if isinstance(data, dict)]
 
@@ -45,11 +46,11 @@ def get_workflow_plugin(name: str) -> WorkflowPlugin:
         return plugins[name]
     except KeyError as exc:
         known = ", ".join(plugins)
-        raise ValueError(f"unknown workflow plugin: {name}; known plugins: {known}") from exc
+        raise ValueError(f"unknown workflow template: {name}; known templates: {known}") from exc
 
 
 def render_plugin_command(plugin_name: str, phase: str, provider: str, task: str) -> dict[str, object]:
-    """Render a plugin phase command and translate it for a provider."""
+    """Render a workflow template phase command and translate it for a provider."""
     plugin = get_workflow_plugin(plugin_name)
     if phase not in plugin.phases:
         raise ValueError(f"plugin {plugin.name} does not define phase: {phase}")
@@ -61,6 +62,7 @@ def render_plugin_command(plugin_name: str, phase: str, provider: str, task: str
         "provider": provider,
         "canonical": rendered,
         "command": translate_agent_command(rendered, provider),
+        "prompt": plugin.prompts.get(phase, "").replace("{task}", task),
         "artifact": plugin.artifacts.get(phase, ""),
     }
 
@@ -84,6 +86,7 @@ def _plugin_from_config(name: str, data: dict[str, object]) -> WorkflowPlugin:
         phases=tuple(str(item) for item in data.get("phases", [])),
         supported_providers=tuple(str(item) for item in data.get("supported_providers", [])),
         commands={str(key): str(value) for key, value in (data.get("commands", {}) or {}).items()},
+        prompts={str(key): str(value) for key, value in (data.get("prompts", {}) or {}).items()},
         artifacts={str(key): str(value) for key, value in (data.get("artifacts", {}) or {}).items()},
         notes=str(data.get("notes", "")),
     )

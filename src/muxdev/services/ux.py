@@ -190,10 +190,10 @@ def build_task_ux_summary(payload: dict[str, Any]) -> dict[str, Any]:
         user_state = "failed"
         risk = "high"
     elif status == "completed":
-        scorecard = payload.get("evidence_scorecard") if isinstance(payload.get("evidence_scorecard"), dict) else {}
-        score = scorecard.get("score") if scorecard else None
+        evaluation = payload.get("evidence_evaluation") if isinstance(payload.get("evidence_evaluation"), dict) else {}
+        confidence = evaluation.get("confidence") if evaluation else None
         headline = "Delivery is ready for review"
-        why = f"Run completed with Delivery Confidence {score}/100." if score is not None else "Run completed and delivery artifacts are available."
+        why = f"Run completed with Evidence v2 confidence {float(confidence):.2f}." if confidence is not None else "Run completed and delivery artifacts are available."
         next_actions = [
             NextAction(
                 kind="view_report",
@@ -211,7 +211,7 @@ def build_task_ux_summary(payload: dict[str, Any]) -> dict[str, Any]:
             ),
         ]
         user_state = "deliverable"
-        risk = _scorecard_risk(scorecard)
+        risk = _evidence_risk(evaluation)
     else:
         headline = "Task is running"
         why = f"muxdev is working on stage `{current_stage}`." if current_stage else "muxdev is preparing or running this task."
@@ -394,8 +394,8 @@ def _deliverables(payload: dict[str, Any], run_id: str) -> list[dict[str, Any]]:
         deliverables.append({"kind": "diff", "label": "Diff", "endpoint": f"/api/tasks/{run_id}/diff", "ready": True})
     if not any(row["kind"] == "report" for row in deliverables):
         deliverables.append({"kind": "report", "label": "Report", "endpoint": f"/api/tasks/{run_id}/report", "ready": True})
-    if payload.get("evidence_scorecard"):
-        deliverables.append({"kind": "evidence", "label": "Evidence Scorecard", "ready": True})
+    if payload.get("evidence_evaluation"):
+        deliverables.append({"kind": "evidence", "label": "Evidence Evaluation", "ready": True})
     return deliverables
 
 
@@ -406,14 +406,14 @@ def _first_error(errors: list[dict[str, Any]]) -> str:
     return str(first.get("message") or first.get("error") or first.get("type") or "")
 
 
-def _scorecard_risk(scorecard: dict[str, Any]) -> str:
-    if not scorecard:
+def _evidence_risk(evaluation: dict[str, Any]) -> str:
+    if not evaluation:
         return "medium"
-    label = str(scorecard.get("label") or "")
-    score = int(scorecard.get("score") or 0)
-    if label in {"blocked", "risky"} or score < 60:
+    label = str(evaluation.get("label") or "")
+    confidence = float(evaluation.get("confidence") or 0)
+    if label in {"blocked", "risky"} or confidence < 0.6:
         return "high"
-    if label == "reviewable" or score < 85:
+    if label == "reviewable" or confidence < 0.85:
         return "medium"
     return "low"
 

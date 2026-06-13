@@ -13,11 +13,12 @@ from typing import Any
 
 from ..application import TaskRuntimeService
 from ..clients.sessions import TmuxBackend
+from ..config.loader import path_config
 from ..core.platforms import follow_file_command, hidden_subprocess_kwargs
 from ..domain import RunSpec
 from ..models import ApprovalStatus, ProviderActionStatus, RunStatus
 from ..runtime import SupervisorRuntime, new_run_id
-from ..services.dashboard import build_run_dashboard_payload, startup_dashboard_payload
+from ..services.dashboard_run import build_run_dashboard_payload, startup_dashboard_payload
 from ..services.feedback import route_feedback
 from ..services.provider_learning import refresh_provider_learning
 from ..services.provider_scores import build_provider_scores
@@ -89,7 +90,7 @@ class TaskManager:
             automation=automation,
         )
         task_id = spec.run_id
-        run_dir = self.paths.runs_dir / task_id
+        run_dir = self._project_run_dir(spec.workspace, task_id)
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "task_context.json").write_text(
             json.dumps(spec.task_context(), ensure_ascii=False, indent=2)
@@ -97,7 +98,7 @@ class TaskManager:
             encoding="utf-8",
         )
         with self.board() as board:
-            RunsRepository(board).create(spec, worktree=run_dir / "worktree")
+            RunsRepository(board).create(spec, worktree=self._project_worktree_dir(spec.workspace, task_id))
         thread = threading.Thread(
             target=self._run_task,
             args=(spec,),
@@ -157,9 +158,10 @@ class TaskManager:
 
     def task_detail(self, task_id: str) -> dict[str, Any]:
         resolved = self.resolve_task_id(task_id)
-        run_dir = self.paths.runs_dir / resolved
         with self.board() as board:
-            workspace = Path(board.get_run(resolved)["workspace"])
+            run = board.get_run(resolved)
+            workspace = Path(run["workspace"])
+            run_dir = self._run_dir(resolved, run=run)
             return DashboardReadModel(
                 workspace,
                 run_dir,
@@ -257,7 +259,6 @@ class TaskManager:
                 "ci_rescues": board.table_rows("ci_rescues"),
                 "cache_entries": board.table_rows("cache_entries"),
                 "skill_locks": board.table_rows("skill_locks"),
-                "plugin_manifests": board.table_rows("plugin_manifests"),
                 "guardrail_events": board.table_rows("guardrail_events"),
                 "parallel_conflicts": board.list_parallel_conflicts(),
                 "semantic_merge_reviews": board.list_semantic_merge_reviews(),
@@ -288,12 +289,12 @@ class TaskManager:
 
     def diff(self, task_id: str) -> dict[str, Any]:
         resolved = self.resolve_task_id(task_id)
-        path = self.paths.runs_dir / resolved / "diff.patch"
+        path = self._run_dir(resolved) / "diff.patch"
         return {"task_id": resolved, "run_id": resolved, "path": str(path), "diff": path.read_text(encoding="utf-8") if path.exists() else ""}
 
     def report(self, task_id: str) -> dict[str, Any]:
         resolved = self.resolve_task_id(task_id)
-        path = self.paths.runs_dir / resolved / "final_report.md"
+        path = self._run_dir(resolved) / "final_report.md"
         return {"task_id": resolved, "run_id": resolved, "path": str(path), "content": path.read_text(encoding="utf-8") if path.exists() else ""}
 
     def rollback(self, task_id: str, *, to_stage: str | None = None) -> dict[str, Any]:
@@ -379,7 +380,7 @@ class TaskManager:
         if tmux.available:
             handoff = {"mode": "tmux", "command": tmux.attach_command(session_name), "session": session_name}
         else:
-            run_dir = self.paths.runs_dir / resolved
+            run_dir = self._run_dir(resolved)
             candidates = sorted((run_dir / "session").glob(f"*{agent}*.log")) if (run_dir / "session").exists() else []
             transcript = candidates[-1] if candidates else run_dir / "trace.jsonl"
             handoff = {"mode": "transcript", "command": follow_file_command(transcript), "path": str(transcript)}
@@ -431,14 +432,21 @@ class TaskManager:
         self._runtime_service().resume(task_id, workspace, max_cost_usd=max_cost_usd)
 
     def _runtime_service(self) -> TaskRuntimeService:
-        return TaskRuntimeService(runtime_factory=self._runtime, board_factory=self.board, publish=self.broadcast)
+        return TaskRuntimeService(runtime_factory=self._runtime_for_task, board_factory=self.board, publish=self.broadcast)
 
-    def _runtime(self, workspace: Path) -> SupervisorRuntime:
+    def _runtime_for_task(self, workspace: Path, run_id: str | None = None) -> SupervisorRuntime:
+        if run_id:
+            run_dir = self._run_dir(run_id)
+            if self.paths.runs_dir == run_dir.parent:
+                return self._runtime(workspace, runs_dir=self.paths.runs_dir, worktrees_root=self.paths.worktrees_dir)
+        return self._runtime(workspace)
+
+    def _runtime(self, workspace: Path, *, runs_dir: Path | None = None, worktrees_root: Path | None = None) -> SupervisorRuntime:
         return SupervisorRuntime(
             workspace,
-            runs_dir=self.paths.runs_dir,
+            runs_dir=runs_dir,
             state_db=self.paths.db_path,
-            worktrees_root=self.paths.worktrees_dir,
+            worktrees_root=worktrees_root,
             write_dashboards=False,
         )
 
@@ -465,11 +473,12 @@ class TaskManager:
             "gate": context.get("gate"),
             "depth": context.get("depth"),
             "topology": context.get("topology"),
+            "role_providers": context.get("role_providers", {}) if isinstance(context.get("role_providers"), dict) else {},
             "skills": [skill.get("name") for skill in context.get("skills", []) if isinstance(skill, dict)],
         }
 
     def _task_context(self, task_id: str) -> dict[str, Any]:
-        path = self.paths.runs_dir / task_id / "task_context.json"
+        path = self._run_dir(task_id) / "task_context.json"
         if not path.exists():
             return {}
         try:
@@ -477,6 +486,26 @@ class TaskManager:
         except json.JSONDecodeError:
             return {}
         return data if isinstance(data, dict) else {}
+
+    def _run_dir(self, task_id: str, *, run: dict[str, Any] | None = None) -> Path:
+        if run is None:
+            with self.board() as board:
+                run = board.get_run(task_id)
+        project_run = self._project_run_dir(Path(str(run["workspace"])), task_id)
+        if project_run.exists():
+            return project_run
+        legacy_run = self.paths.runs_dir / task_id
+        if legacy_run.exists():
+            return legacy_run
+        return project_run
+
+    @staticmethod
+    def _project_run_dir(workspace: Path, task_id: str) -> Path:
+        return path_config(workspace, "runs") / task_id
+
+    @staticmethod
+    def _project_worktree_dir(workspace: Path, task_id: str) -> Path:
+        return path_config(workspace, "worktrees") / task_id
 
 
 def _clean_worktree_without_git(worktree: Path) -> list[str]:

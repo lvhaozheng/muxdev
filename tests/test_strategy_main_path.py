@@ -21,7 +21,7 @@ from muxdev.providers.registry import (
     ProviderProbe,
     ProviderStatus,
 )
-from muxdev.services.skill_engine import bind_skill, resolve_active_skills, scan_skills
+from muxdev.services.skills import bind_skill, resolve_active_skills, scan_skills
 
 
 runner = CliRunner()
@@ -78,8 +78,8 @@ def test_resolve_task_request_maps_new_and_legacy_roles(monkeypatch) -> None:
 def test_skill_scan_priority_and_role_binding() -> None:
     workspace = _workspace_temp("skills")
     try:
-        _write_skill(workspace / ".muxdev" / "skills" / "demo", "demo", "low priority")
-        _write_skill(workspace / ".agents" / "skills" / "demo", "demo", "high priority")
+        _write_skill(workspace / ".muxdev" / "skills" / "demo", "demo", "project priority")
+        _write_skill(workspace / ".agents" / "skills" / "demo", "demo", "lower priority")
         bind_skill(workspace, "review", "demo")
 
         skills = scan_skills(workspace)
@@ -88,10 +88,11 @@ def test_skill_scan_priority_and_role_binding() -> None:
         shutil.rmtree(workspace, ignore_errors=True)
 
     demo = next(skill for skill in skills if skill.name == "demo")
-    assert ".agents" in demo.path
+    assert ".muxdev" in demo.path
     assert active[0]["name"] == "demo"
     assert active[0]["role"] == "review"
     assert active[0]["reason"] == "role_binding"
+    assert "content" not in active[0]
 
 
 def test_daemon_api_persists_profile_gate_and_skills() -> None:
@@ -122,7 +123,8 @@ def test_daemon_api_persists_profile_gate_and_skills() -> None:
     assert detail["context"]["gate"] == "auto"
     assert detail["context"]["skills"][0]["name"] == "demo"
     assert tasks[0]["profile"] == "squad"
-    assert tasks[0]["skills"] == ["demo"]
+    assert tasks[0]["skills"][0] == "demo"
+    assert "default-review" in tasks[0]["skills"]
 
 
 def test_cli_dev_submits_resolved_daemon_payload(monkeypatch) -> None:

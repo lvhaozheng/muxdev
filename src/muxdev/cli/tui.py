@@ -16,7 +16,7 @@ from ..config.runtime import config_check as runtime_config_check
 from ..config.runtime import resolve_task_request
 from ..daemon.paths import DEFAULT_API_PORT, DEFAULT_HOST, DEFAULT_UI_PORT
 from ..daemon.process import start_daemon
-from ..services.skill_engine import resolve_active_skills
+from ..services.skills import resolve_active_skills
 from ..ui.tui import (
     daemon_approvals_text,
     daemon_chat_view,
@@ -397,6 +397,7 @@ def _submit_tui_task(client: DaemonClient, submit: dict[str, Any]) -> tuple[dict
             roles=list(request.get("runtime_roles", {}).keys()),
             provider=str(request["provider"]),
             explicit=list(request.get("skill_specs", [])),
+            include_content=True,
         )
     except ValueError as exc:
         raise DaemonConnectionError(str(exc)) from exc

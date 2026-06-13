@@ -18,9 +18,9 @@
 - lifecycle: `tasks`, `status`, `continue`, `stop`, `retry`, `skip`, `merge`, `report`, `diff`, `rollback`
 - approvals: `approvals`, `approve`, `deny`
 - provider actions: `actions`, `action handled`, `action dismiss`
-- P0/P4 memory: `memory status/query/propose/approve/quarantine/contradictions/quarantine-auto`
-- P4 parallel/learning/multirepo: `parallel conflicts`, `learning provider`, `multirepo plan/design/dev`
-- P3 ecosystem: `feedback add/list`, `cache list`, `skill lock`, plugin manifest commands
+- memory governance: `memory status/query/propose/approve/quarantine/contradictions/quarantine-auto`
+- parallel/learning/multirepo: `parallel conflicts`, `learning provider`, `multirepo plan/design/dev`
+- ecosystem automation: `feedback add/list`, `cache list`, `skill catalog/lock/verify`, plugin manifest commands
 - local tools: `provider`, `config`, `preset`, `policy`, `trace`, `metrics`, `search`, `mcp`, `session`, `rag`, `graph`, `deep-agent`, `workflow`, `flow`, `skill`, `plugin`
 - UI: `repl`, `tui`
 
@@ -79,7 +79,7 @@ muxdev dev "add tests" --provider mock --json
 3. `_submit_main_task` 调用 `config/runtime.py::resolve_task_request`。
 4. runtime config 合并 builtin/global/project/task/CLI options。
 5. 解析 profile、gate、roles、provider、workflow、automation flags。
-6. 调用 `services/skill_engine.py::resolve_active_skills`。
+6. 调用 `services/skills/activation.py::resolve_active_skills`，兼容导入仍通过 `services/skill_engine.py` 暴露。
 7. 生成 daemon task payload。
 8. `clients/daemon.py::DaemonClient.submit_task` 发送 `POST /api/tasks`。
 9. API 调用 `TaskManager.submit_task`。
@@ -91,6 +91,7 @@ muxdev dev "add tests" --provider mock --json
 - `config/runtime.py`
 - `services/automation.py`
 - `services/skill_engine.py`
+- `services/skills/`
 - `clients/daemon.py`
 - `api/web.py`
 - `daemon/tasks.py`
@@ -121,7 +122,7 @@ muxdev dev "add tests" --provider mock --json
 - `POST /api/provider-actions/{action_id}/handled`
 - `POST /api/provider-actions/{action_id}/dismiss`
 
-P3/P4 API：
+生态、学习与并行 API：
 
 - `POST /api/feedback`
 - `GET /api/ecosystem`
@@ -219,35 +220,36 @@ Provider 层：
 
 无法解析明确选项时，也会保留原始 prompt 片段、transcript/chunks 路径和 attach command。
 
-## P0-P4 Services
+## Service Capability Map
 
-### P0
+### 自动、设计与记忆
 
 - `services/automation.py`: intent resolver、flow selector、role topology。
 - `services/design.py`: design brief、design review、design artifact。
 - `storage/memory.py`: memory proposal/query/approval 基础能力。
 
-### P1
+### 可信交付
 
-- `services/evidence.py`: evidence snapshot、Blind Validator。
+- `services/evidence.py`: Evidence v2 events、manifest、evaluation、verification 和 legacy cleanup。
 - `storage/ledger.py`: hash ledger。
 - `storage/contracts.py`: role contract。
 
-### P2
+### 运行时安全与 Provider 稳定性
 
 - `services/session_capsules.py`: session capsule 和 handoff patch。
 - `services/provider_scores.py`: provider attempt/score 汇总。
 - `clients/stream.py`: provider action 解析。
 
-### P3
+### 生态自动化与技能治理
 
 - `services/feedback.py`: feedback router 和 CI rescue。
 - `services/cas_cache.py`: CAS cache。
-- `services/skill_lock.py`: skill lock 和 skill memory proposal。
-- `services/plugin_manifest.py`: safe plugin manifest。
+- `services/skills/`: skill discovery、catalog、trust、activation、selection、lock、eval。
+- `services/skill_engine.py`: backward-compatible facade。
+- `services/skill_lock.py`: backward-compatible lock facade。
 - `api/mcp.py`: MCP guardrail tools。
 
-### P4
+### 并行、语义合并、学习与多仓
 
 - `services/advanced_parallel.py`: parallel-squad conflict detection。
 - `services/semantic_merge.py`: semantic merge reviewer。
@@ -321,18 +323,23 @@ builtin < global < project < task < CLI options
 
 `config/loader.py` 仍用于历史 YAML provider/workflow/path 兼容。
 
-## Skill Engine
+## Skill Governance
 
-`services/skill_engine.py` 负责：
+`services/skills/` 是当前 skill governance 实现包，`services/skill_engine.py` 保留为兼容 facade。
+
+核心能力：
 
 - 扫描 `SKILL.md`
 - 解析 frontmatter
-- 读取 `skills.toml`
+- 读取 `skills.toml` 和 `muxdev.skill.toml`
+- progressive catalog
 - role binding
 - trust/disable/auto policy
 - task explicit activation
 - metadata auto-match
 - provider injection mode 标记
+- whole-tree skill lock
+- skill eval/score/abtest
 
 激活顺序：
 
@@ -380,20 +387,23 @@ task explicit -s
 
 ## MCP
 
-`api/mcp.py` 提供最小 JSON-RPC surface。当前工具包括 provider detect、workspace search、RAG query、workflow plugin、flow render、guardrail-safe blackboard read 等。MCP 是本地工具能力，不直接接管 daemon task lifecycle。
+`api/mcp.py` 提供最小 JSON-RPC surface。当前工具包括 provider detect、workspace search、RAG query、workflow templates、flow render、guardrail-safe blackboard read 等。MCP 是本地工具能力，不直接接管 daemon task lifecycle。
 
 ## 测试定位
 
-按能力找测试：
+按能力找测试可用 `pytest -k`：
 
 - CLI 与别名清理: `tests/test_cli.py`
 - daemon/API/client: `tests/test_daemon_client_server.py`
 - TUI: `tests/test_repl_tui_m7.py`
-- P0 automation/memory: `tests/test_p0_automation_memory.py`
-- P1 trusted delivery: `tests/test_p1_trusted_delivery.py`
-- P2 provider actions/runtime safety: `tests/test_p2_runtime_safety_provider.py`
-- P3 ecosystem automation: `tests/test_p3_ecosystem_automation.py`
-- P4 parallel/learning/multirepo: `tests/test_p4_advanced_parallel_learning.py`
+- automation/memory: `python -m pytest -q -k "auto_request or design_runtime"`
+- trusted delivery: `python -m pytest -q -k "trusted_delivery or approval_subject_drift"`
+- provider actions/runtime safety: `python -m pytest -q -k "read_only_stage or provider_action_writes"`
+- ecosystem automation: `python -m pytest -q -k "feedback_router or skill_lock or mcp_guardrail"`
+- parallel/learning/multirepo: `python -m pytest -q -k "parallel_conflict or provider_learning or multi_repo"`
+- product experience: `python -m pytest -q -k "product_experience or project_setup"`
+- Evidence v2: `python -m pytest -q -k "evidence_v2"`
+- Skill Governance v2: `python -m pytest -q -k "skill"`
 - runtime/storage: `tests/test_runtime_m1_m4.py`
 - stream/workflow/safety: `tests/test_stream_workflow_safety.py`
 - import structure: `tests/test_structure.py`
@@ -416,10 +426,10 @@ python -m pytest -q
 - provider 执行：`providers/adapters.py`。
 - provider action 解析：`clients/stream.py`。
 - TOML runtime config：`config/runtime.py`。
-- skill 扫描/激活：`services/skill_engine.py`。
+- skill 扫描/激活：`services/skills/`，兼容入口在 `services/skill_engine.py`。
 - evidence/validator：`services/evidence.py`。
 - provider scores/learning：`services/provider_scores.py`、`services/provider_learning.py`。
-- feedback/cache/plugin：`services/feedback.py`、`services/cas_cache.py`、`services/plugin_manifest.py`。
+- feedback/cache：`services/feedback.py`、`services/cas_cache.py`。
 - parallel/semantic merge/multirepo：`services/advanced_parallel.py`、`services/semantic_merge.py`、`services/multirepo.py`。
 - SQLite schema 或 run 状态：`storage/blackboard.py`。
 - memory：`storage/memory.py`。

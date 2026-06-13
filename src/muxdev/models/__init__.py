@@ -103,6 +103,9 @@ class WorkflowStage(BaseModel):
     output_schema: str | None = None
     when: str | None = None
     max_loops: int | None = None
+    prompt: str | None = None
+    prompt_template: str | None = None
+    default_skills: list[str] = Field(default_factory=list)
 
 
 class WorkflowDefinition(BaseModel):

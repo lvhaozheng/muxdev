@@ -1,6 +1,6 @@
 # muxdev 最佳实践
 
-本文面向日常使用和维护 muxdev 的开发者，覆盖最新 P0-P4 实现后的推荐路径。
+本文面向日常使用和维护 muxdev 的开发者，覆盖当前已实现能力后的推荐路径。
 
 ## 推荐日常路径
 
@@ -263,7 +263,7 @@ muxdev memory propose latest --json
 muxdev memory approve <mem_id>
 ```
 
-P4 后建议定期检查矛盾：
+建议定期检查记忆矛盾：
 
 ```powershell
 muxdev memory contradictions --json
@@ -283,13 +283,16 @@ muxdev memory quarantine-auto --json
 ```powershell
 muxdev report latest
 muxdev diff latest
+muxdev evidence latest
+muxdev evidence verify latest --json
 ```
 
 Dashboard task detail 中应检查：
 
 - role contracts
 - role results
-- evidence snapshots
+- Evidence v2 evaluation
+- Evidence v2 manifest and event stream
 - hash ledger
 - Blind Validator
 - semantic merge review
@@ -384,10 +387,24 @@ CI rescue 会把 CI 失败反馈路由到修复任务，并记录 feedback 与 r
 muxdev dev "review API compatibility" -s review=api-review
 ```
 
+选择前先看轻量 catalog，不要把完整 `SKILL.md` 全量塞进上下文：
+
+```powershell
+muxdev skill catalog --role review --json
+muxdev skill explain --task "review API compatibility" --role review --json
+```
+
 长期绑定：
 
 ```powershell
 muxdev skill bind review api-review --project
+```
+
+信任和激活应显式进行：
+
+```powershell
+muxdev skill trust api-review project_trusted --scope project
+muxdev skill activate api-review --role review --provider mock --json
 ```
 
 生成 skill lock：
@@ -406,13 +423,14 @@ muxdev skill lock --no-memory --json
 
 ```powershell
 muxdev skill doctor --json
+muxdev skill verify --lock --json
 ```
 
 Plugin manifest 必须经过安全校验。只包含安全权限的 manifest 才会被标为 trusted。
 
 ## Multi-Repo
 
-P4 的 multi-repo 是可审计编排计划，不直接跨仓写代码：
+Multi-repo 是可审计编排计划，不直接跨仓写代码：
 
 ```powershell
 muxdev multirepo plan "coordinate auth API change" --repo path\to\repo-a --repo path\to\repo-b --mode design --json
@@ -499,11 +517,7 @@ python -m pytest -q
 ```powershell
 python -m pytest tests/test_daemon_client_server.py -q
 python -m pytest tests/test_repl_tui_m7.py -q
-python -m pytest tests/test_p0_automation_memory.py -q
-python -m pytest tests/test_p1_trusted_delivery.py -q
-python -m pytest tests/test_p2_runtime_safety_provider.py -q
-python -m pytest tests/test_p3_ecosystem_automation.py -q
-python -m pytest tests/test_p4_advanced_parallel_learning.py -q
+python -m pytest -q -k "auto_request or trusted_delivery or read_only_stage or feedback_router or parallel_conflict or product_experience"
 ```
 
 Windows 上如果 `.pytest_cache` 写入失败，通常只是权限 warning，不影响功能结果。

@@ -32,16 +32,17 @@ def test_run_writes_trusted_delivery_evidence() -> None:
         assert (result.run_dir / "ledger.jsonl").exists()
         assert (result.run_dir / "contracts" / "design.stage_contract.json").exists()
         assert (result.run_dir / "contracts" / "implement.role_result.json").exists()
-        assert (result.run_dir / "evidence" / "implement.evidence.json").exists()
+        assert (result.run_dir / "evidence" / "events.jsonl").exists()
+        assert (result.run_dir / "evidence" / "manifest.json").exists()
+        assert (result.run_dir / "evidence" / "evaluation.json").exists()
         assert (result.run_dir / "snapshots" / "implement.patch").exists()
         assert (result.run_dir / "validation" / "blind_validator_panel.json").exists()
 
         with Blackboard(result.run_dir) as blackboard:
             payload = verify_run_evidence(result.run_dir, result.run_id, blackboard)
             assert payload["valid"] is True
-            assert payload["contracts"] >= 6
-            assert payload["evidence_bundles"] >= 4
-            assert payload["validators"] == 1
+            assert payload["events"] > 0
+            assert payload["manifest"]["contract_version"] == "muxdev.evidence.v2"
             assert blackboard.table_rows("ledger_events", run_id=result.run_id)
             assert blackboard.table_rows("snapshots", run_id=result.run_id)
             assert blackboard.table_rows("validator_panels", run_id=result.run_id)[0]["decision"] == "accept"
@@ -92,7 +93,7 @@ def test_cli_evidence_verify_reports_valid_run() -> None:
         payload = json.loads(verified.stdout)
         assert payload["valid"] is True
         assert payload["run_id"] == result.run_id
-        assert payload["ledger"]["valid"] is True
+        assert payload["manifest"]["contract_version"] == "muxdev.evidence.v2"
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 
@@ -115,7 +116,7 @@ def test_daemon_rollback_to_stage_snapshot() -> None:
         assert verified.exit_code == 0
         verified_payload = json.loads(verified.stdout)
         assert verified_payload["valid"] is True
-        assert verified_payload["contracts"] > 0
+        assert verified_payload["events"] > 0
         assert rollback["status"] == "rolled_back"
         assert rollback["to_stage"] == "implement"
         assert rollback["snapshot"].endswith("implement.patch")

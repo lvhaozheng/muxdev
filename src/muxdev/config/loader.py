@@ -30,6 +30,7 @@ DEFAULT_CONFIG_FILES = (
     "accounts.yaml",
     "installers.yaml",
     "workflows.yaml",
+    "prompt_templates.yaml",
     "workflow_plugins.yaml",
     "ui.yaml",
 )
@@ -39,6 +40,7 @@ KNOWN_SECTIONS = {
     "command_dialects",
     "installers",
     "paths",
+    "prompt_templates",
     "providers",
     "ui",
     "workflow_plugins",
