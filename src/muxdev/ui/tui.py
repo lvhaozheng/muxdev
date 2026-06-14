@@ -51,6 +51,7 @@ DAEMON_COMMAND_GROUPS: dict[str, list[tuple[str, str]]] = {
         ("/test [task]", "submit a test task"),
         ("/run <task>", "alias for /dev"),
         ("/continue [id]", "continue a paused task"),
+        ("/recover [id]", "recover a blocked or failed task"),
         ("/stop <id>", "abort a task"),
         ("/status [id]", "show compact task detail"),
         ("/tasks", "list recent tasks"),
@@ -150,7 +151,7 @@ def _render_tui(console: Console, workspace: Path, run_id: str, message: str = "
     console.print(status_panel(load_payload(workspace, run_id)))
     if message:
         console.print(Panel(message, title="Message", box=box.ASCII, border_style="cyan"))
-    console.print("[dim]Type / for commands. Common: /run <task> | /resume | /report | /trace | /approve <id> | /quit[/dim]")
+    console.print("[dim]Type / for commands. Common: /run <task> | /recover | /report | /trace | /approve <id> | /quit[/dim]")
 
 
 def daemon_chat_view(
@@ -204,17 +205,25 @@ def daemon_tasks_text(rows: list[dict[str, Any]]) -> str:
         return "No daemon tasks yet.\nStart with /run <task>."
     lines = ["Recent tasks:"]
     for row in rows[:12]:
+        reason = _task_error_reason(row)
         lines.append(
-            "  {task_id:<22} {status:<25} stage={stage:<12} approvals={approvals:<2} actions={actions:<2} tokens={tokens:<6} {task}".format(
-                task_id=_clip(row.get("task_id") or row.get("run_id") or "-", 22),
-                status=_clip(row.get("status") or "-", 25),
-                stage=_clip(row.get("current_stage") or "-", 12),
+            "  {task_id:<20} {status:<18} stage={stage:<10} time={elapsed:<7} approvals={approvals:<2} actions={actions:<2} tokens={tokens:<6} {task}".format(
+                task_id=_clip(row.get("task_id") or row.get("run_id") or "-", 20),
+                status=_clip(row.get("status") or "-", 18),
+                stage=_clip(row.get("current_stage") or "-", 10),
+                elapsed=_clip(_format_duration(row.get("elapsed_seconds")), 7),
                 approvals=row.get("pending_approvals", 0),
                 actions=row.get("pending_provider_actions", 0),
                 tokens=row.get("tokens", 0),
-                task=_clip(row.get("task") or "", 40),
+                task=_clip(row.get("task") or "", 28),
             )
         )
+        if row.get("current_activity"):
+            lines.append(f"    activity: {_clip(row.get('current_activity'), 100)}")
+        if reason:
+            task_id = row.get("task_id") or row.get("run_id") or "latest"
+            lines.append(f"    error: {_clip(reason, 100)}")
+            lines.append(f"    recover: /recover {task_id}  |  /report {task_id}")
     if len(rows) > 12:
         lines.append(f"  ... {len(rows) - 12} more")
     return "\n".join(lines)
@@ -251,13 +260,15 @@ def daemon_provider_actions_text(rows: list[dict[str, Any]]) -> str:
             "  {action:<24} task={task:<22} {kind:<18} {provider}/{stage}".format(
                 action=_clip(row.get("action_id") or "-", 24),
                 task=_clip(row.get("run_id") or row.get("task_id") or "-", 22),
-                kind=_clip(row.get("kind") or "-", 18),
+                kind=_clip(row.get("input_kind") or row.get("kind") or "-", 18),
                 provider=_clip(row.get("provider") or "-", 12),
                 stage=_clip(row.get("stage_id") or "-", 12),
             )
         )
         lines.append(f"    prompt: {_clip(row.get('prompt_text') or '', 120)}")
-        lines.append(f"    options: {options or '-'}")
+        lines.append(f"    choices: {options or '-'}  default={row.get('default_choice') or '-'}  auto={row.get('auto_policy') or 'manual'}")
+        if row.get("response") is not None:
+            lines.append(f"    response: {_clip(row.get('response'), 120)}")
         lines.append(f"    attach: {_clip(row.get('attach_command') or row.get('transcript_path') or '-', 120)}")
     if len(rows) > 12:
         lines.append(f"  ... {len(rows) - 12} more")
@@ -290,6 +301,15 @@ def daemon_task_detail_text(payload: dict[str, Any]) -> str:
         first_action = next((row for row in ux.get("next_actions", []) if isinstance(row, dict)), None)
         if first_action:
             lines.append(f"Action: {first_action.get('label', '-')} {first_action.get('command') or first_action.get('endpoint') or ''}")
+    reason = _task_error_reason(payload)
+    if reason:
+        lines.extend(
+            [
+                "",
+                f"Error: {_clip(reason, 110)}",
+                f"Recover: /recover {run.get('run_id') or payload.get('task_id') or 'latest'}  |  /report {run.get('run_id') or payload.get('task_id') or 'latest'}",
+            ]
+        )
     actions = [row for row in payload.get("provider_actions", []) if isinstance(row, dict) and row.get("status") == "pending"]
     if actions:
         lines.append("")
@@ -382,14 +402,24 @@ def _daemon_focus_panel(
         if isinstance(row, dict) and (not run_id or str(row.get("run_id") or row.get("task_id") or "") == run_id)
     ]
     grid = Table.grid(expand=True)
-    grid.add_column(ratio=1, style="bold")
-    grid.add_column(ratio=4)
-    grid.add_row("task", _clip(run.get("task") or "", 104))
+    grid.add_column(ratio=1, style="bold", no_wrap=True)
+    grid.add_column(ratio=4, overflow="fold")
+    grid.add_row("task", _clip(run.get("task") or "", 600))
     grid.add_row("id", str(run.get("run_id") or task_payload.get("task_id") or "-"))
     grid.add_row("status", _status_text(str(run.get("status") or "-")))
     if ux:
-        grid.add_row("next", _clip(ux.get("headline") or "-", 104))
-        grid.add_row("why", _clip(ux.get("why") or "", 104))
+        grid.add_row("next", _clip(ux.get("headline") or "-", 300))
+        grid.add_row("why", _clip(ux.get("why") or "", 1000))
+    if summary.get("current_activity"):
+        grid.add_row("activity", _clip(summary.get("current_activity"), 1000))
+    if summary.get("elapsed_seconds") is not None:
+        grid.add_row("elapsed", _format_duration(summary.get("elapsed_seconds")))
+    if summary.get("current_stage_elapsed_seconds") is not None:
+        grid.add_row("stage time", _format_duration(summary.get("current_stage_elapsed_seconds")))
+    reason = _task_error_reason(task_payload)
+    if reason:
+        grid.add_row("error", _clip(reason, 1000))
+        grid.add_row("recover", f"/recover {run_id or 'latest'}  |  /report {run_id or 'latest'}")
     grid.add_row("stage", _current_stage(task_payload))
     grid.add_row("profile/gate", f"{context.get('profile') or '-'} / {context.get('gate') or '-'}")
     grid.add_row("usage", f"{summary.get('tokens', 0)} tokens  ${float(summary.get('cost_usd') or 0):.4f}")
@@ -406,15 +436,15 @@ def _daemon_focus_panel(
         grid.add_row("provider learning", f"{len(provider_learning)} snapshot(s)")
     if pending_actions:
         first = pending_actions[0]
-        grid.add_row("provider prompt", _clip(first.get("prompt_text") or "", 104))
+        grid.add_row("provider prompt", _clip(first.get("prompt_text") or "", 1000))
         grid.add_row("options", _option_labels(first) or "-")
-        grid.add_row("attach", _clip(first.get("attach_command") or first.get("transcript_path") or "-", 104))
+        grid.add_row("attach", _clip(first.get("attach_command") or first.get("transcript_path") or "-", 500))
         grid.add_row("after attach", f"/action handled {first.get('action_id')}  then  /continue {run_id or 'latest'}")
     elif ux:
         first_action = next((row for row in ux.get("next_actions", []) if isinstance(row, dict)), None)
         if first_action:
-            grid.add_row("action", f"{first_action.get('label', '-')}  {first_action.get('command') or first_action.get('endpoint') or ''}")
-    grid.add_row("skills", ", ".join(skills) if skills else "-")
+            grid.add_row("action", _clip(f"{first_action.get('label', '-')}  {first_action.get('command') or first_action.get('endpoint') or ''}", 500))
+    grid.add_row("skills", _clip(", ".join(skills), 1000) if skills else "-")
     events = _recent_event_lines(task_payload.get("trace", []), limit=5)
     if events:
         grid.add_row("recent", "\n".join(events))
@@ -614,12 +644,12 @@ def _handle_tui_command(line: str, workspace: Path, run_id: str) -> str:
     if line.startswith("!"):
         result = SafetyPolicyEngine().evaluate_shell(line[1:].strip())
         return f"{result.decision}: {result.reason}"
-    if line == "resume":
+    if line in {"resume", "recover"}:
         latest = RunStore(workspace).latest_run_id()
         if not latest:
-            return "no run to resume"
+            return "no run to recover"
         result = SupervisorRuntime(workspace).resume(latest)
-        return f"resumed {result.run_id}: {result.status}"
+        return f"recover {result.run_id}: {result.status}"
     if line == "report":
         latest = RunStore(workspace).latest_run_id() if run_id == "latest" else run_id
         if not latest:
@@ -815,6 +845,7 @@ def _provider_summary(payload: dict[str, Any]) -> Table:
 
 
 def _quick_summary(payload: dict[str, Any]) -> Table:
+    run = payload.get("run") or {}
     pending = [row for row in payload["approvals"] if row["status"] == "pending"]
     pending_actions = [row for row in payload.get("provider_actions", []) if row.get("status") == "pending"]
     table = Table.grid(expand=True)
@@ -834,6 +865,10 @@ def _quick_summary(payload: dict[str, Any]) -> Table:
     table.add_row("dev", "/dev <task>")
     table.add_row("design", "/design <task>")
     table.add_row("continue", "/continue")
+    reason = _task_error_reason(payload)
+    if reason:
+        table.add_row("recover", f"/recover {run.get('run_id') or payload.get('task_id') or 'latest'}")
+        table.add_row("error", _clip(reason, 72))
     table.add_row("report", quick.get("report", "muxdev report latest"))
     return table
 
@@ -955,6 +990,22 @@ def _clip(value: object, width: int) -> str:
     return text[: max(0, width - 3)] + "..."
 
 
+def _format_duration(value: object) -> str:
+    if value is None or value == "":
+        return "-"
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return "-"
+    minutes, second = divmod(max(0, seconds), 60)
+    hours, minute = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h{minute:02d}m"
+    if minutes:
+        return f"{minutes}m{second:02d}s"
+    return f"{second}s"
+
+
 def _display_path(value: object, width: int) -> str:
     return _clip(str(value).replace("\\", "/"), width)
 
@@ -963,8 +1014,23 @@ def _display_value(value: object) -> str:
     return str(value).replace("\\", "/")
 
 
+def _task_error_reason(payload: dict[str, Any]) -> str:
+    summary = payload.get("error_summary") if isinstance(payload.get("error_summary"), dict) else None
+    if summary is None:
+        errors = payload.get("errors", []) if isinstance(payload.get("errors"), list) else []
+        summary = errors[0] if errors and isinstance(errors[0], dict) else None
+    if not summary:
+        return ""
+    stage = str(summary.get("stage_id") or "run")
+    kind = str(summary.get("type") or summary.get("error") or "")
+    message = str(summary.get("message") or "")
+    if kind and message:
+        return f"{stage} {kind}: {message}"
+    return message or kind
+
+
 def _option_labels(row: dict[str, Any]) -> str:
-    options = row.get("options")
+    options = row.get("choices") or row.get("options")
     if not isinstance(options, list):
         return ""
     return ", ".join(str(option.get("label") or option.get("value")) for option in options if isinstance(option, dict) and (option.get("label") or option.get("value")))

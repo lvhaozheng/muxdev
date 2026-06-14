@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config.loader import path_config
-from ..models import ApprovalStatus, ProviderActionStatus, RunStatus, StageStatus, TraceEvent, utc_now
+from ..models import ApprovalStatus, ProviderActionKind, ProviderActionStatus, RunStatus, StageStatus, TraceEvent, utc_now
 from ..core.redaction import redact
 from .contracts import canonical_hash
 
@@ -165,6 +165,12 @@ class Blackboard:
               status TEXT NOT NULL,
               prompt_text TEXT NOT NULL,
               options_json TEXT NOT NULL,
+              input_kind TEXT,
+              choices_json TEXT,
+              default_choice TEXT,
+              timeout_seconds INTEGER,
+              response_json TEXT,
+              auto_policy TEXT,
               transcript_path TEXT,
               chunks_path TEXT,
               attach_command TEXT,
@@ -441,12 +447,23 @@ class Blackboard:
         )
         self._ensure_column("approvals", "subject_hash", "TEXT")
         self._ensure_column("approvals", "subject_json", "TEXT")
+        self._ensure_column("provider_actions", "input_kind", "TEXT")
+        self._ensure_column("provider_actions", "choices_json", "TEXT")
+        self._ensure_column("provider_actions", "default_choice", "TEXT")
+        self._ensure_column("provider_actions", "timeout_seconds", "INTEGER")
+        self._ensure_column("provider_actions", "response_json", "TEXT")
+        self._ensure_column("provider_actions", "auto_policy", "TEXT")
         self.conn.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         columns = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
         if column not in columns:
-            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            try:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            except sqlite3.OperationalError as exc:
+                if "readonly" in str(exc).lower() or "read-only" in str(exc).lower():
+                    return
+                raise
 
     def create_run(
         self,
@@ -591,6 +608,11 @@ class Blackboard:
         kind: str,
         prompt_text: str,
         options: list[dict[str, Any]] | None = None,
+        input_kind: str | None = None,
+        choices: list[dict[str, Any]] | None = None,
+        default_choice: str | None = None,
+        timeout_seconds: int | None = None,
+        auto_policy: str | None = None,
         transcript_path: str | None = None,
         chunks_path: str | None = None,
         attach_command: str | None = None,
@@ -611,14 +633,18 @@ class Blackboard:
                 return str(existing["action_id"])
         action_id = f"pact_{run_id}_{len(self.list_provider_actions(run_id=run_id)) + 1}"
         now = utc_now()
+        action_choices = choices if choices is not None else (options or [])
+        action_input_kind = input_kind or _provider_action_input_kind(kind, action_choices)
+        action_default = default_choice or _default_choice(action_choices)
         self.conn.execute(
             """
             INSERT INTO provider_actions(
               action_id, run_id, stage_id, provider, role, kind, status, prompt_text,
-              options_json, transcript_path, chunks_path, attach_command, source_event_hash,
+              options_json, input_kind, choices_json, default_choice, timeout_seconds, response_json, auto_policy,
+              transcript_path, chunks_path, attach_command, source_event_hash,
               created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 action_id,
@@ -630,6 +656,12 @@ class Blackboard:
                 str(ProviderActionStatus.PENDING),
                 redact(prompt_text),
                 json.dumps(options or [], ensure_ascii=False),
+                action_input_kind,
+                json.dumps(action_choices, ensure_ascii=False),
+                action_default,
+                timeout_seconds,
+                None,
+                auto_policy or "manual",
                 transcript_path,
                 chunks_path,
                 attach_command,
@@ -660,12 +692,36 @@ class Blackboard:
                 row["options"] = json.loads(row.get("options_json") or "[]")
             except json.JSONDecodeError:
                 row["options"] = []
+            try:
+                row["choices"] = json.loads(row.get("choices_json") or row.get("options_json") or "[]")
+            except json.JSONDecodeError:
+                row["choices"] = []
+            try:
+                row["response"] = json.loads(row.get("response_json") or "null")
+            except json.JSONDecodeError:
+                row["response"] = None
+            row["input_kind"] = row.get("input_kind") or _provider_action_input_kind(str(row.get("kind") or ""), row["choices"])
+            row["default_choice"] = row.get("default_choice") or _default_choice(row["choices"])
+            row["auto_policy"] = row.get("auto_policy") or "manual"
         return rows
 
     def update_provider_action_status(self, action_id: str, status: ProviderActionStatus | str) -> None:
         self.conn.execute(
             "UPDATE provider_actions SET status = ?, updated_at = ? WHERE action_id = ?",
             (str(status), utc_now(), action_id),
+        )
+        self.conn.commit()
+
+    def respond_provider_action(
+        self,
+        action_id: str,
+        *,
+        response: Any,
+        status: ProviderActionStatus | str = ProviderActionStatus.HANDLED,
+    ) -> None:
+        self.conn.execute(
+            "UPDATE provider_actions SET response_json = ?, status = ?, updated_at = ? WHERE action_id = ?",
+            (json.dumps(response, ensure_ascii=False, sort_keys=True), str(status), utc_now(), action_id),
         )
         self.conn.commit()
 
@@ -1416,6 +1472,24 @@ def _json_dict(value: object) -> dict[str, object]:
     except json.JSONDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _provider_action_input_kind(kind: str, choices: list[dict[str, Any]] | None = None) -> str:
+    choices = choices or []
+    if kind == str(ProviderActionKind.CLI_CONFIRMATION):
+        return "confirmation"
+    if choices:
+        return "choice"
+    if kind in {str(ProviderActionKind.AUTH_REQUIRED), str(ProviderActionKind.RATE_LIMIT), str(ProviderActionKind.IDLE_TIMEOUT)}:
+        return "external"
+    return "text"
+
+
+def _default_choice(choices: list[dict[str, Any]] | None = None) -> str | None:
+    for choice in choices or []:
+        if choice.get("default") and choice.get("value") is not None:
+            return str(choice["value"])
+    return None
 
 
 class TraceWriter:

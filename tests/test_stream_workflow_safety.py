@@ -81,6 +81,27 @@ def test_headless_backend_parses_output_in_chunks() -> None:
     assert len(chunks.read_text(encoding="utf-8").splitlines()) >= 2
 
 
+def test_headless_backend_sends_stdin_to_provider() -> None:
+    result = HeadlessSubprocessBackend().run(
+        [sys.executable, "-c", "import sys; print(sys.stdin.read())"],
+        cwd=Path.cwd(),
+        input_text="hello from stdin",
+    )
+
+    assert result.returncode == 0
+    assert "hello from stdin" in result.stdout
+
+
+def test_headless_backend_decodes_windows_cli_output() -> None:
+    result = HeadlessSubprocessBackend().run(
+        [sys.executable, "-c", "import sys; sys.stdout.buffer.write(bytes.fromhex('c3fcc1eed0d0ccabb3a4') + b'\\n')"],
+        cwd=Path.cwd(),
+    )
+
+    assert result.returncode == 0
+    assert "\u547d\u4ee4\u884c\u592a\u957f" in result.stdout
+
+
 def test_headless_backend_enforces_idle_timeout_without_output() -> None:
     result = HeadlessSubprocessBackend().run(
         [sys.executable, "-c", "import time; time.sleep(5)"],

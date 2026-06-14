@@ -40,6 +40,13 @@ class MockProvider:
             result = ReviewResult(has_blockers=False, blockers=[])
             content = "# Review\n\nNo blockers.\n\n```json\n" + result.model_dump_json(indent=2) + "\n```\n"
             return MockStageOutput("review.md", content, "no blockers")
+        if stage_id == "design_review":
+            result = ReviewResult(has_blockers=False, blockers=[])
+            content = "# Design Review\n\nNo blockers.\n\n```json\n" + result.model_dump_json(indent=2) + "\n```\n"
+            return MockStageOutput("design/design_review.md", content, "design review passed")
+        if stage_id == "design_revise":
+            content = f"# Revised Design\n\nMock revised design output for task: {safe_task}\n"
+            return MockStageOutput("design/design_revise.md", content, "mock design revision completed")
         if stage_id == "fix":
             return MockStageOutput("session/fix.log", "no fix needed\n", "fix skipped")
         if stage_id in {

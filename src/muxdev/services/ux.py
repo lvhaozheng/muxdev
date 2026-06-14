@@ -96,13 +96,13 @@ def build_task_ux_summary(payload: dict[str, Any]) -> dict[str, Any]:
     current_stage = _current_stage(stages)
     progress = [_stage_progress(row) for row in stages]
     deliverables = _deliverables(payload, run_id)
+    planning_feedback = _planning_feedback_action(run_id, stages)
 
     if pending_actions:
         first = pending_actions[0]
-        provider = str(first.get("provider") or "provider")
         action_id = str(first.get("action_id") or "")
-        headline = f"{provider} is waiting for your action"
-        why = "The external provider CLI/session asked for confirmation, auth, rate-limit handling, or another manual step. muxdev will not answer it for you."
+        headline = _provider_action_headline(first)
+        why = _provider_action_why(first)
         next_actions = []
         attach = first.get("attach_command") or first.get("transcript_path")
         if attach:
@@ -187,6 +187,8 @@ def build_task_ux_summary(payload: dict[str, Any]) -> dict[str, Any]:
                 danger=True,
             ),
         ]
+        if planning_feedback:
+            next_actions.append(planning_feedback)
         user_state = "failed"
         risk = "high"
     elif status == "completed":
@@ -210,11 +212,14 @@ def build_task_ux_summary(payload: dict[str, Any]) -> dict[str, Any]:
                 method="GET",
             ),
         ]
+        if planning_feedback:
+            next_actions.append(planning_feedback)
         user_state = "deliverable"
         risk = _evidence_risk(evaluation)
     else:
+        summary = payload.get("summary", {}) if isinstance(payload.get("summary"), dict) else {}
         headline = "Task is running"
-        why = f"muxdev is working on stage `{current_stage}`." if current_stage else "muxdev is preparing or running this task."
+        why = _running_why(current_stage, str(summary.get("current_activity") or ""), summary.get("current_stage_elapsed_seconds"))
         next_actions = [
             NextAction(
                 kind="refresh",
@@ -231,6 +236,8 @@ def build_task_ux_summary(payload: dict[str, Any]) -> dict[str, Any]:
                 danger=True,
             ),
         ]
+        if planning_feedback:
+            next_actions.insert(0, planning_feedback)
         user_state = "running"
         risk = "low" if not blockers else "medium"
 
@@ -268,34 +275,78 @@ def build_ux_overview(
 ) -> dict[str, Any]:
     """Build an action-first dashboard overview."""
     action_items: list[dict[str, Any]] = []
+    task_index = {_task_id(task): task for task in tasks if isinstance(task, dict) and _task_id(task)}
     for row in provider_actions:
         if not isinstance(row, dict):
             continue
         run_id = str(row.get("run_id") or row.get("task_id") or "")
         action_id = str(row.get("action_id") or "")
+        task = task_index.get(run_id, {})
         action_items.append(
             {
                 "kind": "provider_action",
                 "run_id": run_id,
+                "task_id": run_id,
                 "action_id": action_id,
-                "headline": f"{row.get('provider') or 'provider'} is waiting for your action",
-                "why": "Handle the provider CLI prompt, then continue the task.",
+                "headline": _provider_action_headline(row),
+                "why": _provider_action_why(row, overview=True),
                 "endpoint": f"/api/tasks/{run_id}/actions/{action_id}/handled-and-continue",
                 "command": row.get("attach_command") or row.get("transcript_path"),
+                **_action_context(task, run_id=run_id, stage_id=str(row.get("stage_id") or "")),
             }
         )
     for row in approvals:
         if not isinstance(row, dict):
             continue
+        run_id = str(row.get("run_id") or row.get("task_id") or "")
+        task = task_index.get(run_id, {})
         approval_id = str(row.get("approval_id") or "")
         action_items.append(
             {
                 "kind": "approval",
-                "run_id": row.get("run_id") or row.get("task_id"),
+                "run_id": run_id,
+                "task_id": run_id,
                 "approval_id": approval_id,
                 "headline": "Approval required",
                 "why": row.get("reason") or "A policy gate needs a decision.",
                 "endpoint": f"/api/approvals/{approval_id}/approve",
+                **_action_context(task, run_id=run_id, stage_id=str(row.get("stage_id") or "")),
+            }
+        )
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        if _task_is_planning(task):
+            run_id = str(task.get("task_id") or task.get("run_id") or "")
+            action_items.append(
+                {
+                    "kind": "plan_feedback",
+                    "run_id": run_id,
+                    "task_id": run_id,
+                    "headline": "Plan is open for feedback",
+                    "why": task.get("current_activity") or f"muxdev is working on {task.get('current_stage') or 'planning'}.",
+                    "command": f'muxdev feedback add manual_feedback "<your feedback>" --run-id {run_id}',
+                    "endpoint": "/api/feedback",
+                    **_action_context(task, run_id=run_id, stage_id=str(task.get("current_stage") or "")),
+                }
+            )
+        status = str(task.get("status") or "")
+        if status not in FAILED_STATUSES and not int(task.get("errors") or 0):
+            continue
+        run_id = str(task.get("task_id") or task.get("run_id") or "")
+        error = task.get("error_summary") if isinstance(task.get("error_summary"), dict) else {}
+        reason = _error_reason(error) or "The task stopped before normal delivery."
+        action_items.append(
+            {
+                "kind": "recovery",
+                "run_id": run_id,
+                "task_id": run_id,
+                "headline": "Task needs recovery",
+                "why": reason,
+                "endpoint": task.get("recover_endpoint") or f"/api/tasks/{run_id}/continue",
+                "secondary_endpoint": task.get("report_endpoint") or f"/api/tasks/{run_id}/report",
+                "rollback_endpoint": task.get("rollback_endpoint") or f"/api/tasks/{run_id}/rollback",
+                **_action_context(task, run_id=run_id, stage_id=str(error.get("stage_id") or task.get("current_stage") or "")),
             }
         )
 
@@ -380,13 +431,129 @@ def _stage_progress(row: dict[str, Any]) -> dict[str, Any]:
         "role": row.get("role"),
         "status": row.get("status"),
         "summary": row.get("summary"),
+        "elapsed_seconds": row.get("elapsed_seconds"),
     }
+
+
+def _task_id(task: dict[str, Any]) -> str:
+    return str(task.get("task_id") or task.get("run_id") or "")
+
+
+def _action_context(task: dict[str, Any], *, run_id: str, stage_id: str = "") -> dict[str, Any]:
+    return {
+        "task_id": run_id,
+        "task_title": task.get("task_title") or task.get("task") or task.get("title") or run_id or "muxdev task",
+        "project_id": task.get("project_id") or "",
+        "project_name": task.get("project_name") or "",
+        "project_path": task.get("project_path") or task.get("workspace") or "",
+        "stage_id": stage_id or str(task.get("current_stage") or ""),
+    }
+
+
+def _provider_action_headline(row: dict[str, Any]) -> str:
+    provider = str(row.get("provider") or "provider")
+    if _is_design_provider_action(row):
+        return f"{provider} 需要你确认设计风格"
+    return f"{provider} is waiting for your action"
+
+
+def _provider_action_why(row: dict[str, Any], *, overview: bool = False) -> str:
+    prompt = str(row.get("prompt_text") or "").strip()
+    if _is_design_provider_action(row):
+        base = "Provider 在设计阶段通过自身 CLI/session 请求你的目标用户、视觉风格、参考产品或平台偏好；muxdev 只保存回答并继续原 run。"
+        return f"{base} {prompt}" if prompt and not overview else base
+    if overview:
+        return "Handle the provider CLI prompt, then continue the task."
+    return "The external provider CLI/session asked for confirmation, auth, rate-limit handling, or another manual step. muxdev will not answer it for you."
+
+
+def _is_design_provider_action(row: dict[str, Any]) -> bool:
+    text = " ".join(
+        str(row.get(key) or "")
+        for key in ("stage_id", "role", "prompt_text", "kind")
+    ).lower()
+    return any(
+        token in text
+        for token in (
+            "design",
+            "design_brief",
+            "architecture",
+            "视觉",
+            "风格",
+            "设计",
+            "style",
+            "target user",
+            "reference product",
+        )
+    )
+
+
+def _planning_feedback_action(run_id: str, stages: list[dict[str, Any]]) -> NextAction | None:
+    planning = [row for row in stages if _is_planning_stage(str(row.get("stage_id") or ""), str(row.get("role") or ""))]
+    if not planning or not any(str(row.get("status")) in {"running", "completed"} for row in planning):
+        return None
+    return NextAction(
+        kind="plan_feedback",
+        label="Give plan feedback",
+        description="Add constraints, corrections, or preferences for the planning/design stages.",
+        command=f'muxdev feedback add manual_feedback "<your feedback>" --run-id {run_id}',
+        endpoint="/api/feedback",
+    )
+
+
+def _is_planning_stage(stage_id: str, role: str) -> bool:
+    text = f"{stage_id} {role}".lower()
+    return any(token in text for token in ("plan", "design", "requirement", "architecture", "roadmap", "problem_statement"))
+
+
+def _task_is_planning(task: dict[str, Any]) -> bool:
+    status = str(task.get("status") or "")
+    if status in TERMINAL_STATUSES:
+        return False
+    current = str(task.get("current_stage") or "")
+    if _is_planning_stage(current, str(task.get("role") or "")):
+        return True
+    timeline = task.get("stage_timeline", []) if isinstance(task.get("stage_timeline"), list) else []
+    return any(isinstance(row, dict) and str(row.get("status")) == "running" and _is_planning_stage(str(row.get("stage_id") or ""), str(row.get("role") or "")) for row in timeline)
+
+
+def _running_why(current_stage: str | None, activity: str, elapsed: object) -> str:
+    if activity:
+        base = activity
+    elif current_stage:
+        base = f"muxdev is working on stage `{current_stage}`."
+    else:
+        base = "muxdev is preparing or running this task."
+    if elapsed is None:
+        return base
+    return f"{base} Current step has been running for {_format_duration(elapsed)}."
+
+
+def _format_duration(value: object) -> str:
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return "unknown time"
+    minutes, second = divmod(max(0, seconds), 60)
+    hours, minute = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minute}m"
+    if minutes:
+        return f"{minutes}m {second}s"
+    return f"{second}s"
 
 
 def _deliverables(payload: dict[str, Any], run_id: str) -> list[dict[str, Any]]:
     rows = [row for row in payload.get("artifacts", []) if isinstance(row, dict)]
     deliverables: list[dict[str, Any]] = []
-    for kind, label in (("plan", "Plan"), ("diff", "Diff"), ("test", "Test report"), ("report", "Final report"), ("dashboard", "Dashboard")):
+    for kind, label in (
+        ("project_design_doc", "Design document"),
+        ("plan", "Plan"),
+        ("diff", "Diff"),
+        ("test", "Test report"),
+        ("report", "Final report"),
+        ("dashboard", "Dashboard"),
+    ):
         match = next((row for row in rows if str(row.get("kind") or "").lower() == kind), None)
         if match:
             deliverables.append({"kind": kind, "label": label, "path": match.get("path"), "ready": True})
@@ -402,8 +569,16 @@ def _deliverables(payload: dict[str, Any], run_id: str) -> list[dict[str, Any]]:
 def _first_error(errors: list[dict[str, Any]]) -> str:
     if not errors:
         return ""
-    first = errors[0]
-    return str(first.get("message") or first.get("error") or first.get("type") or "")
+    return _error_reason(errors[0])
+
+
+def _error_reason(error: dict[str, Any]) -> str:
+    stage = str(error.get("stage_id") or "run")
+    kind = str(error.get("type") or error.get("error") or "")
+    message = str(error.get("message") or "")
+    if message and kind:
+        return f"{stage} {kind}: {message}"
+    return message or kind
 
 
 def _evidence_risk(evaluation: dict[str, Any]) -> str:
@@ -524,7 +699,7 @@ def _overview_artifact_center(tasks: list[dict[str, Any]]) -> dict[str, Any]:
             }
             for task in completed[:8]
         ],
-        "kinds": ["final_report", "diff", "test_result", "provider_transcript", "stage_contract", "snapshot", "rollback_point", "semantic_merge_result"],
+        "kinds": ["project_design_doc", "final_report", "diff", "test_result", "provider_transcript", "stage_contract", "snapshot", "rollback_point", "semantic_merge_result"],
     }
 
 

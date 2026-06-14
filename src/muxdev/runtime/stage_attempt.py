@@ -99,6 +99,10 @@ def provider_actions_from_output(output: ProviderStageOutput) -> list[dict[str, 
             "kind": action.kind,
             "prompt_text": action.prompt_text,
             "options": action.options,
+            "input_kind": "confirmation" if action.kind == str(ProviderActionKind.CLI_CONFIRMATION) else ("external" if not action.options else "choice"),
+            "choices": action.options,
+            "default_choice": _default_choice(action.options),
+            "auto_policy": "manual",
         }
         for action in StreamAdapter().provider_actions(events)
     ]
@@ -110,6 +114,9 @@ def provider_actions_from_output(output: ProviderStageOutput) -> list[dict[str, 
                 "kind": str(ProviderActionKind.IDLE_TIMEOUT),
                 "prompt_text": output.summary or "provider session timed out without output",
                 "options": [],
+                "input_kind": "external",
+                "choices": [],
+                "auto_policy": "manual",
             }
         ]
     return []
@@ -160,3 +167,10 @@ def provider_stage_kwargs(
     if session_dir is not None and (accepts_extra or "session_dir" in parameters):
         kwargs["session_dir"] = session_dir
     return kwargs
+
+
+def _default_choice(options: list[dict[str, object]]) -> str | None:
+    for option in options:
+        if option.get("default") and option.get("value") is not None:
+            return str(option["value"])
+    return None

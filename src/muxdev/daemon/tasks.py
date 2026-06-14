@@ -7,6 +7,7 @@ import json
 import shutil
 import subprocess
 import threading
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from ..models import ApprovalStatus, ProviderActionStatus, RunStatus
 from ..runtime import SupervisorRuntime, new_run_id
 from ..services.dashboard_run import build_run_dashboard_payload, startup_dashboard_payload
 from ..services.feedback import route_feedback
+from ..services.progress import enrich_provider_attempts, enrich_stages, progress_summary
 from ..services.provider_learning import refresh_provider_learning
 from ..services.provider_scores import build_provider_scores
 from ..storage import Blackboard
@@ -154,7 +156,15 @@ class TaskManager:
 
     def list_tasks(self) -> list[dict[str, Any]]:
         with self.board() as board:
-            return [self._task_summary(board, row) for row in board.list_runs()]
+            rows_by_table = {
+                "stages": _rows_by_run(board.table_rows("stages")),
+                "approvals": _rows_by_run(board.table_rows("approvals")),
+                "provider_actions": _rows_by_run(board.table_rows("provider_actions")),
+                "provider_attempts": _rows_by_run(board.table_rows("provider_attempts")),
+                "usage_records": _rows_by_run(board.table_rows("usage_records")),
+                "error_details": _rows_by_run(board.table_rows("error_details")),
+            }
+            return [self._task_summary(board, row, rows_by_table=rows_by_table) for row in board.list_runs()]
 
     def task_detail(self, task_id: str) -> dict[str, Any]:
         resolved = self.resolve_task_id(task_id)
@@ -287,6 +297,18 @@ class TaskManager:
         self.broadcast({"type": "provider_action_updated", "action_id": action_id, "status": str(status)})
         return match
 
+    def respond_provider_action(
+        self,
+        action_id: str,
+        response: Any,
+        *,
+        status: ProviderActionStatus = ProviderActionStatus.HANDLED,
+    ) -> dict[str, Any]:
+        with self.board() as board:
+            match = ProviderActionsRepository(board).respond(action_id, response, status=status)
+        self.broadcast({"type": "provider_action_updated", "action_id": action_id, "status": str(status), "response": response})
+        return match
+
     def diff(self, task_id: str) -> dict[str, Any]:
         resolved = self.resolve_task_id(task_id)
         path = self._run_dir(resolved) / "diff.patch"
@@ -351,6 +373,8 @@ class TaskManager:
         apply_result = None
         patch_text = patch_path.read_text(encoding="utf-8", errors="replace")
         if patch_text.strip():
+            if git_failed and fallback:
+                _remove_patch_targets(worktree, patch_text)
             apply_result = subprocess.run(
                 ["git", "apply", str(patch_path)],
                 cwd=worktree,
@@ -360,6 +384,8 @@ class TaskManager:
                 **hidden_subprocess_kwargs(),
             )
         apply_failed = apply_result is not None and apply_result.returncode != 0
+        if apply_failed and fallback and "already exists in working directory" in (apply_result.stderr or ""):
+            apply_failed = False
         failed = apply_failed or (git_failed and not fallback)
         return {
             "task_id": task_id,
@@ -450,35 +476,68 @@ class TaskManager:
             write_dashboards=False,
         )
 
-    def _task_summary(self, board: Blackboard, run: dict[str, Any]) -> dict[str, Any]:
+    def _task_summary(
+        self,
+        board: Blackboard,
+        run: dict[str, Any],
+        *,
+        rows_by_table: dict[str, dict[str, list[dict[str, Any]]]] | None = None,
+    ) -> dict[str, Any]:
         run_id = str(run["run_id"])
-        context = self._task_context(run_id)
-        stages = board.table_rows("stages", run_id=run_id)
-        approvals = board.table_rows("approvals", run_id=run_id)
-        provider_actions = board.list_provider_actions(run_id=run_id)
-        usage = board.table_rows("usage_records", run_id=run_id)
-        errors = board.table_rows("error_details", run_id=run_id)
-        current = next((row["stage_id"] for row in stages if row.get("status") == "running"), "")
+        context = self._task_context(run_id, run=run)
+        if rows_by_table is None:
+            stages = board.table_rows("stages", run_id=run_id)
+            approvals = board.table_rows("approvals", run_id=run_id)
+            provider_actions = board.table_rows("provider_actions", run_id=run_id)
+            provider_attempts = board.table_rows("provider_attempts", run_id=run_id)
+            usage = board.table_rows("usage_records", run_id=run_id)
+            errors = board.table_rows("error_details", run_id=run_id)
+        else:
+            stages = rows_by_table["stages"].get(run_id, [])
+            approvals = rows_by_table["approvals"].get(run_id, [])
+            provider_actions = rows_by_table["provider_actions"].get(run_id, [])
+            provider_attempts = rows_by_table["provider_attempts"].get(run_id, [])
+            usage = rows_by_table["usage_records"].get(run_id, [])
+            errors = rows_by_table["error_details"].get(run_id, [])
+        enriched_stages = enrich_stages(stages)
+        enriched_attempts = enrich_provider_attempts(provider_attempts)
+        progress = progress_summary(
+            run=run,
+            stages=enriched_stages,
+            provider_attempts=enriched_attempts,
+            approvals=approvals,
+            provider_actions=provider_actions,
+        )
+        latest_error = _latest_error(errors)
         return {
             **run,
             "task_id": run_id,
             "run_id": run_id,
-            "current_stage": current,
+            "current_stage": progress.get("current_stage") or "",
+            "current_activity": progress.get("current_activity") or "",
+            "elapsed_seconds": progress.get("elapsed_seconds"),
+            "current_stage_elapsed_seconds": progress.get("current_stage_elapsed_seconds"),
+            "latest_provider_attempt": progress.get("latest_provider_attempt"),
+            "stage_timeline": progress.get("stage_timeline", []),
             "pending_approvals": sum(1 for row in approvals if row.get("status") == str(ApprovalStatus.PENDING)),
             "pending_provider_actions": sum(1 for row in provider_actions if row.get("status") == str(ProviderActionStatus.PENDING)),
             "tokens": sum(int(row.get("tokens") or 0) for row in usage),
             "cost_usd": round(sum(float(row.get("cost_usd") or 0) for row in usage), 6),
             "errors": len(errors),
+            "error_summary": latest_error,
             "profile": context.get("profile"),
             "gate": context.get("gate"),
             "depth": context.get("depth"),
             "topology": context.get("topology"),
             "role_providers": context.get("role_providers", {}) if isinstance(context.get("role_providers"), dict) else {},
             "skills": [skill.get("name") for skill in context.get("skills", []) if isinstance(skill, dict)],
+            "recover_endpoint": f"/api/tasks/{run_id}/continue",
+            "rollback_endpoint": f"/api/tasks/{run_id}/rollback",
+            "report_endpoint": f"/api/tasks/{run_id}/report",
         }
 
-    def _task_context(self, task_id: str) -> dict[str, Any]:
-        path = self._run_dir(task_id) / "task_context.json"
+    def _task_context(self, task_id: str, *, run: dict[str, Any] | None = None) -> dict[str, Any]:
+        path = self._run_dir(task_id, run=run) / "task_context.json"
         if not path.exists():
             return {}
         try:
@@ -508,6 +567,25 @@ class TaskManager:
         return path_config(workspace, "worktrees") / task_id
 
 
+def _rows_by_run(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[str(row.get("run_id") or "")].append(row)
+    return grouped
+
+
+def _latest_error(errors: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not errors:
+        return None
+    row = max(errors, key=lambda item: str(item.get("created_at") or ""))
+    return {
+        "stage_id": row.get("stage_id"),
+        "type": row.get("type"),
+        "message": row.get("message"),
+        "created_at": row.get("created_at"),
+    }
+
+
 def _clean_worktree_without_git(worktree: Path) -> list[str]:
     resolved = worktree.resolve()
     cleaned: list[str] = []
@@ -528,3 +606,29 @@ def _clean_worktree_without_git(worktree: Path) -> list[str]:
                 child.write_text("", encoding="utf-8")
                 cleaned.append(f"{child.relative_to(worktree)} (truncated)")
     return cleaned
+
+
+def _remove_patch_targets(worktree: Path, patch_text: str) -> None:
+    root = worktree.resolve()
+    for rel_path in _patch_target_paths(patch_text):
+        target = (worktree / rel_path).resolve()
+        if root not in target.parents and target != root:
+            raise RuntimeError(f"refusing to remove patch target outside worktree: {target}")
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+        elif target.exists():
+            try:
+                target.unlink()
+            except OSError:
+                target.write_text("", encoding="utf-8")
+
+
+def _patch_target_paths(patch_text: str) -> list[str]:
+    paths: list[str] = []
+    for line in patch_text.splitlines():
+        if not line.startswith("+++ b/"):
+            continue
+        rel = line.removeprefix("+++ b/").strip()
+        if rel and rel != "/dev/null" and rel not in paths:
+            paths.append(rel)
+    return paths

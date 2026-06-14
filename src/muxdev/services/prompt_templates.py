@@ -97,8 +97,9 @@ def _lookup_stage_template(templates: dict[str, Any], *, workflow: str, stage: W
     workflow_stages = stages.get(workflow)
     if isinstance(workflow_stages, dict) and workflow_stages.get(stage.id):
         return str(workflow_stages[stage.id])
-    if stages.get(stage.id):
-        return str(stages[stage.id])
+    fallback = stages.get(stage.id)
+    if isinstance(fallback, str):
+        return fallback
     return ""
 
 

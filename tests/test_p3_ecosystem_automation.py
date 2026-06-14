@@ -48,6 +48,43 @@ def test_feedback_router_submits_ci_rescue_and_records_cache() -> None:
         shutil.rmtree(workspace, ignore_errors=True)
 
 
+def test_dashboard_feedback_infers_workspace_from_run_id() -> None:
+    workspace = _workspace_temp("p3-feedback-run")
+    try:
+        manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())
+        client = TestClient(create_app(task_manager=manager))
+        with manager.board() as board:
+            board.create_run(
+                run_id="run_feedback",
+                task="design game",
+                workflow="dev",
+                provider="mock",
+                workspace=workspace,
+                worktree=workspace / ".muxdev" / "runs" / "run_feedback" / "worktree",
+            )
+
+        routed = client.post(
+            "/api/feedback",
+            json={
+                "kind": "manual_feedback",
+                "source": "dashboard",
+                "content": "make the game playable with keyboard controls",
+                "run_id": "run_feedback",
+                "auto_submit": False,
+            },
+        ).json()
+        ecosystem = client.get("/api/ecosystem").json()
+
+        assert routed["auto"] is False
+        assert routed["status"] == "needs_review"
+        assert ecosystem["feedback_events"][0]["run_id"] == "run_feedback"
+        assert ecosystem["feedback_events"][0]["source"] == "dashboard"
+        cache_path = Path(str(ecosystem["cache_entries"][0]["path"]))
+        assert workspace in cache_path.parents
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
 def test_skill_lock_writes_lock_and_optional_skill_memory() -> None:
     workspace = _workspace_temp("p3-skill-lock")
     try:

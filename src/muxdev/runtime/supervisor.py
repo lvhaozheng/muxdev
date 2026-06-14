@@ -28,7 +28,7 @@ from ..domain import new_run_id
 from ..providers.adapters import ProviderAdapter, ProviderStageOutput, extract_json_object, get_runtime_provider
 from ..providers.planner import ProviderPlanner
 from ..services.dashboard_run import write_run_dashboard
-from ..services.design import write_design_pack
+from ..services.design import write_design_pack, write_user_design_document
 from ..services.advanced_parallel import planned_stage_writes_from_automation, record_parallel_conflicts, write_parallel_conflict_report
 from ..services.provider_learning import refresh_provider_learning
 from ..services.provider_scores import recommend_provider
@@ -127,6 +127,7 @@ class SupervisorRuntime:
             provider_impls.setdefault(role_provider, get_runtime_provider(role_provider))
 
         task_context = {
+            "workflow_name": workflow_name,
             "profile": profile,
             "gate": gate,
             "depth": depth,
@@ -250,7 +251,7 @@ class SupervisorRuntime:
                 trace=trace,
                 task=str(run["task"]),
                 provider=provider,
-                workflow_name=str(run["workflow"]),
+                workflow_name=str(task_context.get("workflow_name") or run["workflow"]),
                 provider_impls=provider_impls,
                 policy=policy,
                 worktree=worktree,
@@ -306,7 +307,7 @@ class SupervisorRuntime:
         workflow_hash = sha256_file(run_dir / "workflow.yaml") if (run_dir / "workflow.yaml").exists() else sha256_text(workflow.model_dump_json())
         policy_hash = _policy_hash(policy)
 
-        context: dict[str, object] = {"loop": 0, "review": {"has_blockers": False}}
+        context: dict[str, object] = _initial_workflow_context(blackboard, run_id, workflow)
         by_id = {stage.id: stage for stage in workflow.stages}
         report_path: Path | None = None
         try:
@@ -345,7 +346,15 @@ class SupervisorRuntime:
                     trace.write("stage_resumed_skip", stage=stage.id)
                     index += 1
                     continue
+                context["max_loops"] = _effective_max_loops(stage, automation)
                 if not should_run_when(stage.when, context):
+                    if _loop_stage_exhausted(stage, context):
+                        max_loops = _effective_max_loops(stage, automation)
+                        review_stage = _loop_review_stage(stage)
+                        blackboard.add_error(run_id, stage.id, "review_blockers", f"{review_stage} blockers remain after {max_loops} revision loop(s)")
+                        blackboard.set_run_status(run_id, RunStatus.BLOCKED)
+                        trace.write("run_blocked", stage=stage.id, reason="review blockers remain", review_stage=review_stage, loop=context.get("loop"), max_loops=max_loops)
+                        return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
                     blackboard.upsert_stage(run_id, stage.id, role=stage.role, status=StageStatus.SKIPPED, summary="when condition false")
                     trace.write("stage_skipped", stage=stage.id)
                     index += 1
@@ -384,28 +393,32 @@ class SupervisorRuntime:
                 )
 
                 if stage.type == "human_gate":
+                    approval_type = stage.approval_type or "plan"
+                    approval_reason = stage.approval_reason or ("approve generated plan" if approval_type == "plan" else f"approve {approval_type} gate")
+                    if approval_type == "design":
+                        _record_design_pack(blackboard, run_dir=run_dir, run_id=run_id, task=task, workflow=workflow.name, automation=automation)
                     subject = _approval_subject(
                         blackboard,
                         run_id=run_id,
-                        approval_type="plan",
+                        approval_type=approval_type,
                         stage_id=stage.id,
                         policy_hash=policy_hash,
-                        extra={"plan_hash": _latest_planning_hash(blackboard, run_id)},
+                        extra=_human_gate_subject_extra(blackboard, run_dir=run_dir, run_id=run_id, approval_type=approval_type),
                     )
                     if self._approval_gate(
                         blackboard,
                         trace,
                         run_id,
                         stage.id,
-                        "plan",
-                        "approve generated plan",
+                        approval_type,
+                        approval_reason,
                         policy,
                         subject=subject,
                     ):
                         blackboard.set_run_status(run_id, _approval_wait_status(ci_block_on_approval))
                         blackboard.upsert_stage(run_id, stage.id, role=stage.role, status=StageStatus.RUNNING, summary="waiting for approval")
                         return RunResult(run_id, _approval_wait_status(ci_block_on_approval), run_dir, None)
-                    blackboard.upsert_stage(run_id, stage.id, role=stage.role, status=StageStatus.COMPLETED, summary="auto-approved")
+                    blackboard.upsert_stage(run_id, stage.id, role=stage.role, status=StageStatus.COMPLETED, summary="approval not required")
                     blackboard.add_checkpoint(run_id, stage.id, "stage_completed")
                     trace.write("stage_completed", stage=stage.id)
                     index += 1
@@ -677,6 +690,7 @@ class SupervisorRuntime:
                             blackboard,
                             run_id=run_id,
                             stage_id=stage.id,
+                            workspace=self.workspace,
                             worktree=worktree,
                             content=output.content,
                         )
@@ -701,7 +715,7 @@ class SupervisorRuntime:
                     if not test_result.passed:
                         decision_text = "reject"
                         findings.append({"severity": "high", "type": "test_failure", "summary": test_result.summary})
-                if stage.id == "review":
+                if _is_review_stage(stage):
                     review = _parse_review_result(output.content)
                     for blocker in review.blockers:
                         blackboard.add_review_blocker(
@@ -713,7 +727,9 @@ class SupervisorRuntime:
                             severity=blocker.severity,
                             suggestion=blocker.suggestion,
                         )
-                    context["review"] = review.model_dump()
+                    context[stage.id] = review.model_dump()
+                    if stage.id == "review":
+                        context["review"] = review.model_dump()
                     if review.has_blockers:
                         decision_text = "reject"
                         findings.extend(blocker.model_dump() for blocker in review.blockers)
@@ -735,20 +751,18 @@ class SupervisorRuntime:
                 blackboard.add_checkpoint(run_id, stage.id, "stage_completed")
                 trace.write("stage_completed", stage=stage.id, output=str(artifact_path))
                 completed.add(stage.id)
-                if stage.id == "fix" and _review_has_blockers(context):
+                if _stage_triggers_review_loop(stage, context):
                     context["loop"] = int(context.get("loop", 0)) + 1
-                    max_loops = stage.max_loops or 1
-                    trace.write("fix_loop_iteration", stage=stage.id, loop=context["loop"], max_loops=max_loops)
-                    if int(context["loop"]) >= max_loops:
-                        blackboard.add_error(run_id, stage.id, "review_blockers", f"review blockers remain after {max_loops} fix loops")
-                        blackboard.set_run_status(run_id, RunStatus.BLOCKED)
-                        trace.write("run_blocked", stage=stage.id, reason="review blockers remain")
-                        return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
-                    for reset_stage in ("test", "review", "fix"):
+                    max_loops = _effective_max_loops(stage, automation)
+                    review_stage = _loop_review_stage(stage)
+                    trace.write("review_loop_iteration", stage=stage.id, review_stage=review_stage, loop=context["loop"], max_loops=max_loops)
+                    if stage.id == "fix":
+                        trace.write("fix_loop_iteration", stage=stage.id, loop=context["loop"], max_loops=max_loops)
+                    for reset_stage in _loop_reset_stages(stage):
                         if reset_stage in by_id:
                             blackboard.reset_stage(run_id, reset_stage)
                             completed.discard(reset_stage)
-                    restart = "test" if "test" in by_id else "review"
+                    restart = stage.loop_restart_stage or ("test" if stage.id == "fix" and "test" in by_id else review_stage)
                     index = ordered.index(restart)
                     continue
                 index += 1
@@ -791,8 +805,23 @@ class SupervisorRuntime:
                 blackboard.set_run_status(run_id, _approval_wait_status(ci_block_on_approval))
                 return RunResult(run_id, _approval_wait_status(ci_block_on_approval), run_dir, None)
             blackboard.set_run_status(run_id, RunStatus.COMPLETED)
-            if workflow.name in {"design", "design-lite"}:
-                _record_design_pack(blackboard, run_dir=run_dir, run_id=run_id, task=task, workflow=workflow.name, automation=automation)
+            if workflow.name in {"design", "design-lite", "design-v2"}:
+                try:
+                    _record_design_deliverables(
+                        blackboard,
+                        run_dir=run_dir,
+                        run_id=run_id,
+                        workspace=self.workspace,
+                        task=task,
+                        workflow=workflow.name,
+                        automation=automation,
+                    )
+                except Exception as exc:
+                    message = f"required design document was not created: {exc}"
+                    blackboard.set_run_status(run_id, RunStatus.BLOCKED)
+                    blackboard.add_error(run_id, None, "missing_design_document", message)
+                    trace.write("run_blocked", reason="missing_design_document", error=redact(str(exc)))
+                    return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
             _record_evidence_run(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
             report_path = generate_final_report(run_dir, run_id, blackboard)
             _refresh_provider_learning(blackboard, run_id)
@@ -1166,7 +1195,22 @@ class SupervisorRuntime:
             return RunResult(run_id, _approval_wait_status(ci_block_on_approval), run_dir, None)
         blackboard.set_run_status(run_id, RunStatus.COMPLETED)
         if workflow.name in {"design", "design-lite"}:
-            _record_design_pack(blackboard, run_dir=run_dir, run_id=run_id, task=task, workflow=workflow.name, automation=automation)
+            try:
+                _record_design_deliverables(
+                    blackboard,
+                    run_dir=run_dir,
+                    run_id=run_id,
+                    workspace=self.workspace,
+                    task=task,
+                    workflow=workflow.name,
+                    automation=automation,
+                )
+            except Exception as exc:
+                message = f"required design document was not created: {exc}"
+                blackboard.set_run_status(run_id, RunStatus.BLOCKED)
+                blackboard.add_error(run_id, None, "missing_design_document", message)
+                trace.write("run_blocked", reason="missing_design_document", error=redact(str(exc)))
+                return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
         _record_evidence_run(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
         report_path = generate_final_report(run_dir, run_id, blackboard)
         _refresh_provider_learning(blackboard, run_id)
@@ -1225,6 +1269,9 @@ class SupervisorRuntime:
                 old_subject_hash=existing.get("subject_hash"),
                 new_subject_hash=subject_hash,
             )
+        if not stale_subject and not existing and not policy.requires_approval(approval_type):
+            trace.write("approval_not_required", stage=stage_id, approval_type=approval_type, subject_hash=subject_hash)
+            return False
         approval_id = blackboard.create_approval(run_id, stage_id, approval_type, reason, subject=subject)
         trace.write("approval_requested", stage=stage_id, approval_id=approval_id, approval_type=approval_type, subject_hash=subject_hash)
         if stale_subject or policy.requires_approval(approval_type):
@@ -1424,9 +1471,8 @@ def _current_test_results(blackboard: Blackboard, run_id: str) -> list[dict[str,
 
 
 def _current_review_blockers(blackboard: Blackboard, run_id: str) -> list[dict[str, object]]:
-    if _latest_role_decision(blackboard, run_id, "review") == "accept":
-        return []
-    return blackboard.table_rows("review_blockers", run_id=run_id)
+    rows = blackboard.table_rows("review_blockers", run_id=run_id)
+    return [row for row in rows if _latest_role_decision(blackboard, run_id, str(row.get("stage_id") or "review")) != "accept"]
 
 
 def _latest_role_decision(blackboard: Blackboard, run_id: str, stage_id: str) -> str | None:
@@ -1464,33 +1510,66 @@ def _record_project_design_doc(
     *,
     run_id: str,
     stage_id: str,
+    workspace: Path,
     worktree: Path,
     content: str,
 ) -> Path:
-    design_dir = worktree / "docs" / "design"
-    design_dir.mkdir(parents=True, exist_ok=True)
-    path = design_dir / f"{run_id}-design.md"
     body = redact(content).strip()
     if not body:
         raise ValueError("design stage output was empty")
+    user_path = write_user_design_document(
+        workspace=workspace,
+        run_id=run_id,
+        task=_task_for_run(blackboard, run_id),
+        workflow="software-dev",
+        sections=[("Software Design", body)],
+    )
+
+    # Keep a copy in the execution worktree so diff/evidence tooling can still
+    # reason about the generated deliverable without asking users to inspect it.
+    design_dir = worktree / "docs" / "design"
+    design_dir.mkdir(parents=True, exist_ok=True)
+    path = design_dir / f"{run_id}-design.md"
     path.write_text(
-        "\n".join(
-            [
-                "# Design Document",
-                "",
-                f"- Run: {run_id}",
-                f"- Stage: {stage_id}",
-                "",
-                body,
-                "",
-            ]
-        ),
+        user_path.read_text(encoding="utf-8"),
         encoding="utf-8",
     )
     if not path.exists() or path.stat().st_size == 0:
         raise OSError(f"design document missing after write: {path}")
-    blackboard.add_artifact(run_id, stage_id, "Design Document", path, "project_design_doc")
+    blackboard.add_artifact(run_id, stage_id, "Design Document", user_path, "project_design_doc")
+    blackboard.add_artifact(run_id, stage_id, "Execution Worktree Design Copy", path, "run_design_doc")
+    return user_path
+
+
+def _record_user_design_document_from_stage_outputs(
+    blackboard: Blackboard,
+    *,
+    run_id: str,
+    workspace: Path,
+    task: str,
+    workflow: str,
+) -> Path:
+    sections: list[tuple[str, str]] = []
+    for row in blackboard.table_rows("artifacts", run_id=run_id):
+        if row.get("kind") != "stage_output":
+            continue
+        path = Path(str(row.get("path") or ""))
+        if not path.exists() or not path.is_file():
+            continue
+        title = str(row.get("stage_id") or path.stem).replace("_", " ").title()
+        sections.append((title, path.read_text(encoding="utf-8", errors="replace")))
+    if not sections:
+        raise ValueError("no design stage outputs available")
+    path = write_user_design_document(workspace=workspace, run_id=run_id, task=task, workflow=workflow, sections=sections)
+    blackboard.add_artifact(run_id, None, "Design Document", path, "project_design_doc")
     return path
+
+
+def _task_for_run(blackboard: Blackboard, run_id: str) -> str:
+    try:
+        return str(blackboard.get_run(run_id).get("task") or "")
+    except Exception:
+        return ""
 
 
 def _latest_planning_hash(blackboard: Blackboard, run_id: str) -> str | None:
@@ -1537,6 +1616,26 @@ def _record_design_pack(
     blackboard.add_artifact(run_id, None, "memory_proposals.json", Path(str(manifest["memory_proposals"])), "memory_proposals")
     for path in manifest.get("files", []):
         blackboard.add_artifact(run_id, None, Path(str(path)).name, Path(str(path)), "design_pack")
+
+
+def _record_design_deliverables(
+    blackboard: Blackboard,
+    *,
+    run_dir: Path,
+    run_id: str,
+    workspace: Path,
+    task: str,
+    workflow: str,
+    automation: dict[str, object],
+) -> Path:
+    _record_design_pack(blackboard, run_dir=run_dir, run_id=run_id, task=task, workflow=workflow, automation=automation)
+    return _record_user_design_document_from_stage_outputs(
+        blackboard,
+        run_id=run_id,
+        workspace=workspace,
+        task=task,
+        workflow=workflow,
+    )
 
 
 def _record_evidence_run(
@@ -1712,6 +1811,7 @@ def _record_provider_actions(
         prompt_text = str(action.get("prompt_text") or output.summary or "provider is waiting for external action")
         kind = str(action.get("kind") or ProviderActionKind.PROVIDER_BLOCKED)
         options = action.get("options") if isinstance(action.get("options"), list) else []
+        choices = action.get("choices") if isinstance(action.get("choices"), list) else options
         attach_agent = role or stage_id
         source_hash = sha256_text(
             json.dumps(
@@ -1736,6 +1836,11 @@ def _record_provider_actions(
                 kind=kind,
                 prompt_text=prompt_text,
                 options=[option for option in options if isinstance(option, dict)],
+                input_kind=str(action.get("input_kind") or _provider_action_input_kind(kind, choices)),
+                choices=[choice for choice in choices if isinstance(choice, dict)],
+                default_choice=str(action.get("default_choice") or "") or None,
+                timeout_seconds=int(action["timeout_seconds"]) if str(action.get("timeout_seconds") or "").isdigit() else None,
+                auto_policy=str(action.get("auto_policy") or "manual"),
                 transcript_path=str(action.get("transcript_path") or "") or None,
                 chunks_path=str(action.get("chunks_path") or "") or None,
                 attach_command=f"muxdev attach {run_id} --agent {attach_agent}",
@@ -1745,9 +1850,115 @@ def _record_provider_actions(
     return action_ids
 
 
-def _review_has_blockers(context: dict[str, object]) -> bool:
-    review = context.get("review", {})
+def _initial_workflow_context(blackboard: Blackboard, run_id: str, workflow) -> dict[str, object]:
+    context: dict[str, object] = {"loop": 0, "review": {"has_blockers": False}}
+    blockers_by_stage: dict[str, list[dict[str, object]]] = {}
+    for row in blackboard.table_rows("review_blockers", run_id=run_id):
+        blockers_by_stage.setdefault(str(row.get("stage_id") or "review"), []).append(row)
+    for stage in workflow.stages:
+        if not _is_review_stage(stage):
+            continue
+        decision = _latest_role_decision(blackboard, run_id, stage.id)
+        blockers = [] if decision == "accept" else blockers_by_stage.get(stage.id, [])
+        review = {"has_blockers": bool(decision == "reject" or blockers), "blockers": blockers}
+        context[stage.id] = review
+        if stage.id == "review":
+            context["review"] = review
+    return context
+
+
+def _is_review_stage(stage) -> bool:
+    return stage.output_schema == "ReviewResult" or stage.id in {"review", "design_review", "final_design_review"}
+
+
+def _review_has_blockers(context: dict[str, object], review_stage: str = "review") -> bool:
+    review = context.get(review_stage, {})
     return bool(review.get("has_blockers")) if isinstance(review, dict) else False
+
+
+def _loop_review_stage(stage) -> str:
+    if stage.loop_review_stage:
+        return stage.loop_review_stage
+    if stage.id == "fix":
+        return "review"
+    if stage.id.endswith("_revise"):
+        return stage.id[: -len("_revise")] + "_review"
+    return "review"
+
+
+def _loop_reset_stages(stage) -> tuple[str, ...]:
+    if stage.loop_reset_stages:
+        return tuple(stage.loop_reset_stages)
+    if stage.id == "fix":
+        return ("test", "review", "fix")
+    review_stage = _loop_review_stage(stage)
+    return (review_stage, stage.id)
+
+
+def _stage_triggers_review_loop(stage, context: dict[str, object]) -> bool:
+    if not (stage.loop_review_stage or stage.id == "fix" or stage.id.endswith("_revise")):
+        return False
+    return _review_has_blockers(context, _loop_review_stage(stage))
+
+
+def _loop_stage_exhausted(stage, context: dict[str, object]) -> bool:
+    if not (stage.loop_review_stage or stage.id == "fix" or stage.id.endswith("_revise")):
+        return False
+    return _review_has_blockers(context, _loop_review_stage(stage))
+
+
+def _effective_max_loops(stage, automation: dict[str, object]) -> int:
+    if stage.loop_review_stage or stage.id.endswith("_revise"):
+        configured = automation.get("max_review_fixes") if isinstance(automation, dict) else None
+        try:
+            if configured is not None:
+                return max(0, int(configured))
+        except (TypeError, ValueError):
+            pass
+    return int(stage.max_loops or 1)
+
+
+def _human_gate_subject_extra(
+    blackboard: Blackboard,
+    *,
+    run_dir: Path,
+    run_id: str,
+    approval_type: str,
+) -> dict[str, object]:
+    if approval_type != "design":
+        return {"plan_hash": _latest_planning_hash(blackboard, run_id)}
+    contract_path = run_dir / "design" / "design_contract.json"
+    return {
+        "design_contract_hash": sha256_file(contract_path) if contract_path.exists() else None,
+        "review_result_hash": _latest_stage_output_hash(blackboard, run_id, "design_review"),
+        "revision_count": _stage_attempt_count(blackboard, run_id, "design_revise"),
+    }
+
+
+def _latest_stage_output_hash(blackboard: Blackboard, run_id: str, stage_id: str) -> str | None:
+    artifacts = [
+        row
+        for row in blackboard.table_rows("artifacts", run_id=run_id)
+        if row.get("stage_id") == stage_id and row.get("kind") == "stage_output"
+    ]
+    if not artifacts:
+        return None
+    path = Path(str(artifacts[-1].get("path") or ""))
+    return sha256_file(path) if path.exists() else None
+
+
+def _stage_attempt_count(blackboard: Blackboard, run_id: str, stage_id: str) -> int:
+    return sum(1 for row in blackboard.table_rows("provider_attempts", run_id=run_id) if row.get("stage_id") == stage_id and row.get("status") not in {"retried", "provider_action"})
+
+
+def _provider_action_input_kind(kind: str, choices: list[object] | None = None) -> str:
+    if kind == str(ProviderActionKind.CLI_CONFIRMATION):
+        return "confirmation"
+    if choices:
+        return "choice"
+    if kind in {str(ProviderActionKind.AUTH_REQUIRED), str(ProviderActionKind.RATE_LIMIT), str(ProviderActionKind.IDLE_TIMEOUT)}:
+        return "external"
+    return "text"
 
 
 def _can_use_parallel_runtime(workflow) -> bool:

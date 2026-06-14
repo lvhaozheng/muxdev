@@ -8,6 +8,7 @@ without forcing every platform to provide native terminal takeover.
 from __future__ import annotations
 
 import json
+import locale
 import queue
 import subprocess
 import shutil
@@ -44,18 +45,16 @@ class HeadlessSubprocessBackend:
         timeout: float = 30,
         transcript_path: Path | None = None,
         chunks_path: Path | None = None,
+        input_text: str | None = None,
     ) -> SessionResult:
         """Execute a command, parse stream events, and enforce an idle timeout."""
         try:
             process = subprocess.Popen(
                 command,
                 cwd=cwd,
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
                 **hidden_subprocess_kwargs(),
             )
             events: list[StreamEvent] = []
@@ -69,10 +68,21 @@ class HeadlessSubprocessBackend:
             def read_stdout() -> None:
                 assert process.stdout is not None
                 for stdout_line in process.stdout:
-                    lines.put(stdout_line)
+                    lines.put(_decode_process_output(stdout_line))
+
+            def write_stdin() -> None:
+                if input_text is None or process.stdin is None:
+                    return
+                try:
+                    process.stdin.write(input_text.encode("utf-8"))
+                    process.stdin.close()
+                except (BrokenPipeError, OSError):
+                    pass
 
             reader = threading.Thread(target=read_stdout, name="muxdev-provider-stdout", daemon=True)
             reader.start()
+            input_writer = threading.Thread(target=write_stdin, name="muxdev-provider-stdin", daemon=True)
+            input_writer.start()
             try:
                 while True:
                     if process.poll() is not None and lines.empty() and not reader.is_alive():
@@ -111,6 +121,7 @@ class HeadlessSubprocessBackend:
                     returncode = process.wait(timeout=3)
             finally:
                 reader.join(timeout=1)
+                input_writer.join(timeout=1)
                 if transcript_handle:
                     transcript_handle.close()
                 if chunks_handle:
@@ -265,3 +276,23 @@ def _terminate_process_tree(process: subprocess.Popen[object]) -> None:
         )
         return
     process.kill()
+
+
+def _decode_process_output(data: bytes | str) -> str:
+    if isinstance(data, str):
+        return data
+    preferred = locale.getpreferredencoding(False)
+    encodings = ["utf-8", "utf-8-sig"]
+    if preferred:
+        encodings.append(preferred)
+    encodings.extend(["mbcs", "gbk", "cp936"])
+    seen: set[str] = set()
+    for encoding in encodings:
+        if encoding in seen:
+            continue
+        seen.add(encoding)
+        try:
+            return data.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return data.decode("utf-8", errors="replace")

@@ -113,17 +113,26 @@ DEFAULT_PROMPT_TEMPLATE = (
 
 
 class HeadlessCliProviderAdapter(ProviderAdapter):
-    def __init__(self, provider_id: str, command: list[str], *, timeout: float = 300, prompt_template: str = DEFAULT_PROMPT_TEMPLATE) -> None:
+    def __init__(
+        self,
+        provider_id: str,
+        command: list[str],
+        *,
+        timeout: float = 300,
+        prompt_template: str = DEFAULT_PROMPT_TEMPLATE,
+        prompt_transport: str = "argument",
+    ) -> None:
         self.id = provider_id
         self.command = command
         self.timeout = timeout
         self.prompt_template = prompt_template
+        self.prompt_transport = prompt_transport
         self.backend = HeadlessSubprocessBackend()
         self.descriptor = ProviderDescriptor(
             id=provider_id,
             commands=tuple(command),
             runtime_kind=ProviderRuntimeKind.HEADLESS_CLI,
-            metadata={"timeout": timeout},
+            metadata={"timeout": timeout, "prompt_transport": prompt_transport},
         )
 
     def run_stage(
@@ -137,7 +146,7 @@ class HeadlessCliProviderAdapter(ProviderAdapter):
     ) -> ProviderStageOutput:
         """Execute one workflow stage in a worktree and archive transcripts."""
         prompt = self._prompt(stage_id, task, skills=skills or [])
-        command = [*self.command, prompt]
+        command, input_text = _command_for_prompt(self.command, prompt, transport=self.prompt_transport)
         session_dir = session_dir or path_config(worktree, "runtime_root") / "provider_sessions"
         session_dir.mkdir(parents=True, exist_ok=True)
         transcript_path = session_dir / f"{self.id}_{stage_id}.transcript.log"
@@ -148,6 +157,7 @@ class HeadlessCliProviderAdapter(ProviderAdapter):
             timeout=self.timeout,
             transcript_path=transcript_path,
             chunks_path=chunks_path,
+            input_text=input_text,
         )
         content = redact((result.stdout or "") + (("\n" + result.stderr) if result.stderr else ""))
         event_lines = "\n".join(f"{event.type}: {event.text}" for event in result.events)
@@ -159,15 +169,20 @@ class HeadlessCliProviderAdapter(ProviderAdapter):
                 "kind": action.kind,
                 "prompt_text": action.prompt_text,
                 "options": action.options,
+                "input_kind": "confirmation" if action.kind == "cli_confirmation" else ("external" if not action.options else "choice"),
+                "choices": action.options,
+                "default_choice": _default_choice(action.options),
+                "auto_policy": "manual",
                 "transcript_path": str(transcript_path),
                 "chunks_path": str(chunks_path),
             }
             for action in self.backend.adapter.provider_actions(result.events)
         ]
+        summary = _provider_stage_summary(self.id, stage_id, result.returncode, content)
         return ProviderStageOutput(
             artifact_name=f"session/{self.id}_{stage_id}.log",
             content=content,
-            summary=f"{self.id} {stage_id} exited with {result.returncode}",
+            summary=summary,
             tokens=0,
             cost_usd=0,
             returncode=result.returncode,
@@ -202,11 +217,15 @@ def get_runtime_provider(provider: str) -> ProviderAdapter:
     executable = _resolve_runtime_executable(template_command[0], [str(item) for item in provider_config.get("commands", [])])
     if not executable:
         raise ValueError(f"{provider} command not found; run muxdev provider install {provider} or muxdev provider doctor {provider}")
+    prompt_transport = runtime.get("prompt_transport")
+    if prompt_transport is None and provider == "codex":
+        prompt_transport = "stdin"
     return HeadlessCliProviderAdapter(
         provider,
         [executable, *template_command[1:]],
         timeout=float(runtime.get("timeout", 300)),
         prompt_template=str(runtime.get("prompt_template", DEFAULT_PROMPT_TEMPLATE)),
+        prompt_transport=str(prompt_transport or "argument"),
     )
 
 
@@ -245,6 +264,48 @@ def _resolve_runtime_executable(primary: str, candidates: list[str]) -> str | No
     if resolved:
         return resolved
     return _which_any(*candidates)
+
+
+def _command_for_prompt(command: list[str], prompt: str, *, transport: str) -> tuple[list[str], str | None]:
+    if any("{prompt}" in item for item in command):
+        return [item.replace("{prompt}", prompt) for item in command], None
+    if transport == "stdin":
+        return list(command), prompt
+    if transport == "dash-stdin":
+        return [*command, "-"], prompt
+    return [*command, prompt], None
+
+
+def _provider_stage_summary(provider_id: str, stage_id: str, returncode: int, output: str) -> str:
+    base = f"{provider_id} {stage_id} exited with {returncode}"
+    if returncode == 0:
+        return base
+    excerpt = _failure_excerpt(output)
+    return f"{base}: {excerpt}" if excerpt else base
+
+
+def _failure_excerpt(output: str, *, max_chars: int = 320) -> str:
+    clean = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", output)
+    lines = [line.strip() for line in clean.splitlines() if line.strip()]
+    ignored_prefixes = ("# Stream Events", "# Session Archives", "transcript:", "chunks:", "cli_exited:")
+    useful = [
+        line
+        for line in lines
+        if not any(line.startswith(prefix) for prefix in ignored_prefixes)
+    ]
+    if not useful:
+        return ""
+    excerpt = "\n".join(useful[-4:])
+    if len(excerpt) <= max_chars:
+        return excerpt
+    return excerpt[-max_chars:].lstrip()
+
+
+def _default_choice(options: list[dict[str, object]]) -> str | None:
+    for option in options:
+        if option.get("default") and option.get("value") is not None:
+            return str(option["value"])
+    return None
 
 
 def _skill_prompt_block(skills: list[dict[str, object]]) -> str:

@@ -16,9 +16,13 @@ from ..providers import detect_providers
 from ..presentation.dashboard import (
     build_dashboard_overview,
     dashboard_hidden_projects_path,
+    dashboard_hidden_tasks_path,
     hide_dashboard_project,
+    hide_dashboard_task,
     load_hidden_projects,
+    load_hidden_tasks,
     restore_dashboard_project,
+    restore_dashboard_task,
 )
 from ..services.multirepo import plan_multi_repo_orchestration
 from ..services.product_experience import build_product_experience
@@ -26,6 +30,7 @@ from ..services.skills import activate_skill, build_skill_catalog, scan_skills, 
 from ..services.skills.events import read_skill_events
 from ..services.skills import verify_skill_lock, write_skill_lock
 from ..services.ux import build_provider_health, build_setup_status, build_task_ux_summary, build_ux_overview
+from ..services.validation import list_validation_experiments, load_validation_experiment
 from ..storage import MemoryStore
 
 
@@ -147,7 +152,7 @@ def render_dashboard_html(payload: dict[str, Any]) -> str:
     </section>
     <section class="panel span-6">
       <h2>Provider Action Wizard</h2>
-      {_table(_provider_action_rows(payload.get("provider_actions", [])), ["action_id", "stage_id", "provider", "kind", "status", "prompt", "options", "attach"])}
+      {_table(_provider_action_rows(payload.get("provider_actions", [])), ["action_id", "stage_id", "provider", "kind", "input_kind", "status", "prompt", "choices", "default_choice", "response", "attach"])}
     </section>
     <section class="panel span-6">
       <h2>Provider Attempts</h2>
@@ -352,10 +357,10 @@ def _provider_action_rows(rows: object) -> list[dict[str, Any]]:
     for row in rows:
         if not isinstance(row, dict):
             continue
-        options = row.get("options")
+        options = row.get("choices") or row.get("options")
         if not isinstance(options, list):
             try:
-                options = json.loads(str(row.get("options_json") or "[]"))
+                options = json.loads(str(row.get("choices_json") or row.get("options_json") or "[]"))
             except json.JSONDecodeError:
                 options = []
         normalized.append(
@@ -364,9 +369,12 @@ def _provider_action_rows(rows: object) -> list[dict[str, Any]]:
                 "stage_id": row.get("stage_id"),
                 "provider": row.get("provider"),
                 "kind": row.get("kind"),
+                "input_kind": row.get("input_kind"),
                 "status": row.get("status"),
                 "prompt": row.get("prompt_text"),
-                "options": ", ".join(str(option.get("label") or option.get("value")) for option in options if isinstance(option, dict)) or "-",
+                "choices": ", ".join(str(option.get("label") or option.get("value")) for option in options if isinstance(option, dict)) or "-",
+                "default_choice": row.get("default_choice") or "-",
+                "response": row.get("response") if row.get("response") is not None else "-",
                 "attach": row.get("attach_command") or row.get("transcript_path"),
             }
         )
@@ -430,6 +438,22 @@ class ContinueRequest(BaseModel):
     max_cost_usd: float = 0.5
 
 
+class ProviderActionResponseRequest(BaseModel):
+    response: Any | None = None
+    choice: str | None = None
+    text: str | None = None
+    max_cost_usd: float = 0.5
+
+    def response_payload(self) -> Any:
+        if self.response is not None:
+            return self.response
+        if self.choice is not None:
+            return {"choice": self.choice}
+        if self.text is not None:
+            return {"text": self.text}
+        return {"handled": True}
+
+
 class MultiRepoPlanRequest(BaseModel):
     task: str
     repos: list[str] = Field(default_factory=list)
@@ -476,7 +500,10 @@ def create_app(*, task_manager: object | None = None, paths: object | None = Non
     def _dashboard_project_store() -> Path:
         return dashboard_hidden_projects_path(manager.paths.data_dir)
 
-    def _dashboard_payload(root: Path, *, include_hidden: bool = False) -> dict[str, object]:
+    def _dashboard_task_store() -> Path:
+        return dashboard_hidden_tasks_path(manager.paths.data_dir)
+
+    def _dashboard_payload(root: Path, *, include_hidden: bool = False, include_global_config: bool = True) -> dict[str, object]:
         tasks = manager.list_tasks()
         approvals = manager.approvals(status=str(ApprovalStatus.PENDING))
         actions = manager.provider_actions(status=str(ProviderActionStatus.PENDING))
@@ -489,7 +516,9 @@ def create_app(*, task_manager: object | None = None, paths: object | None = Non
             provider_health=_provider_health_payload(),
             ecosystem=manager.ecosystem_state(),
             hidden_projects=load_hidden_projects(_dashboard_project_store()),
+            hidden_tasks=load_hidden_tasks(_dashboard_task_store()),
             include_hidden=include_hidden,
+            include_global_config=include_global_config,
         )
 
     @app.get("/api/daemon/status")
@@ -497,9 +526,9 @@ def create_app(*, task_manager: object | None = None, paths: object | None = Non
         return manager.daemon_status()
 
     @app.get("/api/dashboard/overview")
-    def dashboard_overview(workspace: str | None = None, include_hidden: bool = False) -> dict[str, object]:
+    def dashboard_overview(workspace: str | None = None, include_hidden: bool = False, include_global_config: bool = True) -> dict[str, object]:
         root = Path(workspace or Path.cwd()).resolve()
-        return _dashboard_payload(root, include_hidden=include_hidden)
+        return _dashboard_payload(root, include_hidden=include_hidden, include_global_config=include_global_config)
 
     @app.delete("/api/dashboard/projects/{project_id}")
     def dashboard_hide_project(project_id: str, workspace: str | None = None) -> dict[str, object]:
@@ -511,6 +540,17 @@ def create_app(*, task_manager: object | None = None, paths: object | None = Non
     @app.post("/api/dashboard/projects/{project_id}/restore")
     def dashboard_restore_project(project_id: str) -> dict[str, object]:
         return restore_dashboard_project(_dashboard_project_store(), project_id)
+
+    @app.delete("/api/dashboard/tasks/{task_id}")
+    def dashboard_hide_task(task_id: str, workspace: str | None = None) -> dict[str, object]:
+        root = Path(workspace or Path.cwd()).resolve()
+        overview = _dashboard_payload(root, include_hidden=True, include_global_config=False)
+        task = _find_dashboard_task(overview, task_id)
+        return hide_dashboard_task(_dashboard_task_store(), task_id, task=task)
+
+    @app.post("/api/dashboard/tasks/{task_id}/restore")
+    def dashboard_restore_task(task_id: str) -> dict[str, object]:
+        return restore_dashboard_task(_dashboard_task_store(), task_id)
 
     @app.get("/api/ux/overview")
     def ux_overview() -> dict[str, object]:
@@ -543,6 +583,19 @@ def create_app(*, task_manager: object | None = None, paths: object | None = Non
     def product_experience(workspace: str | None = None) -> dict[str, object]:
         root = Path(workspace or Path.cwd()).resolve()
         return build_product_experience(root, tasks=manager.list_tasks(), provider_health=_provider_health_payload())
+
+    @app.get("/api/validation/experiments")
+    def validation_experiments(workspace: str | None = None) -> list[dict[str, object]]:
+        root = Path(workspace or Path.cwd()).resolve()
+        return list_validation_experiments(root)
+
+    @app.get("/api/validation/experiments/{experiment_id}")
+    def validation_experiment(experiment_id: str, workspace: str | None = None) -> dict[str, object]:
+        root = Path(workspace or Path.cwd()).resolve()
+        try:
+            return load_validation_experiment(root, experiment_id).model_dump()
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/skills/catalog")
     def skills_catalog(workspace: str | None = None) -> dict[str, object]:
@@ -718,7 +771,7 @@ def create_app(*, task_manager: object | None = None, paths: object | None = Non
 
     @app.post("/api/feedback")
     def feedback(request: FeedbackRequest) -> dict[str, object]:
-        workspace = Path(request.workspace or Path.cwd()).resolve()
+        workspace = _feedback_workspace(request)
         return manager.ingest_feedback(
             kind=request.kind,
             source=request.source,
@@ -730,6 +783,17 @@ def create_app(*, task_manager: object | None = None, paths: object | None = Non
             payload=request.payload,
             auto_submit=request.auto_submit,
         )
+
+    def _feedback_workspace(request: FeedbackRequest) -> Path:
+        if request.workspace:
+            return Path(request.workspace).resolve()
+        if request.run_id:
+            try:
+                run = manager.get_run(request.run_id)
+                return Path(str(run["workspace"])).resolve()
+            except (KeyError, FileNotFoundError):
+                pass
+        return Path.cwd().resolve()
 
     @app.get("/api/ecosystem")
     def ecosystem() -> dict[str, object]:
@@ -783,17 +847,45 @@ def create_app(*, task_manager: object | None = None, paths: object | None = Non
             return store.auto_quarantine_contradictions()
 
     @app.post("/api/provider-actions/{action_id}/handled")
-    def provider_action_handled(action_id: str) -> dict[str, object]:
+    def provider_action_handled(action_id: str, request: ProviderActionResponseRequest | None = None) -> dict[str, object]:
         try:
+            if request is not None:
+                return manager.respond_provider_action(action_id, request.response_payload())
             return manager.update_provider_action(action_id, ProviderActionStatus.HANDLED)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    @app.post("/api/tasks/{task_id}/actions/{action_id}/handled-and-continue")
-    def provider_action_handled_and_continue(task_id: str, action_id: str, request: ContinueRequest | None = None) -> dict[str, object]:
+    @app.post("/api/provider-actions/{action_id}/response")
+    def provider_action_response(action_id: str, request: ProviderActionResponseRequest) -> dict[str, object]:
         try:
-            handled = manager.update_provider_action(action_id, ProviderActionStatus.HANDLED)
+            return manager.respond_provider_action(action_id, request.response_payload())
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/tasks/{task_id}/actions/{action_id}/handled-and-continue")
+    def provider_action_handled_and_continue(task_id: str, action_id: str, request: ProviderActionResponseRequest | None = None) -> dict[str, object]:
+        try:
+            handled = (
+                manager.respond_provider_action(action_id, request.response_payload())
+                if request is not None and (request.response is not None or request.choice is not None or request.text is not None)
+                else manager.update_provider_action(action_id, ProviderActionStatus.HANDLED)
+            )
             continued = manager.continue_task(task_id, max_cost_usd=(request.max_cost_usd if request else 0.5))
+            return {
+                "task_id": task_id,
+                "run_id": task_id,
+                "action": handled,
+                "continue": continued,
+                "status": continued.get("status"),
+            }
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/tasks/{task_id}/actions/{action_id}/respond-and-continue")
+    def provider_action_respond_and_continue(task_id: str, action_id: str, request: ProviderActionResponseRequest) -> dict[str, object]:
+        try:
+            handled = manager.respond_provider_action(action_id, request.response_payload())
+            continued = manager.continue_task(task_id, max_cost_usd=request.max_cost_usd)
             return {
                 "task_id": task_id,
                 "run_id": task_id,
@@ -846,6 +938,27 @@ def create_app(*, task_manager: object | None = None, paths: object | None = Non
 def _provider_health_payload() -> dict[str, object]:
     return build_provider_health([probe.to_dict() for probe in detect_providers()])
 
+
+def _find_dashboard_task(overview: dict[str, object], task_id: str) -> dict[str, object] | None:
+    projects = overview.get("projects", [])
+    for project in projects if isinstance(projects, list) else []:
+        if not isinstance(project, dict):
+            continue
+        workflows = project.get("workflows", [])
+        for workflow in workflows if isinstance(workflows, list) else []:
+            if not isinstance(workflow, dict):
+                continue
+            role_groups = workflow.get("role_groups", [])
+            for group in role_groups if isinstance(role_groups, list) else []:
+                if not isinstance(group, dict):
+                    continue
+                tasks = group.get("tasks", [])
+                for task in tasks if isinstance(tasks, list) else []:
+                    if isinstance(task, dict) and str(task.get("task_id") or task.get("run_id") or "") == task_id:
+                        return task
+    return None
+
+
 def render_live_dashboard_html(task_id: str | None = None) -> str:
     """Render the daemon-backed Mission Control dashboard."""
     initial_hash = f"data-task-id=\"{_escape(task_id)}\"" if task_id else ""
@@ -853,19 +966,22 @@ def render_live_dashboard_html(task_id: str | None = None) -> str:
 
 
 _LIVE_DASHBOARD_TEMPLATE = """<!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>muxdev Mission Control</title>
+  <title>muxdev 控制台</title>
   <style>
-    :root { --bg:#f6f7f9; --panel:#fff; --ink:#17202a; --muted:#64748b; --line:#d9e0ea; --accent:#0f766e; --warn:#a16207; --bad:#b91c1c; --good:#15803d; }
+    :root { --bg:#f6f7f9; --panel:#fff; --ink:#17202a; --muted:#64748b; --line:#d9e0ea; --accent:#0f766e; --warn:#a16207; --bad:#b91c1c; --good:#15803d; --soft:#f8fafc; }
     * { box-sizing:border-box; }
     body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 ui-sans-serif,system-ui,"Segoe UI",sans-serif; }
     header { padding:16px 24px; border-bottom:1px solid var(--line); background:var(--panel); display:flex; justify-content:space-between; gap:16px; align-items:center; }
     h1 { margin:0; font-size:22px; letter-spacing:0; } h2 { margin:0 0 10px; font-size:16px; } h3 { margin:0 0 8px; font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:0; }
-    button { border:1px solid var(--line); background:#fff; color:var(--ink); border-radius:6px; padding:6px 10px; cursor:pointer; }
+    button { border:1px solid var(--line); background:#fff; color:var(--ink); border-radius:6px; padding:6px 10px; cursor:pointer; white-space:nowrap; }
     button.active, button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+    button.subtle { background:var(--soft); }
+    code { background:#eef2f7; border:1px solid #d8dee8; border-radius:4px; padding:1px 5px; }
+    textarea { width:100%; border:1px solid var(--line); border-radius:6px; padding:8px; resize:vertical; font:inherit; }
     main { padding:18px 24px 28px; display:grid; gap:14px; }
     .panel,.card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; min-width:0; }
     .tabs,.subtabs,.actions,.chips { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
@@ -873,19 +989,19 @@ _LIVE_DASHBOARD_TEMPLATE = """<!doctype html>
     .metrics { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:10px; }
     .metric strong { display:block; font-size:24px; }
     .project-shell { display:grid; grid-template-columns:minmax(240px,320px) minmax(0,1fr); gap:16px; align-items:start; }
-    .project-sidebar { max-height:calc(100vh - 230px); overflow:auto; }
+    .project-sidebar { max-height:calc(100vh - 250px); overflow:auto; }
     .project-list { display:grid; gap:10px; }
     .project-item { width:100%; min-width:0; overflow:hidden; display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; align-items:center; border:1px solid var(--line); border-radius:8px; padding:8px; background:#fff; }
     .project-item.active { border-color:var(--accent); box-shadow:inset 3px 0 0 var(--accent); }
     .project-select { border:0; padding:0; min-width:0; text-align:left; display:grid; gap:3px; background:transparent; }
     .project-name { font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .project-path { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
-    .project-hide { white-space:nowrap; }
     .meta { color:var(--muted); font-size:12px; overflow-wrap:anywhere; }
     .chips span { border:1px solid var(--line); border-radius:999px; padding:1px 7px; background:#fff; font-size:12px; }
     .board { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:10px; }
-    .column { min-width:0; background:#f8fafc; border:1px solid var(--line); border-radius:8px; padding:10px; }
+    .column { min-width:0; background:var(--soft); border:1px solid var(--line); border-radius:8px; padding:10px; }
     .task-card { position:relative; border:1px solid var(--line); border-radius:8px; padding:10px; margin-top:8px; background:#fff; }
+    .task-card.hidden { opacity:.7; }
     .hover-detail { display:none; margin-top:8px; }
     .task-card:hover .hover-detail,.task-card:focus-within .hover-detail { display:block; }
     .status { display:inline-flex; border:1px solid var(--line); border-radius:999px; padding:1px 7px; font-weight:700; }
@@ -893,52 +1009,81 @@ _LIVE_DASHBOARD_TEMPLATE = """<!doctype html>
     .awaiting_approval,.awaiting_provider_action,.paused_budget { color:var(--warn); background:#fffbeb; border-color:#fde68a; } .blocked,.aborted,.failed { color:var(--bad); background:#fef2f2; border-color:#fecaca; }
     table { width:100%; border-collapse:collapse; table-layout:fixed; } th,td { border-bottom:1px solid #edf1f7; padding:7px 6px; text-align:left; vertical-align:top; overflow-wrap:anywhere; } th { color:var(--muted); font-size:12px; }
     .timeline-step,.action-card { border:1px solid var(--line); border-radius:8px; padding:10px; margin-bottom:8px; background:#fff; }
+    .compact-action-center { padding:10px 12px; }
+    .action-summary { display:grid; grid-template-columns:auto minmax(0,1fr) auto; gap:12px; align-items:center; }
+    .action-count { min-width:34px; height:34px; display:grid; place-items:center; border-radius:8px; background:#fff7ed; color:#9a3412; border:1px solid #fed7aa; font-weight:800; }
+    .action-summary.calm .action-count { background:#f0fdf4; color:var(--good); border-color:#bbf7d0; }
+    .action-title { font-weight:800; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .action-list { margin-top:10px; display:grid; gap:8px; max-height:280px; overflow:auto; }
+    .action-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; align-items:start; border:1px solid var(--line); border-radius:8px; padding:10px; background:#fff; }
+    .action-context { display:flex; gap:6px; flex-wrap:wrap; margin:4px 0; }
+    .action-context span { border:1px solid var(--line); border-radius:999px; padding:1px 7px; background:var(--soft); font-size:12px; }
+    .feedback-box { margin-top:8px; display:grid; gap:8px; }
     pre { background:#0f172a; color:#e2e8f0; border-radius:8px; padding:12px; overflow:auto; max-height:300px; }
-    @media (max-width:900px){ header{align-items:flex-start;flex-direction:column;} .metrics{grid-template-columns:1fr 1fr;} .project-shell{grid-template-columns:1fr;} }
+    @media (max-width:900px){ header{align-items:flex-start;flex-direction:column;} .metrics{grid-template-columns:1fr 1fr;} .project-shell{grid-template-columns:1fr;} .action-summary,.action-row{grid-template-columns:1fr;} }
     @media (max-width:560px){ main{padding:14px;} .metrics{grid-template-columns:1fr;} }
   </style>
 </head>
 <body __INITIAL_HASH__>
-  <header><div><h1>muxdev Mission Control</h1><div class="meta">Projects | Workflows | Roles | Tasks | Global Config</div></div><div class="meta" id="daemon-status">connecting</div></header>
+  <header><div><h1>muxdev 控制台</h1><div class="meta">项目 | 工作流 | 角色 | 任务 | 全局配置</div></div><div class="meta" id="daemon-status">连接中</div></header>
   <main>
-    <section class="tabs"><button id="tab-projects" class="active" onclick="setMainTab('projects')">Projects</button><button id="tab-global" onclick="setMainTab('global')">Global Config</button></section>
-    <section class="panel"><h2>Current Status</h2><div id="current-status" class="metrics"></div></section>
-    <section class="panel"><h2>Action Center</h2><div id="action-center"></div></section>
-    <section class="panel" style="display:none"><h2>Product Experience</h2><code>/product/experience</code></section>
-    <section class="panel" style="display:none"><h2>Memory Context</h2><h2>Role Sessions</h2></section>
-    <section id="panel-projects" class="tab-panel active"><div class="project-shell"><aside class="panel project-sidebar"><h2>Projects</h2><div class="meta">Current task directory owns the project.</div><div id="project-list" class="project-list"></div></aside><section class="panel"><div style="display:flex;justify-content:space-between;gap:12px;align-items:start"><div><h2 id="project-title">Project</h2><div id="project-path" class="meta"></div></div><div class="subtabs"><button id="subtab-workflows" class="active" onclick="setProjectSubtab('workflows')">Workflows</button><button id="subtab-tasks" onclick="setProjectSubtab('tasks')">Tasks</button><button id="subtab-activity" onclick="setProjectSubtab('activity')">Activity</button><button id="subtab-artifacts" onclick="setProjectSubtab('artifacts')">Artifacts</button><button id="subtab-config" onclick="setProjectSubtab('config')">Config</button></div></div><hr><div id="project-workflows"></div><div id="project-tasks" style="display:none"></div><div id="project-activity" style="display:none"><h2>Task Timeline</h2><div id="timeline"></div><h2>Provider Action Wizard</h2><div id="provider-actions"></div><h2>Approval Risk Review</h2><div id="approvals"></div><h2>Recent Events</h2><pre id="events"></pre></div><div id="project-artifacts" style="display:none"><h2>Evidence / Artifacts Center</h2><div id="artifacts-center"></div></div><div id="project-config" style="display:none"></div></section></div></section>
-    <section id="panel-global" class="tab-panel"><section class="panel"><h2>MCP</h2><div id="mcp-summary"></div></section><section class="panel"><h2>Role Templates</h2><div id="role-templates"></div></section><section class="panel"><h2>Workflow Templates</h2><div id="workflow-templates"></div></section><section class="panel"><h2>Skills</h2><div id="skills-catalog"></div></section></section>
+    <section class="tabs"><button id="tab-projects" class="active" onclick="setMainTab('projects')">项目</button><button id="tab-validation" onclick="setMainTab('validation')">验证</button><button id="tab-global" onclick="setMainTab('global')">全局配置</button></section>
+    <section class="panel"><h2>当前状态</h2><div id="current-status" class="metrics"></div></section>
+    <section class="panel compact-action-center"><h2>行动中心</h2><div id="action-center"></div></section>
+    <section class="panel" style="display:none"><h2>产品体验</h2><code>/product/experience</code></section>
+    <section class="panel" style="display:none"><h2>记忆上下文</h2><h2>角色会话</h2></section>
+    <section class="panel" style="display:none"><h2>并行冲突</h2><h2>语义合并</h2><h2>Provider 学习</h2><h2>多仓编排</h2></section>
+    <section id="panel-projects" class="tab-panel active"><div class="project-shell"><aside class="panel project-sidebar"><h2>项目</h2><div class="meta">当前任务目录归属为项目。</div><div id="project-list" class="project-list"></div></aside><section class="panel"><div style="display:flex;justify-content:space-between;gap:12px;align-items:start"><div><h2 id="project-title">项目</h2><div id="project-path" class="meta"></div></div><div class="subtabs"><button id="subtab-workflows" class="active" onclick="setProjectSubtab('workflows')">工作流</button><button id="subtab-tasks" onclick="setProjectSubtab('tasks')">任务</button><button id="subtab-activity" onclick="setProjectSubtab('activity')">动态</button><button id="subtab-artifacts" onclick="setProjectSubtab('artifacts')">产物</button><button id="subtab-config" onclick="setProjectSubtab('config')">配置</button></div></div><hr><div id="project-workflows"></div><div id="project-tasks" style="display:none"></div><div id="project-activity" style="display:none"><h2>任务时间线</h2><div id="timeline"></div><h2>Provider 操作</h2><div id="provider-actions"></div><h2>审批风险</h2><div id="approvals"></div><h2>最近事件</h2><pre id="events"></pre></div><div id="project-artifacts" style="display:none"><h2>证据 / 产物中心</h2><div id="artifacts-center"></div></div><div id="project-config" style="display:none"></div></section></div></section>
+    <section id="panel-validation" class="tab-panel"><section class="panel"><h2>验证实验</h2><div class="meta">对比单 Agent 与多 Agent 运行的证据、可靠性、成本和可观测性。</div><div id="validation-experiments"></div></section></section>
+    <section id="panel-global" class="tab-panel"><section class="panel"><h2>MCP</h2><div id="mcp-summary"></div></section><section class="panel"><h2>角色模板</h2><div id="role-templates"></div></section><section class="panel"><h2>工作流模板</h2><div id="workflow-templates"></div></section><section class="panel"><h2>技能</h2><div id="skills-catalog"></div></section></section>
   </main>
 <script>
-const state={taskId:document.body.dataset.taskId||null,selectedProjectId:null,mainTab:'projects',projectSubtab:'workflows',events:[]};
+const state={taskId:document.body.dataset.taskId||null,selectedProjectId:null,mainTab:'projects',projectSubtab:'workflows',events:[],globalConfigLoaded:false,actionExpanded:false,actionRows:[]};
 const esc=v=>String(v??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 const fmt=v=>Array.isArray(v)||(v&&typeof v==='object')?JSON.stringify(v):v;
+const statusLabels={completed:'已完成',running:'运行中',awaiting_approval:'待审批',awaiting_provider_action:'待处理',paused_budget:'预算暂停',blocked:'已阻塞',aborted:'已终止',failed:'失败',created:'已创建',queued:'排队中',pending:'等待中'};
+const actionLabels={provider_action:'Provider 等待操作',approval:'需要审批',recovery:'任务需要恢复',plan_feedback:'计划可反馈'};
 const statusClass=v=>`status ${v||''}`;
+const statusText=v=>statusLabels[v]||v||'-';
 async function api(path,options){const r=await fetch('/api'+path,options);if(!r.ok)throw new Error(await r.text());return r.json();}
 async function optionalApi(path,fallback){try{return await api(path)}catch(_e){return fallback}}
-function setMainTab(tab){state.mainTab=tab;document.getElementById('tab-projects').classList.toggle('active',tab==='projects');document.getElementById('tab-global').classList.toggle('active',tab==='global');document.getElementById('panel-projects').classList.toggle('active',tab==='projects');document.getElementById('panel-global').classList.toggle('active',tab==='global');}
-function setProjectSubtab(tab){state.projectSubtab=tab;for(const name of ['workflows','tasks','activity','artifacts','config']){document.getElementById('subtab-'+name).classList.toggle('active',tab===name);document.getElementById('project-'+name).style.display=tab===name?'':'none';}}
-async function refresh(){const overview=await api('/dashboard/overview');document.getElementById('daemon-status').textContent=`tasks=${overview.counts?.tasks??0} active=${overview.counts?.active??0} attention=${overview.counts?.needs_attention??0}`;const ids=(overview.projects||[]).map(p=>p.id);if(!state.selectedProjectId||!ids.includes(state.selectedProjectId)){state.selectedProjectId=overview.selected_project_id||ids[0]||null;state.taskId=null;}const selected=(overview.projects||[]).find(p=>p.id===state.selectedProjectId)||(overview.projects||[])[0];if(selected&&!state.taskId){const first=firstProjectTask(selected);if(first)state.taskId=first.task_id;}renderCurrentStatus(overview.current_status||{},overview.counts||{});renderActionCenter(overview.action_center||[]);renderProjects(overview.projects||[],selected);renderGlobalConfig(overview.global_config||{});renderProviderActions(overview.pending_provider_actions||[]);renderApprovals(overview.pending_approvals||[]);if(state.taskId){const detail=await optionalApi('/tasks/'+encodeURIComponent(state.taskId),null);renderSelectedTask(detail,overview.artifact_center||{});}else{renderSelectedTask(null,overview.artifact_center||{});}setMainTab(state.mainTab);setProjectSubtab(state.projectSubtab);}
+function setMainTab(tab){state.mainTab=tab;document.getElementById('tab-projects').classList.toggle('active',tab==='projects');document.getElementById('tab-validation').classList.toggle('active',tab==='validation');document.getElementById('tab-global').classList.toggle('active',tab==='global');document.getElementById('panel-projects').classList.toggle('active',tab==='projects');document.getElementById('panel-validation').classList.toggle('active',tab==='validation');document.getElementById('panel-global').classList.toggle('active',tab==='global');if(tab==='global'&&!state.globalConfigLoaded)loadGlobalConfig().catch(e=>document.getElementById('daemon-status').textContent=e.message);}
+function setProjectSubtab(tab,load=true){state.projectSubtab=tab;for(const name of ['workflows','tasks','activity','artifacts','config']){document.getElementById('subtab-'+name).classList.toggle('active',tab===name);document.getElementById('project-'+name).style.display=tab===name?'':'none';}if(load&&needsTaskDetail())loadSelectedTask().catch(e=>document.getElementById('daemon-status').textContent=e.message);}
+const needsTaskDetail=()=>state.taskId&&(state.projectSubtab==='activity'||state.projectSubtab==='artifacts');
+async function refresh(){const overview=await api('/dashboard/overview?include_global_config=false');document.getElementById('daemon-status').textContent=`任务=${overview.counts?.tasks??0} 运行=${overview.counts?.active??0} 待处理=${overview.counts?.needs_attention??0}`;const ids=(overview.projects||[]).map(p=>p.id);if(!state.selectedProjectId||!ids.includes(state.selectedProjectId)){state.selectedProjectId=overview.selected_project_id||ids[0]||null;state.taskId=null;}const selected=(overview.projects||[]).find(p=>p.id===state.selectedProjectId)||(overview.projects||[])[0];if(selected&&!state.taskId){const first=firstProjectTask(selected);if(first)state.taskId=first.task_id;}renderCurrentStatus(overview.current_status||{},overview.counts||{});renderActionCenter(overview.action_center||[]);renderValidation(overview.validation||{});renderProjects(overview.projects||[],selected);renderProviderActions(overview.pending_provider_actions||[]);renderApprovals(overview.pending_approvals||[]);if(needsTaskDetail()){await loadSelectedTask(overview.artifact_center||{});}else if(!state.taskId){renderSelectedTask(null,overview.artifact_center||{});}setMainTab(state.mainTab);setProjectSubtab(state.projectSubtab,false);}
+async function loadGlobalConfig(){const overview=await api('/dashboard/overview?include_global_config=true');renderGlobalConfig(overview.global_config||{});state.globalConfigLoaded=true;}
+async function loadSelectedTask(center={}){if(!state.taskId){renderSelectedTask(null,center);return;}const detail=await optionalApi('/tasks/'+encodeURIComponent(state.taskId),null);renderSelectedTask(detail,center);}
 function firstProjectTask(project){for(const workflow of project.workflows||[])for(const group of workflow.role_groups||[])if((group.tasks||[]).length)return group.tasks[0];return null;}
-function renderCurrentStatus(status,counts){const rows=[['Running',status.running??counts.active??0,'active tasks'],['Waiting',(status.waiting_provider_action??0)+(status.waiting_muxdev_approval??0),'actions and approvals'],['Stuck',status.stuck??0,'blocked or errored'],['Projects',counts.projects??'-','workspace groups'],['Done',(status.recent_completed||[]).length,'recent deliverables']];document.getElementById('current-status').innerHTML=rows.map(([a,b,c])=>`<div class="card metric"><h3>${esc(a)}</h3><strong>${esc(b)}</strong><span class="meta">${esc(c)}</span></div>`).join('');}
-function renderActionCenter(rows){document.getElementById('action-center').innerHTML=rows.length?rows.map(r=>`<div class="action-card"><strong>${esc(r.headline)}</strong><div>${esc(r.why||'')}</div>${r.command?`<code>${esc(r.command)}</code>`:''}<div class="actions">${r.endpoint?`<button class="primary" onclick="post('${esc(r.endpoint).replace('/api','')}')">Take action</button>`:''}</div></div>`).join(''):'<div class="meta">Nothing needs your attention. Running tasks will appear here if they pause.</div>';}
-function renderProjects(projects,selected){document.getElementById('project-list').innerHTML=projects.length?projects.map(p=>`<div class="project-item ${p.id===(selected||{}).id?'active':''}"><button class="project-select" title="${esc(p.path)}" onclick="state.selectedProjectId='${esc(p.id)}';state.taskId=null;refresh()"><span class="project-name">${esc(p.name)}</span><span class="project-path meta">${esc(p.path)}</span><span class="chips"><span>${esc(p.summary?.tasks??0)} tasks</span><span>${esc(p.summary?.active??0)} active</span><span>$${esc(p.summary?.cost_usd??0)}</span></span></button><button class="project-hide" title="Hide project from dashboard" onclick="hideProject(event,'${esc(p.id)}')">Hide</button></div>`).join(''):'<div class="meta">No visible projects. Hidden projects can be restored with include_hidden=true from the API.</div>';if(!selected){document.getElementById('project-title').textContent='Project';document.getElementById('project-path').textContent='';document.getElementById('project-workflows').innerHTML='<div class="meta">No project selected.</div>';document.getElementById('project-tasks').innerHTML='';document.getElementById('timeline').innerHTML='<div class="meta">No task selected.</div>';document.getElementById('artifacts-center').innerHTML='<div class="meta">No artifacts yet.</div>';document.getElementById('project-config').innerHTML='';return;}document.getElementById('project-title').textContent=selected.name;document.getElementById('project-path').textContent=selected.path;renderProjectWorkflows(selected);renderProjectTasks(selected);renderProjectConfig(selected.config||{});}
-function renderProjectWorkflows(project){document.getElementById('project-workflows').innerHTML='<h2>Task Board</h2>'+((project.workflows||[]).map(w=>`<section><h2>${esc(w.name||w.id)}</h2><div class="meta">${esc(w.stage_count)} stages | ${esc(w.task_count)} tasks</div><div class="board">${(w.role_groups||[]).map(g=>`<div class="column"><h3>${esc(g.role)} <span>${(g.tasks||[]).length}</span></h3>${(g.tasks||[]).map(taskCard).join('')||'<div class="meta">No tasks.</div>'}</div>`).join('')}</div></section>`).join('')||'<div class="meta">No workflows.</div>');}
-function renderProjectTasks(project){const tasks=[];(project.workflows||[]).forEach(w=>(w.role_groups||[]).forEach(g=>(g.tasks||[]).forEach(t=>tasks.push(t))));document.getElementById('project-tasks').innerHTML=tasks.length?tasks.map(taskCard).join(''):'<div class="meta">No tasks.</div>';}
-function taskCard(t){return `<div class="task-card" tabindex="0" onclick="state.taskId='${esc(t.task_id)}';refresh()"><strong>${esc(t.title||t.task_id)}</strong> <span class="${statusClass(t.status)}">${esc(t.status||'-')}</span><div class="meta">${esc(t.provider||'-')} | ${esc(t.current_stage||'-')} | ${esc(t.workflow||'-')}</div><div class="hover-detail"><div class="meta">cost=${esc(t.cost_usd||0)} tokens=${esc(t.tokens||0)} approvals=${esc(t.pending_approvals||0)} actions=${esc(t.pending_provider_actions||0)}</div><div class="actions"><button onclick="loadText('${esc(t.report_endpoint||'').replace('/api','')}','events');event.stopPropagation()">Report</button><button onclick="loadText('${esc(t.diff_endpoint||'').replace('/api','')}','events');event.stopPropagation()">Diff</button></div></div></div>`;}
-function renderProjectConfig(config){document.getElementById('project-config').innerHTML=`<div class="metrics"><div class="card"><h3>Profile</h3><strong>${esc(config.profile||'-')}</strong><div class="meta">gate=${esc(config.gate||'-')}</div></div><div class="card"><h3>Approvals</h3><strong>${esc(config.approvals?.pending||0)}</strong><div class="meta">pending project approval gates</div></div></div>${tableBlock('Roles',Object.entries(config.roles||{}).map(([role,value])=>({role,value})),['role','value'])}${tableBlock('Skills',config.skills||[],['name','source','trust'])}`;}
-function renderGlobalConfig(config){renderMcpSummary(config.mcp||{});document.getElementById('role-templates').innerHTML=tableBlock('Role Templates',config.role_templates||[],['name','workflow','roles','providers']);const templates=config.workflow_templates||{};document.getElementById('workflow-templates').innerHTML=tableBlock('Workflow Templates',templates.templates||[],['name','description','phases','supported_providers']);const skills=config.skills_catalog||{};document.getElementById('skills-catalog').innerHTML=tableBlock('Catalog',(skills.catalog||{}).skills||[],['name','trust','risk_level','source','description'])+tableBlock('Lock',(skills.lock||{}).skills||[],['name','status']);}
-function renderMcpSummary(mcp){const rows=[['status',mcp.status||'enabled'],['mode',mcp.mode||'local stdio'],['tools',mcp.tools_count??0],['resources',mcp.resources_count??0],['prompts',mcp.prompts_count??0],['guarded writes',mcp.write_policy||'guarded'],['guardrails',(mcp.recent_guardrails||[]).length],['recent denials',mcp.recent_denials??0]];const commands=mcp.commands||{};document.getElementById('mcp-summary').innerHTML=`<div class="metrics">${rows.map(([a,b])=>`<div class="card metric"><h3>${esc(a)}</h3><strong>${esc(b)}</strong></div>`).join('')}</div><div class="actions"><button onclick="copyText('${esc(commands.manifest||'muxdev mcp manifest --json')}')">Manifest</button><button onclick="copyText('${esc(commands.doctor||'muxdev mcp doctor --json')}')">Doctor</button></div>${(mcp.recent_guardrails||[]).length?tableBlock('Recent Guardrails',mcp.recent_guardrails||[],['tool','decision','reason','created_at']):'<div class="meta">No recent MCP guardrails.</div>'}`;}
-function renderSelectedTask(payload,center){if(!payload){document.getElementById('timeline').innerHTML='<div class="meta">No task selected.</div>';document.getElementById('artifacts-center').innerHTML='<div class="meta">No artifacts yet.</div>';return;}const stages=payload.stages||[];document.getElementById('timeline').innerHTML=stages.length?stages.map(s=>`<div class="timeline-step"><strong>${esc(s.stage_id)}</strong> <span class="${statusClass(s.status)}">${esc(s.status||'-')}</span><div>${esc(s.summary||'')}</div></div>`).join(''):'<div class="meta">No stage timeline yet.</div>';document.getElementById('artifacts-center').innerHTML=tableBlock('Final Reports / Artifacts',payload.artifacts||[],['name','kind','stage_id','path','created_at'])+tableBlock('Test Output',payload.test_results||[],['stage_id','passed','command','summary'])+tableBlock('Evidence Evaluation',payload.evidence_evaluations||[],['run_id','label','confidence','path']);}
-function renderApprovals(rows){document.getElementById('approvals').innerHTML=rows.length?rows.map(r=>`<div class="action-card"><h3>Approval Required</h3><strong>${esc(r.type||'policy gate')}</strong><div>${esc(r.reason||'')}</div><div class="actions"><button class="primary" onclick="post('/approvals/${encodeURIComponent(r.approval_id)}/approve')">Approve</button><button onclick="post('/approvals/${encodeURIComponent(r.approval_id)}/deny')">Deny</button></div></div>`).join(''):'<div class="meta">No pending approvals.</div>';}
-function renderProviderActions(rows){document.getElementById('provider-actions').innerHTML=rows.length?rows.map(r=>`<div class="action-card"><h3>Provider Action Required</h3><strong>${esc(r.provider||'provider')}</strong><p>${esc(r.prompt_text||'')}</p><div class="actions"><button onclick="copyText('${esc(r.attach_command||'')}')">Copy attach command</button><button class="primary" onclick="post('/tasks/${encodeURIComponent(r.run_id)}/actions/${encodeURIComponent(r.action_id)}/handled-and-continue')">Mark handled and continue</button></div></div>`).join(''):'<div class="meta">No pending provider actions.</div>';}
-function tableBlock(title,rows,cols){rows=rows||[];if(!rows.length)return `<h3>${esc(title)}</h3><div class="meta">No records.</div>`;return `<h3>${esc(title)}</h3><table><thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${cols.map(c=>tableCell(r,c)).join('')}</tr>`).join('')}</tbody></table>`;}
+function renderCurrentStatus(status,counts){const rows=[['运行中',status.running??counts.active??0,'正在执行的任务'],['等待中',(status.waiting_provider_action??0)+(status.waiting_muxdev_approval??0),'操作和审批'],['阻塞',status.stuck??0,'失败或中断'],['项目',counts.projects??'-','工作区分组'],['完成',(status.recent_completed||[]).length,'近期交付']];document.getElementById('current-status').innerHTML=rows.map(([a,b,c])=>`<div class="card metric"><h3>${esc(a)}</h3><strong>${esc(b)}</strong><span class="meta">${esc(c)}</span></div>`).join('');}
+function renderActionCenter(rows){state.actionRows=rows||[];const el=document.getElementById('action-center');if(!state.actionRows.length){el.innerHTML='<div class="action-summary calm"><div class="action-count">0</div><div><div class="action-title">暂无需要处理的事项</div><div class="meta">任务暂停、审批或恢复请求会出现在这里。</div></div></div>';return;}const first=state.actionRows[0];const details=state.actionExpanded?`<div class="action-list">${state.actionRows.map(actionRow).join('')}</div>`:'';el.innerHTML=`<div class="action-summary"><div class="action-count">${esc(state.actionRows.length)}</div><div><div class="action-title">${esc(state.actionRows.length)} 项需要处理：${esc(actionLabels[first.kind]||first.headline||'待处理')}</div><div class="meta">${actionContext(first)}</div></div><button class="subtle" onclick="toggleActionCenter()">${state.actionExpanded?'收起详情':'展开详情'}</button></div>${details}`;}
+function toggleActionCenter(){state.actionExpanded=!state.actionExpanded;renderActionCenter(state.actionRows);}
+function actionContext(r){const parts=[];if(r.project_name)parts.push(`项目：${r.project_name}`);if(r.task_title)parts.push(`任务：${r.task_title}`);if(r.run_id)parts.push(`run：${r.run_id}`);if(r.stage_id)parts.push(`阶段：${r.stage_id}`);return esc(parts.join(' / ')||r.why||'');}
+function actionRow(r){const label=actionLabels[r.kind]||r.headline||'待处理';const primary=r.endpoint&&r.kind!=='plan_feedback'?`<button class="primary" onclick="post('${esc(r.endpoint).replace('/api','')}')">${actionButtonLabel(r.kind)}</button>`:'';const report=r.secondary_endpoint?`<button onclick="loadText('${esc(r.secondary_endpoint).replace('/api','')}','events')">报告</button>`:'';const rollback=r.rollback_endpoint?`<button onclick="post('${esc(r.rollback_endpoint).replace('/api','')}')">回滚</button>`:'';const hide=r.task_id?`<button onclick="hideTask(event,'${esc(r.task_id)}')">隐藏</button>`:'';return `<div class="action-row"><div><strong>${esc(label)}</strong><div class="action-context"><span title="${esc(r.project_path||'')}">项目：${esc(r.project_name||'-')}</span><span>任务：${esc(r.task_title||r.task_id||'-')}</span><span>run：${esc(r.run_id||'-')}</span>${r.stage_id?`<span>阶段：${esc(r.stage_id)}</span>`:''}</div><div class="meta">${esc(r.why||'')}</div>${r.command?`<code>${esc(r.command)}</code>`:''}${r.kind==='plan_feedback'?planFeedbackForm(r):''}</div><div class="actions">${primary}${report}${rollback}${hide}</div></div>`;}
+function actionButtonLabel(kind){return kind==='recovery'?'恢复':kind==='approval'?'批准':'继续';}
+function renderValidation(validation){const rows=validation.experiments||[];document.getElementById('validation-experiments').innerHTML=rows.length?tableBlock('最近实验',rows,['experiment_id','suite','winner','strategies','report','updated_at']):'<div class="meta">暂无验证实验。可运行 <code>muxdev validate run validation/suites/example.yaml</code>。</div>';}
+function planFeedbackForm(r){const id='feedback-'+String(r.run_id||'latest').replace(/[^a-zA-Z0-9_-]/g,'-');return `<div class="feedback-box"><textarea id="${esc(id)}" rows="3" placeholder="补充约束、修正或偏好"></textarea><div class="actions"><button class="primary" onclick="submitPlanFeedback('${esc(r.run_id||'')}','${esc(id)}')">提交反馈</button></div></div>`;}
+async function submitPlanFeedback(runId,fieldId){const field=document.getElementById(fieldId);const content=(field?.value||'').trim();if(!content){document.getElementById('daemon-status').textContent='反馈为空';return;}await api('/feedback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:'manual_feedback',source:'dashboard',content,run_id:runId||null,workspace:document.body.dataset.workspace||null,auto_submit:false})});field.value='';document.getElementById('daemon-status').textContent='反馈已记录';await refresh();}
+function renderProjects(projects,selected){document.getElementById('project-list').innerHTML=projects.length?projects.map(p=>`<div class="project-item ${p.id===(selected||{}).id?'active':''}"><button class="project-select" title="${esc(p.path)}" onclick="state.selectedProjectId='${esc(p.id)}';state.taskId=null;refresh()"><span class="project-name">${esc(p.name)}</span><span class="project-path meta">${esc(p.path)}</span><span class="chips"><span>${esc(p.summary?.tasks??0)} 个任务</span><span>${esc(p.summary?.active??0)} 活跃</span><span>$${esc(p.summary?.cost_usd??0)}</span></span></button><button class="project-hide" title="从控制台隐藏项目" onclick="hideProject(event,'${esc(p.id)}')">隐藏</button></div>`).join(''):'<div class="meta">没有可见项目。隐藏项目可通过 include_hidden=true 的 API 恢复。</div>';if(!selected){document.getElementById('project-title').textContent='项目';document.getElementById('project-path').textContent='';document.getElementById('project-workflows').innerHTML='<div class="meta">未选择项目。</div>';document.getElementById('project-tasks').innerHTML='';document.getElementById('timeline').innerHTML='<div class="meta">未选择任务。</div>';document.getElementById('artifacts-center').innerHTML='<div class="meta">暂无产物。</div>';document.getElementById('project-config').innerHTML='';return;}document.getElementById('project-title').textContent=selected.name;document.getElementById('project-path').textContent=selected.path;renderProjectWorkflows(selected);renderProjectTasks(selected);renderProjectConfig(selected.config||{});}
+function renderProjectWorkflows(project){document.getElementById('project-workflows').innerHTML='<h2>任务看板</h2>'+((project.workflows||[]).map(w=>`<section><h2>${esc(w.name||w.id)}</h2><div class="meta">${esc(w.stage_count)} 个阶段 | ${esc(w.task_count)} 个任务</div><div class="board">${(w.role_groups||[]).map(g=>`<div class="column"><h3>${esc(g.role)} <span>${(g.tasks||[]).length}</span></h3>${(g.tasks||[]).map(taskCard).join('')||'<div class="meta">暂无任务。</div>'}</div>`).join('')}</div></section>`).join('')||'<div class="meta">暂无工作流。</div>');}
+function renderProjectTasks(project){const tasks=[];(project.workflows||[]).forEach(w=>(w.role_groups||[]).forEach(g=>(g.tasks||[]).forEach(t=>tasks.push(t))));document.getElementById('project-tasks').innerHTML=tasks.length?tasks.map(taskCard).join(''):'<div class="meta">暂无任务。</div>';}
+function fmtDuration(s){s=Number(s||0);if(!s)return '-';const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=Math.floor(s%60);if(h)return `${h}h ${m}m`;if(m)return `${m}m ${sec}s`;return `${sec}s`;}
+function taskCard(t){const err=t.error_summary||{};const reason=err.message||err.type||'';return `<div class="task-card ${t.hidden?'hidden':''}" tabindex="0" onclick="state.taskId='${esc(t.task_id)}';refresh()"><strong>${esc(t.title||t.task_id)}</strong> <span class="${statusClass(t.status)}">${esc(statusText(t.status))}</span>${t.hidden?'<span class="status">已隐藏</span>':''}<div class="meta">${esc(t.provider||'-')} | 阶段=${esc(t.current_stage||'-')} | 工作流=${esc(t.workflow||'-')} | 用时=${fmtDuration(t.elapsed_seconds)}</div>${t.current_activity?`<div class="meta">${esc(t.current_activity)}</div>`:''}<div class="hover-detail"><div class="meta">阶段用时=${fmtDuration(t.current_stage_elapsed_seconds)} 成本=${esc(t.cost_usd||0)} tokens=${esc(t.tokens||0)} 审批=${esc(t.pending_approvals||0)} 操作=${esc(t.pending_provider_actions||0)}</div>${reason?`<div class="meta">错误=${esc(err.stage_id||'run')} ${esc(err.type||'')}: ${esc(err.message||'')}</div>`:''}<div class="actions">${t.recover_endpoint?`<button class="primary" onclick="post('${esc(t.recover_endpoint).replace('/api','')}');event.stopPropagation()">恢复</button>`:''}<button onclick="loadText('${esc(t.report_endpoint||'').replace('/api','')}','events');event.stopPropagation()">报告</button><button onclick="loadText('${esc(t.diff_endpoint||'').replace('/api','')}','events');event.stopPropagation()">Diff</button><button onclick="hideTask(event,'${esc(t.task_id)}')">隐藏</button></div></div></div>`;}
+function renderProjectConfig(config){document.getElementById('project-config').innerHTML=`<div class="metrics"><div class="card"><h3>运行档</h3><strong>${esc(config.profile||'-')}</strong><div class="meta">gate=${esc(config.gate||'-')}</div></div><div class="card"><h3>审批</h3><strong>${esc(config.approvals?.pending||0)}</strong><div class="meta">项目待审批门禁</div></div></div>${tableBlock('角色',Object.entries(config.roles||{}).map(([role,value])=>({role,value})),['role','value'])}${tableBlock('技能',config.skills||[],['name','source','trust'])}`;}
+function renderGlobalConfig(config){renderMcpSummary(config.mcp||{});document.getElementById('role-templates').innerHTML=tableBlock('角色模板',config.role_templates||[],['name','workflow','roles','providers']);const templates=config.workflow_templates||{};document.getElementById('workflow-templates').innerHTML=tableBlock('工作流模板',templates.templates||[],['name','description','phases','supported_providers']);const skills=config.skills_catalog||{};document.getElementById('skills-catalog').innerHTML=tableBlock('技能目录',(skills.catalog||{}).skills||[],['name','trust','risk_level','source','description'])+tableBlock('技能锁',(skills.lock||{}).skills||[],['name','status']);}
+function renderMcpSummary(mcp){const rows=[['状态',mcp.status||'enabled'],['模式',mcp.mode||'local stdio'],['工具',mcp.tools_count??0],['资源',mcp.resources_count??0],['提示词',mcp.prompts_count??0],['写入策略',mcp.write_policy||'guarded'],['护栏',(mcp.recent_guardrails||[]).length],['近期拒绝',mcp.recent_denials??0]];const commands=mcp.commands||{};document.getElementById('mcp-summary').innerHTML=`<div class="metrics">${rows.map(([a,b])=>`<div class="card metric"><h3>${esc(a)}</h3><strong>${esc(b)}</strong></div>`).join('')}</div><div class="actions"><button onclick="copyText('${esc(commands.manifest||'muxdev mcp manifest --json')}')">复制 Manifest</button><button onclick="copyText('${esc(commands.doctor||'muxdev mcp doctor --json')}')">复制 Doctor</button></div>${(mcp.recent_guardrails||[]).length?tableBlock('近期护栏',mcp.recent_guardrails||[],['tool','decision','reason','created_at']):'<div class="meta">暂无近期 MCP 护栏。</div>'}`;}
+function renderSelectedTask(payload,center){if(!payload){document.getElementById('timeline').innerHTML='<div class="meta">未选择任务。</div>';document.getElementById('artifacts-center').innerHTML='<div class="meta">暂无产物。</div>';return;}const stages=payload.stages||[];document.getElementById('timeline').innerHTML=stages.length?stages.map(s=>`<div class="timeline-step"><strong>${esc(s.stage_id)}</strong> <span class="${statusClass(s.status)}">${esc(statusText(s.status))}</span><div>${esc(s.summary||'')}</div></div>`).join(''):'<div class="meta">暂无阶段时间线。</div>';document.getElementById('artifacts-center').innerHTML=tableBlock('最终报告 / 产物',payload.artifacts||[],['name','kind','stage_id','path','created_at'])+tableBlock('测试输出',payload.test_results||[],['stage_id','passed','command','summary'])+tableBlock('证据评估',payload.evidence_evaluations||[],['run_id','label','confidence','path']);}
+function renderApprovals(rows){document.getElementById('approvals').innerHTML=rows.length?rows.map(r=>`<div class="action-card"><h3>需要审批</h3><strong>${esc(r.type||'policy gate')}</strong><div>${esc(r.reason||'')}</div><div class="actions"><button class="primary" onclick="post('/approvals/${encodeURIComponent(r.approval_id)}/approve')">批准</button><button onclick="post('/approvals/${encodeURIComponent(r.approval_id)}/deny')">拒绝</button></div></div>`).join(''):'<div class="meta">暂无待审批项。</div>';}
+function renderProviderActions(rows){document.getElementById('provider-actions').innerHTML=rows.length?rows.map(r=>{const choices=r.choices||r.options||[];const field='action-response-'+String(r.action_id||'').replace(/[^a-zA-Z0-9_-]/g,'-');const choiceButtons=choices.map(c=>{const payload=encodeURIComponent(JSON.stringify({choice:String(c.value??c.label??'')}));return `<button onclick="respondProviderAction('${esc(r.run_id)}','${esc(r.action_id)}','${esc(payload)}')">${esc(c.label??c.value)}</button>`;}).join('');const textBox=(r.input_kind==='text'||!choices.length&&r.input_kind!=='external'&&r.input_kind!=='confirmation')?`<textarea id="${esc(field)}" rows="2" placeholder="请输入响应"></textarea><button onclick="respondProviderActionText('${esc(r.run_id)}','${esc(r.action_id)}','${esc(field)}')">提交响应</button>`:'';return `<div class="action-card"><h3>Provider 需要操作</h3><strong>${esc(r.provider||'provider')} / ${esc(r.input_kind||r.kind||'action')}</strong><p>${esc(r.prompt_text||'')}</p><div class="meta">默认=${esc(r.default_choice||'-')} 自动策略=${esc(r.auto_policy||'manual')}</div><div class="actions">${choiceButtons}${textBox}<button onclick="copyText('${esc(r.attach_command||'')}')">复制 attach 命令</button><button class="primary" onclick="post('/tasks/${encodeURIComponent(r.run_id)}/actions/${encodeURIComponent(r.action_id)}/handled-and-continue')">已处理并继续</button></div></div>`;}).join(''):'<div class="meta">暂无待处理 Provider 操作。</div>';}
+function tableBlock(title,rows,cols){rows=rows||[];if(!rows.length)return `<h3>${esc(title)}</h3><div class="meta">暂无记录。</div>`;return `<h3>${esc(title)}</h3><table><thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${cols.map(c=>tableCell(r,c)).join('')}</tr>`).join('')}</tbody></table>`;}
 function tableCell(r,c){const v=c==='path'&&r.path_display?r.path_display:r[c];const title=c==='path'&&r.path_title?` title="${esc(r.path_title)}"`:'';return `<td${title}>${esc(fmt(v))}</td>`;}
+async function respondProviderAction(runId,actionId,encoded){const response=JSON.parse(decodeURIComponent(encoded));await api('/tasks/'+encodeURIComponent(runId)+'/actions/'+encodeURIComponent(actionId)+'/respond-and-continue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({response})});await refresh();}
+async function respondProviderActionText(runId,actionId,fieldId){const text=(document.getElementById(fieldId)?.value||'').trim();if(!text){document.getElementById('daemon-status').textContent='响应为空';return;}await api('/tasks/'+encodeURIComponent(runId)+'/actions/'+encodeURIComponent(actionId)+'/respond-and-continue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({response:{text}})});await refresh();}
 async function post(path){await api(path,{method:'POST'});await refresh();}
-async function hideProject(event,id){event.stopPropagation();if(!confirm('Hide this project from Mission Control? This does not delete the workspace, runs, evidence, or files.'))return;await api('/dashboard/projects/'+encodeURIComponent(id),{method:'DELETE'});if(state.selectedProjectId===id){state.selectedProjectId=null;state.taskId=null;}await refresh();}
+async function hideProject(event,id){event.stopPropagation();if(!confirm('从控制台隐藏这个项目？不会删除工作区、运行记录、证据或文件。'))return;await api('/dashboard/projects/'+encodeURIComponent(id),{method:'DELETE'});if(state.selectedProjectId===id){state.selectedProjectId=null;state.taskId=null;}await refresh();}
+async function hideTask(event,id){event.stopPropagation();if(!confirm('隐藏这个任务提醒？不会删除运行记录、证据或文件。'))return;await api('/dashboard/tasks/'+encodeURIComponent(id),{method:'DELETE'});if(state.taskId===id)state.taskId=null;await refresh();}
 async function loadText(path,target){const payload=await api(path);document.getElementById(target==='events'?'events':target).textContent=payload[target]||payload.content||payload.diff||JSON.stringify(payload,null,2);}
 async function copyText(v){if(navigator.clipboard&&v)await navigator.clipboard.writeText(v);}
-function connectEvents(){const socket=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/events`);socket.onmessage=e=>{state.events.push(e.data);state.events=state.events.slice(-20);document.getElementById('events').textContent=state.events.join('\n');refresh().catch(()=>{});};socket.onclose=()=>setTimeout(connectEvents,2000);}
+function connectEvents(){const socket=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/events`);socket.onmessage=e=>{state.events.push(e.data);state.events=state.events.slice(-20);document.getElementById('events').textContent=state.events.join(String.fromCharCode(10));refresh().catch(()=>{});};socket.onclose=()=>setTimeout(connectEvents,2000);}
 refresh().catch(e=>document.getElementById('daemon-status').textContent=e.message);connectEvents();setInterval(()=>refresh().catch(()=>{}),5000);
 </script>
 </body>

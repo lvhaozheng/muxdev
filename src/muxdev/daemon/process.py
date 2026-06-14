@@ -22,7 +22,7 @@ def daemon_status(paths: DaemonPaths | None = None) -> dict[str, Any]:
     pid = read_pid(paths.pid_path)
     alive = pid is not None and is_pid_alive(pid)
     if pid is not None and not alive:
-        paths.pid_path.unlink(missing_ok=True)
+        _unlink_pid_file(paths.pid_path)
     return {
         "running": alive,
         "pid": pid if alive else None,
@@ -55,6 +55,19 @@ def start_daemon(
             "api_url": f"http://{host}:{api_port}",
             "health": health,
         }
+    occupied_pids = _listening_pids_for_ports({api_port, ui_port})
+    if occupied_pids:
+        return {
+            **current,
+            "running": False,
+            "started": False,
+            "dashboard_url": f"http://{host}:{ui_port}",
+            "api_url": f"http://{host}:{api_port}",
+            "health": health,
+            "error": "port_conflict",
+            "message": f"ports {api_port}/{ui_port} are already in use; stop the owning process or choose different ports",
+            "pids": occupied_pids,
+        }
 
     command = [
         sys.executable,
@@ -82,7 +95,7 @@ def start_daemon(
     health = wait_for_daemon_health(host=host, api_port=api_port, process=process)
     running = process.poll() is None
     if not running:
-        paths.pid_path.unlink(missing_ok=True)
+        _unlink_pid_file(paths.pid_path)
     return {
         "running": running,
         "started": running,
@@ -106,20 +119,28 @@ def stop_daemon(
 ) -> dict[str, Any]:
     paths = (paths or default_daemon_paths()).ensure()
     pid = read_pid(paths.pid_path)
+    port_pids = _listening_pids_for_ports({api_port, ui_port})
     stopped_pids: list[int] = []
     if pid is not None and is_pid_alive(pid):
         _terminate_pid(pid)
         stopped_pids.append(pid)
     else:
-        paths.pid_path.unlink(missing_ok=True)
-        if daemon_health(host=host, api_port=api_port).get("ok"):
-            for owner in _listening_pids_for_ports({api_port, ui_port}):
-                _terminate_pid(owner)
-                stopped_pids.append(owner)
+        _unlink_pid_file(paths.pid_path)
+    for owner in port_pids:
+        if owner in stopped_pids:
+            continue
+        _terminate_pid(owner)
+        stopped_pids.append(owner)
     if stopped_pids:
         wait_for_daemon_stop(host=host, api_port=api_port)
-    paths.pid_path.unlink(missing_ok=True)
-    return {"running": False, "stopped": bool(stopped_pids), "pid": pid if pid in stopped_pids else None, "pids": stopped_pids}
+    _unlink_pid_file(paths.pid_path)
+    return {
+        "running": False,
+        "stopped": bool(stopped_pids),
+        "pid": pid if pid in stopped_pids else None,
+        "pids": stopped_pids,
+        "port_pids": port_pids,
+    }
 
 
 def read_pid(path: Path) -> int | None:
@@ -127,6 +148,13 @@ def read_pid(path: Path) -> int | None:
         return int(path.read_text(encoding="utf-8").strip())
     except Exception:
         return None
+
+
+def _unlink_pid_file(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def is_pid_alive(pid: int) -> bool:

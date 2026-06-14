@@ -103,6 +103,11 @@ class WorkflowStage(BaseModel):
     output_schema: str | None = None
     when: str | None = None
     max_loops: int | None = None
+    approval_type: str | None = None
+    approval_reason: str | None = None
+    loop_review_stage: str | None = None
+    loop_reset_stages: list[str] = Field(default_factory=list)
+    loop_restart_stage: str | None = None
     prompt: str | None = None
     prompt_template: str | None = None
     default_skills: list[str] = Field(default_factory=list)
@@ -124,3 +129,30 @@ class TraceEvent(BaseModel):
     run_id: str | None = None
     stage: str | None = None
     data: dict[str, Any] = Field(default_factory=dict)
+
+
+from .validation import ComparisonReport, StrategyRun, ValidationCase, ValidationExperiment, ValidationMetric, ValidationSuite  # noqa: E402
+
+
+__all__ = [
+    "ApprovalStatus",
+    "ComparisonReport",
+    "PlanArtifact",
+    "PolicyDecision",
+    "ProviderActionKind",
+    "ProviderActionStatus",
+    "ReviewBlocker",
+    "ReviewResult",
+    "RunStatus",
+    "StageStatus",
+    "StrategyRun",
+    "TestResult",
+    "TraceEvent",
+    "ValidationCase",
+    "ValidationExperiment",
+    "ValidationMetric",
+    "ValidationSuite",
+    "WorkflowDefinition",
+    "WorkflowStage",
+    "utc_now",
+]

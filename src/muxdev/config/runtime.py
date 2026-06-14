@@ -41,6 +41,7 @@ GATES = {
 WORKFLOW_ALIASES = {
     "design": "design",
     "design-lite": "design-lite",
+    "design-v2": "design-v2",
     "dev": "dev",
     "fix": "fix",
     "refactor": "dev",

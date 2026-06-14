@@ -68,6 +68,12 @@ def write_context_packet(
             for row in blackboard.table_rows("provider_attempts", run_id=run_id)
             if row.get("stage_id") == stage_id
         ],
+        provider_action_responses=[
+            _provider_action_response(row)
+            for row in blackboard.list_provider_actions(run_id=run_id)
+            if row.get("status") == "handled" and row.get("response") is not None
+        ],
+        review_blockers=blackboard.table_rows("review_blockers", run_id=run_id),
     )
     body = redact(json.dumps(packet, ensure_ascii=False, indent=2, sort_keys=True))
     digest = sha256_text(body)
@@ -102,6 +108,8 @@ def build_context_packet(
     skills: list[dict[str, object]],
     automation: dict[str, object],
     provider_attempts: list[dict[str, object]],
+    provider_action_responses: list[dict[str, object]] | None = None,
+    review_blockers: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     memory_items = _context_memory_items(automation)
     grouped = _memory_by_layer(memory_items)
@@ -120,9 +128,11 @@ def build_context_packet(
             "worktree": str(worktree),
             "previous_attempts": provider_attempts,
             "skills": [skill.get("name") for skill in skills if isinstance(skill, dict)],
+            "provider_action_responses": provider_action_responses or [],
         },
         "run": {
             "task_memory": grouped.get("run", []),
+            "review_blockers": review_blockers or [],
         },
         "branch": {
             "feature_memory": grouped.get("branch", []),
@@ -190,6 +200,18 @@ def _context_memory_items(automation: dict[str, object]) -> list[dict[str, objec
             }
         )
     return result
+
+
+def _provider_action_response(row: dict[str, object]) -> dict[str, object]:
+    return {
+        "action_id": row.get("action_id"),
+        "stage_id": row.get("stage_id"),
+        "provider": row.get("provider"),
+        "kind": row.get("kind"),
+        "input_kind": row.get("input_kind"),
+        "prompt_text": row.get("prompt_text"),
+        "response": row.get("response"),
+    }
 
 
 def _memory_by_layer(memory_items: list[dict[str, object]]) -> dict[str, list[dict[str, object]]]:

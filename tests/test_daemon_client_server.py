@@ -74,7 +74,7 @@ def test_daemon_api_task_lifecycle_and_websocket() -> None:
     assert report["path"].startswith(str(project_run_dir))
     assert attach["handoff"]["command"]
     assert rollback["status"] in {"rolled_back", "failed"}
-    assert "<title>muxdev Mission Control</title>" in page
+    assert "<title>muxdev 控制台</title>" in page
     assert hello["type"] == "hello"
 
 
@@ -115,33 +115,41 @@ def test_live_dashboard_renders_mission_control_sections() -> None:
 
     html = render_live_dashboard_html("run_demo")
 
-    assert "muxdev Mission Control" in html
-    assert "Projects" in html
-    assert "Global Config" in html
-    assert "Workflows" in html
-    assert "Tasks" in html
-    assert "Activity" in html
-    assert "Artifacts" in html
-    assert "Config" in html
-    assert "Current Status" in html
-    assert "Action Center" in html
+    assert "muxdev 控制台" in html
+    assert "项目" in html
+    assert "全局配置" in html
+    assert "工作流" in html
+    assert "任务" in html
+    assert "动态" in html
+    assert "产物" in html
+    assert "配置" in html
+    assert "当前状态" in html
+    assert "行动中心" in html
+    assert "compact-action-center" in html
+    assert "展开详情" in html
+    assert "submitPlanFeedback" in html
+    assert "补充约束、修正或偏好" in html
     assert "MCP" in html
     assert "local stdio" in html
-    assert "tools" in html
-    assert "guarded writes" in html
+    assert "工具" in html
+    assert "写入策略" in html
     assert "tab-mcp" not in html
-    assert "Task Board" in html
-    assert "Task Timeline" in html
-    assert "Provider Action Wizard" in html
-    assert "Approval Risk Review" in html
-    assert "Evidence / Artifacts Center" in html
+    assert "任务看板" in html
+    assert "任务时间线" in html
+    assert "Provider 操作" in html
+    assert "审批风险" in html
+    assert "证据 / 产物中心" in html
     assert "project-name" in html
     assert "project-path" in html
     assert "project-hide" in html
     assert "hover-detail" in html
     assert "/dashboard/overview" in html
-    assert "Copy attach command" in html
-    assert "Mark handled and continue" in html
+    assert "复制 attach 命令" in html
+    assert "提交响应" in html
+    assert "已处理并继续" in html
+    assert "/dashboard/tasks/" in html
+    assert "String.fromCharCode(10)" in html
+    assert "state.events.join('\n')" not in html
 
 
 def test_dashboard_overview_groups_projects_workflows_roles(monkeypatch) -> None:
@@ -163,10 +171,13 @@ def test_dashboard_overview_groups_projects_workflows_roles(monkeypatch) -> None
                 board.create_run(run_id=run_id, task=task, workflow="dev", provider="mock", workspace=project, worktree=project / ".muxdev" / run_id)
                 board.set_run_status(run_id, "running")
                 board.upsert_stage(run_id, "code", role="code", status="running", summary="coding")
+                if run_id == "run_dash_2":
+                    board.add_error(run_id, "code", "provider_exit", "temporary network error")
 
         monkeypatch.setattr(web_module, "_provider_health_payload", lambda: {"ready": ["mock"], "partial": [], "unavailable": [], "total": 1, "providers": []})
         client = TestClient(create_app(task_manager=manager))
         payload = client.get("/api/dashboard/overview", params={"workspace": str(project)}).json()
+        light_payload = client.get("/api/dashboard/overview", params={"workspace": str(project), "include_global_config": "false"}).json()
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 
@@ -178,10 +189,20 @@ def test_dashboard_overview_groups_projects_workflows_roles(monkeypatch) -> None
     assert {task["task_id"] for task in code_group["tasks"]} == {"run_dash_1", "run_dash_2"}
     first = next(task for task in code_group["tasks"] if task["task_id"] == "run_dash_1")
     assert first["diff_endpoint"] == "/api/tasks/run_dash_1/diff"
+    assert first["current_activity"] == "running stage code"
+    assert first["elapsed_seconds"] is not None
+    assert first["stage_timeline"][0]["elapsed_seconds"] is not None
+    failed = next(task for task in code_group["tasks"] if task["task_id"] == "run_dash_2")
+    assert failed["error_summary"]["message"] == "temporary network error"
+    recovery = next(item for item in payload["action_center"] if item["kind"] == "recovery")
+    assert recovery["endpoint"] == "/api/tasks/run_dash_2/continue"
+    assert "temporary network error" in recovery["why"]
     assert payload["global_config"]["role_templates"]
     assert "plugin_market" not in payload["global_config"]
     assert payload["global_config"]["workflow_templates"]["templates"]
     assert "catalog" in payload["global_config"]["skills_catalog"]
+    assert light_payload["global_config"] == {}
+    assert light_payload["global_config_deferred"] is True
     mcp = payload["global_config"]["mcp"]
     assert mcp["status"] == "enabled"
     assert mcp["mode"] == "local stdio"
@@ -215,6 +236,7 @@ def test_dashboard_project_hide_and_restore(monkeypatch) -> None:
                 prompt_text="Continue project a?",
                 options=[],
             )
+            board.add_error("run_project_a", "code", "provider_exit", "project a failed")
 
         monkeypatch.setattr(web_module, "_provider_health_payload", lambda: {"ready": ["mock"], "partial": [], "unavailable": [], "total": 1, "providers": []})
         client = TestClient(create_app(task_manager=manager))
@@ -234,10 +256,47 @@ def test_dashboard_project_hide_and_restore(monkeypatch) -> None:
     assert project_id not in {project["id"] for project in after["projects"]}
     assert after["pending_approvals"] == []
     assert after["pending_provider_actions"] == []
+    assert not any(item.get("project_id") == project_id for item in after["action_center"])
     hidden_row = next(project for project in with_hidden["projects"] if project["id"] == project_id)
     assert hidden_row["hidden"] is True
     assert restored["hidden"] is False
     assert project_id in {project["id"] for project in final["projects"]}
+
+
+def test_dashboard_task_hide_filters_action_center_without_hiding_project(monkeypatch) -> None:
+    workspace = _workspace_temp("dashboard-task-hide")
+    try:
+        import muxdev.api.web as web_module
+
+        project = workspace / "project-a"
+        project.mkdir(parents=True)
+        manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())
+        with manager.board() as board:
+            board.create_run(run_id="run_visible", task="keep visible", workflow="dev", provider="mock", workspace=project, worktree=project / ".muxdev" / "visible")
+            board.set_run_status("run_visible", "running")
+            board.create_run(run_id="run_failed", task="hide failed", workflow="dev", provider="mock", workspace=project, worktree=project / ".muxdev" / "failed")
+            board.set_run_status("run_failed", "blocked")
+            board.add_error("run_failed", "code", "provider_exit", "temporary network error")
+
+        monkeypatch.setattr(web_module, "_provider_health_payload", lambda: {"ready": ["mock"], "partial": [], "unavailable": [], "total": 1, "providers": []})
+        client = TestClient(create_app(task_manager=manager))
+        before = client.get("/api/dashboard/overview", params={"workspace": str(project)}).json()
+        hidden = client.delete("/api/dashboard/tasks/run_failed", params={"workspace": str(project)}).json()
+        after = client.get("/api/dashboard/overview", params={"workspace": str(project)}).json()
+        with_hidden = client.get("/api/dashboard/overview", params={"workspace": str(project), "include_hidden": "true"}).json()
+        restored = client.post("/api/dashboard/tasks/run_failed/restore").json()
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    project_id = before["projects"][0]["id"]
+    assert hidden["hidden"] is True
+    assert hidden["project_id"] == project_id
+    assert after["projects"][0]["id"] == project_id
+    assert _dashboard_task_ids(after) == {"run_visible"}
+    assert not any(item.get("task_id") == "run_failed" for item in after["action_center"])
+    hidden_card = next(task for task in _dashboard_tasks(with_hidden) if task["task_id"] == "run_failed")
+    assert hidden_card["hidden"] is True
+    assert restored["hidden"] is False
 
 
 def test_dashboard_provider_health_uses_cache_without_probe(monkeypatch) -> None:
@@ -373,16 +432,20 @@ def test_daemon_provider_actions_api_and_continue_wait(monkeypatch) -> None:
         task_ux = client.get("/api/tasks/run_provider_action/ux").json()
         overview = client.get("/api/ux/overview").json()
         continued = client.post("/api/tasks/run_provider_action/continue").json()
+        responded = client.post(f"/api/provider-actions/{action_id}/response", json={"choice": "y"}).json()
         handled = client.post(f"/api/tasks/run_provider_action/actions/{action_id}/handled-and-continue").json()
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 
     assert listed[0]["action_id"] == action_id
     assert task_listed[0]["options"][0]["label"] == "Yes"
+    assert task_listed[0]["input_kind"] == "confirmation"
+    assert task_listed[0]["choices"][0]["label"] == "Yes"
     assert detail["ux"]["user_state"] == "needs_action"
     assert task_ux["next_actions"][1]["kind"] == "mark_handled_continue"
     assert overview["action_center"][0]["kind"] == "provider_action"
     assert continued["status"] == "awaiting_provider_action"
+    assert responded["response"] == {"choice": "y"}
     assert handled["action"]["status"] == str(ProviderActionStatus.HANDLED)
     assert handled["continue"]["status"] == "continue_requested"
 
@@ -457,6 +520,9 @@ def test_cli_task_commands_use_daemon_client(monkeypatch) -> None:
         def provider_action_handled(self, action_id: str) -> dict[str, object]:
             return {"action_id": action_id, "run_id": "task-1", "status": "handled"}
 
+        def provider_action_response(self, action_id: str, response: object) -> dict[str, object]:
+            return {"action_id": action_id, "run_id": "task-1", "status": "handled", "response": response}
+
         def provider_action_dismiss(self, action_id: str) -> dict[str, object]:
             return {"action_id": action_id, "run_id": "task-1", "status": "dismissed"}
 
@@ -487,6 +553,7 @@ def test_cli_task_commands_use_daemon_client(monkeypatch) -> None:
     approve = runner.invoke(app, ["approve", "appr-1", "--json"])
     actions = runner.invoke(app, ["actions", "--json"])
     handled = runner.invoke(app, ["action", "handled", "pact-1", "--json"])
+    responded = runner.invoke(app, ["action", "respond", "pact-1", "--choice", "yes", "--json"])
 
     assert run.exit_code == 0
     assert json.loads(run.stdout)["task_id"] == "task-1"
@@ -500,6 +567,8 @@ def test_cli_task_commands_use_daemon_client(monkeypatch) -> None:
     assert json.loads(actions.stdout)[0]["action_id"] == "pact-1"
     assert handled.exit_code == 0
     assert json.loads(handled.stdout)["status"] == "handled"
+    assert responded.exit_code == 0
+    assert json.loads(responded.stdout)["response"] == {"choice": "yes"}
 
 
 def test_daemon_status_uses_pid_file_without_repo_state() -> None:
@@ -555,6 +624,7 @@ def test_start_daemon_uses_hidden_windows_subprocess_kwargs(monkeypatch) -> None
     try:
         paths = default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure()
         monkeypatch.setattr(process_module, "daemon_health", lambda **kwargs: {"ok": False})
+        monkeypatch.setattr(process_module, "_listening_pids_for_ports", lambda ports: [])
         monkeypatch.setattr(process_module, "wait_for_daemon_health", lambda **kwargs: {"ok": True})
         monkeypatch.setattr(process_module.subprocess, "Popen", fake_popen)
         payload = start_daemon(paths=paths)
@@ -567,6 +637,29 @@ def test_start_daemon_uses_hidden_windows_subprocess_kwargs(monkeypatch) -> None
         assert int(kwargs["creationflags"]) & subprocess.CREATE_NO_WINDOW
         assert not (int(kwargs["creationflags"]) & getattr(subprocess, "DETACHED_PROCESS", 0))
         assert kwargs["startupinfo"].wShowWindow == getattr(subprocess, "SW_HIDE", 0)
+
+
+def test_start_daemon_reports_port_conflict_without_spawning(monkeypatch) -> None:
+    import muxdev.daemon.process as process_module
+
+    workspace = _workspace_temp("process-port-conflict")
+    try:
+        paths = default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure()
+        monkeypatch.setattr(process_module, "daemon_health", lambda **kwargs: {"ok": False, "error": "connection refused"})
+        monkeypatch.setattr(process_module, "_listening_pids_for_ports", lambda ports: [24680])
+
+        def fail_popen(*args, **kwargs):  # pragma: no cover - should never be reached
+            raise AssertionError("start_daemon should not spawn when dashboard ports are occupied")
+
+        monkeypatch.setattr(process_module.subprocess, "Popen", fail_popen)
+        payload = process_module.start_daemon(paths=paths, api_port=8788, ui_port=8787)
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    assert payload["running"] is False
+    assert payload["started"] is False
+    assert payload["error"] == "port_conflict"
+    assert payload["pids"] == [24680]
 
 
 def test_stop_daemon_can_stop_health_only_daemon_by_port(monkeypatch) -> None:
@@ -589,6 +682,29 @@ def test_stop_daemon_can_stop_health_only_daemon_by_port(monkeypatch) -> None:
     assert payload["stopped"] is True
     assert payload["pids"] == [24680]
     assert killed == [24680]
+
+
+def test_stop_daemon_stops_pid_and_dashboard_port_owner(monkeypatch) -> None:
+    import muxdev.daemon.process as process_module
+
+    workspace = _workspace_temp("process-stop-port-owner")
+    killed: list[int] = []
+    try:
+        paths = default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure()
+        paths.pid_path.write_text("13579", encoding="utf-8")
+        monkeypatch.setattr(process_module, "is_pid_alive", lambda pid: pid == 13579)
+        monkeypatch.setattr(process_module, "_listening_pids_for_ports", lambda ports: [24680])
+        monkeypatch.setattr(process_module, "_terminate_pid", lambda pid: killed.append(pid))
+        monkeypatch.setattr(process_module, "wait_for_daemon_stop", lambda **kwargs: True)
+
+        payload = process_module.stop_daemon(paths=paths, api_port=8788, ui_port=8787)
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    assert payload["stopped"] is True
+    assert payload["pids"] == [13579, 24680]
+    assert payload["port_pids"] == [24680]
+    assert killed == [13579, 24680]
 
 
 def _wait_for_terminal(client: TestClient, task_id: str) -> str:
@@ -624,6 +740,25 @@ def _detail_payload(task_id: str) -> dict[str, object]:
         "trace": [],
         "summary": {"tokens": 0, "cost_usd": 0.0},
     }
+
+
+def _dashboard_tasks(payload: dict[str, object]) -> list[dict[str, object]]:
+    tasks: list[dict[str, object]] = []
+    for project in payload.get("projects", []):
+        if not isinstance(project, dict):
+            continue
+        for workflow in project.get("workflows", []):
+            if not isinstance(workflow, dict):
+                continue
+            for group in workflow.get("role_groups", []):
+                if not isinstance(group, dict):
+                    continue
+                tasks.extend(task for task in group.get("tasks", []) if isinstance(task, dict))
+    return tasks
+
+
+def _dashboard_task_ids(payload: dict[str, object]) -> set[str]:
+    return {str(task.get("task_id") or task.get("run_id") or "") for task in _dashboard_tasks(payload)}
 
 
 def _workspace_temp(prefix: str) -> Path:

@@ -82,6 +82,7 @@ def _start_daemon_tui(run_id: str = "latest", *, host: str = DEFAULT_HOST, port:
         "/test": "Submit a test task: /test [options] <task>",
         "/status": "Show task detail: /status [task-id]",
         "/continue": "Continue a task: /continue [task-id]",
+        "/recover": "Recover a failed task: /recover [task-id]",
         "/stop": "Stop a task: /stop [task-id]",
         "/approve": "Approve an item: /approve <approval-id>",
         "/deny": "Deny an item: /deny <approval-id>",
@@ -238,10 +239,11 @@ def _handle_daemon_tui_command(
             payload = client.task(task_id)
             run = payload.get("run", {})
             return daemon_task_detail_text(payload), str(run.get("run_id") or task_id)
-        if text == "/continue" or text.startswith("/continue "):
+        if text == "/continue" or text.startswith("/continue ") or text == "/recover" or text.startswith("/recover "):
             task_id = text.split(maxsplit=1)[1] if " " in text else current_task
             payload = client.continue_task(task_id)
-            return f"{payload.get('task_id')}: {payload.get('status')}", str(payload.get("task_id") or task_id)
+            label = "recover" if text.startswith("/recover") else "continue"
+            return f"{payload.get('task_id')}: {label} {payload.get('status')}", str(payload.get("task_id") or task_id)
         if text == "/stop" or text.startswith("/stop "):
             task_id = text.split(maxsplit=1)[1] if " " in text else current_task
             payload = client.stop_task(task_id)

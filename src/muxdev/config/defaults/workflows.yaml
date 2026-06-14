@@ -55,6 +55,38 @@ workflows:
         role: architect
         deps: []
         read_only: true
+  design-v2:
+    name: design-v2
+    max_parallel: 1
+    stages:
+      - id: design
+        role: architect
+        deps: []
+        read_only: true
+        output_schema: PlanArtifact
+      - id: design_review
+        role: review
+        deps: [design]
+        read_only: true
+        output_schema: ReviewResult
+      - id: design_revise
+        role: architect
+        deps: [design_review]
+        read_only: true
+        when: design_review.has_blockers && loop < max_loops
+        max_loops: 2
+        loop_review_stage: design_review
+        loop_reset_stages: [design_review, design_revise]
+        loop_restart_stage: design_review
+      - id: human_design_approval
+        type: human_gate
+        deps: [design_review, design_revise]
+        approval_type: design
+        approval_reason: approve reviewed design contract
+      - id: memory_proposals
+        role: memory_curator
+        deps: [human_design_approval]
+        read_only: true
   dev:
     name: dev
     max_parallel: 1

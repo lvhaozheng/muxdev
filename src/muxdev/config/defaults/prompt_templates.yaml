@@ -42,3 +42,29 @@ prompt_templates:
       Return whether verification passed, the command or method used, and a short summary. If tests were not run, say why.
     ReviewResult: |
       Return whether blockers exist. Each blocker should include type, severity, file or line when known, and a concrete suggestion.
+  stages:
+    design-lite:
+      design_brief: |
+        This is a user-facing design task. If the task does not specify the desired style, target users, platform/device priorities, references, constraints, or non-goals, ask the user through your native CLI/session interaction before producing the final design. muxdev should only pass through your prompt; do not assume muxdev will ask these questions for you.
+
+        If you are running headless and cannot directly ask the user, emit a clear provider action / external confirmation prompt that muxdev can surface, for example: "waiting_external_confirmation: Please confirm target users, visual style, reference products, platform/device priorities, and anything to avoid."
+
+        After the necessary preferences are available, return a clean final JSON object with:
+        - summary
+        - design_doc.problem_statement
+        - design_doc.user_preferences or design_doc.unconfirmed_items
+        - design_doc.acceptance_criteria
+        - design_doc.proposed_design
+        - design_doc.state_model when relevant
+        - design_doc.data_flow when relevant
+        - design_doc.implementation_sequence
+        - design_doc.risks_and_mitigations
+        - design_doc.open_questions when anything remains unclear
+    design-v2:
+      design: |
+        This is a user-facing design task. Use provider-native interaction to ask for missing style, audience, reference, platform, and constraint preferences before finalizing the design. In headless mode, emit a muxdev-detectable provider action / external confirmation prompt instead of silently assuming those preferences.
+
+        The final answer must include a structured design_doc JSON object. If preferences are still missing, list them under design_doc.unconfirmed_items and design_doc.open_questions.
+    design:
+      problem_statement: |
+        Start the design workflow by checking whether the user has specified style, audience, reference products, platform/device priorities, constraints, and non-goals. If important preferences are missing, ask through the provider's native CLI/session interaction first. In headless mode, emit a clear provider action / external confirmation prompt that muxdev can surface.

@@ -83,6 +83,9 @@ class WorktreeManager:
             current = Path(directory).resolve()
             for name in names:
                 child = (current / name).resolve()
+                if _looks_like_muxdev_home(child):
+                    ignored.add(name)
+                    continue
                 for target in targets:
                     if child == target or child in target.parents:
                         ignored.add(name)
@@ -105,3 +108,7 @@ class WorktreeManager:
             "\tlogallrefupdates = true\n",
             encoding="utf-8",
         )
+
+
+def _looks_like_muxdev_home(path: Path) -> bool:
+    return (path / "data" / "muxdev.sqlite").exists() or (path / "data" / "muxdev.pid").exists()

@@ -10,7 +10,8 @@ from .. import __version__
 from ..api.web import write_dashboard
 from ..config.runtime import load_runtime_config, provider_cache_path
 from ..models import ApprovalStatus, ProviderActionStatus
-from ..storage import Blackboard, compact_trace, read_trace
+from ..storage import Blackboard, compact_trace, read_recent_trace
+from .progress import enrich_provider_attempts, enrich_stages, progress_summary
 from .ux import build_task_ux_summary
 
 
@@ -82,7 +83,7 @@ def build_run_dashboard_payload(workspace: Path, run_dir: Path, run_id: str, bla
     stages = blackboard.table_rows("stages", run_id=run_id)
     approvals = blackboard.table_rows("approvals", run_id=run_id)
     provider_actions = blackboard.list_provider_actions(run_id=run_id)
-    provider_attempts = blackboard.table_rows("provider_attempts", run_id=run_id)
+    provider_attempts = enrich_provider_attempts(blackboard.table_rows("provider_attempts", run_id=run_id))
     usage = blackboard.table_rows("usage_records", run_id=run_id)
     blockers = blackboard.table_rows("review_blockers", run_id=run_id)
     errors = blackboard.table_rows("error_details", run_id=run_id)
@@ -92,7 +93,7 @@ def build_run_dashboard_payload(workspace: Path, run_dir: Path, run_id: str, bla
     payload = {
         "app": _app_payload(workspace),
         "run": run,
-        "stages": stages,
+        "stages": enrich_stages(stages),
         "agents": blackboard.table_rows("agents", run_id=run_id),
         "approvals": approvals,
         "provider_actions": provider_actions,
@@ -122,8 +123,17 @@ def build_run_dashboard_payload(workspace: Path, run_dir: Path, run_id: str, bla
         "ledger_events": blackboard.table_rows("ledger_events", run_id=run_id),
         "snapshots": blackboard.table_rows("snapshots", run_id=run_id),
         "validator_panels": blackboard.table_rows("validator_panels", run_id=run_id),
-        "trace": compact_trace(read_trace(run_dir))[-50:],
-        "summary": _summary(stages, approvals, provider_actions, usage, blockers, errors, run),
+        "trace": compact_trace(read_recent_trace(run_dir, limit=50)),
+        "summary": {
+            **_summary(stages, approvals, provider_actions, usage, blockers, errors, run),
+            **progress_summary(
+                run=run,
+                stages=enrich_stages(stages),
+                provider_attempts=provider_attempts,
+                approvals=approvals,
+                provider_actions=provider_actions,
+            ),
+        },
     }
     payload["ux"] = build_task_ux_summary(payload)
     return payload

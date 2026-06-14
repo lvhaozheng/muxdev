@@ -13,6 +13,7 @@ from ...config.runtime import GATES, PROFILES, load_runtime_config
 from ...services.product_experience import budget_panel, git_safety_panel, project_context_status, rules_skills_panel
 from ...services.skills import build_skill_catalog, verify_skill_lock
 from ...services.ux import build_ux_overview
+from ...services.validation import list_validation_experiments
 from ...services.workflow_plugins import list_workflow_plugins
 
 
@@ -26,14 +27,19 @@ def build_dashboard_overview(
     provider_health: dict[str, Any],
     ecosystem: dict[str, Any] | None = None,
     hidden_projects: dict[str, dict[str, Any]] | None = None,
+    hidden_tasks: dict[str, dict[str, Any]] | None = None,
     include_hidden: bool = False,
+    include_global_config: bool = True,
 ) -> dict[str, Any]:
     """Return the aggregated project/global view used by the live dashboard."""
     workspace = workspace.resolve()
     ecosystem = ecosystem or {}
     hidden_projects = hidden_projects or {}
-    visible_tasks = tasks if include_hidden else [
-        task for task in tasks if _project_id(_task_workspace(task, workspace)) not in hidden_projects
+    hidden_tasks = hidden_tasks or {}
+    enriched_tasks = [_task_with_dashboard_context(task, workspace, hidden_tasks) for task in tasks]
+    hidden_project_ids = _hidden_project_ids(hidden_projects)
+    visible_tasks = enriched_tasks if include_hidden else [
+        task for task in enriched_tasks if task.get("project_id") not in hidden_project_ids and str(task.get("task_id") or task.get("run_id") or "") not in hidden_tasks
     ]
     visible_task_ids = {str(task.get("task_id") or task.get("run_id") or "") for task in visible_tasks}
     visible_approvals = approvals if include_hidden else [
@@ -49,7 +55,7 @@ def build_dashboard_overview(
         provider_actions=visible_provider_actions,
         selected_task=visible_tasks[0] if visible_tasks else None,
     )
-    projects = _apply_hidden_projects(_projects(workspace, tasks), hidden_projects, include_hidden=include_hidden)
+    projects = _apply_hidden_projects(_projects(workspace, visible_tasks), hidden_projects, include_hidden=include_hidden)
     counts = dict(action_overview["counts"])
     counts["projects"] = len(projects)
     current_project_id = _project_id(workspace)
@@ -64,8 +70,10 @@ def build_dashboard_overview(
         "pending_approvals": visible_approvals,
         "pending_provider_actions": visible_provider_actions,
         "projects": projects,
-        "global_config": _global_config(workspace, visible_tasks, provider_health, ecosystem),
+        "global_config": _global_config(workspace, visible_tasks, provider_health, ecosystem) if include_global_config else {},
+        "global_config_deferred": not include_global_config,
         "artifact_center": action_overview["artifact_center"],
+        "validation": {"experiments": list_validation_experiments(workspace)[:8]},
     }
 
 
@@ -74,18 +82,32 @@ def dashboard_hidden_projects_path(data_dir: Path) -> Path:
     return data_dir / "dashboard_hidden_projects.json"
 
 
+def dashboard_hidden_tasks_path(data_dir: Path) -> Path:
+    """Return the daemon-local hidden task store path."""
+    return data_dir / "dashboard_hidden_tasks.json"
+
+
 def load_hidden_projects(path: Path) -> dict[str, dict[str, Any]]:
     """Read hidden project metadata from a small JSON file."""
+    return _load_hidden_records(path, "projects")
+
+
+def load_hidden_tasks(path: Path) -> dict[str, dict[str, Any]]:
+    """Read hidden task metadata from a small JSON file."""
+    return _load_hidden_records(path, "tasks")
+
+
+def _load_hidden_records(path: Path, key: str) -> dict[str, dict[str, Any]]:
     if not path.exists():
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return {}
-    projects = data.get("projects", data) if isinstance(data, dict) else {}
-    if not isinstance(projects, dict):
+    records = data.get(key, data) if isinstance(data, dict) else {}
+    if not isinstance(records, dict):
         return {}
-    return {str(key): value for key, value in projects.items() if isinstance(value, dict)}
+    return {str(record_key): value for record_key, value in records.items() if isinstance(value, dict)}
 
 
 def hide_dashboard_project(path: Path, project_id: str, *, project: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -110,6 +132,35 @@ def restore_dashboard_project(path: Path, project_id: str) -> dict[str, Any]:
     metadata["hidden"] = False
     metadata["restored_at"] = _utc_now()
     _write_hidden_projects(path, hidden)
+    return metadata
+
+
+def hide_dashboard_task(path: Path, task_id: str, *, task: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Mark one dashboard task hidden without deleting run data."""
+    hidden = load_hidden_tasks(path)
+    metadata = {
+        "id": task_id,
+        "task_id": task_id,
+        "run_id": task_id,
+        "title": (task or {}).get("task_title") or (task or {}).get("title") or (task or {}).get("task") or task_id,
+        "project_id": (task or {}).get("project_id") or "",
+        "project_name": (task or {}).get("project_name") or "",
+        "project_path": (task or {}).get("project_path") or (task or {}).get("workspace") or "",
+        "hidden": True,
+        "hidden_at": _utc_now(),
+    }
+    hidden[task_id] = metadata
+    _write_hidden_tasks(path, hidden)
+    return metadata
+
+
+def restore_dashboard_task(path: Path, task_id: str) -> dict[str, Any]:
+    """Restore a dashboard task that was hidden."""
+    hidden = load_hidden_tasks(path)
+    metadata = hidden.pop(task_id, {"id": task_id, "task_id": task_id, "run_id": task_id})
+    metadata["hidden"] = False
+    metadata["restored_at"] = _utc_now()
+    _write_hidden_tasks(path, hidden)
     return metadata
 
 
@@ -267,7 +318,16 @@ def _task_card(task: dict[str, Any], role: str) -> dict[str, Any]:
         "workflow": task.get("workflow"),
         "provider": task.get("provider"),
         "current_stage": task.get("current_stage") or "",
+        "current_activity": task.get("current_activity") or "",
+        "elapsed_seconds": task.get("elapsed_seconds"),
+        "current_stage_elapsed_seconds": task.get("current_stage_elapsed_seconds"),
+        "latest_provider_attempt": task.get("latest_provider_attempt"),
+        "stage_timeline": task.get("stage_timeline") or [],
         "workspace": task.get("workspace") or "",
+        "project_id": task.get("project_id") or "",
+        "project_name": task.get("project_name") or "",
+        "project_path": task.get("project_path") or "",
+        "hidden": bool(task.get("hidden")),
         "branch": task.get("branch") or task.get("worktree") or "",
         "risk": task.get("risk") or _task_risk(task),
         "cost_usd": task.get("cost_usd", 0),
@@ -275,9 +335,12 @@ def _task_card(task: dict[str, Any], role: str) -> dict[str, Any]:
         "pending_approvals": task.get("pending_approvals", 0),
         "pending_provider_actions": task.get("pending_provider_actions", 0),
         "errors": task.get("errors", 0),
+        "error_summary": task.get("error_summary"),
         "profile": task.get("profile") or "",
         "gate": task.get("gate") or "",
         "skills": task.get("skills") or [],
+        "recover_endpoint": task.get("recover_endpoint") or f"/api/tasks/{task_id}/continue",
+        "rollback_endpoint": task.get("rollback_endpoint") or f"/api/tasks/{task_id}/rollback",
         "detail_endpoint": f"/api/tasks/{task_id}",
         "report_endpoint": f"/api/tasks/{task_id}/report",
         "diff_endpoint": f"/api/tasks/{task_id}/diff",
@@ -407,6 +470,39 @@ def _task_workspace(task: dict[str, Any], fallback: Path) -> Path:
         return fallback
 
 
+def _task_with_dashboard_context(task: dict[str, Any], fallback: Path, hidden_tasks: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    task_id = str(task.get("task_id") or task.get("run_id") or "")
+    project_path = _task_workspace(task, fallback)
+    project_id = _project_id(project_path)
+    return {
+        **task,
+        "task_id": task_id,
+        "run_id": task_id,
+        "task_title": str(task.get("task") or task.get("title") or task_id or "muxdev task"),
+        "project_id": project_id,
+        "project_name": project_path.name or str(project_path),
+        "project_path": str(project_path),
+        "hidden": task_id in hidden_tasks,
+        "hidden_at": hidden_tasks.get(task_id, {}).get("hidden_at"),
+    }
+
+
+def _hidden_project_ids(hidden_projects: dict[str, dict[str, Any]]) -> set[str]:
+    ids = {str(project_id) for project_id in hidden_projects}
+    for metadata in hidden_projects.values():
+        path = metadata.get("path") if isinstance(metadata, dict) else None
+        if path:
+            ids.add(_project_id(_resolve_path(str(path))))
+    return ids
+
+
+def _resolve_path(value: str) -> Path:
+    try:
+        return Path(value).expanduser().resolve()
+    except OSError:
+        return Path(value)
+
+
 def _project_id(path: Path) -> str:
     normalized = str(path).replace("\\", "/").lower()
     digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:12]
@@ -434,6 +530,11 @@ def _json_list(value: object) -> list[object]:
 def _write_hidden_projects(path: Path, projects: dict[str, dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"projects": projects}, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _write_hidden_tasks(path: Path, tasks: dict[str, dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"tasks": tasks}, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _utc_now() -> str:

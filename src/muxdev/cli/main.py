@@ -55,6 +55,7 @@ from ..services.multirepo import plan_multi_repo_orchestration
 from ..services.provider_learning import refresh_provider_learning
 from ..services.product_experience import build_product_experience, write_project_context
 from ..services.workflow_plugins import get_workflow_plugin, list_workflow_plugins, render_plugin_command
+from ..services.validation import load_validation_experiment, run_validation_experiment
 from ..services.skills import (
     abtest_skill,
     activate_skill,
@@ -160,6 +161,7 @@ evidence_app = typer.Typer(help="Evidence v2 event, manifest, and evaluation too
 action_app = typer.Typer(help="Provider action handoff tools")
 feedback_app = typer.Typer(help="External feedback routing tools")
 cache_app = typer.Typer(help="Content-addressed cache tools")
+validate_app = typer.Typer(help="Multi-agent validation experiment tools")
 app.add_typer(provider_app, name="provider")
 app.add_typer(policy_app, name="policy")
 app.add_typer(trace_app, name="trace")
@@ -183,6 +185,7 @@ app.add_typer(evidence_app, name="evidence")
 app.add_typer(action_app, name="action")
 app.add_typer(feedback_app, name="feedback")
 app.add_typer(cache_app, name="cache")
+app.add_typer(validate_app, name="validate")
 console = Console(width=320)
 
 
@@ -661,6 +664,8 @@ def design(
     skill: Annotated[list[str] | None, typer.Option("-s", "--skill", help="Skill activation.")] = None,
     task_file: Annotated[Path | None, typer.Option("-f", "--file", help="Task TOML file.")] = None,
     provider: Annotated[str | None, typer.Option("--provider", help="Fallback provider.")] = None,
+    workflow: Annotated[str | None, typer.Option("--workflow", help="Workflow name or YAML path, e.g. design-v2.")] = None,
+    max_review_fixes: Annotated[int, typer.Option("--max-review-fixes", help="Maximum design review revision loops for design-v2.")] = 2,
     max_cost_usd: Annotated[float, typer.Option("--max-cost-usd", help="Budget limit for this task.")] = 0.5,
     host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
     port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
@@ -676,14 +681,15 @@ def design(
         skill=skill,
         task_file=task_file,
         provider=provider,
-        workflow=None,
-        require_approval="",
+        workflow=workflow,
+        require_approval="design" if workflow == "design-v2" and (gate or "auto") != "auto" else "",
         max_cost_usd=max_cost_usd,
         host=host,
         port=port,
         json_output=json_output,
         title="muxdev design",
         depth=_depth_override(simple=simple, safe=safe_depth, deep=deep, parallel=False),
+        max_review_fixes=max_review_fixes,
     )
 
 
@@ -824,6 +830,61 @@ def cache_list(
     for row in rows:
         table.add_row(*(str(row.get(column) or "") for column in ("cache_key", "kind", "path", "value_hash", "last_accessed_at")))
     console.print(table)
+
+
+@validate_app.command("run")
+def validate_run(
+    suite: Annotated[str, typer.Argument(help="Suite path or validation/suites/<name>.yaml.")],
+    strategies: Annotated[str, typer.Option("--strategies", help="Comma-separated strategies: single_agent,multi_agent.")] = "single_agent,multi_agent",
+    provider: Annotated[str, typer.Option("--provider", help="Provider to use for all strategy runs.")] = "mock",
+    multi_workflow: Annotated[str, typer.Option("--multi-workflow", help="Workflow for the multi_agent strategy.")] = "software-dev",
+    experiment_id: Annotated[str | None, typer.Option("--experiment-id", help="Optional deterministic experiment id.")] = None,
+    export: Annotated[str, typer.Option("--export", help="Comma-separated exporters: local,langfuse,langsmith.")] = "local",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Run a validation experiment comparing single-agent and multi-agent strategies."""
+    experiment = run_validation_experiment(
+        Path.cwd(),
+        suite,
+        strategies=_parse_csv(strategies),
+        provider=provider,
+        multi_workflow=multi_workflow,
+        experiment_id=experiment_id,
+        export_targets=_parse_csv(export),
+    )
+    payload = experiment.model_dump()
+    if json_output:
+        _print_json(payload)
+        return
+    comparison = experiment.comparison
+    lines = [
+        f"experiment_id: {experiment.experiment_id}",
+        f"suite: {experiment.suite.name}",
+        f"winner: {comparison.winner if comparison else '-'}",
+        f"report: {experiment.artifacts.get('report', '-')}",
+    ]
+    console.print(Panel("\n".join(lines), title="Validation Experiment"))
+
+
+@validate_app.command("report")
+def validate_report(
+    experiment_id: Annotated[str, typer.Argument(help="Validation experiment id.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Show a validation experiment report path and summary."""
+    experiment = load_validation_experiment(Path.cwd(), experiment_id)
+    if json_output:
+        _print_json(experiment.model_dump())
+        return
+    report = experiment.artifacts.get("report")
+    comparison = experiment.comparison
+    table = Table(title=f"Validation {experiment.experiment_id}")
+    for column in ("strategy", "score"):
+        table.add_column(column)
+    for strategy, score in (comparison.strategy_scores if comparison else {}).items():
+        table.add_row(strategy, str(score))
+    console.print(table)
+    console.print(Panel(f"winner: {comparison.winner if comparison else '-'}\nreport: {report or '-'}", title="Validation Report"))
 
 
 @app.command()
@@ -1446,26 +1507,51 @@ def actions(
         _print_json(rows)
         return
     table = Table(title="Provider Actions")
-    for column in ("action_id", "run_id", "stage_id", "provider", "kind", "status", "prompt_text", "attach_command"):
+    for column in ("action_id", "run_id", "stage_id", "provider", "kind", "input_kind", "status", "prompt_text", "choices", "default_choice", "attach_command"):
         table.add_column(column)
     for row in rows:
-        table.add_row(*(str(row.get(column) or "") for column in ("action_id", "run_id", "stage_id", "provider", "kind", "status", "prompt_text", "attach_command")))
+        table.add_row(*(str(row.get(column) or "") for column in ("action_id", "run_id", "stage_id", "provider", "kind", "input_kind", "status", "prompt_text", "choices", "default_choice", "attach_command")))
     console.print(table)
 
 
 @action_app.command("handled")
 def action_handled(
     action_id: Annotated[str, typer.Argument(help="Provider action id to mark handled.")],
+    choice: Annotated[str | None, typer.Option("--choice", help="Record a selected choice value before marking handled.")] = None,
+    text: Annotated[str | None, typer.Option("--text", help="Record a free-form response before marking handled.")] = None,
+    response_json: Annotated[str | None, typer.Option("--response-json", help="Record a JSON response before marking handled.")] = None,
     host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
     port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     """Mark a provider action handled after dealing with the CLI/session."""
-    payload = _daemon_client(host, port).provider_action_handled(action_id)
+    response = _provider_action_response(choice=choice, text=text, response_json=response_json)
+    payload = _daemon_client(host, port).provider_action_handled(action_id, response=response) if response is not None else _daemon_client(host, port).provider_action_handled(action_id)
     if json_output:
         _print_json(payload)
         return
     console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Provider Action Handled"))
+
+
+@action_app.command("respond")
+def action_respond(
+    action_id: Annotated[str, typer.Argument(help="Provider action id to answer.")],
+    choice: Annotated[str | None, typer.Option("--choice", help="Selected choice value.")] = None,
+    text: Annotated[str | None, typer.Option("--text", help="Free-form response text.")] = None,
+    response_json: Annotated[str | None, typer.Option("--response-json", help="Structured JSON response.")] = None,
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Answer a provider action inside muxdev and mark it handled."""
+    response = _provider_action_response(choice=choice, text=text, response_json=response_json)
+    if response is None:
+        raise typer.BadParameter("provide --choice, --text, or --response-json")
+    payload = _daemon_client(host, port).provider_action_response(action_id, response)
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Provider Action Response"))
 
 
 @action_app.command("dismiss")
@@ -2859,6 +2945,7 @@ def _submit_main_task(
     title: str,
     depth: str | None = None,
     from_design: str | None = None,
+    max_review_fixes: int | None = None,
 ) -> None:
     try:
         task = _task_with_design_contract(task, from_design)
@@ -2876,6 +2963,10 @@ def _submit_main_task(
             task_file=task_file,
             require_approval=_parse_csv(require_approval),
         )
+        if max_review_fixes is not None:
+            automation = request.get("automation", {})
+            if isinstance(automation, dict):
+                automation["max_review_fixes"] = max_review_fixes
         active_skills = resolve_active_skills(
             Path.cwd(),
             task=str(request["task"]),
@@ -2965,6 +3056,22 @@ def _provider_actions_restart_hint() -> str:
     return "Provider Actions API is not available on the running daemon. Run `muxdev serve --restart` to restart the daemon with the current muxdev code."
 
 
+def _provider_action_response(*, choice: str | None, text: str | None, response_json: str | None) -> object | None:
+    provided = [value is not None for value in (choice, text, response_json)]
+    if sum(provided) > 1:
+        raise typer.BadParameter("use only one of --choice, --text, or --response-json")
+    if response_json is not None:
+        try:
+            return json.loads(response_json)
+        except json.JSONDecodeError as exc:
+            raise typer.BadParameter(f"invalid --response-json: {exc}") from exc
+    if choice is not None:
+        return {"choice": choice}
+    if text is not None:
+        return {"text": text}
+    return None
+
+
 def _resolve_run_id(run_id: str) -> str:
     if run_id != "latest":
         return run_id
@@ -2992,6 +3099,9 @@ def _resolve_evidence_run(run_id: str) -> tuple[str, Path]:
         if candidates:
             latest = max(candidates, key=lambda path: path.stat().st_mtime)
             return latest.name, latest
+        daemon_latest = _daemon_project_run_dir("latest")
+        if daemon_latest:
+            return daemon_latest[0], daemon_latest[1]
         raise typer.BadParameter("no muxdev runs found")
     try:
         return run_id, local_store.find_run_dir(run_id)
@@ -2999,17 +3109,62 @@ def _resolve_evidence_run(run_id: str) -> tuple[str, Path]:
         daemon_dir = default_daemon_paths().runs_dir / run_id
         if daemon_dir.exists():
             return run_id, daemon_dir
+        project_run = _daemon_project_run_dir(run_id)
+        if project_run:
+            return project_run
         raise typer.BadParameter(f"run not found: {run_id}")
 
 
 def _evidence_blackboard(run_dir: Path) -> Blackboard:
     daemon_paths = default_daemon_paths()
     try:
-        if run_dir.resolve().is_relative_to(daemon_paths.runs_dir.resolve()) and daemon_paths.db_path.exists():
+        if daemon_paths.db_path.exists() and (
+            run_dir.resolve().is_relative_to(daemon_paths.runs_dir.resolve())
+            or _run_record_for_dir(run_dir) is not None
+        ):
             return Blackboard(daemon_paths.data_dir, db_path=daemon_paths.db_path)
     except OSError:
         pass
     return Blackboard(run_dir)
+
+
+def _daemon_project_run_dir(run_id: str) -> tuple[str, Path] | None:
+    daemon_paths = default_daemon_paths()
+    if not daemon_paths.db_path.exists():
+        return None
+    with Blackboard(daemon_paths.data_dir, db_path=daemon_paths.db_path) as board:
+        rows = board.list_runs()
+    if run_id == "latest":
+        candidates = [(str(row.get("run_id") or ""), row) for row in rows]
+    else:
+        candidates = [(str(row.get("run_id") or ""), row) for row in rows if str(row.get("run_id") or "") == run_id]
+    for resolved, row in candidates:
+        if not resolved:
+            continue
+        run_dir = path_config(Path(str(row.get("workspace") or ".")), "runs") / resolved
+        if run_dir.exists():
+            return resolved, run_dir
+    return None
+
+
+def _run_record_for_dir(run_dir: Path) -> dict[str, object] | None:
+    daemon_paths = default_daemon_paths()
+    if not daemon_paths.db_path.exists():
+        return None
+    try:
+        target = run_dir.resolve()
+    except OSError:
+        return None
+    with Blackboard(daemon_paths.data_dir, db_path=daemon_paths.db_path) as board:
+        for row in board.list_runs():
+            run_id = str(row.get("run_id") or "")
+            candidate = path_config(Path(str(row.get("workspace") or ".")), "runs") / run_id
+            try:
+                if candidate.resolve() == target:
+                    return row
+            except OSError:
+                continue
+    return None
 
 
 def _iter_run_blackboards() -> list[tuple[str, Path, Blackboard]]:

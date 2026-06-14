@@ -116,11 +116,18 @@ class DaemonClient:
     def ecosystem(self) -> dict[str, Any]:
         return self._request("GET", "/api/ecosystem")
 
-    def provider_action_handled(self, action_id: str) -> dict[str, Any]:
-        return self._request("POST", f"/api/provider-actions/{action_id}/handled")
+    def provider_action_handled(self, action_id: str, *, response: Any | None = None) -> dict[str, Any]:
+        kwargs = {"json": {"response": response}} if response is not None else {}
+        return self._request("POST", f"/api/provider-actions/{action_id}/handled", **kwargs)
 
     def provider_action_handled_and_continue(self, task_id: str, action_id: str, *, max_cost_usd: float = 0.5) -> dict[str, Any]:
         return self._request("POST", f"/api/tasks/{task_id}/actions/{action_id}/handled-and-continue", json={"max_cost_usd": max_cost_usd})
+
+    def provider_action_response(self, action_id: str, response: Any) -> dict[str, Any]:
+        return self._request("POST", f"/api/provider-actions/{action_id}/response", json={"response": response})
+
+    def provider_action_respond_and_continue(self, task_id: str, action_id: str, response: Any, *, max_cost_usd: float = 0.5) -> dict[str, Any]:
+        return self._request("POST", f"/api/tasks/{task_id}/actions/{action_id}/respond-and-continue", json={"response": response, "max_cost_usd": max_cost_usd})
 
     def provider_action_dismiss(self, action_id: str) -> dict[str, Any]:
         return self._request("POST", f"/api/provider-actions/{action_id}/dismiss")

@@ -1,0 +1,99 @@
+"""Validation experiment contracts for comparing agent strategies."""
+
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
+
+from . import utc_now
+
+
+ValidationStrategy = Literal["single_agent", "multi_agent"]
+
+
+class ValidationCase(BaseModel):
+    id: str
+    task: str
+    fixture: str | None = None
+    tags: list[str] = Field(default_factory=list)
+
+
+class ValidationSuite(BaseModel):
+    name: str
+    description: str = ""
+    cases: list[ValidationCase]
+
+
+class StrategyRun(BaseModel):
+    task_id: str
+    fixture: str | None = None
+    strategy: ValidationStrategy
+    workflow: str
+    provider: str
+    role_providers: dict[str, str] = Field(default_factory=dict)
+    run_id: str
+    baseline_run_id: str | None = None
+    status: str
+    seed_config: dict[str, Any] = Field(default_factory=dict)
+
+
+class ValidationMetric(BaseModel):
+    task_id: str
+    strategy: ValidationStrategy
+    run_id: str
+    status: str
+    completed: bool
+    test_pass_rate: float
+    review_blockers: int
+    high_review_blockers: int
+    evidence_confidence: float
+    missing_evidence_count: int
+    total_seconds: float
+    stage_seconds: dict[str, float] = Field(default_factory=dict)
+    tokens: int
+    cost_usd: float
+    retry_count: int
+    provider_action_count: int
+    human_intervention_count: int
+    recover_count: int
+    blocked: bool
+    rollback_success: bool
+    stage_failure_kinds: list[str] = Field(default_factory=list)
+    resume_success_rate: float
+    plan_test_review_consistency: float
+    defect_detection_rate: float
+    independent_review_block_rate: float
+    security_risk_block_rate: float
+    quality_score: float
+    reliability_score: float
+    evidence_score: float
+    efficiency_score: float
+    human_effort_inverse: float
+    score: float
+
+
+class ComparisonReport(BaseModel):
+    experiment_id: str
+    suite: str
+    strategy_scores: dict[str, float]
+    winner: str
+    recommendation: str
+    advantages: list[str] = Field(default_factory=list)
+    tradeoffs: list[str] = Field(default_factory=list)
+    failure_cases: list[dict[str, Any]] = Field(default_factory=list)
+    cost_delta_usd: float = 0.0
+    token_delta: int = 0
+
+
+class ValidationExperiment(BaseModel):
+    contract_version: str = "muxdev.validation.v1"
+    experiment_id: str
+    suite: ValidationSuite
+    strategies: list[ValidationStrategy]
+    runs: list[StrategyRun] = Field(default_factory=list)
+    metrics: list[ValidationMetric] = Field(default_factory=list)
+    comparison: ComparisonReport | None = None
+    artifacts: dict[str, str] = Field(default_factory=dict)
+    created_at: str = Field(default_factory=utc_now)
+    updated_at: str = Field(default_factory=utc_now)

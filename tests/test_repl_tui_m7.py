@@ -17,6 +17,7 @@ from muxdev.ui.tui import (
     daemon_provider_actions_text,
     daemon_task_detail_text,
     daemon_tasks_text,
+    _daemon_focus_panel,
     _handle_tui_command,
     _normalize_command,
     _render_tui,
@@ -132,6 +133,9 @@ def test_daemon_tui_command_results_use_chat_format(monkeypatch) -> None:
         def diff(self, task_id: str) -> dict[str, object]:
             return {"task_id": "run_1", "diff": "diff --git a/a b/a\n+hello"}
 
+        def continue_task(self, task_id: str) -> dict[str, object]:
+            return {"task_id": task_id, "status": "continue_requested"}
+
         def provider_actions(self, *, status: str | None = None) -> list[dict[str, object]]:
             return [_provider_action()]
 
@@ -151,6 +155,7 @@ def test_daemon_tui_command_results_use_chat_format(monkeypatch) -> None:
     report, report_selected = cli_app_module._handle_daemon_tui_command("/report run_1", "latest", host="127.0.0.1", port=8788, commands={})
     actions, _ = cli_app_module._handle_daemon_tui_command("/actions", "latest", host="127.0.0.1", port=8788, commands={})
     handled, handled_selected = cli_app_module._handle_daemon_tui_command("/action handled pact_1", "latest", host="127.0.0.1", port=8788, commands={})
+    recover, recover_selected = cli_app_module._handle_daemon_tui_command("/recover run_1", "latest", host="127.0.0.1", port=8788, commands={})
 
     assert "Recent tasks" in tasks
     assert "run_1" in tasks
@@ -170,6 +175,64 @@ def test_daemon_tui_command_results_use_chat_format(monkeypatch) -> None:
     assert "Apply this change" in actions
     assert handled == "pact_1: handled"
     assert handled_selected == "run_1"
+    assert recover == "run_1: recover continue_requested"
+    assert recover_selected == "run_1"
+
+
+def test_tui_surfaces_recovery_hint_and_error_reason() -> None:
+    task = {
+        "task_id": "run_failed",
+        "status": "blocked",
+        "current_stage": "code",
+        "errors": 1,
+        "error_summary": {"stage_id": "code", "type": "provider_exit", "message": "temporary network error"},
+        "pending_approvals": 0,
+        "pending_provider_actions": 0,
+        "tokens": 10,
+        "task": "fix dashboard",
+    }
+    detail = _daemon_payload("blocked")
+    detail["errors"] = [{"stage_id": "code", "type": "provider_exit", "message": "temporary network error"}]
+
+    tasks_text = daemon_tasks_text([task])
+    detail_text = daemon_task_detail_text(detail)
+
+    assert "/recover run_failed" in tasks_text
+    assert "temporary network error" in tasks_text
+    assert "Recover: /recover run_blocked" in detail_text
+    assert "temporary network error" in detail_text
+
+
+def test_tui_current_task_does_not_hard_clip_error_reason() -> None:
+    message = "fatal: command line too long because prompt was passed as argv; argv-limit-sentinel"
+    payload = {
+        "task_id": "run_failed",
+        "run": {
+            "run_id": "run_failed",
+            "task": "design a game",
+            "status": "blocked",
+        },
+        "summary": {},
+        "context": {},
+        "ux": {
+            "headline": "Task needs recovery",
+            "why": f"problem_statement provider_exit: {message}",
+            "next_actions": [],
+        },
+        "error_summary": {"stage_id": "problem_statement", "type": "provider_exit", "message": message},
+        "stages": [],
+        "trace": [],
+        "parallel_conflicts": [],
+        "semantic_merge_reviews": [],
+        "provider_learning": [],
+    }
+    console = Console(width=58, record=True)
+
+    console.print(_daemon_focus_panel(task_payload=payload, tasks=[], approvals=[], provider_actions=[]))
+    text = console.export_text()
+
+    assert "argv-limit-sentinel" in text
+    assert "..." not in text
 
 
 def test_daemon_tui_tolerates_old_daemon_without_provider_actions(monkeypatch) -> None:

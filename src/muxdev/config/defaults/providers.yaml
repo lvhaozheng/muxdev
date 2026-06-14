@@ -23,6 +23,7 @@ providers:
         - --skip-git-repo-check
         - --sandbox
         - workspace-write
+      prompt_transport: stdin
       prompt_template: "You are running muxdev stage '{stage_id}'. Keep output concise. If you modify files, stay inside the current workspace. Task: {task}"
   claude-code:
     mode: local CLI

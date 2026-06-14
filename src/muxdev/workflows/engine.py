@@ -7,6 +7,7 @@ groups independent stages into batches for the supervisor's safe parallel path.
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict, deque
 from pathlib import Path
 
@@ -105,4 +106,12 @@ def should_run_when(expression: str | None, context: dict[str, object]) -> bool:
         has_blockers = bool(review.get("has_blockers")) if isinstance(review, dict) else False
         loop = int(context.get("loop", 0))
         return has_blockers and loop < 2
+    match = re.fullmatch(r"([A-Za-z_][\w]*)\.has_blockers\s+and\s+loop\s+<\s+([A-Za-z_][\w]*|\d+)", normalized.strip())
+    if match:
+        review = context.get(match.group(1), {})
+        has_blockers = bool(review.get("has_blockers")) if isinstance(review, dict) else False
+        loop = int(context.get("loop", 0))
+        limit_token = match.group(2)
+        limit = int(limit_token) if limit_token.isdigit() else int(context.get(limit_token, 0) or 0)
+        return has_blockers and loop < limit
     return False

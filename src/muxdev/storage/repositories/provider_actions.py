@@ -20,7 +20,7 @@ class ProviderActionsRepository:
 
     def mark(self, action_id: str, status: ProviderActionStatus | str) -> dict[str, Any]:
         match: dict[str, Any] | None = None
-        for row in self.blackboard.table_rows("provider_actions"):
+        for row in self.blackboard.list_provider_actions():
             if row["action_id"] == action_id:
                 match = row
                 break
@@ -28,5 +28,19 @@ class ProviderActionsRepository:
             raise KeyError(f"provider action not found: {action_id}")
         self.blackboard.update_provider_action_status(action_id, status)
         match["status"] = str(status)
+        match["updated"] = True
+        return match
+
+    def respond(self, action_id: str, response: Any, *, status: ProviderActionStatus | str = ProviderActionStatus.HANDLED) -> dict[str, Any]:
+        match: dict[str, Any] | None = None
+        for row in self.blackboard.list_provider_actions():
+            if row["action_id"] == action_id:
+                match = row
+                break
+        if match is None:
+            raise KeyError(f"provider action not found: {action_id}")
+        self.blackboard.respond_provider_action(action_id, response=response, status=status)
+        match["status"] = str(status)
+        match["response"] = response
         match["updated"] = True
         return match
