@@ -27,6 +27,7 @@ from ..config.runtime import (
     config_check as runtime_config_check,
     global_config_path,
     load_runtime_config,
+    parse_role_overrides,
     project_config_path,
     resolve_task_request,
     runtime_config_sources,
@@ -835,20 +836,30 @@ def cache_list(
 @validate_app.command("run")
 def validate_run(
     suite: Annotated[str, typer.Argument(help="Suite path or validation/suites/<name>.yaml.")],
-    strategies: Annotated[str, typer.Option("--strategies", help="Comma-separated strategies: single_agent,multi_agent.")] = "single_agent,multi_agent",
+    strategies: Annotated[str, typer.Option("--strategies", help="Comma-separated strategies: direct_cli,muxdev_single_cli,muxdev_multi_cli.")] = "direct_cli,muxdev_single_cli,muxdev_multi_cli",
     provider: Annotated[str, typer.Option("--provider", help="Provider to use for all strategy runs.")] = "mock",
+    role: Annotated[list[str] | None, typer.Option("--role", help="Role provider override for muxdev_multi_cli, e.g. --role code=codex.")] = None,
     multi_workflow: Annotated[str, typer.Option("--multi-workflow", help="Workflow for the multi_agent strategy.")] = "software-dev",
+    judge_provider: Annotated[str | None, typer.Option("--judge-provider", help="Optional provider used for LLM-as-a-Judge scoring.")] = None,
+    judge_weight: Annotated[float, typer.Option("--judge-weight", help="Weight for judge score when --judge-provider is set.")] = 0.2,
     experiment_id: Annotated[str | None, typer.Option("--experiment-id", help="Optional deterministic experiment id.")] = None,
     export: Annotated[str, typer.Option("--export", help="Comma-separated exporters: local,langfuse,langsmith.")] = "local",
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
-    """Run a validation experiment comparing single-agent and multi-agent strategies."""
+    """Run a validation experiment comparing direct CLI and muxdev orchestration."""
+    try:
+        role_providers = parse_role_overrides(role)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     experiment = run_validation_experiment(
         Path.cwd(),
         suite,
-        strategies=_parse_csv(strategies),
+        strategies=[item.strip() for item in strategies.split(",") if item.strip()],
         provider=provider,
         multi_workflow=multi_workflow,
+        role_providers=role_providers,
+        judge_provider=judge_provider,
+        judge_weight=judge_weight,
         experiment_id=experiment_id,
         export_targets=_parse_csv(export),
     )

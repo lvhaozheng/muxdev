@@ -24,6 +24,24 @@ class MockProvider:
 
     def run_stage(self, *, stage_id: str, task: str, worktree: Path) -> MockStageOutput:
         safe_task = redact(task)
+        if stage_id == "direct":
+            target = worktree / "muxdev_mock_direct.txt"
+            target.write_text(f"Mock direct CLI result for task: {safe_task}\n", encoding="utf-8")
+            content = "# Direct CLI Result\n\nmock direct CLI completed the task in one pass.\n"
+            return MockStageOutput("direct_output.md", content, "mock direct CLI completed", tokens=70, cost_usd=0.005)
+        if stage_id == "judge":
+            payload = {
+                "score": 0.82,
+                "pass": True,
+                "task_completion": 0.8,
+                "answer_quality": 0.8,
+                "groundedness": 0.75,
+                "safety": 0.9,
+                "process_quality": 0.8,
+                "reasons": ["mock judge accepted the run"],
+                "risks": [],
+            }
+            return MockStageOutput("validation/judge_mock.json", json.dumps(payload, ensure_ascii=False, indent=2), "mock judge completed", tokens=40, cost_usd=0.002)
         if stage_id == "design":
             artifact = PlanArtifact(summary=f"Plan for: {safe_task}", steps=["inspect", "implement", "test", "review"])
             content = "# Plan\n\n" + artifact.summary + "\n\n```json\n" + artifact.model_dump_json(indent=2) + "\n```\n"

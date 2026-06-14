@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 from . import utc_now
 
 
-ValidationStrategy = Literal["single_agent", "multi_agent"]
+ValidationStrategy = Literal["direct_cli", "muxdev_single_cli", "muxdev_multi_cli", "single_agent", "multi_agent"]
 
 
 class ValidationCase(BaseModel):
@@ -29,12 +29,16 @@ class StrategyRun(BaseModel):
     task_id: str
     fixture: str | None = None
     strategy: ValidationStrategy
+    mode: str = "muxdev"
     workflow: str
     provider: str
     role_providers: dict[str, str] = Field(default_factory=dict)
     run_id: str
     baseline_run_id: str | None = None
     status: str
+    output_path: str | None = None
+    diff_path: str | None = None
+    judge_path: str | None = None
     seed_config: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -70,6 +74,13 @@ class ValidationMetric(BaseModel):
     evidence_score: float
     efficiency_score: float
     human_effort_inverse: float
+    task_completion_score: float = 0.0
+    answer_quality_score: float = 0.0
+    process_score: float = 0.0
+    safety_score: float = 0.0
+    judge_score: float | None = None
+    judge_pass: bool | None = None
+    judge_reasons: list[str] = Field(default_factory=list)
     score: float
 
 
@@ -84,6 +95,9 @@ class ComparisonReport(BaseModel):
     failure_cases: list[dict[str, Any]] = Field(default_factory=list)
     cost_delta_usd: float = 0.0
     token_delta: int = 0
+    baseline_strategy: str = "direct_cli"
+    muxdev_delta: dict[str, float] = Field(default_factory=dict)
+    judge_summary: dict[str, Any] = Field(default_factory=dict)
 
 
 class ValidationExperiment(BaseModel):

@@ -25,15 +25,15 @@ def _workspace(name: str) -> Path:
 
 
 def test_validation_comparison_prefers_higher_multi_agent_score() -> None:
-    single = _metric("task", "single_agent", "run_single", score=0.55, evidence=0.6, cost=0.01, tokens=100)
-    multi = _metric("task", "multi_agent", "run_multi", score=0.82, evidence=0.9, cost=0.03, tokens=250)
+    single = _metric("task", "muxdev_single_cli", "run_single", score=0.55, evidence=0.6, cost=0.01, tokens=100)
+    multi = _metric("task", "muxdev_multi_cli", "run_multi", score=0.82, evidence=0.9, cost=0.03, tokens=250)
 
     report = compare_validation_metrics("val_test", "suite", [single, multi])
 
-    assert report.winner == "multi_agent"
-    assert report.strategy_scores["multi_agent"] > report.strategy_scores["single_agent"]
-    assert "higher aggregate" in " ".join(report.advantages)
-    assert "cost more" in " ".join(report.tradeoffs)
+    assert report.winner == "muxdev_multi_cli"
+    assert report.strategy_scores["muxdev_multi_cli"] > report.strategy_scores["muxdev_single_cli"]
+    assert report.baseline_strategy == "muxdev_single_cli"
+    assert report.muxdev_delta["muxdev_multi_cli"] > 0
 
 
 def test_validation_exporters_write_stable_payloads() -> None:
@@ -42,10 +42,10 @@ def test_validation_exporters_write_stable_payloads() -> None:
         experiment = ValidationExperiment(
             experiment_id="val_export",
             suite=ValidationSuite(name="suite", cases=[]),
-            strategies=["single_agent", "multi_agent"],
-            runs=[StrategyRun(task_id="task", strategy="single_agent", workflow="single-agent", provider="mock", run_id="run_single", status="completed")],
-            metrics=[_metric("task", "single_agent", "run_single", score=0.7, evidence=0.8, cost=0.01, tokens=100)],
-            comparison=ComparisonReport(experiment_id="val_export", suite="suite", strategy_scores={"single_agent": 0.7}, winner="single_agent", recommendation="Use single_agent"),
+            strategies=["direct_cli", "muxdev_single_cli"],
+            runs=[StrategyRun(task_id="task", strategy="direct_cli", mode="direct_cli", workflow="direct-cli", provider="mock", run_id="run_single", status="completed")],
+            metrics=[_metric("task", "direct_cli", "run_single", score=0.7, evidence=0.8, cost=0.01, tokens=100)],
+            comparison=ComparisonReport(experiment_id="val_export", suite="suite", strategy_scores={"direct_cli": 0.7}, winner="direct_cli", recommendation="Use direct_cli"),
         )
         local = LocalValidationTraceExporter().export_experiment(experiment, workspace / "local")
         langfuse = LangfusePayloadExporter().export_experiment(experiment, workspace / "langfuse")
@@ -54,7 +54,10 @@ def test_validation_exporters_write_stable_payloads() -> None:
         assert local.path.name == "otel_spans.json"
         assert local.spans >= 3
         assert json.loads(langfuse.path.read_text(encoding="utf-8"))["traces"][0]["name"] == "validation.experiment"
-        assert json.loads(langsmith.path.read_text(encoding="utf-8"))["project_name"] == "muxdev-validation"
+        langsmith_payload = json.loads(langsmith.path.read_text(encoding="utf-8"))
+        assert langsmith_payload["project_name"] == "muxdev-validation"
+        metric_run = next(row for row in langsmith_payload["runs"] if row["name"] == "validation.metrics")
+        assert metric_run["extra"]["muxdev.task_completion_score"] == 0.7
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 
@@ -77,14 +80,55 @@ def test_validation_harness_runs_mock_suite_and_publishes_report() -> None:
         experiment = run_validation_experiment(workspace, "snake", provider="mock", experiment_id="val_snake")
 
         assert experiment.experiment_id == "val_snake"
-        assert {run.strategy for run in experiment.runs} == {"single_agent", "multi_agent"}
-        assert len(experiment.metrics) == 2
+        assert {run.strategy for run in experiment.runs} == {"direct_cli", "muxdev_single_cli", "muxdev_multi_cli"}
+        assert len(experiment.metrics) == 3
+        direct = next(run for run in experiment.runs if run.strategy == "direct_cli")
+        assert direct.output_path and Path(direct.output_path).exists()
+        assert direct.diff_path and Path(direct.diff_path).exists()
         assert experiment.comparison is not None
         report = workspace / "reports" / "validation" / "val_snake.md"
         assert report.exists()
         assert "Strategy Scores" in report.read_text(encoding="utf-8")
         assert (workspace / ".muxdev" / "runs" / "val_snake" / "validation" / "experiment.json").exists()
         assert (workspace / ".muxdev" / "runs" / "val_snake" / "validation" / "exports" / "local" / "otel_spans.json").exists()
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_validation_harness_applies_multi_cli_role_overrides_and_optional_judge() -> None:
+    workspace = _workspace("validation-judge")
+    try:
+        suite = workspace / "validation" / "suites" / "judge.yaml"
+        suite.parent.mkdir(parents=True, exist_ok=True)
+        suite.write_text(
+            "name: judge\n"
+            "cases:\n"
+            "  - id: judge_case\n"
+            "    task: implement a tiny judged change\n",
+            encoding="utf-8",
+        )
+
+        experiment = run_validation_experiment(
+            workspace,
+            "judge",
+            provider="mock",
+            strategies=["direct_cli", "muxdev_multi_cli"],
+            role_providers={"code": "mock", "test": "mock"},
+            judge_provider="mock",
+            experiment_id="val_judge",
+        )
+
+        multi = next(run for run in experiment.runs if run.strategy == "muxdev_multi_cli")
+        assert multi.role_providers["code"] == "mock"
+        assert multi.role_providers["implementer"] == "mock"
+        assert multi.role_providers["test"] == "mock"
+        assert multi.role_providers["tester"] == "mock"
+        assert multi.judge_path and Path(multi.judge_path).exists()
+        judged = [metric for metric in experiment.metrics if metric.judge_score is not None]
+        assert len(judged) == 2
+        assert all(metric.judge_pass is True for metric in judged)
+        assert experiment.comparison is not None
+        assert experiment.comparison.judge_summary["judged_runs"] == 2
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 
@@ -103,12 +147,13 @@ def test_validation_cli_run_outputs_experiment_json(monkeypatch) -> None:
             encoding="utf-8",
         )
 
-        result = runner.invoke(app, ["validate", "run", "snake", "--provider", "mock", "--experiment-id", "val_cli", "--json"])
+        result = runner.invoke(app, ["validate", "run", "snake", "--provider", "mock", "--strategies", "direct_cli,muxdev_single_cli", "--experiment-id", "val_cli", "--json"])
 
         assert result.exit_code == 0, result.stdout
         payload = json.loads(result.stdout)
         assert payload["experiment_id"] == "val_cli"
-        assert payload["comparison"]["winner"] in {"single_agent", "multi_agent"}
+        assert payload["strategies"] == ["direct_cli", "muxdev_single_cli"]
+        assert payload["comparison"]["winner"] in {"direct_cli", "muxdev_single_cli"}
         assert Path("reports/validation/val_cli.md").exists()
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
@@ -125,8 +170,8 @@ def test_validation_api_and_live_dashboard_surface_experiments(monkeypatch) -> N
         experiment = ValidationExperiment(
             experiment_id="val_api",
             suite=ValidationSuite(name="suite", cases=[]),
-            strategies=["single_agent", "multi_agent"],
-            comparison=ComparisonReport(experiment_id="val_api", suite="suite", strategy_scores={"single_agent": 0.5, "multi_agent": 0.8}, winner="multi_agent", recommendation="Use multi_agent"),
+            strategies=["direct_cli", "muxdev_multi_cli"],
+            comparison=ComparisonReport(experiment_id="val_api", suite="suite", strategy_scores={"direct_cli": 0.5, "muxdev_multi_cli": 0.8}, winner="muxdev_multi_cli", recommendation="Use muxdev"),
             artifacts={"report": str(report)},
         )
         (validation_dir / "experiment.json").write_text(experiment.model_dump_json(indent=2), encoding="utf-8")
@@ -137,9 +182,9 @@ def test_validation_api_and_live_dashboard_surface_experiments(monkeypatch) -> N
         html = render_live_dashboard_html()
 
         assert rows[0]["experiment_id"] == "val_api"
-        assert rows[0]["winner"] == "multi_agent"
-        assert detail["comparison"]["winner"] == "multi_agent"
-        assert "Validation Experiments" in html
+        assert rows[0]["winner"] == "muxdev_multi_cli"
+        assert detail["comparison"]["winner"] == "muxdev_multi_cli"
+        assert "验证实验" in html
         assert "/api/validation/experiments" in html or "validation.experiments" in html
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
@@ -176,5 +221,9 @@ def _metric(task_id: str, strategy: str, run_id: str, *, score: float, evidence:
         evidence_score=evidence,
         efficiency_score=score,
         human_effort_inverse=1.0,
+        task_completion_score=score,
+        answer_quality_score=score,
+        process_score=score,
+        safety_score=score,
         score=score,
     )

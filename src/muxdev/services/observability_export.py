@@ -96,6 +96,9 @@ def validation_spans(experiment: ValidationExperiment) -> list[dict[str, object]
             "muxdev.contract_version": experiment.contract_version,
             "muxdev.suite": experiment.suite.name,
             "muxdev.strategies": ",".join(experiment.strategies),
+            "muxdev.baseline_strategy": experiment.comparison.baseline_strategy if experiment.comparison else "",
+            "muxdev.winner": experiment.comparison.winner if experiment.comparison else "",
+            "muxdev.muxdev_delta": json.dumps(experiment.comparison.muxdev_delta if experiment.comparison else {}, sort_keys=True),
         },
     }
     spans.append(experiment_span)
@@ -111,9 +114,12 @@ def validation_spans(experiment: ValidationExperiment) -> list[dict[str, object]
                     "muxdev.task_id": run.task_id,
                     "muxdev.run_id": run.run_id,
                     "muxdev.strategy": run.strategy,
+                    "muxdev.mode": run.mode,
                     "muxdev.workflow": run.workflow,
                     "muxdev.provider": run.provider,
                     "muxdev.status": run.status,
+                    "muxdev.output_path": run.output_path or "",
+                    "muxdev.diff_path": run.diff_path or "",
                 },
             }
         )
@@ -130,6 +136,12 @@ def validation_spans(experiment: ValidationExperiment) -> list[dict[str, object]
                         "muxdev.quality_score": metric.quality_score,
                         "muxdev.reliability_score": metric.reliability_score,
                         "muxdev.evidence_score": metric.evidence_score,
+                        "muxdev.task_completion_score": metric.task_completion_score,
+                        "muxdev.answer_quality_score": metric.answer_quality_score,
+                        "muxdev.process_score": metric.process_score,
+                        "muxdev.safety_score": metric.safety_score,
+                        "muxdev.judge_score": metric.judge_score,
+                        "muxdev.judge_pass": metric.judge_pass,
                         "muxdev.cost_usd": metric.cost_usd,
                         "muxdev.tokens": metric.tokens,
                     },
