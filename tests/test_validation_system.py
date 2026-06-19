@@ -43,9 +43,22 @@ def test_validation_exporters_write_stable_payloads() -> None:
             experiment_id="val_export",
             suite=ValidationSuite(name="suite", cases=[]),
             strategies=["direct_cli", "muxdev_single_cli"],
-            runs=[StrategyRun(task_id="task", strategy="direct_cli", mode="direct_cli", workflow="direct-cli", provider="mock", run_id="run_single", status="completed")],
-            metrics=[_metric("task", "direct_cli", "run_single", score=0.7, evidence=0.8, cost=0.01, tokens=100)],
-            comparison=ComparisonReport(experiment_id="val_export", suite="suite", strategy_scores={"direct_cli": 0.7}, winner="direct_cli", recommendation="Use direct_cli"),
+            runs=[
+                StrategyRun(task_id="task", strategy="direct_cli", mode="direct_cli", workflow="direct-cli", provider="mock", run_id="run_direct", status="completed"),
+                StrategyRun(task_id="task", strategy="muxdev_single_cli", mode="muxdev", workflow="software-dev", provider="mock", run_id="run_single", status="completed"),
+            ],
+            metrics=[
+                _metric("task", "direct_cli", "run_direct", score=0.7, evidence=0.8, cost=0.01, tokens=100),
+                _metric("task", "muxdev_single_cli", "run_single", score=0.8, evidence=0.9, cost=0.02, tokens=150),
+            ],
+            comparison=ComparisonReport(
+                experiment_id="val_export",
+                suite="suite",
+                strategy_scores={"direct_cli": 0.7, "muxdev_single_cli": 0.8},
+                winner="muxdev_single_cli",
+                recommendation="Use muxdev",
+                muxdev_delta={"muxdev_single_cli": 0.1},
+            ),
         )
         local = LocalValidationTraceExporter().export_experiment(experiment, workspace / "local")
         langfuse = LangfusePayloadExporter().export_experiment(experiment, workspace / "langfuse")
@@ -58,6 +71,8 @@ def test_validation_exporters_write_stable_payloads() -> None:
         assert langsmith_payload["project_name"] == "muxdev-validation"
         metric_run = next(row for row in langsmith_payload["runs"] if row["name"] == "validation.metrics")
         assert metric_run["extra"]["muxdev.task_completion_score"] == 0.7
+        muxdev_metric_run = next(row for row in langsmith_payload["runs"] if row["name"] == "validation.metrics" and row["extra"]["muxdev.strategy"] == "muxdev_single_cli")
+        assert muxdev_metric_run["extra"]["muxdev.baseline_delta"] == 0.1
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 
@@ -85,12 +100,41 @@ def test_validation_harness_runs_mock_suite_and_publishes_report() -> None:
         direct = next(run for run in experiment.runs if run.strategy == "direct_cli")
         assert direct.output_path and Path(direct.output_path).exists()
         assert direct.diff_path and Path(direct.diff_path).exists()
+        assert all(metric.judge_score is None and metric.judge_pass is None and not metric.judge_reasons for metric in experiment.metrics)
         assert experiment.comparison is not None
         report = workspace / "reports" / "validation" / "val_snake.md"
         assert report.exists()
         assert "Strategy Scores" in report.read_text(encoding="utf-8")
         assert (workspace / ".muxdev" / "runs" / "val_snake" / "validation" / "experiment.json").exists()
         assert (workspace / ".muxdev" / "runs" / "val_snake" / "validation" / "exports" / "local" / "otel_spans.json").exists()
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_validation_legacy_strategy_names_map_to_muxdev_single_cli() -> None:
+    workspace = _workspace("validation-legacy")
+    try:
+        suite = workspace / "validation" / "suites" / "legacy.yaml"
+        suite.parent.mkdir(parents=True, exist_ok=True)
+        suite.write_text(
+            "name: legacy\n"
+            "cases:\n"
+            "  - id: legacy_case\n"
+            "    task: validate old strategy aliases\n",
+            encoding="utf-8",
+        )
+
+        experiment = run_validation_experiment(
+            workspace,
+            "legacy",
+            provider="mock",
+            strategies=["single_agent", "multi_agent"],
+            experiment_id="val_legacy",
+        )
+
+        assert experiment.strategies == ["muxdev_single_cli"]
+        assert [run.strategy for run in experiment.runs] == ["muxdev_single_cli"]
+        assert experiment.runs[0].workflow == "software-dev"
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 

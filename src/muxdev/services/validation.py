@@ -59,7 +59,6 @@ def run_validation_experiment(
     experiment_dir = validation_experiment_dir(workspace, experiment_id)
     validation_dir = experiment_dir / "validation"
     validation_dir.mkdir(parents=True, exist_ok=True)
-    single_workflow = _write_single_agent_workflow(validation_dir)
     experiment = ValidationExperiment(experiment_id=experiment_id, suite=suite, strategies=selected)
 
     for case in suite.cases:
@@ -75,7 +74,7 @@ def run_validation_experiment(
                     seed_config={"provider": provider, "suite": suite.name, "case_tags": case.tags},
                 )
             else:
-                workflow = _workflow_for_strategy(strategy, single_workflow, multi_workflow)
+                workflow = _workflow_for_strategy(strategy, multi_workflow)
                 selected_role_providers = _role_providers_for_strategy(strategy, provider, workflow, role_providers)
                 run = SupervisorRuntime(workspace).run(
                     case.task,
@@ -89,7 +88,7 @@ def run_validation_experiment(
                     fixture=case.fixture,
                     strategy=strategy,
                     mode="muxdev",
-                    workflow="single-agent" if strategy == "single_agent" else multi_workflow,
+                    workflow=workflow,
                     provider=provider,
                     role_providers=selected_role_providers,
                     run_id=run.run_id,
@@ -558,9 +557,7 @@ def _write_single_agent_workflow(validation_dir: Path) -> Path:
     return path
 
 
-def _workflow_for_strategy(strategy: ValidationStrategy, single_workflow: Path, multi_workflow: str) -> str:
-    if strategy == "single_agent":
-        return str(single_workflow)
+def _workflow_for_strategy(strategy: ValidationStrategy, multi_workflow: str) -> str:
     return multi_workflow
 
 
@@ -575,8 +572,6 @@ def _role_providers_for_strategy(
         return {}
     if strategy == "muxdev_multi_cli":
         return dict(explicit_role_providers)
-    if strategy == "single_agent":
-        return {"solo_agent": provider}
     roles = _workflow_roles(workflow)
     if not roles:
         roles = {"architect", "implementer", "tester", "reviewer", "secure"}
@@ -602,11 +597,14 @@ def _workflow_roles(workflow: str) -> set[str]:
 
 def _normalize_strategies(values: list[str]) -> list[ValidationStrategy]:
     result: list[ValidationStrategy] = []
+    aliases = {"single_agent": "muxdev_single_cli", "multi_agent": "muxdev_single_cli"}
     for value in values:
-        strategy = value.strip()
-        if strategy not in {"direct_cli", "muxdev_single_cli", "muxdev_multi_cli", "single_agent", "multi_agent"}:
+        raw = value.strip()
+        strategy = aliases.get(raw, raw)
+        if strategy not in {"direct_cli", "muxdev_single_cli", "muxdev_multi_cli"}:
             raise ValueError(f"unknown validation strategy: {strategy}")
-        result.append(strategy)  # type: ignore[arg-type]
+        if strategy not in result:
+            result.append(strategy)  # type: ignore[arg-type]
     return result or DEFAULT_STRATEGIES
 
 

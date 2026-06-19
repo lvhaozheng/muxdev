@@ -839,7 +839,7 @@ def validate_run(
     strategies: Annotated[str, typer.Option("--strategies", help="Comma-separated strategies: direct_cli,muxdev_single_cli,muxdev_multi_cli.")] = "direct_cli,muxdev_single_cli,muxdev_multi_cli",
     provider: Annotated[str, typer.Option("--provider", help="Provider to use for all strategy runs.")] = "mock",
     role: Annotated[list[str] | None, typer.Option("--role", help="Role provider override for muxdev_multi_cli, e.g. --role code=codex.")] = None,
-    multi_workflow: Annotated[str, typer.Option("--multi-workflow", help="Workflow for the multi_agent strategy.")] = "software-dev",
+    multi_workflow: Annotated[str, typer.Option("--multi-workflow", help="Workflow for muxdev_single_cli and muxdev_multi_cli strategies.")] = "software-dev",
     judge_provider: Annotated[str | None, typer.Option("--judge-provider", help="Optional provider used for LLM-as-a-Judge scoring.")] = None,
     judge_weight: Annotated[float, typer.Option("--judge-weight", help="Weight for judge score when --judge-provider is set.")] = 0.2,
     experiment_id: Annotated[str | None, typer.Option("--experiment-id", help="Optional deterministic experiment id.")] = None,

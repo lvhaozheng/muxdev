@@ -88,6 +88,7 @@ class LangSmithPayloadExporter:
 
 def validation_spans(experiment: ValidationExperiment) -> list[dict[str, object]]:
     spans: list[dict[str, object]] = []
+    baseline_deltas = experiment.comparison.muxdev_delta if experiment.comparison else {}
     experiment_span = {
         "span_id": experiment.experiment_id,
         "name": "validation.experiment",
@@ -120,11 +121,13 @@ def validation_spans(experiment: ValidationExperiment) -> list[dict[str, object]
                     "muxdev.status": run.status,
                     "muxdev.output_path": run.output_path or "",
                     "muxdev.diff_path": run.diff_path or "",
+                    "muxdev.baseline_delta": float(baseline_deltas.get(str(run.strategy), 0.0)),
                 },
             }
         )
         for metric in [row for row in experiment.metrics if row.run_id == run.run_id]:
             metric_span_id = f"{run_span_id}:metrics"
+            baseline_delta = float(baseline_deltas.get(str(metric.strategy), 0.0))
             spans.append(
                 {
                     "span_id": metric_span_id,
@@ -132,6 +135,9 @@ def validation_spans(experiment: ValidationExperiment) -> list[dict[str, object]
                     "name": "validation.metrics",
                     "kind": "INTERNAL",
                     "attributes": {
+                        "muxdev.task_id": metric.task_id,
+                        "muxdev.run_id": metric.run_id,
+                        "muxdev.strategy": metric.strategy,
                         "muxdev.score": metric.score,
                         "muxdev.quality_score": metric.quality_score,
                         "muxdev.reliability_score": metric.reliability_score,
@@ -142,6 +148,7 @@ def validation_spans(experiment: ValidationExperiment) -> list[dict[str, object]
                         "muxdev.safety_score": metric.safety_score,
                         "muxdev.judge_score": metric.judge_score,
                         "muxdev.judge_pass": metric.judge_pass,
+                        "muxdev.baseline_delta": baseline_delta,
                         "muxdev.cost_usd": metric.cost_usd,
                         "muxdev.tokens": metric.tokens,
                     },
