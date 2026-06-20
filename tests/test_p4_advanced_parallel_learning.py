@@ -209,7 +209,8 @@ def test_p4_api_and_dashboards_expose_advanced_state() -> None:
         assert "Advanced Parallel" in html
         assert "Semantic Merge" in html
         assert "Provider Learning" in html
-        assert "Parallel Conflicts" in live
+        assert "并行冲突图" in live
+        assert "Parallel Conflict Map" in render_live_dashboard_html(lang="en")
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 

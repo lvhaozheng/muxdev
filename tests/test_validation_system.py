@@ -215,7 +215,15 @@ def test_validation_api_and_live_dashboard_surface_experiments(monkeypatch) -> N
             experiment_id="val_api",
             suite=ValidationSuite(name="suite", cases=[]),
             strategies=["direct_cli", "muxdev_multi_cli"],
-            comparison=ComparisonReport(experiment_id="val_api", suite="suite", strategy_scores={"direct_cli": 0.5, "muxdev_multi_cli": 0.8}, winner="muxdev_multi_cli", recommendation="Use muxdev"),
+            metrics=[_metric("case-1", "muxdev_multi_cli", "run-1", score=0.8, evidence=0.9, cost=0.1, tokens=1200)],
+            comparison=ComparisonReport(
+                experiment_id="val_api",
+                suite="suite",
+                strategy_scores={"direct_cli": 0.5, "muxdev_multi_cli": 0.8},
+                winner="muxdev_multi_cli",
+                recommendation="Use muxdev",
+                muxdev_delta={"score": 0.3},
+            ),
             artifacts={"report": str(report)},
         )
         (validation_dir / "experiment.json").write_text(experiment.model_dump_json(indent=2), encoding="utf-8")
@@ -227,8 +235,15 @@ def test_validation_api_and_live_dashboard_surface_experiments(monkeypatch) -> N
 
         assert rows[0]["experiment_id"] == "val_api"
         assert rows[0]["winner"] == "muxdev_multi_cli"
+        assert rows[0]["baseline_strategy"] == "direct_cli"
+        assert rows[0]["strategy_scores"]["muxdev_multi_cli"] == 0.8
+        assert rows[0]["muxdev_delta"]["score"] == 0.3
+        assert rows[0]["metrics_summary"]["score"] == 0.8
         assert detail["comparison"]["winner"] == "muxdev_multi_cli"
         assert "验证实验" in html
+        assert "验证标准" in html
+        assert "Validation Experiments" in render_live_dashboard_html(lang="en")
+        assert "Validation Standards" in render_live_dashboard_html(lang="en")
         assert "/api/validation/experiments" in html or "validation.experiments" in html
     finally:
         shutil.rmtree(workspace, ignore_errors=True)

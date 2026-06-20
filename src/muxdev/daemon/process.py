@@ -165,7 +165,7 @@ def is_pid_alive(pid: int) -> bool:
         return False
 
 
-def daemon_health(*, host: str = DEFAULT_HOST, api_port: int = DEFAULT_API_PORT, timeout: float = 0.35) -> dict[str, Any]:
+def daemon_health(*, host: str = DEFAULT_HOST, api_port: int = DEFAULT_API_PORT, timeout: float = 2.0) -> dict[str, Any]:
     url = f"http://{host}:{api_port}/api/health"
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:

@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import importlib
 import shutil
+import threading
 import time
 import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -13,9 +15,10 @@ from typer.testing import CliRunner
 from muxdev.api.web import create_app
 from muxdev.cli import app
 from muxdev.daemon.paths import default_daemon_paths
-from muxdev.daemon.process import daemon_status, start_daemon
+from muxdev.daemon.process import daemon_health, daemon_status, start_daemon
 from muxdev.daemon.tasks import TaskManager
 from muxdev.models import ApprovalStatus, ProviderActionStatus
+from muxdev.storage import MemoryStore
 
 
 runner = CliRunner()
@@ -54,7 +57,10 @@ def test_daemon_api_task_lifecycle_and_websocket() -> None:
         report = client.get(f"/api/tasks/{task_id}/report").json()
         attach = client.get(f"/api/tasks/{task_id}/attach-command").json()
         rollback = client.post(f"/api/tasks/{task_id}/rollback").json()
+        review_page = client.get(f"/review/{task_id}").text
         page = client.get("/").text
+        english_page = client.get("/", params={"lang": "en"}).text
+        task_english_page = client.get(f"/tasks/{task_id}", params={"lang": "en"}).text
         with client.websocket_connect("/events") as ws:
             hello = ws.receive_json()
         project_run_dir = workspace / ".muxdev" / "runs" / task_id
@@ -74,7 +80,15 @@ def test_daemon_api_task_lifecycle_and_websocket() -> None:
     assert report["path"].startswith(str(project_run_dir))
     assert attach["handoff"]["command"]
     assert rollback["status"] in {"rolled_back", "failed"}
+    assert "muxdev Shareable Run Review" in review_page
+    assert "Sensitive transcript hidden" in review_page
+    assert "daemon api smoke" in review_page
     assert "<title>muxdev 控制台</title>" in page
+    assert "命令面板" in page
+    assert "Command Palette" not in page
+    assert "<title>muxdev Dashboard</title>" in english_page
+    assert "Command Palette" in english_page
+    assert f'data-task-id="{task_id}"' in task_english_page
     assert hello["type"] == "hello"
 
 
@@ -110,46 +124,90 @@ def test_daemon_legacy_global_run_remains_readable() -> None:
     assert report["content"] == "legacy report"
 
 
-def test_live_dashboard_renders_mission_control_sections() -> None:
+def test_live_dashboard_renders_workbench_sections_and_i18n() -> None:
     from muxdev.api.web import render_live_dashboard_html
 
     html = render_live_dashboard_html("run_demo")
+    english = render_live_dashboard_html("run_demo", lang="en")
 
     assert "muxdev 控制台" in html
+    assert 'lang="zh-CN"' in html
+    assert 'data-task-id="run_demo"' in html
+    assert "命令面板" in html
+    assert "资源管理器" in html
+    assert "总览" in html
     assert "项目" in html
-    assert "全局配置" in html
+    assert "运行列表" in html
     assert "工作流" in html
-    assert "任务" in html
-    assert "动态" in html
-    assert "产物" in html
-    assert "配置" in html
+    assert "验证实验" in html
+    assert "证据与产物" in html
+    assert "系统治理" in html
     assert "当前状态" in html
     assert "行动中心" in html
-    assert "compact-action-center" in html
-    assert "展开详情" in html
-    assert "submitPlanFeedback" in html
-    assert "补充约束、修正或偏好" in html
+    assert "交付可信度" in html
+    assert "可信交付标准" in html
+    assert "验证标准" in html
+    assert "治理标准" in html
+    assert "配置标准" in html
+    assert "当前值" in html
+    assert "目标值" in html
+    assert "建议操作" in html
+    assert "学习与治理" in html
+    assert "决策条" in html
+    assert "交付焦点" in html
+    assert "优先队列" in html
+    assert "运行流" in html
+    assert "最近证据" in html
+    assert "详情检查器" in html
+    assert "支撑信号" in html
+    assert "问题" in html
+    assert "输出" in html
+    assert "证据" in html
+    assert "操作" in html
+    assert "attention-strip" in html
+    assert "detail-inspector" in html
+    assert "bottom-panel" not in html
+    assert "setBottomPanel" not in html
+    assert "localStorage.setItem('muxdev.dashboard.lang'" in html
+    assert "switchLanguage()" in html
     assert "MCP" in html
-    assert "local stdio" in html
-    assert "工具" in html
-    assert "写入策略" in html
-    assert "tab-mcp" not in html
     assert "任务看板" in html
-    assert "任务时间线" in html
-    assert "Provider 操作" in html
-    assert "审批风险" in html
-    assert "证据 / 产物中心" in html
     assert "project-name" in html
-    assert "project-path" in html
-    assert "project-hide" in html
-    assert "hover-detail" in html
     assert "/dashboard/overview" in html
-    assert "复制 attach 命令" in html
+    assert "复制接管命令" in html
     assert "提交响应" in html
     assert "已处理并继续" in html
     assert "/dashboard/tasks/" in html
     assert "String.fromCharCode(10)" in html
     assert "state.events.join('\n')" not in html
+    assert "低风险批量操作" in html
+    assert "提供方学习趋势" in html
+    assert "工作流模板预览" in html
+    assert "并行冲突图" in html
+    assert "多仓编排图" in html
+    assert "分享审查" in html
+    assert "/review/" in html
+    assert "/product/experience" in html
+    assert "Mission Control" not in html
+    assert "Command Palette" not in html
+    assert "Project Workspace" not in html
+    assert "System Center" not in html
+    assert not any(marker in html for marker in ("�", "鎺", "浠", "椤", "楠", "琛", "褰"))
+    assert "<title>muxdev Dashboard</title>" in english
+    assert 'lang="en"' in english
+    assert "Command Palette" in english
+    assert "Explorer" in english
+    assert "Decision Rail" in english
+    assert "Delivery Focus" in english
+    assert "Priority Queue" in english
+    assert "Run Stream" in english
+    assert "Recent Evidence" in english
+    assert "Detail Inspector" in english
+    assert "System Governance" in english
+    assert "Trusted Delivery Standards" in english
+    assert "Validation Standards" in english
+    assert "Governance Standards" in english
+    assert "Configuration Standards" in english
 
 
 def test_dashboard_overview_groups_projects_workflows_roles(monkeypatch) -> None:
@@ -171,8 +229,48 @@ def test_dashboard_overview_groups_projects_workflows_roles(monkeypatch) -> None
                 board.create_run(run_id=run_id, task=task, workflow="dev", provider="mock", workspace=project, worktree=project / ".muxdev" / run_id)
                 board.set_run_status(run_id, "running")
                 board.upsert_stage(run_id, "code", role="code", status="running", summary="coding")
+                if run_id == "run_dash_1":
+                    snapshot = project / "snapshot.patch"
+                    snapshot.write_text("diff --git a/app.py b/app.py\n", encoding="utf-8")
+                    board.add_test_result(run_id, "code", True, "pytest", "passed")
+                    board.add_snapshot(run_id, "code", path=snapshot, patch_hash="sha256:test")
                 if run_id == "run_dash_2":
                     board.add_error(run_id, "code", "provider_exit", "temporary network error")
+
+        with manager.board() as board:
+            board.upsert_provider_learning(provider="mock", role="code", run_id="run_dash_1", attempts=2, successes=2, failures=0, human_actions=0, score=1.0)
+            board.add_parallel_conflict(run_id="run_dash_1", stage_id="parallel_batch", stages=["code_a", "code_b"], files=["src/app.py"], severity="high")
+            review_path = project / "semantic.json"
+            review_path.write_text("{}", encoding="utf-8")
+            board.add_semantic_merge_review(run_id="run_dash_1", decision="accept", patch_hash="sha256:abc", findings=[], path=review_path)
+            board.add_multi_repo_orchestration(
+                orchestration_id="mrepo_dash",
+                run_id=None,
+                workspace=project,
+                mode="design",
+                task="coordinate dashboard",
+                status="planned",
+                repos=[{"path": str(project), "workflow": "dev"}],
+            )
+        validation_dir = project / ".muxdev" / "runs" / "val_dash" / "validation"
+        validation_dir.mkdir(parents=True, exist_ok=True)
+        (validation_dir / "experiment.json").write_text(
+            json.dumps(
+                {
+                    "experiment_id": "val_dash",
+                    "suite": {"name": "dashboard"},
+                    "strategies": ["direct_cli", "muxdev_multi_cli"],
+                    "comparison": {"winner": "muxdev_multi_cli"},
+                    "artifacts": {"report": str(project / "reports" / "validation" / "val_dash.md")},
+                    "updated_at": "2026-06-19T00:00:00Z",
+                }
+            ),
+            encoding="utf-8",
+        )
+        with MemoryStore(project) as store:
+            active = store.propose_claim(claim="Use pytest for tests", kind="test_command", role="test", confidence=0.9)
+            store.approve(str(active["id"]))
+            store.propose_claim(claim="Do not use pytest for tests", kind="test_command", role="test", confidence=0.4)
 
         monkeypatch.setattr(web_module, "_provider_health_payload", lambda: {"ready": ["mock"], "partial": [], "unavailable": [], "total": 1, "providers": []})
         client = TestClient(create_app(task_manager=manager))
@@ -192,11 +290,39 @@ def test_dashboard_overview_groups_projects_workflows_roles(monkeypatch) -> None
     assert first["current_activity"] == "running stage code"
     assert first["elapsed_seconds"] is not None
     assert first["stage_timeline"][0]["elapsed_seconds"] is not None
+    assert first["delivery_confidence"]["tests"]["status"] == "passed"
+    assert first["delivery_confidence"]["rollback"]["available"] is True
     failed = next(task for task in code_group["tasks"] if task["task_id"] == "run_dash_2")
     assert failed["error_summary"]["message"] == "temporary network error"
     recovery = next(item for item in payload["action_center"] if item["kind"] == "recovery")
     assert recovery["endpoint"] == "/api/tasks/run_dash_2/continue"
     assert "temporary network error" in recovery["why"]
+    assert {column["id"] for column in payload["task_board"]} == {"todo", "running", "waiting", "needs_review", "done", "failed"}
+    assert payload["delivery_confidence"]["items"][0]["task_id"] in {"run_dash_1", "run_dash_2"}
+    assert {item["id"] for item in payload["health_strip"]} == {"daemon", "providers", "budget", "git", "skills", "memory"}
+    assert payload["projects"][0]["health"]["status"] in {"blocked", "running", "needs_attention"}
+    assert payload["projects"][0]["shared_state"]["label"] == "Shared State / Memory Board"
+    assert payload["validation"]["summary"]["count"] == 1
+    assert set(payload["standards"]) == {"trusted_delivery", "validation", "governance", "configuration"}
+    trusted_standards = payload["standards"]["trusted_delivery"]
+    assert trusted_standards["total"] == 7
+    assert {"confidence", "tests", "review", "rollback", "artifacts", "budget", "human_attention"} <= {
+        item["id"] for item in trusted_standards["items"]
+    }
+    confidence_standard = next(item for item in trusted_standards["items"] if item["id"] == "confidence")
+    assert {"id", "label", "status", "current", "target", "evidence", "action"} <= set(confidence_standard)
+    validation_standards = payload["standards"]["validation"]
+    assert {"experiment_exists", "baseline_coverage", "score", "test_pass_rate", "evidence_confidence", "safety", "rollback_efficiency"} <= {
+        item["id"] for item in validation_standards["items"]
+    }
+    assert next(item for item in validation_standards["items"] if item["id"] == "baseline_coverage")["status"] == "ready"
+    assert payload["standards"]["configuration"]["items"]
+    assert payload["standards"]["governance"]["items"]
+    assert payload["governance_summary"]["validation"]["latest"]["experiment_id"] == "val_dash"
+    assert payload["governance_summary"]["provider_learning"]["trend"][0]["provider"] == "mock"
+    assert payload["governance_summary"]["parallel_control"]["open_conflicts"] == 1
+    assert payload["governance_summary"]["multi_repo"]["count"] == 1
+    assert payload["governance_summary"]["memory"]["counts"]["contradictions"] >= 1
     assert payload["global_config"]["role_templates"]
     assert "plugin_market" not in payload["global_config"]
     assert payload["global_config"]["workflow_templates"]["templates"]
@@ -599,6 +725,33 @@ def test_start_daemon_reuses_healthy_api_without_spawning(monkeypatch) -> None:
 
     assert payload["running"] is True
     assert payload["started"] is False
+
+
+def test_daemon_health_tolerates_slow_local_health_response() -> None:
+    class SlowHealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            time.sleep(0.6)
+            body = json.dumps({"service": "muxdev", "status": "ok"}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SlowHealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        payload = daemon_health(host="127.0.0.1", api_port=server.server_port)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert payload["ok"] is True
 
 
 def test_start_daemon_uses_hidden_windows_subprocess_kwargs(monkeypatch) -> None:

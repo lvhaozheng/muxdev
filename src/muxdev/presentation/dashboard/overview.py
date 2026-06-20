@@ -30,6 +30,7 @@ def build_dashboard_overview(
     hidden_tasks: dict[str, dict[str, Any]] | None = None,
     include_hidden: bool = False,
     include_global_config: bool = True,
+    memory_governance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the aggregated project/global view used by the live dashboard."""
     workspace = workspace.resolve()
@@ -48,6 +49,8 @@ def build_dashboard_overview(
     visible_provider_actions = provider_actions if include_hidden else [
         row for row in provider_actions if str(row.get("run_id") or row.get("task_id") or "") in visible_task_ids
     ]
+    validation_experiments = list_validation_experiments(workspace)[:8]
+    governance_summary = _governance_summary(validation_experiments, ecosystem, memory_governance or {})
     action_overview = build_ux_overview(
         daemon=daemon,
         tasks=visible_tasks,
@@ -60,6 +63,22 @@ def build_dashboard_overview(
     counts["projects"] = len(projects)
     current_project_id = _project_id(workspace)
     selected_project_id = current_project_id if any(project["id"] == current_project_id for project in projects) else (projects[0]["id"] if projects else "")
+    delivery_confidence = _delivery_confidence_overview(visible_tasks)
+    health_strip = _health_strip(workspace, daemon, visible_tasks, provider_health, projects)
+    global_config = _global_config(workspace, visible_tasks, provider_health, ecosystem) if include_global_config else {}
+    standards = _dashboard_standards(
+        workspace,
+        tasks=visible_tasks,
+        approvals=visible_approvals,
+        provider_actions=visible_provider_actions,
+        provider_health=provider_health,
+        delivery_confidence=delivery_confidence,
+        validation_experiments=validation_experiments,
+        governance_summary=governance_summary,
+        health_strip=health_strip,
+        projects=projects,
+        ecosystem=ecosystem,
+    )
     return {
         "workspace": str(workspace),
         "selected_project_id": selected_project_id,
@@ -70,10 +89,17 @@ def build_dashboard_overview(
         "pending_approvals": visible_approvals,
         "pending_provider_actions": visible_provider_actions,
         "projects": projects,
-        "global_config": _global_config(workspace, visible_tasks, provider_health, ecosystem) if include_global_config else {},
+        "task_board": action_overview["task_board"],
+        "filters": action_overview["filters"],
+        "selected_task": action_overview["selected_task"],
+        "delivery_confidence": delivery_confidence,
+        "health_strip": health_strip,
+        "governance_summary": governance_summary,
+        "global_config": global_config,
         "global_config_deferred": not include_global_config,
         "artifact_center": action_overview["artifact_center"],
-        "validation": {"experiments": list_validation_experiments(workspace)[:8]},
+        "validation": {"experiments": validation_experiments, "summary": governance_summary["validation"]},
+        "standards": standards,
     }
 
 
@@ -183,6 +209,8 @@ def _projects(workspace: Path, tasks: list[dict[str, Any]]) -> list[dict[str, An
                 "summary": _project_summary(project_tasks),
                 "workflows": _workflow_groups(Path(str(project["path"])), project_tasks),
                 "config": config,
+                "health": _project_health(project_tasks),
+                "shared_state": _shared_state(Path(str(project["path"])), project_tasks, config),
             }
         )
     return sorted(projects, key=lambda item: (item["summary"]["active"] == 0, str(item["name"]).lower()))
@@ -217,6 +245,8 @@ def _apply_hidden_projects(
                     "hidden": True,
                     "hidden_at": metadata.get("hidden_at"),
                     "summary": {"tasks": 0, "active": 0, "waiting": 0, "failed": 0, "cost_usd": 0, "tokens": 0},
+                    "health": {"status": "idle", "blocking": 0, "waiting": 0, "failed": 0, "budget": "ok"},
+                    "shared_state": {},
                     "workflows": [],
                     "config": {},
                 }
@@ -244,6 +274,49 @@ def _project_summary(tasks: list[dict[str, Any]]) -> dict[str, Any]:
         "failed": len(failed),
         "cost_usd": round(sum(float(task.get("cost_usd") or 0) for task in tasks), 6),
         "tokens": sum(int(task.get("tokens") or 0) for task in tasks),
+    }
+
+
+def _project_health(tasks: list[dict[str, Any]]) -> dict[str, Any]:
+    waiting = [task for task in tasks if int(task.get("pending_approvals") or 0) or int(task.get("pending_provider_actions") or 0)]
+    failed = [task for task in tasks if str(task.get("status")) in {"blocked", "aborted", "failed"} or int(task.get("errors") or 0)]
+    high_cost = [task for task in tasks if float(task.get("cost_usd") or 0) > 0.5]
+    if failed:
+        status = "blocked"
+    elif waiting:
+        status = "needs_attention"
+    elif high_cost:
+        status = "budget_watch"
+    elif any(str(task.get("status") or "") not in {"completed", "blocked", "aborted"} for task in tasks):
+        status = "running"
+    else:
+        status = "ready" if tasks else "idle"
+    return {
+        "status": status,
+        "blocking": len(failed) + len(waiting),
+        "waiting": len(waiting),
+        "failed": len(failed),
+        "budget": "watch" if high_cost else "ok",
+    }
+
+
+def _shared_state(project: Path, tasks: list[dict[str, Any]], config: dict[str, Any]) -> dict[str, Any]:
+    context = config.get("project_context") if isinstance(config.get("project_context"), dict) else {}
+    memory = config.get("memory") if isinstance(config.get("memory"), dict) else {}
+    recent_facts = []
+    for task in tasks[:3]:
+        title = task.get("task_title") or task.get("task") or task.get("task_id")
+        stage = task.get("current_stage") or task.get("status") or ""
+        if title:
+            recent_facts.append({"task_id": task.get("task_id") or task.get("run_id"), "summary": str(title), "stage": stage})
+    return {
+        "label": "Shared State / Memory Board",
+        "project": str(project),
+        "context_exists": bool(context.get("exists")),
+        "context_path": context.get("path"),
+        "memory_policy": memory.get("promotion", "explicit"),
+        "review_queue": memory.get("review_queue", "muxdev memory inbox"),
+        "recent_facts": recent_facts,
     }
 
 
@@ -330,6 +403,8 @@ def _task_card(task: dict[str, Any], role: str) -> dict[str, Any]:
         "hidden": bool(task.get("hidden")),
         "branch": task.get("branch") or task.get("worktree") or "",
         "risk": task.get("risk") or _task_risk(task),
+        "delivery_confidence": task.get("delivery_confidence", {}),
+        "evidence_summary": task.get("evidence_summary", {}),
         "cost_usd": task.get("cost_usd", 0),
         "tokens": task.get("tokens", 0),
         "pending_approvals": task.get("pending_approvals", 0),
@@ -396,6 +471,588 @@ def _global_config(workspace: Path, tasks: list[dict[str, Any]], provider_health
             "git": git_safety_panel(workspace),
         },
     }
+
+
+def _delivery_confidence_overview(tasks: list[dict[str, Any]]) -> dict[str, Any]:
+    rows = []
+    for task in tasks:
+        confidence = task.get("delivery_confidence") if isinstance(task.get("delivery_confidence"), dict) else {}
+        if not confidence:
+            continue
+        rows.append(
+            {
+                "task_id": task.get("task_id") or task.get("run_id"),
+                "task_title": task.get("task_title") or task.get("task") or task.get("title"),
+                "project_name": task.get("project_name") or "",
+                "status": task.get("status"),
+                "current_stage": task.get("current_stage"),
+                "label": confidence.get("label"),
+                "confidence": confidence.get("confidence"),
+                "score": confidence.get("score"),
+                "tests": confidence.get("tests", {}),
+                "review": confidence.get("review", {}),
+                "rollback": confidence.get("rollback", {}),
+                "diff": confidence.get("diff", {}),
+                "usage": confidence.get("usage", {}),
+                "reasons": confidence.get("reasons", []),
+                "missing_evidence": confidence.get("missing_evidence", []),
+            }
+        )
+    priority = {"blocked": 0, "risky": 1, "collecting": 2, "reviewable": 3, "trusted": 4}
+    rows.sort(key=lambda row: (priority.get(str(row.get("label")), 2), str(row.get("status")) == "completed", str(row.get("task_title") or "")))
+    counts: dict[str, int] = {}
+    for row in rows:
+        label = str(row.get("label") or "unknown")
+        counts[label] = counts.get(label, 0) + 1
+    return {"items": rows[:8], "counts": counts}
+
+
+def _dashboard_standards(
+    workspace: Path,
+    *,
+    tasks: list[dict[str, Any]],
+    approvals: list[dict[str, Any]],
+    provider_actions: list[dict[str, Any]],
+    provider_health: dict[str, Any],
+    delivery_confidence: dict[str, Any],
+    validation_experiments: list[dict[str, Any]],
+    governance_summary: dict[str, Any],
+    health_strip: list[dict[str, Any]],
+    projects: list[dict[str, Any]],
+    ecosystem: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "trusted_delivery": _trusted_delivery_standards(tasks, approvals, provider_actions, delivery_confidence),
+        "validation": _validation_standards(validation_experiments),
+        "governance": _governance_standards(workspace, tasks, provider_health, governance_summary, health_strip, ecosystem),
+        "configuration": _configuration_standards(workspace, projects),
+    }
+
+
+def _standard_section(section_id: str, label: str, items: list[dict[str, Any]]) -> dict[str, Any]:
+    total = len(items)
+    passed = sum(1 for item in items if str(item.get("status")) == "ready")
+    blocked = any(str(item.get("status")) == "blocked" for item in items)
+    status = "blocked" if blocked else ("ready" if total and passed == total else "watch")
+    return {
+        "id": section_id,
+        "label": label,
+        "status": status,
+        "passed": passed,
+        "total": total,
+        "summary": f"{passed}/{total} standard(s) met",
+        "items": items,
+    }
+
+
+def _standard_item(
+    item_id: str,
+    label: str,
+    status: str,
+    current: object,
+    target: object,
+    *,
+    evidence: object = "",
+    action: str = "none",
+) -> dict[str, Any]:
+    return {
+        "id": item_id,
+        "label": label,
+        "status": status,
+        "current": current,
+        "target": target,
+        "evidence": evidence,
+        "action": action,
+    }
+
+
+def _trusted_delivery_standards(
+    tasks: list[dict[str, Any]],
+    approvals: list[dict[str, Any]],
+    provider_actions: list[dict[str, Any]],
+    delivery_confidence: dict[str, Any],
+) -> dict[str, Any]:
+    rows = delivery_confidence.get("items") if isinstance(delivery_confidence.get("items"), list) else []
+    focus = rows[0] if rows else {}
+    confidence = _as_float(focus.get("confidence"), default=0.0)
+    tests = [row.get("tests", {}) for row in rows if isinstance(row, dict)]
+    reviews = [row.get("review", {}) for row in rows if isinstance(row, dict)]
+    rollbacks = [row.get("rollback", {}) for row in rows if isinstance(row, dict)]
+    diffs = [row.get("diff", {}) for row in rows if isinstance(row, dict)]
+    budget = budget_panel(tasks)
+    pending_actions = len(approvals) + len(provider_actions)
+    missing = focus.get("missing_evidence") if isinstance(focus.get("missing_evidence"), list) else []
+    confidence_status = "watch"
+    if rows:
+        confidence_status = "ready" if confidence >= 0.85 else ("blocked" if confidence < 0.60 or str(focus.get("label")) in {"blocked", "risky"} else "watch")
+    items = [
+        _standard_item(
+            "confidence",
+            "Delivery confidence",
+            confidence_status,
+            round(confidence, 3) if rows else "missing",
+            ">= 0.85 trusted; 0.60-0.84 reviewable; < 0.60 risky",
+            evidence=focus.get("task_id") or "",
+            action="publish_evidence" if not rows else ("resolve_risk" if confidence_status != "ready" else "none"),
+        ),
+        _standard_item(
+            "tests",
+            "Tests",
+            "ready" if tests and all(str(row.get("status")) == "passed" for row in tests if isinstance(row, dict)) else ("watch" if not tests else "blocked"),
+            _passed_total(tests, "passed", "total"),
+            "all recorded tests passed",
+            evidence=_task_refs(rows),
+            action="add_tests",
+        ),
+        _standard_item(
+            "review",
+            "Review blockers",
+            "ready" if reviews and all(int(row.get("high_blockers") or 0) == 0 for row in reviews if isinstance(row, dict)) else ("watch" if not reviews else "blocked"),
+            sum(int(row.get("high_blockers") or 0) for row in reviews if isinstance(row, dict)),
+            "0 high review blockers",
+            evidence=_task_refs(rows),
+            action="complete_review",
+        ),
+        _standard_item(
+            "rollback",
+            "Rollback",
+            "ready" if rollbacks and all(bool(row.get("available")) for row in rollbacks if isinstance(row, dict)) else ("watch" if not rollbacks else "blocked"),
+            f"{sum(1 for row in rollbacks if isinstance(row, dict) and row.get('available'))}/{len(rollbacks)} available" if rollbacks else "missing",
+            "rollback snapshot available",
+            evidence=_task_refs(rows),
+            action="enable_rollback",
+        ),
+        _standard_item(
+            "artifacts",
+            "Report / diff / evidence",
+            "ready" if rows and not missing and all(bool(row.get("available")) for row in diffs if isinstance(row, dict)) else "watch",
+            "complete" if rows and not missing else (", ".join(str(item) for item in missing) or "missing"),
+            "report, diff, evidence bundle complete",
+            evidence=_task_refs(rows),
+            action="publish_evidence",
+        ),
+        _standard_item(
+            "budget",
+            "Budget",
+            "ready" if int(budget.get("high_cost_tasks") or 0) == 0 else "watch",
+            f"${float(budget.get('total_cost_usd') or 0):.4f}; {budget.get('high_cost_tasks', 0)} high-cost task(s)",
+            "no task above default budget",
+            evidence=f"default=${budget.get('default_task_budget_usd')}",
+            action="review_budget",
+        ),
+        _standard_item(
+            "human_attention",
+            "Human attention",
+            "ready" if pending_actions == 0 else "blocked",
+            pending_actions,
+            "0 pending approvals/provider actions",
+            evidence={"approvals": len(approvals), "provider_actions": len(provider_actions)},
+            action="resolve_attention",
+        ),
+    ]
+    return _standard_section("trusted_delivery", "Trusted delivery standards", items)
+
+
+def _validation_standards(experiments: list[dict[str, Any]]) -> dict[str, Any]:
+    latest = experiments[0] if experiments else {}
+    strategies = latest.get("strategies") if isinstance(latest.get("strategies"), list) else []
+    scores = latest.get("strategy_scores") if isinstance(latest.get("strategy_scores"), dict) else {}
+    metrics = latest.get("metrics_summary") if isinstance(latest.get("metrics_summary"), dict) else {}
+    muxdev_delta = latest.get("muxdev_delta") if isinstance(latest.get("muxdev_delta"), dict) else {}
+    best_score = max((_as_float(value) for value in scores.values()), default=_as_float(metrics.get("score"), default=0.0))
+    has_experiment = bool(latest)
+    has_baseline = "direct_cli" in {str(item) for item in strategies} or str(latest.get("baseline_strategy") or "") == "direct_cli"
+    has_muxdev = any(str(item).startswith("muxdev_") or str(item) in {"single_agent", "multi_agent"} for item in strategies)
+    items = [
+        _standard_item(
+            "experiment_exists",
+            "Validation experiment",
+            "ready" if has_experiment else "watch",
+            latest.get("experiment_id") or "not_run",
+            "latest validation experiment exists",
+            evidence=latest.get("report") or "",
+            action="run_validation",
+        ),
+        _standard_item(
+            "baseline_coverage",
+            "Baseline coverage",
+            "ready" if has_baseline and has_muxdev else "watch",
+            ", ".join(str(item) for item in strategies) or "missing",
+            "direct_cli + one muxdev strategy",
+            evidence=latest.get("experiment_id") or "",
+            action="run_validation",
+        ),
+        _standard_item(
+            "score",
+            "Validation score",
+            "ready" if best_score >= 0.85 else ("watch" if has_experiment else "watch"),
+            round(best_score, 4),
+            ">= 0.85",
+            evidence=scores,
+            action="review_validation",
+        ),
+        _standard_item(
+            "test_pass_rate",
+            "Test pass rate",
+            "ready" if _as_float(metrics.get("test_pass_rate")) >= 1.0 else ("watch" if has_experiment else "watch"),
+            metrics.get("test_pass_rate", 0.0),
+            "1.0",
+            evidence=latest.get("experiment_id") or "",
+            action="add_tests",
+        ),
+        _standard_item(
+            "evidence_confidence",
+            "Evidence confidence",
+            "ready" if _as_float(metrics.get("evidence_confidence")) >= 0.85 else ("watch" if has_experiment else "watch"),
+            metrics.get("evidence_confidence", 0.0),
+            ">= 0.85",
+            evidence=latest.get("experiment_id") or "",
+            action="publish_evidence",
+        ),
+        _standard_item(
+            "safety",
+            "Safety",
+            "ready" if _as_float(metrics.get("safety_score")) >= 0.80 and int(metrics.get("high_review_blockers") or 0) == 0 else ("blocked" if int(metrics.get("high_review_blockers") or 0) else "watch"),
+            {"safety_score": metrics.get("safety_score", 0.0), "high_review_blockers": metrics.get("high_review_blockers", 0)},
+            "safety_score >= 0.80 and 0 high blockers",
+            evidence=latest.get("experiment_id") or "",
+            action="complete_review",
+        ),
+        _standard_item(
+            "rollback_efficiency",
+            "Rollback / cost efficiency",
+            "ready" if bool(metrics.get("rollback_success")) and has_experiment else ("watch" if has_experiment else "watch"),
+            {"rollback_success": bool(metrics.get("rollback_success")), "cost_usd": metrics.get("cost_usd", 0.0), "tokens": metrics.get("tokens", 0)},
+            "rollback_success=true with visible cost/tokens",
+            evidence=muxdev_delta,
+            action="enable_rollback",
+        ),
+    ]
+    return _standard_section("validation", "Validation standards", items)
+
+
+def _governance_standards(
+    workspace: Path,
+    tasks: list[dict[str, Any]],
+    provider_health: dict[str, Any],
+    governance_summary: dict[str, Any],
+    health_strip: list[dict[str, Any]],
+    ecosystem: dict[str, Any],
+) -> dict[str, Any]:
+    budget = budget_panel(tasks)
+    git = git_safety_panel(workspace)
+    mcp = _mcp_summary(workspace, ecosystem)
+    memory = governance_summary.get("memory") if isinstance(governance_summary.get("memory"), dict) else {}
+    ready_providers = provider_health.get("ready") if isinstance(provider_health.get("ready"), list) else []
+    items = [
+        _standard_item("provider_ready", "Provider availability", "ready" if ready_providers else "blocked", len(ready_providers), ">= 1 ready provider", evidence=provider_health, action="fix_provider"),
+        _standard_item("git_safety", "Git safety", "ready" if str(git.get("status")) in {"clean", "dirty", "not_git"} else "blocked", git.get("status") or "-", "not blocked; branch/dirty state visible", evidence=git.get("branch") or git.get("warning") or "", action="fix_git"),
+        _standard_item("budget_guardrail", "Budget guardrail", "ready" if int(budget.get("high_cost_tasks") or 0) == 0 else "watch", budget.get("high_cost_tasks", 0), "0 high-cost tasks", evidence=budget, action="review_budget"),
+        _standard_item("mcp_guardrails", "MCP guardrails", "ready" if str(mcp.get("status") or "enabled") in {"enabled", "ok", "ready"} else "watch", mcp.get("status") or "enabled", "enabled", evidence={"tools": mcp.get("tools_count", 0), "write_policy": mcp.get("write_policy", "-")}, action="setup_mcp"),
+        _standard_item("skills_lock", "Skills lock", "ready" if any(row.get("id") == "skills" and row.get("status") in {"ok", "ready"} for row in health_strip) else "watch", next((row.get("summary") for row in health_strip if row.get("id") == "skills"), "-"), "skills visible and lock readable", evidence="skills health strip", action="configure_project"),
+        _standard_item("memory_conflicts", "Memory conflicts", "ready" if int((memory.get("counts") or {}).get("contradictions") or 0) == 0 else "blocked", int((memory.get("counts") or {}).get("contradictions") or 0), "0 unresolved contradictions", evidence=memory.get("path") or "", action="resolve_memory"),
+    ]
+    return _standard_section("governance", "Governance standards", items)
+
+
+def _configuration_standards(workspace: Path, projects: list[dict[str, Any]]) -> dict[str, Any]:
+    runtime = _runtime_config(workspace)
+    selected = projects[0] if projects else {}
+    config = selected.get("config") if isinstance(selected.get("config"), dict) else {}
+    context = config.get("project_context") if isinstance(config.get("project_context"), dict) else project_context_status(workspace)
+    workflow_count = sum(len(project.get("workflows") or []) for project in projects)
+    role_count = len(runtime.get("roles") or {}) if isinstance(runtime.get("roles"), dict) else 0
+    items = [
+        _standard_item("profile_gate", "Profile and gate", "ready" if runtime.get("profile") and runtime.get("gate") else "watch", {"profile": runtime.get("profile") or "", "gate": runtime.get("gate") or ""}, "profile and gate configured", evidence="muxdev config", action="configure_project"),
+        _standard_item("workflow_template", "Workflow template", "ready" if workflow_count else "watch", workflow_count, ">= 1 workflow template visible", evidence=_default_workflow(workspace), action="configure_project"),
+        _standard_item("role_template", "Role providers", "ready" if role_count else "watch", role_count, "role providers configured or auto", evidence=runtime.get("roles") or {}, action="configure_project"),
+        _standard_item("project_context", "Project context", "ready" if context.get("exists") else "watch", context.get("path") or "missing", "project context exists", evidence=context.get("preview") or "", action="configure_project"),
+        _standard_item("project_budget", "Project budget", "ready", "$0.50 default", "default budget visible", evidence="--max-cost-usd", action="review_budget"),
+    ]
+    return _standard_section("configuration", "Configuration standards", items)
+
+
+def _task_refs(rows: list[object]) -> list[str]:
+    return [str(row.get("task_id") or row.get("run_id") or "") for row in rows if isinstance(row, dict) and (row.get("task_id") or row.get("run_id"))][:6]
+
+
+def _passed_total(rows: list[object], passed_key: str, total_key: str) -> str:
+    passed = sum(int(row.get(passed_key) or 0) for row in rows if isinstance(row, dict))
+    total = sum(int(row.get(total_key) or 0) for row in rows if isinstance(row, dict))
+    return f"{passed}/{total}" if total else "missing"
+
+
+def _as_float(value: object, *, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _health_strip(workspace: Path, daemon: dict[str, Any], tasks: list[dict[str, Any]], provider_health: dict[str, Any], projects: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    budget = budget_panel(tasks)
+    selected_project = projects[0] if projects else {}
+    selected_config = selected_project.get("config", {}) if isinstance(selected_project.get("config"), dict) else {}
+    git = selected_config.get("git_safety") if isinstance(selected_config.get("git_safety"), dict) else git_safety_panel(workspace)
+    skills = selected_config.get("skills", []) if isinstance(selected_config.get("skills"), list) else []
+    memory = selected_project.get("shared_state", {}) if isinstance(selected_project.get("shared_state"), dict) else {}
+    ready = len(provider_health.get("ready", []) if isinstance(provider_health.get("ready"), list) else [])
+    partial = len(provider_health.get("partial", []) if isinstance(provider_health.get("partial"), list) else [])
+    unavailable = len(provider_health.get("unavailable", []) if isinstance(provider_health.get("unavailable"), list) else [])
+    daemon_status = str(daemon.get("status") or "unknown")
+    return [
+        {
+            "id": "daemon",
+            "label": "Daemon",
+            "status": "ok" if daemon_status in {"ok", "running"} else "degraded",
+            "summary": f"{daemon_status}; {daemon.get('running_tasks', 0)} running",
+        },
+        {
+            "id": "providers",
+            "label": "Providers",
+            "status": "ok" if ready else ("degraded" if partial else "blocked"),
+            "summary": f"{ready} ready / {partial} partial / {unavailable} unavailable",
+        },
+        {
+            "id": "budget",
+            "label": "Budget",
+            "status": "watch" if int(budget.get("high_cost_tasks") or 0) else "ok",
+            "summary": f"${float(budget.get('total_cost_usd') or 0):.4f}; {budget.get('active_tasks', 0)} active",
+        },
+        {
+            "id": "git",
+            "label": "Git Safety",
+            "status": str(git.get("status") or "unknown"),
+            "summary": str(git.get("branch") or git.get("warning") or git.get("status") or "-"),
+        },
+        {
+            "id": "skills",
+            "label": "Skills",
+            "status": "ok" if skills else "watch",
+            "summary": f"{len(skills)} project skill(s)",
+        },
+        {
+            "id": "memory",
+            "label": "Memory",
+            "status": "ok" if memory.get("context_exists") else "watch",
+            "summary": str(memory.get("review_queue") or "muxdev memory inbox"),
+        },
+    ]
+
+
+def _governance_summary(validation_experiments: list[dict[str, Any]], ecosystem: dict[str, Any], memory_governance: dict[str, Any]) -> dict[str, Any]:
+    provider_learning = _rows(ecosystem.get("provider_learning"))
+    parallel_conflicts = _rows(ecosystem.get("parallel_conflicts"))
+    semantic_reviews = _rows(ecosystem.get("semantic_merge_reviews"))
+    multi_repo = _rows(ecosystem.get("multi_repo_orchestrations"))
+    memory = _memory_governance(memory_governance)
+    validation = _validation_summary(validation_experiments)
+    provider = _provider_learning_summary(provider_learning)
+    parallel = _parallel_summary(parallel_conflicts, semantic_reviews)
+    repos = _multi_repo_summary(multi_repo)
+    items = [
+        {
+            "id": "validation",
+            "label": "Validation",
+            "status": validation["status"],
+            "summary": validation["summary"],
+        },
+        {
+            "id": "provider_learning",
+            "label": "Provider Learning",
+            "status": provider["status"],
+            "summary": provider["summary"],
+        },
+        {
+            "id": "parallel_control",
+            "label": "Parallel Control",
+            "status": parallel["status"],
+            "summary": parallel["summary"],
+        },
+        {
+            "id": "memory",
+            "label": "Memory Governance",
+            "status": memory["status"],
+            "summary": memory["summary"],
+        },
+        {
+            "id": "multi_repo",
+            "label": "Multi-Repo",
+            "status": repos["status"],
+            "summary": repos["summary"],
+        },
+    ]
+    return {
+        "items": items,
+        "validation": validation,
+        "provider_learning": provider,
+        "parallel_control": parallel,
+        "memory": memory,
+        "multi_repo": repos,
+    }
+
+
+def _validation_summary(experiments: list[dict[str, Any]]) -> dict[str, Any]:
+    winners = _count_by(experiments, "winner")
+    latest = experiments[0] if experiments else {}
+    winner = latest.get("winner") or "-"
+    return {
+        "status": "ready" if experiments else "watch",
+        "count": len(experiments),
+        "latest": latest,
+        "winners": winners,
+        "summary": f"{len(experiments)} experiment(s); latest winner {winner}",
+        "items": experiments[:5],
+    }
+
+
+def _provider_learning_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    trend = []
+    for row in sorted(rows, key=lambda item: (-float(item.get("score") or 0), str(item.get("provider") or ""), str(item.get("role") or "")))[:8]:
+        trend.append(
+            {
+                "provider": row.get("provider"),
+                "role": row.get("role") or "any",
+                "score": round(float(row.get("score") or 0), 3),
+                "attempts": int(row.get("attempts") or 0),
+                "successes": int(row.get("successes") or 0),
+                "failures": int(row.get("failures") or 0),
+                "human_actions": int(row.get("human_actions") or 0),
+                "updated_at": row.get("updated_at"),
+            }
+        )
+    best = trend[0] if trend else {}
+    best_label = f"{best.get('provider')}/{best.get('role')}" if best else "-"
+    return {
+        "status": "ready" if trend else "watch",
+        "summary": f"{len(rows)} score row(s); best {best_label}",
+        "count": len(rows),
+        "trend": trend,
+    }
+
+
+def _parallel_summary(conflicts: list[dict[str, Any]], semantic_reviews: list[dict[str, Any]]) -> dict[str, Any]:
+    open_conflicts = [row for row in conflicts if str(row.get("status") or "open") == "open"]
+    blocked_reviews = [row for row in semantic_reviews if str(row.get("decision") or "").lower() in {"reject", "blocked"}]
+    status = "blocked" if open_conflicts or blocked_reviews else ("ready" if conflicts or semantic_reviews else "watch")
+    items = []
+    for row in conflicts[:6]:
+        items.append(
+            {
+                "kind": "parallel_conflict",
+                "id": row.get("conflict_id"),
+                "status": row.get("status") or "open",
+                "severity": row.get("severity") or "-",
+                "run_id": row.get("run_id"),
+                "stage_id": row.get("stage_id"),
+                "lanes": len(row.get("stages") or []),
+                "files": len(row.get("files") or []),
+                "summary": f"{len(row.get('stages') or [])} lane(s) / {len(row.get('files') or [])} file(s)",
+            }
+        )
+    for row in semantic_reviews[:6]:
+        findings = row.get("findings") if isinstance(row.get("findings"), list) else []
+        items.append(
+            {
+                "kind": "semantic_merge",
+                "id": row.get("review_id"),
+                "status": row.get("decision") or "-",
+                "severity": "high" if str(row.get("decision") or "").lower() in {"reject", "blocked"} else "medium",
+                "run_id": row.get("run_id"),
+                "stage_id": "merge",
+                "lanes": 1,
+                "files": 0,
+                "summary": f"{row.get('decision') or '-'}; {len(findings)} finding(s)",
+            }
+        )
+    return {
+        "status": status,
+        "summary": f"{len(open_conflicts)} open conflict(s); {len(blocked_reviews)} blocked merge review(s)",
+        "open_conflicts": len(open_conflicts),
+        "semantic_reviews": len(semantic_reviews),
+        "items": items[:8],
+    }
+
+
+def _multi_repo_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    active = [row for row in rows if str(row.get("status") or "") not in {"completed", "cancelled", "failed"}]
+    items = []
+    for row in rows[:6]:
+        repos = row.get("repos") if isinstance(row.get("repos"), list) else []
+        items.append(
+            {
+                "orchestration_id": row.get("orchestration_id"),
+                "status": row.get("status"),
+                "mode": row.get("mode"),
+                "task": row.get("task"),
+                "repos": len(repos),
+                "plan_path": row.get("plan_path"),
+                "updated_at": row.get("updated_at"),
+            }
+        )
+    return {
+        "status": "ready" if rows else "watch",
+        "summary": f"{len(rows)} orchestration(s); {len(active)} active",
+        "count": len(rows),
+        "active": len(active),
+        "items": items,
+    }
+
+
+def _memory_governance(payload: dict[str, Any]) -> dict[str, Any]:
+    inbox = payload.get("inbox") if isinstance(payload.get("inbox"), dict) else {}
+    counts = payload.get("counts") if isinstance(payload.get("counts"), dict) else {}
+    if not counts:
+        counts = {key: len(value) for key, value in inbox.items() if isinstance(value, list)}
+    pending_contradictions = counts.get("contradictions", 0)
+    promotable = counts.get("promotable", 0)
+    proposed = counts.get("proposed", 0)
+    memory_status = str(payload.get("status") or ("blocked" if pending_contradictions else ("watch" if promotable or proposed else "ready")))
+    return {
+        "status": memory_status,
+        "summary": payload.get("summary") or f"{proposed} proposed; {promotable} promotable; {pending_contradictions} contradiction(s)",
+        "counts": counts,
+        "path": payload.get("path") or "",
+        "proposed": _compact_memory_items(inbox.get("proposed")),
+        "promotable": _compact_memory_items(inbox.get("promotable")),
+        "contradictions": _compact_contradictions(inbox.get("contradictions")),
+        "quarantined": _compact_memory_items(inbox.get("quarantined")),
+    }
+
+
+def _compact_memory_items(rows: object) -> list[dict[str, Any]]:
+    result = []
+    for row in _rows(rows)[:5]:
+        result.append(
+            {
+                "id": row.get("id"),
+                "layer": row.get("layer"),
+                "scope_id": row.get("scope_id"),
+                "kind": row.get("kind"),
+                "role": row.get("role"),
+                "status": row.get("status"),
+                "promotion_state": row.get("promotion_state"),
+                "claim": row.get("claim"),
+                "confidence": row.get("confidence"),
+            }
+        )
+    return result
+
+
+def _compact_contradictions(rows: object) -> list[dict[str, Any]]:
+    result = []
+    for row in _rows(rows)[:5]:
+        result.append(
+            {
+                "contradiction_id": row.get("contradiction_id"),
+                "status": row.get("status"),
+                "reason": row.get("reason"),
+                "claim": row.get("claim"),
+                "conflicting_claim": row.get("conflicting_claim"),
+                "quarantine_target": row.get("quarantine_target"),
+            }
+        )
+    return result
 
 
 def _mcp_summary(workspace: Path, ecosystem: dict[str, Any]) -> dict[str, Any]:
@@ -517,6 +1174,18 @@ def _task_risk(task: dict[str, Any]) -> str:
     if float(task.get("cost_usd") or 0) > 0.5:
         return "medium"
     return "low"
+
+
+def _rows(value: object) -> list[dict[str, Any]]:
+    return [row for row in value if isinstance(row, dict)] if isinstance(value, list) else []
+
+
+def _count_by(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        value = str(row.get(key) or "unknown")
+        counts[value] = counts.get(value, 0) + 1
+    return counts
 
 
 def _json_list(value: object) -> list[object]:

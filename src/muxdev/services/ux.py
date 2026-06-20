@@ -7,6 +7,7 @@ what can be done next.
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -310,6 +311,8 @@ def build_ux_overview(
                 "headline": "Approval required",
                 "why": row.get("reason") or "A policy gate needs a decision.",
                 "endpoint": f"/api/approvals/{approval_id}/approve",
+                "subject_hash": row.get("subject_hash") or "",
+                "subject_summary": _approval_subject_summary(row),
                 **_action_context(task, run_id=run_id, stage_id=str(row.get("stage_id") or "")),
             }
         )
@@ -465,6 +468,26 @@ def _provider_action_why(row: dict[str, Any], *, overview: bool = False) -> str:
     if overview:
         return "Handle the provider CLI prompt, then continue the task."
     return "The external provider CLI/session asked for confirmation, auth, rate-limit handling, or another manual step. muxdev will not answer it for you."
+
+
+def _approval_subject_summary(row: dict[str, Any]) -> str:
+    subject = row.get("subject")
+    if not isinstance(subject, dict):
+        try:
+            parsed = json.loads(str(row.get("subject_json") or "{}"))
+        except json.JSONDecodeError:
+            parsed = {}
+        subject = parsed if isinstance(parsed, dict) else {}
+    if not subject:
+        return ""
+    parts = []
+    for key in ("type", "stage", "command", "path", "patch_hash", "plan_hash"):
+        value = subject.get(key)
+        if value:
+            parts.append(f"{key}={value}")
+    if parts:
+        return "; ".join(str(part) for part in parts[:3])
+    return "; ".join(f"{key}={value}" for key, value in list(subject.items())[:3])
 
 
 def _is_design_provider_action(row: dict[str, Any]) -> bool:
@@ -671,6 +694,8 @@ def _board_task(task: dict[str, Any]) -> dict[str, Any]:
         "pending_approvals": task.get("pending_approvals", 0),
         "pending_provider_actions": task.get("pending_provider_actions", 0),
         "current_stage": task.get("current_stage"),
+        "delivery_confidence": task.get("delivery_confidence", {}),
+        "evidence_summary": task.get("evidence_summary", {}),
     }
 
 

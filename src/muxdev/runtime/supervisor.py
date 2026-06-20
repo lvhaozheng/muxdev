@@ -10,6 +10,7 @@ workflow semantics.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -804,6 +805,14 @@ class SupervisorRuntime:
                 ):
                 blackboard.set_run_status(run_id, _approval_wait_status(ci_block_on_approval))
                 return RunResult(run_id, _approval_wait_status(ci_block_on_approval), run_dir, None)
+            _apply_approved_worktree_changes(
+                blackboard,
+                trace,
+                run_dir=run_dir,
+                run_id=run_id,
+                workspace=self.workspace,
+                worktree=worktree,
+            )
             blackboard.set_run_status(run_id, RunStatus.COMPLETED)
             if workflow.name in {"design", "design-lite", "design-v2"}:
                 try:
@@ -1193,6 +1202,14 @@ class SupervisorRuntime:
         ):
             blackboard.set_run_status(run_id, _approval_wait_status(ci_block_on_approval))
             return RunResult(run_id, _approval_wait_status(ci_block_on_approval), run_dir, None)
+        _apply_approved_worktree_changes(
+            blackboard,
+            trace,
+            run_dir=run_dir,
+            run_id=run_id,
+            workspace=self.workspace,
+            worktree=worktree,
+        )
         blackboard.set_run_status(run_id, RunStatus.COMPLETED)
         if workflow.name in {"design", "design-lite"}:
             try:
@@ -1299,6 +1316,69 @@ def _worktree_diff_text(worktree: Path) -> str:
 
 def _worktree_patch_hash(worktree: Path) -> str:
     return sha256_text(_worktree_diff_text(worktree))
+
+
+def _apply_approved_worktree_changes(
+    blackboard: Blackboard,
+    trace: TraceWriter,
+    *,
+    run_dir: Path,
+    run_id: str,
+    workspace: Path,
+    worktree: Path,
+) -> Path:
+    applied: list[str] = []
+    for rel_path in _changed_worktree_files(worktree):
+        if _is_workspace_apply_ignored(rel_path):
+            continue
+        source = worktree / Path(*rel_path.split("/"))
+        if not source.is_file():
+            continue
+        destination = workspace / Path(*rel_path.split("/"))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        applied.append(rel_path)
+
+    manifest = {
+        "contract_version": "muxdev.workspace_apply.v1",
+        "run_id": run_id,
+        "worktree": str(worktree),
+        "workspace": str(workspace),
+        "files": applied,
+    }
+    path = run_dir / "workspace_apply.json"
+    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    blackboard.add_artifact(run_id, None, path.name, path, "workspace_apply")
+    _record_ledger(blackboard, run_dir, run_id, "workspace_apply_completed", payload={"files": applied})
+    trace.write("workspace_apply_completed", files=applied)
+    return path
+
+
+def _changed_worktree_files(worktree: Path) -> list[str]:
+    result = subprocess.run(
+        ["git", "diff", "--name-only", "--diff-filter=ACMRT", "--", "."],
+        cwd=worktree,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        **hidden_subprocess_kwargs(),
+    )
+    paths: set[str] = set()
+    if result.returncode == 0:
+        paths.update(line.strip().replace("\\", "/") for line in (result.stdout or "").splitlines() if line.strip())
+    paths.update(_iter_untracked_files(worktree))
+    return sorted(path for path in paths if path and not _is_workspace_apply_ignored(path))
+
+
+def _is_workspace_apply_ignored(rel_path: str) -> bool:
+    normalized = rel_path.replace("\\", "/").lstrip("/")
+    parts = [part for part in normalized.split("/") if part]
+    if not parts or ".." in parts:
+        return True
+    ignored_roots = {".git", ".muxdev", ".pytest_cache", "__pycache__"}
+    return any(part in ignored_roots or part.startswith("pytest-cache-files-") for part in parts)
 
 
 def _policy_hash(policy: SafetyPolicyEngine) -> str:

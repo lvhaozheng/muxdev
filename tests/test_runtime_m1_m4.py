@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import subprocess
 import uuid
 from pathlib import Path
 
 import pytest
 
 from muxdev.models import ApprovalStatus, ProviderActionStatus, RunStatus
-from muxdev.runtime import SupervisorRuntime
+from muxdev.runtime import SupervisorRuntime, WorktreeManager
 from muxdev.providers.adapters import ProviderStageOutput
 from muxdev.storage import Blackboard
 
@@ -33,7 +34,11 @@ def test_mock_run_creates_m1_artifacts(workspace: Path) -> None:
     assert (result.run_dir / "trace.jsonl").exists()
     assert (result.run_dir / "final_report.md").exists()
     assert (result.run_dir / "diff.patch").read_text(encoding="utf-8")
+    assert (result.run_dir / "workspace_apply.json").exists()
     assert (result.run_dir / "worktree" / ".git" / "config").exists()
+    assert (workspace / "muxdev_mock_change.txt").exists()
+    workspace_apply = json.loads((result.run_dir / "workspace_apply.json").read_text(encoding="utf-8"))
+    assert "muxdev_mock_change.txt" in workspace_apply["files"]
     user_design_doc = workspace / "docs" / "design" / f"{result.run_id}-design.md"
     assert user_design_doc.exists()
     assert "设计文档" in user_design_doc.read_text(encoding="utf-8")
@@ -63,6 +68,46 @@ def test_mock_run_creates_m1_artifacts(workspace: Path) -> None:
     assert design_artifact_path.parent.parent.name == "docs"
     assert design_artifact_path == user_design_doc
     assert "## Design Deliverables" in (result.run_dir / "final_report.md").read_text(encoding="utf-8")
+
+
+def test_git_worktree_fallback_baselines_no_head_repo_and_ignores_generated_files(
+    monkeypatch: pytest.MonkeyPatch,
+    workspace: Path,
+) -> None:
+    (workspace / "app.py").write_text("value = 1\n", encoding="utf-8")
+    (workspace / "pytest-cache-files-source").mkdir()
+    (workspace / "pytest-cache-files-source" / "README").write_text("cache", encoding="utf-8")
+    run_dir = workspace / ".muxdev" / "runs" / "run_no_head"
+    run_dir.mkdir(parents=True)
+
+    monkeypatch.setattr(WorktreeManager, "_is_git_repo", staticmethod(lambda path: path == workspace))
+    monkeypatch.setattr("muxdev.runtime.worktree.shutil.which", lambda name: "git" if name == "git" else None)
+    git_calls: list[list[str]] = []
+
+    def fake_subprocess_run(cmd, **kwargs):
+        assert cmd[:3] == ["git", "worktree", "add"]
+        return subprocess.CompletedProcess(cmd, 128, "", "fatal: invalid reference: HEAD")
+
+    def fake_run_git(path: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+        git_calls.append(args)
+        stdout = "A  app.py\n" if args == ["status", "--porcelain"] else ""
+        return subprocess.CompletedProcess(["git", *args], 0, stdout, "")
+
+    monkeypatch.setattr("muxdev.runtime.worktree.subprocess.run", fake_subprocess_run)
+    monkeypatch.setattr(WorktreeManager, "_run_git", staticmethod(fake_run_git))
+
+    result = WorktreeManager(workspace).prepare("run_no_head", run_dir)
+
+    assert result.strategy == "git_worktree_fallback_copy"
+    assert (result.path / "app.py").read_text(encoding="utf-8") == "value = 1\n"
+    assert not (result.path / "pytest-cache-files-source").exists()
+    assert git_calls[:3] == [["init"], ["add", "--all"], ["status", "--porcelain"]]
+    assert git_calls[3][:4] == ["-c", "user.name=muxdev", "-c", "user.email=muxdev@example.invalid"]
+    assert git_calls[3][4] == "commit"
+    excludes = (result.path / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+    assert "__pycache__/" in excludes
+    assert ".pytest_cache/" in excludes
+    assert "pytest-cache-files-*/" in excludes
 
 
 def test_design_workflow_publishes_user_visible_design_document(workspace: Path) -> None:

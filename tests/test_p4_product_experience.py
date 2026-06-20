@@ -96,7 +96,8 @@ def test_product_experience_api_and_dashboard_section() -> None:
     assert payload["quickstart"]["one_line_install"] == "pipx install muxdev"
     assert "git_safety" in payload
     assert "product_experience" in setup
-    assert "Product Experience" in html
+    assert "产品体验" in html
+    assert "Product Experience" in render_live_dashboard_html(lang="en")
     assert "/product/experience" in html
 
 

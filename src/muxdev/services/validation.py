@@ -311,17 +311,52 @@ def list_validation_experiments(workspace: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for path in sorted((workspace / ".muxdev" / "runs").glob("*/validation/experiment.json")):
         data = json.loads(path.read_text(encoding="utf-8"))
+        comparison = data.get("comparison") or {}
+        metrics = data.get("metrics") if isinstance(data.get("metrics"), list) else []
         rows.append(
             {
                 "experiment_id": data.get("experiment_id"),
                 "suite": (data.get("suite") or {}).get("name"),
                 "strategies": data.get("strategies", []),
-                "winner": ((data.get("comparison") or {}).get("winner")),
+                "winner": comparison.get("winner"),
+                "baseline_strategy": comparison.get("baseline_strategy") or "direct_cli",
+                "strategy_scores": comparison.get("strategy_scores") or {},
+                "muxdev_delta": comparison.get("muxdev_delta") or {},
+                "metrics_summary": _validation_metrics_summary(metrics),
                 "report": (data.get("artifacts") or {}).get("report"),
                 "updated_at": data.get("updated_at"),
             }
         )
     return sorted(rows, key=lambda row: str(row.get("updated_at") or ""), reverse=True)
+
+
+def _validation_metrics_summary(metrics: list[object]) -> dict[str, Any]:
+    rows = [row for row in metrics if isinstance(row, dict)]
+    if not rows:
+        return {
+            "count": 0,
+            "score": 0.0,
+            "test_pass_rate": 0.0,
+            "evidence_confidence": 0.0,
+            "safety_score": 0.0,
+            "high_review_blockers": 0,
+            "rollback_success": False,
+            "cost_usd": 0.0,
+            "tokens": 0,
+        }
+    muxdev_rows = [row for row in rows if str(row.get("strategy") or "").startswith("muxdev_") or str(row.get("strategy") or "") in {"single_agent", "multi_agent"}]
+    scored_rows = muxdev_rows or rows
+    return {
+        "count": len(rows),
+        "score": round(max(float(row.get("score") or 0.0) for row in scored_rows), 4),
+        "test_pass_rate": round(sum(float(row.get("test_pass_rate") or 0.0) for row in scored_rows) / max(len(scored_rows), 1), 4),
+        "evidence_confidence": round(sum(float(row.get("evidence_confidence") or 0.0) for row in scored_rows) / max(len(scored_rows), 1), 4),
+        "safety_score": round(sum(float(row.get("safety_score") or 0.0) for row in scored_rows) / max(len(scored_rows), 1), 4),
+        "high_review_blockers": sum(int(row.get("high_review_blockers") or 0) for row in scored_rows),
+        "rollback_success": all(bool(row.get("rollback_success")) for row in scored_rows),
+        "cost_usd": round(sum(float(row.get("cost_usd") or 0.0) for row in scored_rows), 6),
+        "tokens": sum(int(row.get("tokens") or 0) for row in scored_rows),
+    }
 
 
 def load_validation_experiment(workspace: Path, experiment_id: str) -> ValidationExperiment:

@@ -67,7 +67,15 @@ def test_ux_overview_collects_action_center_items() -> None:
     overview = build_ux_overview(
         daemon={"status": "running", "tasks": 1},
         tasks=[{"task_id": "run_ux", "status": "awaiting_provider_action", "pending_provider_actions": 1}],
-        approvals=[{"approval_id": "appr_1", "run_id": "run_ux", "reason": "plan gate"}],
+        approvals=[
+            {
+                "approval_id": "appr_1",
+                "run_id": "run_ux",
+                "reason": "plan gate",
+                "subject_hash": "sha256:plan",
+                "subject_json": '{"type":"plan","stage":"design","plan_hash":"sha256:plan"}',
+            }
+        ],
         provider_actions=[{"action_id": "pact_1", "run_id": "run_ux", "provider": "codex", "attach_command": "attach"}],
     )
 
@@ -75,6 +83,8 @@ def test_ux_overview_collects_action_center_items() -> None:
     assert [item["kind"] for item in overview["action_center"]] == ["provider_action", "approval"]
     assert overview["headline"] == "2 item(s) need your attention"
     assert overview["current_status"]["waiting_provider_action"] == 1
+    assert overview["action_center"][1]["subject_hash"] == "sha256:plan"
+    assert "plan_hash=sha256:plan" in overview["action_center"][1]["subject_summary"]
     assert {column["id"] for column in overview["task_board"]} == {"todo", "running", "waiting", "needs_review", "done", "failed"}
     assert overview["task_board"][2]["tasks"][0]["task_id"] == "run_ux"
     assert "provider" in overview["filters"]

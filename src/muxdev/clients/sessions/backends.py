@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import locale
+import os
 import queue
 import subprocess
 import shutil
@@ -55,6 +56,7 @@ class HeadlessSubprocessBackend:
                 stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                env=_provider_subprocess_env(),
                 **hidden_subprocess_kwargs(),
             )
             events: list[StreamEvent] = []
@@ -296,3 +298,14 @@ def _decode_process_output(data: bytes | str) -> str:
         except (LookupError, UnicodeDecodeError):
             continue
     return data.decode("utf-8", errors="replace")
+
+
+def _provider_subprocess_env() -> dict[str, str]:
+    """Keep provider-spawned shells from creating noisy transient Python files."""
+    env = os.environ.copy()
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    pytest_addopts = env.get("PYTEST_ADDOPTS", "")
+    cache_flag = "-p no:cacheprovider"
+    if cache_flag not in pytest_addopts:
+        env["PYTEST_ADDOPTS"] = f"{pytest_addopts} {cache_flag}".strip()
+    return env

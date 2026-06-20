@@ -163,6 +163,11 @@ class TaskManager:
                 "provider_attempts": _rows_by_run(board.table_rows("provider_attempts")),
                 "usage_records": _rows_by_run(board.table_rows("usage_records")),
                 "error_details": _rows_by_run(board.table_rows("error_details")),
+                "test_results": _rows_by_run(board.table_rows("test_results")),
+                "review_blockers": _rows_by_run(board.table_rows("review_blockers")),
+                "evidence_evaluations": _rows_by_run(board.table_rows("evidence_evaluations")),
+                "snapshots": _rows_by_run(board.table_rows("snapshots")),
+                "artifacts": _rows_by_run(board.table_rows("artifacts")),
             }
             return [self._task_summary(board, row, rows_by_table=rows_by_table) for row in board.list_runs()]
 
@@ -332,6 +337,8 @@ class TaskManager:
             cwd=worktree,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
             **hidden_subprocess_kwargs(),
         )
@@ -340,6 +347,8 @@ class TaskManager:
             cwd=worktree,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
             **hidden_subprocess_kwargs(),
         )
@@ -364,8 +373,26 @@ class TaskManager:
         patch_path = Path(str(rows[-1]["path"]))
         if not patch_path.exists():
             return {"task_id": task_id, "run_id": task_id, "status": "failed", "error": f"snapshot patch missing: {patch_path}"}
-        checkout = subprocess.run(["git", "checkout", "--", "."], cwd=worktree, capture_output=True, text=True, check=False, **hidden_subprocess_kwargs())
-        clean = subprocess.run(["git", "clean", "-fd"], cwd=worktree, capture_output=True, text=True, check=False, **hidden_subprocess_kwargs())
+        checkout = subprocess.run(
+            ["git", "checkout", "--", "."],
+            cwd=worktree,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            **hidden_subprocess_kwargs(),
+        )
+        clean = subprocess.run(
+            ["git", "clean", "-fd"],
+            cwd=worktree,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            **hidden_subprocess_kwargs(),
+        )
         fallback = ""
         git_failed = checkout.returncode != 0 or clean.returncode != 0
         if git_failed:
@@ -380,6 +407,8 @@ class TaskManager:
                 cwd=worktree,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
                 **hidden_subprocess_kwargs(),
             )
@@ -492,6 +521,11 @@ class TaskManager:
             provider_attempts = board.table_rows("provider_attempts", run_id=run_id)
             usage = board.table_rows("usage_records", run_id=run_id)
             errors = board.table_rows("error_details", run_id=run_id)
+            test_results = board.table_rows("test_results", run_id=run_id)
+            review_blockers = board.table_rows("review_blockers", run_id=run_id)
+            evaluations = board.table_rows("evidence_evaluations", run_id=run_id)
+            snapshots = board.table_rows("snapshots", run_id=run_id)
+            artifacts = board.table_rows("artifacts", run_id=run_id)
         else:
             stages = rows_by_table["stages"].get(run_id, [])
             approvals = rows_by_table["approvals"].get(run_id, [])
@@ -499,6 +533,11 @@ class TaskManager:
             provider_attempts = rows_by_table["provider_attempts"].get(run_id, [])
             usage = rows_by_table["usage_records"].get(run_id, [])
             errors = rows_by_table["error_details"].get(run_id, [])
+            test_results = rows_by_table["test_results"].get(run_id, [])
+            review_blockers = rows_by_table["review_blockers"].get(run_id, [])
+            evaluations = rows_by_table["evidence_evaluations"].get(run_id, [])
+            snapshots = rows_by_table["snapshots"].get(run_id, [])
+            artifacts = rows_by_table["artifacts"].get(run_id, [])
         enriched_stages = enrich_stages(stages)
         enriched_attempts = enrich_provider_attempts(provider_attempts)
         progress = progress_summary(
@@ -509,6 +548,16 @@ class TaskManager:
             provider_actions=provider_actions,
         )
         latest_error = _latest_error(errors)
+        delivery_confidence = _delivery_confidence(
+            run,
+            test_results=test_results,
+            review_blockers=review_blockers,
+            evaluations=evaluations,
+            snapshots=snapshots,
+            artifacts=artifacts,
+            usage=usage,
+            errors=errors,
+        )
         return {
             **run,
             "task_id": run_id,
@@ -525,6 +574,8 @@ class TaskManager:
             "cost_usd": round(sum(float(row.get("cost_usd") or 0) for row in usage), 6),
             "errors": len(errors),
             "error_summary": latest_error,
+            "delivery_confidence": delivery_confidence,
+            "evidence_summary": delivery_confidence["evidence_summary"],
             "profile": context.get("profile"),
             "gate": context.get("gate"),
             "depth": context.get("depth"),
@@ -584,6 +635,120 @@ def _latest_error(errors: list[dict[str, Any]]) -> dict[str, Any] | None:
         "message": row.get("message"),
         "created_at": row.get("created_at"),
     }
+
+
+def _delivery_confidence(
+    run: dict[str, Any],
+    *,
+    test_results: list[dict[str, Any]],
+    review_blockers: list[dict[str, Any]],
+    evaluations: list[dict[str, Any]],
+    snapshots: list[dict[str, Any]],
+    artifacts: list[dict[str, Any]],
+    usage: list[dict[str, Any]],
+    errors: list[dict[str, Any]],
+) -> dict[str, Any]:
+    evaluation = _latest_evaluation(evaluations)
+    status = str(run.get("status") or "")
+    test_total = len(test_results)
+    test_failed = sum(1 for row in test_results if not bool(row.get("passed")))
+    test_passed = test_total - test_failed
+    blocker_total = len(review_blockers)
+    high_blockers = sum(1 for row in review_blockers if str(row.get("severity") or "").lower() in {"high", "critical"})
+    rollback_available = bool(snapshots)
+    diff_available = _has_artifact_kind(artifacts, "diff", "patch") or any(str(row.get("patch_hash") or "") for row in snapshots)
+
+    if evaluation:
+        label = str(evaluation.get("label") or "reviewable")
+        confidence = float(evaluation.get("confidence") or 0)
+        reasons = [str(reason) for reason in evaluation.get("reasons", []) if reason]
+        missing = [str(item) for item in evaluation.get("missing_evidence", []) if item]
+    else:
+        label = "blocked" if errors else ("reviewable" if status == "completed" else "collecting")
+        confidence = _fallback_confidence(status, test_total=test_total, test_failed=test_failed, blockers=blocker_total, errors=len(errors), rollback_available=rollback_available)
+        reasons = _fallback_reasons(status, test_total=test_total, test_failed=test_failed, blockers=blocker_total, rollback_available=rollback_available)
+        missing = []
+        if test_total == 0:
+            missing.append("tests")
+        if not rollback_available:
+            missing.append("rollback snapshot")
+        if not diff_available:
+            missing.append("diff")
+
+    tokens = sum(int(row.get("tokens") or 0) for row in usage)
+    cost_usd = round(sum(float(row.get("cost_usd") or 0) for row in usage), 6)
+    test_status = "missing" if test_total == 0 else ("failed" if test_failed else "passed")
+    review_status = "blocked" if high_blockers else ("needs_review" if blocker_total else "clear")
+    return {
+        "label": label,
+        "confidence": round(confidence, 3),
+        "score": round(confidence * 100),
+        "tests": {"total": test_total, "passed": test_passed, "failed": test_failed, "status": test_status},
+        "review": {"blockers": blocker_total, "high_blockers": high_blockers, "status": review_status},
+        "rollback": {"available": rollback_available, "snapshots": len(snapshots)},
+        "diff": {"available": diff_available},
+        "usage": {"tokens": tokens, "cost_usd": cost_usd},
+        "reasons": reasons[:4],
+        "missing_evidence": missing[:4],
+        "evidence_summary": {
+            "label": label,
+            "confidence": round(confidence, 3),
+            "tests": test_status,
+            "review": review_status,
+            "rollback": "available" if rollback_available else "missing",
+            "diff": "available" if diff_available else "missing",
+        },
+    }
+
+
+def _latest_evaluation(evaluations: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not evaluations:
+        return None
+    return max(evaluations, key=lambda item: str(item.get("created_at") or ""))
+
+
+def _fallback_confidence(
+    status: str,
+    *,
+    test_total: int,
+    test_failed: int,
+    blockers: int,
+    errors: int,
+    rollback_available: bool,
+) -> float:
+    if errors or status in {"blocked", "aborted", "failed"}:
+        return 0.2
+    score = 0.45 if status == "completed" else 0.25
+    if test_total and not test_failed:
+        score += 0.25
+    if rollback_available:
+        score += 0.15
+    if blockers:
+        score -= 0.2
+    if test_failed:
+        score -= 0.25
+    return max(0.0, min(0.95, score))
+
+
+def _fallback_reasons(status: str, *, test_total: int, test_failed: int, blockers: int, rollback_available: bool) -> list[str]:
+    reasons: list[str] = []
+    if status == "completed":
+        reasons.append("run completed")
+    if test_total:
+        reasons.append("tests passed" if not test_failed else "tests failed")
+    if blockers:
+        reasons.append(f"{blockers} review blocker(s)")
+    if rollback_available:
+        reasons.append("rollback snapshot available")
+    return reasons
+
+
+def _has_artifact_kind(artifacts: list[dict[str, Any]], *needles: str) -> bool:
+    for row in artifacts:
+        text = " ".join(str(row.get(key) or "").lower() for key in ("kind", "name", "path"))
+        if any(needle in text for needle in needles):
+            return True
+    return False
 
 
 def _clean_worktree_without_git(worktree: Path) -> list[str]:

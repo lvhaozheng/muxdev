@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -90,6 +91,28 @@ def test_headless_backend_sends_stdin_to_provider() -> None:
 
     assert result.returncode == 0
     assert "hello from stdin" in result.stdout
+
+
+def test_headless_backend_sets_quiet_python_test_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("PYTHONDONTWRITEBYTECODE", raising=False)
+    monkeypatch.setenv("PYTEST_ADDOPTS", "--strict-markers")
+
+    result = HeadlessSubprocessBackend().run(
+        [
+            sys.executable,
+            "-c",
+            "import json, os; print(json.dumps({"
+            "'dont_write': os.getenv('PYTHONDONTWRITEBYTECODE'), "
+            "'addopts': os.getenv('PYTEST_ADDOPTS')"
+            "}))",
+        ],
+        cwd=Path.cwd(),
+    )
+
+    assert result.returncode == 0
+    env = json.loads(result.stdout)
+    assert env["dont_write"] == "1"
+    assert env["addopts"] == "--strict-markers -p no:cacheprovider"
 
 
 def test_headless_backend_decodes_windows_cli_output() -> None:
