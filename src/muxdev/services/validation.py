@@ -159,6 +159,17 @@ def collect_validation_metric(
     test_pass_rate = _test_pass_rate(tests)
     high_blockers = sum(1 for row in blockers if str(row.get("severity") or "").lower() == "high")
     evidence = evaluations[-1] if evaluations else {}
+    trace_events = _read_run_trace_events(run_dir)
+    context_packets = _read_context_packets(run_dir)
+    loop_iterations = sum(1 for event in trace_events if event.get("type") == "loop_iteration_completed")
+    loop_blocked = any(event.get("type") == "loop_blocked" for event in trace_events)
+    workflow_engine = "langgraph" if any(event.get("type") == "langgraph_runtime_selected" for event in trace_events) else "native"
+    rag_packets = [packet for packet in context_packets if isinstance(packet.get("rag_decision"), dict)]
+    enabled_rag_packets = [packet for packet in rag_packets if bool(packet.get("rag_decision", {}).get("enabled"))]
+    rag_hits = [hit for packet in enabled_rag_packets for hit in packet.get("rag_context", []) if isinstance(hit, dict)]
+    citation_hits = [hit for hit in rag_hits if hit.get("citation")]
+    citation_coverage = len(citation_hits) / max(len(rag_hits), 1) if rag_hits else 0.0
+    retrieval_hit_rate = len([packet for packet in enabled_rag_packets if packet.get("rag_context")]) / max(len(enabled_rag_packets), 1) if enabled_rag_packets else 0.0
     evidence_confidence = float(evidence.get("confidence") or 0.0)
     missing_count = len(evidence.get("missing_evidence") or [])
     stage_seconds = {str(row.get("stage_id")): _duration(row.get("started_at"), row.get("completed_at")) for row in stages}
@@ -235,6 +246,13 @@ def collect_validation_metric(
         answer_quality_score=round(answer_quality_score, 4),
         process_score=round(process_score, 4),
         safety_score=round(safety_score, 4),
+        workflow_engine=workflow_engine,
+        loop_iterations=loop_iterations,
+        loop_blocked=loop_blocked,
+        retrieval_used=bool(enabled_rag_packets),
+        citation_coverage=round(citation_coverage, 4),
+        retrieval_hit_rate=round(retrieval_hit_rate, 4),
+        checkpoint_recovery=1.0 if completed or recover_count == 0 else 0.0,
         judge_score=round(judge_score, 4) if judge_score is not None else None,
         judge_pass=judge_pass,
         judge_reasons=judge_reasons,
@@ -343,6 +361,8 @@ def _validation_metrics_summary(metrics: list[object]) -> dict[str, Any]:
             "rollback_success": False,
             "cost_usd": 0.0,
             "tokens": 0,
+            "loop_iterations": 0,
+            "retrieval_used": False,
         }
     muxdev_rows = [row for row in rows if str(row.get("strategy") or "").startswith("muxdev_") or str(row.get("strategy") or "") in {"single_agent", "multi_agent"}]
     scored_rows = muxdev_rows or rows
@@ -356,7 +376,41 @@ def _validation_metrics_summary(metrics: list[object]) -> dict[str, Any]:
         "rollback_success": all(bool(row.get("rollback_success")) for row in scored_rows),
         "cost_usd": round(sum(float(row.get("cost_usd") or 0.0) for row in scored_rows), 6),
         "tokens": sum(int(row.get("tokens") or 0) for row in scored_rows),
+        "loop_iterations": sum(int(row.get("loop_iterations") or 0) for row in scored_rows),
+        "retrieval_used": any(bool(row.get("retrieval_used")) for row in scored_rows),
     }
+
+
+def _read_run_trace_events(run_dir: Path) -> list[dict[str, Any]]:
+    path = run_dir / "trace.jsonl"
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            rows.append(payload)
+    return rows
+
+
+def _read_context_packets(run_dir: Path) -> list[dict[str, Any]]:
+    root = run_dir / "context_packets"
+    if not root.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for path in sorted(root.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            rows.append(payload)
+    return rows
 
 
 def load_validation_experiment(workspace: Path, experiment_id: str) -> ValidationExperiment:
@@ -385,6 +439,12 @@ def render_validation_report(experiment: ValidationExperiment) -> str:
     for strategy, rows in sorted(by_strategy.items()):
         lines.append(
             f"| {strategy} | {_avg(rows, 'score'):.4f} | {_avg(rows, 'task_completion_score'):.2f} | {_avg(rows, 'answer_quality_score'):.2f} | {_avg(rows, 'process_score'):.2f} | {_avg(rows, 'safety_score'):.2f} | {_avg(rows, 'evidence_confidence'):.2f} | {_sum(rows, 'cost_usd'):.4f} | {int(_sum(rows, 'tokens'))} | {_avg_optional(rows, 'judge_score')} |"
+        )
+    lines.extend(["", "## Loop and Retrieval Signals", "| Strategy | Engine | Loop Iters | Loop Blocked | RAG Used | Citation Coverage | Retrieval Hit Rate |", "| --- | --- | ---: | --- | --- | ---: | ---: |"])
+    for strategy, rows in sorted(by_strategy.items()):
+        engines = sorted({row.workflow_engine for row in rows})
+        lines.append(
+            f"| {strategy} | {', '.join(engines) or '-'} | {int(_sum(rows, 'loop_iterations'))} | {any(row.loop_blocked for row in rows)} | {any(row.retrieval_used for row in rows)} | {_avg(rows, 'citation_coverage'):.2f} | {_avg(rows, 'retrieval_hit_rate'):.2f} |"
         )
     lines.extend(["", "## Task Results", "| Task | Strategy | Run | Status | Score | Missing evidence | Failures |", "| --- | --- | --- | --- | ---: | ---: | --- |"])
     for metric in experiment.metrics:

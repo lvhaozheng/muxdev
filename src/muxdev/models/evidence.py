@@ -26,6 +26,9 @@ EvidenceKind = Literal[
 EvidenceStatus = Literal["observed", "passed", "failed", "missing", "approved", "rejected", "blocked"]
 EvidenceStrength = Literal["A", "B", "C", "D", "E", "X"]
 EvaluationLabel = Literal["ready", "reviewable", "risky", "blocked"]
+StandardSeverity = Literal["P0", "P1", "P2", "P3"]
+RiskLevel = Literal["R0", "R1", "R2", "R3"]
+EvidenceLevel = Literal["E0", "E1", "E2", "E3"]
 
 
 class ArtifactRef(BaseModel):
@@ -52,6 +55,10 @@ class EvidenceEvent(BaseModel):
     claim: str
     status: EvidenceStatus = "observed"
     strength: EvidenceStrength = "C"
+    standard_id: str | None = None
+    severity: StandardSeverity | None = None
+    risk_level: RiskLevel | None = None
+    evidence_level: EvidenceLevel | None = None
     subject_hash: str | None = None
     prev_hash: str | None = None
     event_hash: str | None = None
@@ -88,6 +95,7 @@ class EvidenceEvaluation(BaseModel):
     confidence: float
     gates: dict[str, str] = Field(default_factory=dict)
     components: dict[str, float] = Field(default_factory=dict)
+    standard_scores: dict[str, object] = Field(default_factory=dict)
     reasons: list[str] = Field(default_factory=list)
     missing_evidence: list[str] = Field(default_factory=list)
     next_actions: list[dict[str, str]] = Field(default_factory=list)

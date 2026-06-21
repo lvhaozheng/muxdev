@@ -58,8 +58,8 @@ DAEMON_COMMAND_GROUPS: dict[str, list[tuple[str, str]]] = {
     ],
     "Review": [
         ("/approvals", "list pending approvals"),
-        ("/approve <id>", "approve an item"),
-        ("/deny <id>", "deny an item"),
+        ("/approve <id>", "approve an item or run with one pending approval"),
+        ("/deny <id>", "deny an item or run with one pending approval"),
     ],
     "Provider Actions": [
         ("/actions", "list pending provider CLI actions"),
@@ -545,6 +545,12 @@ def _normalize_command(line: str) -> str:
         return "deny " + text.split(maxsplit=1)[1]
     if text.startswith("/action handled "):
         return "action handled " + text.split(maxsplit=2)[2]
+    if text.startswith("/action choose "):
+        return "action choose " + text.split(maxsplit=2)[2]
+    if text.startswith("/action respond "):
+        return "action respond " + text.split(maxsplit=2)[2]
+    if text.startswith("/action continue "):
+        return "action continue " + text.split(maxsplit=2)[2]
     if text.startswith("/action dismiss "):
         return "action dismiss " + text.split(maxsplit=2)[2]
     if text.startswith("/provider doctor "):
@@ -624,6 +630,18 @@ def _handle_tui_command(line: str, workspace: Path, run_id: str) -> str:
         return "\n".join(f"{row.get('provider')}/{row.get('role')}: score={row.get('score')} attempts={row.get('attempts')}" for row in rows)
     if line.startswith("action handled "):
         return _update_provider_action(workspace, line.split(maxsplit=2)[2], ProviderActionStatus.HANDLED)
+    if line.startswith("action choose "):
+        parts = line.split(maxsplit=3)
+        if len(parts) < 4:
+            return "usage: /action choose <action-id> <choice>"
+        return _respond_provider_action(workspace, parts[2], {"choice": parts[3]})
+    if line.startswith("action respond "):
+        parts = line.split(maxsplit=3)
+        if len(parts) < 4:
+            return "usage: /action respond <action-id> <text>"
+        return _respond_provider_action(workspace, parts[2], {"text": parts[3]})
+    if line.startswith("action continue "):
+        return _continue_provider_action(workspace, line.split(maxsplit=2)[2])
     if line.startswith("action dismiss "):
         return _update_provider_action(workspace, line.split(maxsplit=2)[2], ProviderActionStatus.DISMISSED)
     if line == "repl":
@@ -723,18 +741,43 @@ def _decide_approval(workspace: Path, approval_id: str, status: ApprovalStatus) 
     store = RunStore(workspace)
     if not store.runs_dir.exists():
         return f"approval not found: {approval_id}"
+    run_exists = False
     for run_dir in store.runs_dir.iterdir():
         if not (run_dir / "blackboard.sqlite").exists():
             continue
+        run_exists = run_exists or run_dir.name == approval_id
         blackboard = Blackboard(run_dir)
         try:
             rows = blackboard.list_approvals(run_id=run_dir.name)
-            if any(row["approval_id"] == approval_id for row in rows):
-                blackboard.decide_approval(approval_id, status)
-                return f"{approval_id}: {status}"
+            try:
+                resolved = _resolve_local_approval_id(rows, approval_id)
+            except ValueError as exc:
+                return str(exc)
+            if resolved:
+                blackboard.decide_approval(resolved, status)
+                return f"{resolved}: {status}"
         finally:
             blackboard.close()
+    if run_exists:
+        return f"no pending approval for run: {approval_id}; use /continue {approval_id}"
     return f"approval not found: {approval_id}"
+
+
+def _resolve_local_approval_id(rows: list[dict[str, object]], approval_or_run_id: str) -> str | None:
+    for row in rows:
+        if str(row.get("approval_id") or "") == approval_or_run_id:
+            return str(row["approval_id"])
+    pending_for_run = [
+        row
+        for row in rows
+        if str(row.get("run_id") or row.get("task_id") or "") == approval_or_run_id
+        and str(row.get("status") or "") == str(ApprovalStatus.PENDING)
+    ]
+    if len(pending_for_run) == 1:
+        return str(pending_for_run[0]["approval_id"])
+    if len(pending_for_run) > 1:
+        raise ValueError(f"multiple pending approvals for run: {approval_or_run_id}; use an approval id")
+    return None
 
 
 def _update_provider_action(workspace: Path, action_id: str, status: ProviderActionStatus) -> str:
@@ -752,6 +795,47 @@ def _update_provider_action(workspace: Path, action_id: str, status: ProviderAct
                 return f"{action_id}: {status}"
         finally:
             blackboard.close()
+    return f"provider action not found: {action_id}"
+
+
+def _respond_provider_action(workspace: Path, action_id: str, response: object) -> str:
+    store = RunStore(workspace)
+    if not store.runs_dir.exists():
+        return f"provider action not found: {action_id}"
+    for run_dir in store.runs_dir.iterdir():
+        if not (run_dir / "blackboard.sqlite").exists():
+            continue
+        blackboard = Blackboard(run_dir)
+        try:
+            rows = blackboard.list_provider_actions(run_id=run_dir.name)
+            if any(row["action_id"] == action_id for row in rows):
+                blackboard.respond_provider_action(action_id, response=response)
+                return f"{action_id}: handled response recorded"
+        finally:
+            blackboard.close()
+    return f"provider action not found: {action_id}"
+
+
+def _continue_provider_action(workspace: Path, action_id: str) -> str:
+    store = RunStore(workspace)
+    if not store.runs_dir.exists():
+        return f"provider action not found: {action_id}"
+    run_to_resume: str | None = None
+    for run_dir in store.runs_dir.iterdir():
+        if not (run_dir / "blackboard.sqlite").exists():
+            continue
+        blackboard = Blackboard(run_dir)
+        try:
+            rows = blackboard.list_provider_actions(run_id=run_dir.name)
+            if any(row["action_id"] == action_id for row in rows):
+                blackboard.update_provider_action_status(action_id, ProviderActionStatus.HANDLED)
+                run_to_resume = run_dir.name
+                break
+        finally:
+            blackboard.close()
+    if run_to_resume:
+        result = SupervisorRuntime(workspace).resume(run_to_resume)
+        return f"{action_id}: handled; {result.run_id}: {result.status}"
     return f"provider action not found: {action_id}"
 
 

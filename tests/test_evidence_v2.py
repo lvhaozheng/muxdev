@@ -35,12 +35,17 @@ def test_completed_run_writes_evidence_v2_artifacts() -> None:
         evaluation_path = result.run_dir / "evidence" / "evaluation.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         evaluation = json.loads(evaluation_path.read_text(encoding="utf-8"))
+        events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
         assert result.status == RunStatus.COMPLETED
         assert events_path.exists()
         assert manifest["contract_version"] == "muxdev.evidence.v2"
         assert evaluation["contract_version"] == "muxdev.evidence_evaluation.v2"
         assert evaluation["label"] in {"ready", "reviewable"}
+        assert evaluation["standard_scores"]["max_evidence"] in {"E2", "E3"}
+        assert evaluation["standard_scores"]["meets_minimum"] is True
+        assert any(event["evidence_level"] in {"E2", "E3"} for event in events)
+        assert all({"standard_id", "severity", "risk_level", "evidence_level"} <= set(event) for event in events)
         assert "memory_safety" not in evaluation["components"]
         assert not (result.run_dir / "evidence" / "scorecard.json").exists()
         assert not (result.run_dir / "evidence" / "coverage_matrix.json").exists()

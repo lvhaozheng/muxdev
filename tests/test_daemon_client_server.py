@@ -512,13 +512,15 @@ def test_daemon_approvals_and_continue() -> None:
         _wait_for_status(client, task_id, "awaiting_approval")
         approval = client.get("/api/approvals?status=pending").json()[0]
 
-        decided = client.post(f"/api/approvals/{approval['approval_id']}/approve").json()
+        decided = client.post(f"/api/approvals/{task_id}/approve").json()
         continued = client.post(f"/api/tasks/{task_id}/continue").json()
         _wait_for_status(client, task_id, "completed")
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 
+    assert decided["approval_id"] == approval["approval_id"]
     assert decided["status"] == str(ApprovalStatus.APPROVED)
+    assert decided["decided_at"]
     assert continued["status"] == "continue_requested"
 
 
@@ -824,7 +826,9 @@ def test_stop_daemon_can_stop_health_only_daemon_by_port(monkeypatch) -> None:
         paths = default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure()
         paths.pid_path.unlink(missing_ok=True)
         monkeypatch.setattr(process_module, "daemon_health", lambda **kwargs: {"ok": True})
-        monkeypatch.setattr(process_module, "_listening_pids_for_ports", lambda ports: [24680])
+        port_pid_snapshots = [[24680], []]
+        monkeypatch.setattr(process_module, "_listening_pids_for_ports", lambda ports: port_pid_snapshots.pop(0) if port_pid_snapshots else [])
+        monkeypatch.setattr(process_module, "is_pid_alive", lambda pid: False)
         monkeypatch.setattr(process_module, "_terminate_pid", lambda pid: killed.append(pid))
         monkeypatch.setattr(process_module, "wait_for_daemon_stop", lambda **kwargs: True)
 
@@ -842,12 +846,19 @@ def test_stop_daemon_stops_pid_and_dashboard_port_owner(monkeypatch) -> None:
 
     workspace = _workspace_temp("process-stop-port-owner")
     killed: list[int] = []
+    live_pids = {13579}
     try:
         paths = default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure()
         paths.pid_path.write_text("13579", encoding="utf-8")
-        monkeypatch.setattr(process_module, "is_pid_alive", lambda pid: pid == 13579)
-        monkeypatch.setattr(process_module, "_listening_pids_for_ports", lambda ports: [24680])
-        monkeypatch.setattr(process_module, "_terminate_pid", lambda pid: killed.append(pid))
+        monkeypatch.setattr(process_module, "is_pid_alive", lambda pid: pid in live_pids)
+        port_pid_snapshots = [[24680], []]
+        monkeypatch.setattr(process_module, "_listening_pids_for_ports", lambda ports: port_pid_snapshots.pop(0) if port_pid_snapshots else [])
+
+        def fake_terminate(pid: int) -> None:
+            killed.append(pid)
+            live_pids.discard(pid)
+
+        monkeypatch.setattr(process_module, "_terminate_pid", fake_terminate)
         monkeypatch.setattr(process_module, "wait_for_daemon_stop", lambda **kwargs: True)
 
         payload = process_module.stop_daemon(paths=paths, api_port=8788, ui_port=8787)
@@ -858,6 +869,30 @@ def test_stop_daemon_stops_pid_and_dashboard_port_owner(monkeypatch) -> None:
     assert payload["pids"] == [13579, 24680]
     assert payload["port_pids"] == [24680]
     assert killed == [13579, 24680]
+
+
+def test_stop_daemon_reports_surviving_port_owner(monkeypatch) -> None:
+    import muxdev.daemon.process as process_module
+
+    workspace = _workspace_temp("process-stop-survivor")
+    killed: list[int] = []
+    try:
+        paths = default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure()
+        paths.pid_path.unlink(missing_ok=True)
+        monkeypatch.setattr(process_module, "_listening_pids_for_ports", lambda ports: [24680])
+        monkeypatch.setattr(process_module, "_terminate_pid", lambda pid: killed.append(pid))
+        monkeypatch.setattr(process_module, "wait_for_daemon_stop", lambda **kwargs: False)
+        monkeypatch.setattr(process_module, "_wait_for_pids_exit", lambda pids: False)
+
+        payload = process_module.stop_daemon(paths=paths, api_port=8788, ui_port=8787)
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    assert payload["running"] is True
+    assert payload["stopped"] is False
+    assert payload["pids"] == [24680]
+    assert payload["remaining_port_pids"] == [24680]
+    assert killed == [24680]
 
 
 def _wait_for_terminal(client: TestClient, task_id: str) -> str:

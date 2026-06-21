@@ -84,11 +84,11 @@ def _start_daemon_tui(run_id: str = "latest", *, host: str = DEFAULT_HOST, port:
         "/continue": "Continue a task: /continue [task-id]",
         "/recover": "Recover a failed task: /recover [task-id]",
         "/stop": "Stop a task: /stop [task-id]",
-        "/approve": "Approve an item: /approve <approval-id>",
-        "/deny": "Deny an item: /deny <approval-id>",
+        "/approve": "Approve an item: /approve <approval-id-or-run-id>",
+        "/deny": "Deny an item: /deny <approval-id-or-run-id>",
         "/approvals": "List pending approvals",
         "/actions": "List pending provider actions",
-        "/action": "Update provider action: /action handled <id>",
+        "/action": "Update provider action: /action handled|choose|respond|continue|dismiss <id>",
         "/parallel": "List open parallel-squad conflicts",
         "/learning": "Show provider learning snapshots",
         "/report": "Show report: /report [task-id]",
@@ -272,6 +272,22 @@ def _handle_daemon_tui_command(
         if text.startswith("/action handled "):
             payload = client.provider_action_handled(text.split(maxsplit=2)[2])
             return f"{payload.get('action_id')}: {payload.get('status')}", str(payload.get("run_id") or current_task)
+        if text.startswith("/action choose "):
+            parts = text.split(maxsplit=3)
+            if len(parts) < 4:
+                return "usage: /action choose <action-id> <choice>", current_task
+            payload = client.provider_action_response(parts[2], {"choice": parts[3]})
+            return f"{payload.get('action_id')}: {payload.get('status')} choice={parts[3]}", str(payload.get("run_id") or current_task)
+        if text.startswith("/action respond "):
+            parts = text.split(maxsplit=3)
+            if len(parts) < 4:
+                return "usage: /action respond <action-id> <text>", current_task
+            payload = client.provider_action_response(parts[2], {"text": parts[3]})
+            return f"{payload.get('action_id')}: {payload.get('status')} response recorded", str(payload.get("run_id") or current_task)
+        if text.startswith("/action continue "):
+            action_id = text.split(maxsplit=2)[2]
+            payload = client.provider_action_handled_and_continue(current_task or "latest", action_id)
+            return f"{payload.get('task_id')}: {payload.get('status')}", str(payload.get("run_id") or payload.get("task_id") or current_task)
         if text.startswith("/action dismiss "):
             payload = client.provider_action_dismiss(text.split(maxsplit=2)[2])
             return f"{payload.get('action_id')}: {payload.get('status')}", str(payload.get("run_id") or current_task)

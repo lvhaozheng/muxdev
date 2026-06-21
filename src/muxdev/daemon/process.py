@@ -120,26 +120,35 @@ def stop_daemon(
     paths = (paths or default_daemon_paths()).ensure()
     pid = read_pid(paths.pid_path)
     port_pids = _listening_pids_for_ports({api_port, ui_port})
-    stopped_pids: list[int] = []
+    attempted_pids: list[int] = []
     if pid is not None and is_pid_alive(pid):
         _terminate_pid(pid)
-        stopped_pids.append(pid)
+        attempted_pids.append(pid)
     else:
         _unlink_pid_file(paths.pid_path)
     for owner in port_pids:
-        if owner in stopped_pids:
+        if owner in attempted_pids:
             continue
         _terminate_pid(owner)
-        stopped_pids.append(owner)
-    if stopped_pids:
+        attempted_pids.append(owner)
+    if attempted_pids:
         wait_for_daemon_stop(host=host, api_port=api_port)
-    _unlink_pid_file(paths.pid_path)
+        _wait_for_pids_exit(attempted_pids)
+
+    remaining_port_pids = _listening_pids_for_ports({api_port, ui_port})
+    remaining_pid = pid if pid is not None and is_pid_alive(pid) else None
+    remaining_pids = sorted(set(remaining_port_pids + ([remaining_pid] if remaining_pid is not None else [])))
+    running = bool(remaining_pids)
+    if not running or remaining_pid is None:
+        _unlink_pid_file(paths.pid_path)
     return {
-        "running": False,
-        "stopped": bool(stopped_pids),
-        "pid": pid if pid in stopped_pids else None,
-        "pids": stopped_pids,
+        "running": running,
+        "stopped": bool(attempted_pids) and not running,
+        "pid": remaining_pid,
+        "pids": attempted_pids,
         "port_pids": port_pids,
+        "remaining_pids": remaining_pids,
+        "remaining_port_pids": remaining_port_pids,
     }
 
 
@@ -207,6 +216,16 @@ def wait_for_daemon_stop(*, host: str, api_port: int, timeout: float = 3.0) -> b
             return True
         time.sleep(0.15)
     return False
+
+
+def _wait_for_pids_exit(pids: list[int], timeout: float = 3.0) -> bool:
+    deadline = time.time() + timeout
+    unique_pids = sorted(set(pids))
+    while time.time() < deadline:
+        if all(not is_pid_alive(pid) for pid in unique_pids):
+            return True
+        time.sleep(0.15)
+    return all(not is_pid_alive(pid) for pid in unique_pids)
 
 
 def _terminate_pid(pid: int) -> None:

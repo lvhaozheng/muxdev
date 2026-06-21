@@ -69,6 +69,7 @@ class PolicySpec:
 
     approval_types: frozenset[str] = frozenset()
     max_cost_usd: float = 0.5
+    strict_approval: bool = False
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object] | None, *, max_cost_usd: float = 0.5) -> "PolicySpec":
@@ -76,10 +77,14 @@ class PolicySpec:
         approvals = policy.get("approval_types", [])
         if not isinstance(approvals, list):
             approvals = []
-        return cls(approval_types=frozenset(str(item) for item in approvals), max_cost_usd=float(policy.get("max_cost_usd", max_cost_usd)))
+        return cls(
+            approval_types=frozenset(str(item) for item in approvals),
+            max_cost_usd=float(policy.get("max_cost_usd", max_cost_usd)),
+            strict_approval=bool(policy.get("strict_approval")),
+        )
 
     def to_payload(self) -> dict[str, object]:
-        return {"approval_types": sorted(self.approval_types), "max_cost_usd": self.max_cost_usd}
+        return {"approval_types": sorted(self.approval_types), "max_cost_usd": self.max_cost_usd, "strict_approval": self.strict_approval}
 
 
 @dataclass(frozen=True)
@@ -132,7 +137,11 @@ class RunSpec:
             role_providers={str(key): str(value) for key, value in (role_providers or {}).items() if value},
             skills=tuple(SkillRef.from_payload(skill) for skill in skills or [] if isinstance(skill, Mapping)),
             automation=AutomationDecision.from_payload(automation),
-            policy=PolicySpec(approval_types=frozenset(require_approval or set()), max_cost_usd=max_cost_usd),
+            policy=PolicySpec(
+                approval_types=frozenset(require_approval or set()),
+                max_cost_usd=max_cost_usd,
+                strict_approval=bool(require_approval) and gate not in {"auto", "safe"},
+            ),
             ci_block_on_approval=ci_block_on_approval,
             depth=depth,
             topology=topology,

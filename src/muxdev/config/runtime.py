@@ -33,7 +33,7 @@ PROFILES = {
 
 GATES = {
     "auto": {"require_approval": []},
-    "safe": {"require_approval": ["plan", "write", "shell", "merge"]},
+    "safe": {"require_approval": []},
     "strict": {"require_approval": ["plan", "write", "shell", "merge", "external"]},
     "ci": {"require_approval": ["plan", "write", "shell", "merge", "external"], "block_on_approval": True},
 }

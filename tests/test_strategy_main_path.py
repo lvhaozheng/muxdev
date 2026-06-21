@@ -75,6 +75,24 @@ def test_resolve_task_request_maps_new_and_legacy_roles(monkeypatch) -> None:
     assert request["skill_specs"] == ["review=security-review"]
 
 
+def test_safe_gate_does_not_require_low_risk_approvals(monkeypatch) -> None:
+    workspace = _workspace_temp("safe-gate")
+    monkeypatch.setattr(runtime_config, "detect_providers", lambda: [_probe("mock", ProviderStatus.READY)])
+    try:
+        request = resolve_task_request(
+            workspace=workspace,
+            task="ship low risk change",
+            command_workflow="dev",
+            provider="mock",
+            gate="safe",
+        )
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    assert request["gate"] == "safe"
+    assert request["require_approval"] == []
+
+
 def test_skill_scan_priority_and_role_binding() -> None:
     workspace = _workspace_temp("skills")
     try:

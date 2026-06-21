@@ -9,24 +9,10 @@ from ..workflows import load_workflow
 
 
 def workflow_to_langgraph(name_or_path: str) -> dict[str, Any]:
+    from ..runtime.langgraph_engine import LangGraphWorkflowEngine
+
     workflow = load_workflow(name_or_path)
-    nodes = [
-        {
-            "id": stage.id,
-            "role": stage.role,
-            "type": stage.type,
-            "metadata": {
-                "read_only": stage.read_only,
-                "allow_write": stage.allow_write,
-                "allow_shell": stage.allow_shell,
-                "checkpoint": stage.checkpoint,
-                "when": stage.when,
-            },
-        }
-        for stage in workflow.stages
-    ]
-    edges = [{"source": dep, "target": stage.id} for stage in workflow.stages for dep in stage.deps]
-    return {"name": workflow.name, "max_parallel": workflow.max_parallel, "nodes": nodes, "edges": edges}
+    return LangGraphWorkflowEngine(Path.cwd()).graph_spec(workflow)
 
 
 def deep_agent_task_pack(task: str, workflow_name: str, workspace: Path) -> dict[str, Any]:

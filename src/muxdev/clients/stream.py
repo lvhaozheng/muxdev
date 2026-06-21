@@ -10,6 +10,14 @@ from ..models import ProviderActionKind
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+AUTH_ERROR_PATTERNS = (
+    re.compile(r"\bplease\s+sign\s+in\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:auth|authentication|authorization)\b.*\b(?:error|failed|failure|required|expired|invalid|login|sign\s*in)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:login|sign\s*in)\b.*\b(?:required|failed|failure|error|expired|invalid)\b", re.IGNORECASE),
+)
 
 
 class StreamEventType(StrEnum):
@@ -49,7 +57,7 @@ class StreamAdapter:
         lowered = clean.lower()
         if "waiting_external_confirmation" in lowered:
             events.append(StreamEvent(StreamEventType.WAITING_EXTERNAL_CONFIRMATION, clean))
-        if ("auth" in lowered and ("error" in lowered or "login" in lowered)) or "please sign in" in lowered:
+        if looks_like_auth_error(clean):
             events.append(StreamEvent(StreamEventType.AUTH_ERROR, clean))
         if re.search(r"\brate[- ]limit(?:ed|s)?\b", lowered) or "too many requests" in lowered or "quota exceeded" in lowered:
             events.append(StreamEvent(StreamEventType.RATE_LIMIT, clean))
@@ -90,6 +98,10 @@ def _action_kind(event_type: StreamEventType) -> str | None:
     if event_type == StreamEventType.IDLE_TIMEOUT:
         return str(ProviderActionKind.IDLE_TIMEOUT)
     return None
+
+
+def looks_like_auth_error(text: str) -> bool:
+    return any(pattern.search(text) for pattern in AUTH_ERROR_PATTERNS)
 
 
 def _prompt_excerpt(text: str, *, max_chars: int = 1200) -> str:

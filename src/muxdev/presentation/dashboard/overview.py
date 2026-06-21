@@ -12,9 +12,18 @@ from ...config.loader import load_config
 from ...config.runtime import GATES, PROFILES, load_runtime_config
 from ...services.product_experience import budget_panel, git_safety_panel, project_context_status, rules_skills_panel
 from ...services.skills import build_skill_catalog, verify_skill_lock
+from ...services.standards import EVIDENCE_LEVELS, RISK_LEVELS, SEVERITY_LEVELS, catalog_payload
 from ...services.ux import build_ux_overview
 from ...services.validation import list_validation_experiments
 from ...services.workflow_plugins import list_workflow_plugins
+
+_STANDARD_CATALOG = catalog_payload()
+_STANDARD_IDS = set(SEVERITY_LEVELS) | set(RISK_LEVELS) | set(EVIDENCE_LEVELS)
+_DEFAULT_STANDARD_MARKERS = {
+    "ready": ("P3", "R1", "E1"),
+    "watch": ("P2", "R2", "E1"),
+    "blocked": ("P0", "R3", "E1"),
+}
 
 
 def build_dashboard_overview(
@@ -541,6 +550,7 @@ def _standard_section(section_id: str, label: str, items: list[dict[str, Any]]) 
         "passed": passed,
         "total": total,
         "summary": f"{passed}/{total} standard(s) met",
+        "catalog": _STANDARD_CATALOG,
         "items": items,
     }
 
@@ -554,7 +564,18 @@ def _standard_item(
     *,
     evidence: object = "",
     action: str = "none",
+    standard_id: str | None = None,
+    severity: str | None = None,
+    risk_level: str | None = None,
+    evidence_level: str | None = None,
 ) -> dict[str, Any]:
+    standard_id, severity, risk_level, evidence_level = _standard_markers(
+        status,
+        standard_id=standard_id,
+        severity=severity,
+        risk_level=risk_level,
+        evidence_level=evidence_level,
+    )
     return {
         "id": item_id,
         "label": label,
@@ -563,7 +584,36 @@ def _standard_item(
         "target": target,
         "evidence": evidence,
         "action": action,
+        "standard_id": standard_id,
+        "severity": severity,
+        "risk_level": risk_level,
+        "evidence_level": evidence_level,
     }
+
+
+def _standard_markers(
+    status: str,
+    *,
+    standard_id: str | None,
+    severity: str | None,
+    risk_level: str | None,
+    evidence_level: str | None,
+) -> tuple[str, str, str, str]:
+    default_severity, default_risk, default_evidence = _DEFAULT_STANDARD_MARKERS.get(
+        str(status or "").lower(),
+        _DEFAULT_STANDARD_MARKERS["watch"],
+    )
+    resolved_severity = severity if severity in SEVERITY_LEVELS else default_severity
+    resolved_risk = risk_level if risk_level in RISK_LEVELS else default_risk
+    resolved_evidence = evidence_level if evidence_level in EVIDENCE_LEVELS else default_evidence
+    resolved_standard = (
+        standard_id
+        if standard_id in _STANDARD_IDS
+        else resolved_evidence
+        if resolved_evidence != "E1"
+        else resolved_risk
+    )
+    return resolved_standard, resolved_severity, resolved_risk, resolved_evidence
 
 
 def _trusted_delivery_standards(
@@ -594,6 +644,10 @@ def _trusted_delivery_standards(
             ">= 0.85 trusted; 0.60-0.84 reviewable; < 0.60 risky",
             evidence=focus.get("task_id") or "",
             action="publish_evidence" if not rows else ("resolve_risk" if confidence_status != "ready" else "none"),
+            standard_id="E3",
+            severity="P2" if confidence_status != "ready" else "P3",
+            risk_level="R2" if confidence_status == "ready" else "R3",
+            evidence_level="E3" if confidence_status == "ready" else "E1",
         ),
         _standard_item(
             "tests",
@@ -603,6 +657,10 @@ def _trusted_delivery_standards(
             "all recorded tests passed",
             evidence=_task_refs(rows),
             action="add_tests",
+            standard_id="E2",
+            severity="P1",
+            risk_level="R1",
+            evidence_level="E2" if tests else "E0",
         ),
         _standard_item(
             "review",
@@ -612,6 +670,10 @@ def _trusted_delivery_standards(
             "0 high review blockers",
             evidence=_task_refs(rows),
             action="complete_review",
+            standard_id="E3",
+            severity="P0" if reviews and any(int(row.get("high_blockers") or 0) for row in reviews if isinstance(row, dict)) else "P2",
+            risk_level="R3" if reviews and any(int(row.get("high_blockers") or 0) for row in reviews if isinstance(row, dict)) else "R2",
+            evidence_level="E3" if reviews else "E0",
         ),
         _standard_item(
             "rollback",
@@ -621,6 +683,10 @@ def _trusted_delivery_standards(
             "rollback snapshot available",
             evidence=_task_refs(rows),
             action="enable_rollback",
+            standard_id="R2",
+            severity="P2",
+            risk_level="R2",
+            evidence_level="E1",
         ),
         _standard_item(
             "artifacts",
@@ -630,6 +696,10 @@ def _trusted_delivery_standards(
             "report, diff, evidence bundle complete",
             evidence=_task_refs(rows),
             action="publish_evidence",
+            standard_id="E1",
+            severity="P2",
+            risk_level="R2",
+            evidence_level="E1" if rows else "E0",
         ),
         _standard_item(
             "budget",
@@ -639,6 +709,10 @@ def _trusted_delivery_standards(
             "no task above default budget",
             evidence=f"default=${budget.get('default_task_budget_usd')}",
             action="review_budget",
+            standard_id="R3",
+            severity="P1" if int(budget.get("high_cost_tasks") or 0) else "P3",
+            risk_level="R3" if int(budget.get("high_cost_tasks") or 0) else "R1",
+            evidence_level="E1",
         ),
         _standard_item(
             "human_attention",
@@ -648,6 +722,10 @@ def _trusted_delivery_standards(
             "0 pending approvals/provider actions",
             evidence={"approvals": len(approvals), "provider_actions": len(provider_actions)},
             action="resolve_attention",
+            standard_id="R3",
+            severity="P1" if pending_actions else "P3",
+            risk_level="R3" if pending_actions else "R1",
+            evidence_level="E1",
         ),
     ]
     return _standard_section("trusted_delivery", "Trusted delivery standards", items)

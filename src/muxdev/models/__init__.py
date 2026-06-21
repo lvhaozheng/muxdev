@@ -53,6 +53,7 @@ class ProviderActionStatus(StrEnum):
 
 class ProviderActionKind(StrEnum):
     CLI_CONFIRMATION = "cli_confirmation"
+    CLARIFICATION_REQUIRED = "clarification_required"
     AUTH_REQUIRED = "auth_required"
     RATE_LIMIT = "rate_limit"
     PROVIDER_BLOCKED = "provider_blocked"
@@ -89,6 +90,21 @@ class TestResult(BaseModel):
     summary: str
 
 
+class LoopPolicy(BaseModel):
+    """Declarative loop-engineering metadata for workflow stages.
+
+    The legacy max_loops/loop_* fields remain supported. This richer policy is
+    optional and lets LangGraph-style runtimes expose evaluator/improver loops
+    without changing existing workflow files.
+    """
+
+    evaluator: str | None = None
+    improver: str | None = None
+    max_iterations: int | None = None
+    stop_conditions: list[str] = Field(default_factory=list)
+    budget_guard: str | None = None
+
+
 class WorkflowStage(BaseModel):
     """One node in a DAG-ready workflow definition."""
 
@@ -111,6 +127,9 @@ class WorkflowStage(BaseModel):
     prompt: str | None = None
     prompt_template: str | None = None
     default_skills: list[str] = Field(default_factory=list)
+    context_sources: list[str] = Field(default_factory=list)
+    rag_query: str | None = None
+    loop_policy: LoopPolicy | None = None
 
 
 class WorkflowDefinition(BaseModel):
@@ -137,6 +156,7 @@ from .validation import ComparisonReport, StrategyRun, ValidationCase, Validatio
 __all__ = [
     "ApprovalStatus",
     "ComparisonReport",
+    "LoopPolicy",
     "PlanArtifact",
     "PolicyDecision",
     "ProviderActionKind",

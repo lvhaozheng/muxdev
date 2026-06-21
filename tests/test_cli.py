@@ -49,6 +49,9 @@ class FakeDaemonClient:
     def provider_action_handled(self, action_id: str) -> dict[str, object]:
         return {"action_id": action_id, "status": "handled", "run_id": "run_fake"}
 
+    def provider_action_response(self, action_id: str, response: object) -> dict[str, object]:
+        return {"action_id": action_id, "status": "handled", "run_id": "run_fake", "response": response}
+
     def provider_action_dismiss(self, action_id: str) -> dict[str, object]:
         return {"action_id": action_id, "status": "dismissed", "run_id": "run_fake"}
 
@@ -228,6 +231,7 @@ def test_continue_dashboard_and_tui_json_use_daemon_client(monkeypatch) -> None:
     tui = runner.invoke(app, ["tui", "run_fake", "--json"])
     actions = runner.invoke(app, ["actions", "--json"])
     handled = runner.invoke(app, ["action", "handled", "pact_fake", "--json"])
+    responded = runner.invoke(app, ["action", "respond", "pact_fake", "--choice", "safe", "--continue", "--json"])
     undo = runner.invoke(app, ["undo", "run_fake", "--to-stage", "implement", "--json"])
 
     assert continued.exit_code == 0
@@ -240,6 +244,10 @@ def test_continue_dashboard_and_tui_json_use_daemon_client(monkeypatch) -> None:
     assert json.loads(actions.stdout)[0]["action_id"] == "pact_fake"
     assert handled.exit_code == 0
     assert json.loads(handled.stdout)["status"] == "handled"
+    assert responded.exit_code == 0
+    responded_payload = json.loads(responded.stdout)
+    assert responded_payload["action"]["response"] == {"choice": "safe"}
+    assert responded_payload["continue"]["status"] == "running"
     assert undo.exit_code == 0
     assert json.loads(undo.stdout)["status"] == "rolled_back"
 

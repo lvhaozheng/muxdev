@@ -134,15 +134,40 @@ def _approvals(workspace: Path, *, status: str | None = None) -> list[dict[str, 
 
 def _decide(workspace: Path, approval_id: str, status: ApprovalStatus) -> str:
     store = RunStore(workspace)
+    run_exists = False
     for run_dir in store.runs_dir.iterdir() if store.runs_dir.exists() else []:
         if not (run_dir / "blackboard.sqlite").exists():
             continue
+        run_exists = run_exists or run_dir.name == approval_id
         blackboard = Blackboard(run_dir)
         try:
             rows = blackboard.list_approvals(run_id=run_dir.name)
-            if any(row["approval_id"] == approval_id for row in rows):
-                blackboard.decide_approval(approval_id, status)
-                return f"{approval_id}: {status}"
+            try:
+                resolved = _resolve_local_approval_id(rows, approval_id)
+            except ValueError as exc:
+                return str(exc)
+            if resolved:
+                blackboard.decide_approval(resolved, status)
+                return f"{resolved}: {status}"
         finally:
             blackboard.close()
+    if run_exists:
+        return f"no pending approval for run: {approval_id}; use /run or recover the task"
     return f"approval not found: {approval_id}"
+
+
+def _resolve_local_approval_id(rows: list[dict[str, object]], approval_or_run_id: str) -> str | None:
+    for row in rows:
+        if str(row.get("approval_id") or "") == approval_or_run_id:
+            return str(row["approval_id"])
+    pending_for_run = [
+        row
+        for row in rows
+        if str(row.get("run_id") or row.get("task_id") or "") == approval_or_run_id
+        and str(row.get("status") or "") == str(ApprovalStatus.PENDING)
+    ]
+    if len(pending_for_run) == 1:
+        return str(pending_for_run[0]["approval_id"])
+    if len(pending_for_run) > 1:
+        raise ValueError(f"multiple pending approvals for run: {approval_or_run_id}; use an approval id")
+    return None

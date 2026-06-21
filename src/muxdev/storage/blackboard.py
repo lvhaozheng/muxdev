@@ -1476,6 +1476,8 @@ def _json_dict(value: object) -> dict[str, object]:
 
 def _provider_action_input_kind(kind: str, choices: list[dict[str, Any]] | None = None) -> str:
     choices = choices or []
+    if kind == str(ProviderActionKind.CLARIFICATION_REQUIRED):
+        return "text" if not choices else "choice"
     if kind == str(ProviderActionKind.CLI_CONFIRMATION):
         return "confirmation"
     if choices:

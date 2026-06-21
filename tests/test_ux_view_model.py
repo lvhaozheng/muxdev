@@ -201,6 +201,50 @@ def test_task_ux_summary_surfaces_plan_feedback_and_elapsed_time() -> None:
     assert "1h 1m" in ux["why"]
 
 
+def test_task_ux_summary_reconciles_awaiting_approval_without_pending_record() -> None:
+    payload = {
+        "run": {"run_id": "run_orphan", "task": "fix health endpoint", "status": "awaiting_approval"},
+        "stages": [{"stage_id": "approve_plan", "role": "plan", "status": "running", "summary": "waiting"}],
+        "summary": {"current_activity": "running stage approve_plan", "current_stage_elapsed_seconds": 14400},
+        "approvals": [],
+        "provider_actions": [],
+        "errors": [],
+        "review_blockers": [],
+        "artifacts": [],
+        "trace": [],
+    }
+
+    ux = build_task_ux_summary(payload)
+
+    assert ux["user_state"] == "needs_attention"
+    assert ux["headline"] == "Approval state needs reconciliation"
+    assert ux["next_actions"][0]["kind"] == "continue_task"
+    assert ux["next_actions"][0]["endpoint"] == "/api/tasks/run_orphan/continue"
+    assert all(item["kind"] != "plan_feedback" for item in ux["next_actions"])
+
+
+def test_task_ux_summary_reconciles_awaiting_provider_action_without_pending_record() -> None:
+    payload = {
+        "run": {"run_id": "run_provider_orphan", "task": "verify health endpoint", "status": "awaiting_provider_action"},
+        "stages": [{"stage_id": "test", "role": "test", "status": "running", "summary": "waiting for provider action"}],
+        "summary": {"current_activity": "running stage test", "current_stage_elapsed_seconds": 900},
+        "approvals": [],
+        "provider_actions": [{"action_id": "pact_1", "status": "handled", "run_id": "run_provider_orphan"}],
+        "errors": [],
+        "review_blockers": [],
+        "artifacts": [],
+        "trace": [],
+    }
+
+    ux = build_task_ux_summary(payload)
+
+    assert ux["user_state"] == "needs_attention"
+    assert ux["headline"] == "Provider action state needs reconciliation"
+    assert ux["next_actions"][0]["kind"] == "continue_task"
+    assert ux["next_actions"][0]["endpoint"] == "/api/tasks/run_provider_orphan/continue"
+    assert all(item["kind"] != "plan_feedback" for item in ux["next_actions"])
+
+
 def test_task_ux_summary_surfaces_design_document_deliverable() -> None:
     payload = {
         "run": {"run_id": "run_design", "task": "design snake game", "status": "completed"},
@@ -249,3 +293,51 @@ def test_ux_overview_surfaces_planning_feedback_action() -> None:
 
     assert overview["action_center"][0]["kind"] == "plan_feedback"
     assert "--run-id run_plan" in overview["action_center"][0]["command"]
+
+
+def test_ux_overview_reconciles_awaiting_approval_without_pending_record() -> None:
+    overview = build_ux_overview(
+        daemon={"status": "running", "tasks": 1},
+        tasks=[
+            {
+                "task_id": "run_orphan",
+                "status": "awaiting_approval",
+                "current_stage": "approve_plan",
+                "current_activity": "running stage approve_plan",
+                "pending_approvals": 0,
+                "pending_provider_actions": 0,
+                "errors": 0,
+                "recover_endpoint": "/api/tasks/run_orphan/continue",
+            }
+        ],
+        approvals=[],
+        provider_actions=[],
+    )
+
+    assert overview["counts"]["needs_attention"] == 1
+    assert overview["action_center"][0]["kind"] == "approval_reconcile"
+    assert overview["action_center"][0]["endpoint"] == "/api/tasks/run_orphan/continue"
+
+
+def test_ux_overview_reconciles_awaiting_provider_action_without_pending_record() -> None:
+    overview = build_ux_overview(
+        daemon={"status": "running", "tasks": 1},
+        tasks=[
+            {
+                "task_id": "run_provider_orphan",
+                "status": "awaiting_provider_action",
+                "current_stage": "test",
+                "current_activity": "running stage test",
+                "pending_approvals": 0,
+                "pending_provider_actions": 0,
+                "errors": 0,
+                "recover_endpoint": "/api/tasks/run_provider_orphan/continue",
+            }
+        ],
+        approvals=[],
+        provider_actions=[],
+    )
+
+    assert overview["counts"]["needs_attention"] == 1
+    assert overview["action_center"][0]["kind"] == "provider_action_reconcile"
+    assert overview["action_center"][0]["endpoint"] == "/api/tasks/run_provider_orphan/continue"

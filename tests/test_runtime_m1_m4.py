@@ -110,6 +110,50 @@ def test_git_worktree_fallback_baselines_no_head_repo_and_ignores_generated_file
     assert "pytest-cache-files-*/" in excludes
 
 
+def test_non_git_workspace_copy_fallback_includes_project_files(
+    monkeypatch: pytest.MonkeyPatch,
+    workspace: Path,
+) -> None:
+    (workspace / "app.py").write_text("value = 1\n", encoding="utf-8")
+    (workspace / ".muxdev" / "runs" / "old_run").mkdir(parents=True)
+    run_dir = workspace / ".muxdev" / "runs" / "run_copy"
+    run_dir.mkdir(parents=True)
+    init_calls: list[tuple[Path, bool]] = []
+
+    def fake_init(path: Path, *, commit_baseline: bool = False) -> None:
+        init_calls.append((path, commit_baseline))
+        (path / ".git").mkdir()
+        (path / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+
+    monkeypatch.setattr(WorktreeManager, "_is_git_repo", staticmethod(lambda path: False))
+    monkeypatch.setattr(WorktreeManager, "_init_fallback_git_repo", staticmethod(fake_init))
+
+    result = WorktreeManager(workspace).prepare("run_copy", run_dir)
+
+    assert result.strategy == "workspace_copy"
+    assert (result.path / "app.py").read_text(encoding="utf-8") == "value = 1\n"
+    assert not (result.path / ".muxdev").exists()
+    assert (result.path / ".git" / "config").exists()
+    assert init_calls == [(result.path, True)]
+
+
+def test_git_repo_detection_requires_workspace_top_level(
+    monkeypatch: pytest.MonkeyPatch,
+    workspace: Path,
+) -> None:
+    child = workspace / "nested"
+    child.mkdir()
+
+    def fake_subprocess_run(cmd, **kwargs):
+        assert cmd == ["git", "rev-parse", "--show-toplevel"]
+        return subprocess.CompletedProcess(cmd, 0, str(workspace.resolve()) + "\n", "")
+
+    monkeypatch.setattr("muxdev.runtime.worktree.subprocess.run", fake_subprocess_run)
+
+    assert WorktreeManager._is_git_repo(workspace) is True
+    assert WorktreeManager._is_git_repo(child) is False
+
+
 def test_design_workflow_publishes_user_visible_design_document(workspace: Path) -> None:
     result = SupervisorRuntime(workspace).run("设计一个贪吃蛇游戏方案", provider="mock", workflow_name="design")
 
@@ -663,3 +707,24 @@ stages:
 
     assert resumed.status == RunStatus.COMPLETED
     assert provider.seen_response is True
+
+
+def test_unclear_task_creates_clarification_action_and_resume_uses_response(workspace: Path) -> None:
+    runtime = SupervisorRuntime(workspace)
+    paused = runtime.run("?", provider="mock", workflow_name="fix")
+
+    assert paused.status == RunStatus.AWAITING_PROVIDER_ACTION
+    blackboard = Blackboard(paused.run_dir)
+    try:
+        action = blackboard.list_provider_actions(status=str(ProviderActionStatus.PENDING))[0]
+        assert action["kind"] == "clarification_required"
+        assert action["input_kind"] == "text"
+        blackboard.respond_provider_action(action["action_id"], response={"text": "Fix the navbar hover state and verify with tests."})
+    finally:
+        blackboard.close()
+
+    resumed = runtime.resume(paused.run_id)
+    packet = json.loads((resumed.run_dir / "context_packets" / "code.json").read_text(encoding="utf-8"))
+
+    assert resumed.status == RunStatus.COMPLETED
+    assert packet["task"]["provider_action_responses"][0]["response"] == {"text": "Fix the navbar hover state and verify with tests."}

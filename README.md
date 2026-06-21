@@ -211,6 +211,7 @@ GET  /api/providers/health
 
 - [Product Guide](docs/product_guide.md): positioning, capabilities, complex workflows, and roadmap direction.
 - [Architecture](docs/architecture.md): daemon, runtime, storage, workflow, provider, UI, and API architecture.
+- [LangGraph And Loop Engineering](docs/langgraph_loop_engineering.md): LangGraph-first runtime direction, loop events, optional RAG policy, and validation signals.
 - [Configuration](docs/configuration.md): TOML runtime config, profiles, gates, roles, providers, memory, skills, and troubleshooting.
 - [Best Practices](docs/best_practices.md): daily workflows, provider actions, approvals, memory, evidence, dashboard, and testing.
 - [Source Walkthrough](docs/source_walkthrough.md): code-level map for contributors.

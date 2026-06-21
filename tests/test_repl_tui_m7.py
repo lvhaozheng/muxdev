@@ -54,6 +54,9 @@ def test_tui_slash_commands_normalize() -> None:
     assert _normalize_command("/design plan it") == "workflow design plan it"
     assert _normalize_command("/approve appr_1") == "approve appr_1"
     assert _normalize_command("/action handled pact_1") == "action handled pact_1"
+    assert _normalize_command("/action choose pact_1 safe") == "action choose pact_1 safe"
+    assert _normalize_command("/action respond pact_1 clarify target") == "action respond pact_1 clarify target"
+    assert _normalize_command("/action continue pact_1") == "action continue pact_1"
 
 
 def test_tui_help_lists_slash_commands() -> None:
@@ -142,6 +145,12 @@ def test_daemon_tui_command_results_use_chat_format(monkeypatch) -> None:
         def provider_action_handled(self, action_id: str) -> dict[str, object]:
             return {"action_id": action_id, "run_id": "run_1", "status": "handled"}
 
+        def provider_action_response(self, action_id: str, response: object) -> dict[str, object]:
+            return {"action_id": action_id, "run_id": "run_1", "status": "handled", "response": response}
+
+        def provider_action_handled_and_continue(self, task_id: str, action_id: str) -> dict[str, object]:
+            return {"task_id": task_id, "run_id": task_id, "status": "continue_requested", "action_id": action_id}
+
         def provider_action_dismiss(self, action_id: str) -> dict[str, object]:
             return {"action_id": action_id, "run_id": "run_1", "status": "dismissed"}
 
@@ -155,6 +164,9 @@ def test_daemon_tui_command_results_use_chat_format(monkeypatch) -> None:
     report, report_selected = cli_app_module._handle_daemon_tui_command("/report run_1", "latest", host="127.0.0.1", port=8788, commands={})
     actions, _ = cli_app_module._handle_daemon_tui_command("/actions", "latest", host="127.0.0.1", port=8788, commands={})
     handled, handled_selected = cli_app_module._handle_daemon_tui_command("/action handled pact_1", "latest", host="127.0.0.1", port=8788, commands={})
+    choice, choice_selected = cli_app_module._handle_daemon_tui_command("/action choose pact_1 safe", "run_1", host="127.0.0.1", port=8788, commands={})
+    response, response_selected = cli_app_module._handle_daemon_tui_command("/action respond pact_1 target browser", "run_1", host="127.0.0.1", port=8788, commands={})
+    action_continue, action_continue_selected = cli_app_module._handle_daemon_tui_command("/action continue pact_1", "run_1", host="127.0.0.1", port=8788, commands={})
     recover, recover_selected = cli_app_module._handle_daemon_tui_command("/recover run_1", "latest", host="127.0.0.1", port=8788, commands={})
 
     assert "Recent tasks" in tasks
@@ -175,6 +187,12 @@ def test_daemon_tui_command_results_use_chat_format(monkeypatch) -> None:
     assert "Apply this change" in actions
     assert handled == "pact_1: handled"
     assert handled_selected == "run_1"
+    assert "choice=safe" in choice
+    assert choice_selected == "run_1"
+    assert "response recorded" in response
+    assert response_selected == "run_1"
+    assert action_continue == "run_1: continue_requested"
+    assert action_continue_selected == "run_1"
     assert recover == "run_1: recover continue_requested"
     assert recover_selected == "run_1"
 

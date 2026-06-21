@@ -23,6 +23,9 @@ ui:
     /deny: Deny an approval id
     /actions: List pending provider CLI actions
     /action handled: Mark a provider action handled
+    /action choose: Answer a provider or clarification action with a choice
+    /action respond: Answer a provider or clarification action with text
+    /action continue: Mark a provider action handled and continue
     /action dismiss: Dismiss a provider action
     /parallel: List open parallel-squad conflicts
     /learning: Show provider learning snapshots

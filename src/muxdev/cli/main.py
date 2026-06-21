@@ -47,6 +47,8 @@ from ..services.automation import render_why
 from ..services.design import latest_design_contract
 from ..config.loader import config_sources, load_config, path_config, validate_config
 from ..services.rag import LocalRagIndex
+from ..services.offline_render import OfflineRenderError, render_offline_video
+from ..services.tts_engine import TtsEngineError, synthesize_chunks
 from ..services.reports import generate_final_report
 from ..services.evidence import cleanup_legacy_evidence, load_evidence_artifacts, render_evidence_text, verify_run_evidence, write_evidence_run
 from ..services.advanced_parallel import detect_parallel_conflicts, record_parallel_conflicts
@@ -144,6 +146,8 @@ preset_app = typer.Typer(help="Built-in profile, gate, and workflow presets")
 mcp_app = typer.Typer(help="MCP server tools")
 session_app = typer.Typer(help="Long-lived provider session tools")
 rag_app = typer.Typer(help="Local retrieval index tools")
+offline_render_app = typer.Typer(help="Offline PDF/PNG timeline video renderer")
+tts_engine_app = typer.Typer(help="GPT-SoVITS batch TTS tools")
 graph_app = typer.Typer(help="Workflow graph export tools")
 deep_agent_app = typer.Typer(help="Deep-agent integration tools")
 workflow_app = typer.Typer(help="Workflow template catalog tools")
@@ -172,6 +176,8 @@ app.add_typer(preset_app, name="preset")
 app.add_typer(mcp_app, name="mcp")
 app.add_typer(session_app, name="session")
 app.add_typer(rag_app, name="rag")
+app.add_typer(offline_render_app, name="offline-render")
+app.add_typer(tts_engine_app, name="tts-engine")
 app.add_typer(graph_app, name="graph")
 app.add_typer(deep_agent_app, name="deep-agent")
 app.add_typer(workflow_app, name="workflow")
@@ -1550,6 +1556,9 @@ def action_respond(
     choice: Annotated[str | None, typer.Option("--choice", help="Selected choice value.")] = None,
     text: Annotated[str | None, typer.Option("--text", help="Free-form response text.")] = None,
     response_json: Annotated[str | None, typer.Option("--response-json", help="Structured JSON response.")] = None,
+    continue_: Annotated[bool, typer.Option("--continue", help="Resume the owning task after recording the response.")] = False,
+    task_id: Annotated[str | None, typer.Option("--task-id", help="Task id to continue. Defaults to the action's run id.")] = None,
+    max_cost_usd: Annotated[float, typer.Option("--max-cost-usd", help="Budget limit if continuing.")] = 0.5,
     host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
     port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
@@ -1558,7 +1567,14 @@ def action_respond(
     response = _provider_action_response(choice=choice, text=text, response_json=response_json)
     if response is None:
         raise typer.BadParameter("provide --choice, --text, or --response-json")
-    payload = _daemon_client(host, port).provider_action_response(action_id, response)
+    client = _daemon_client(host, port)
+    payload = client.provider_action_response(action_id, response)
+    if continue_:
+        resolved_task = task_id or str(payload.get("run_id") or payload.get("task_id") or "")
+        if not resolved_task:
+            raise typer.BadParameter("--continue requires --task-id when the daemon response has no run_id")
+        continued = client.continue_task(resolved_task, max_cost_usd=max_cost_usd)
+        payload = {"action": payload, "continue": continued, "task_id": resolved_task, "run_id": resolved_task, "status": continued.get("status")}
     if json_output:
         _print_json(payload)
         return
@@ -2055,11 +2071,129 @@ def rag_query(
         _print_json(rows)
         return
     table = Table(title="RAG Query")
-    for column in ("path", "start_line", "end_line", "score", "text"):
+    for column in ("path", "start_line", "end_line", "score", "citation", "backend", "text"):
         table.add_column(column)
     for row in rows:
-        table.add_row(*(str(row.get(column) or "") for column in ("path", "start_line", "end_line", "score", "text")))
+        table.add_row(*(str(row.get(column) or "") for column in ("path", "start_line", "end_line", "score", "citation", "backend", "text")))
     console.print(table)
+
+
+@offline_render_app.command("run")
+def offline_render_run(
+    input_path: Annotated[
+        Path,
+        typer.Option("--input", "-i", help="PDF file, PNG file, PNG directory, or PNG glob pattern."),
+    ] = Path("slides"),
+    timeline_path: Annotated[Path, typer.Option("--timeline", help="timeline.json path.")] = Path("timeline.json"),
+    output_path: Annotated[Path, typer.Option("--output", "-o", help="Output 1080p MP4 path.")] = Path("offline_render.mp4"),
+    work_dir: Annotated[Path | None, typer.Option("--work-dir", help="Intermediate render directory.")] = None,
+    ffmpeg: Annotated[str, typer.Option("--ffmpeg", help="FFmpeg executable or command prefix.")] = "ffmpeg",
+    pdf_renderer: Annotated[
+        str | None,
+        typer.Option("--pdf-renderer", help="pdftoppm-compatible executable or command prefix for PDF inputs."),
+    ] = None,
+    fps: Annotated[int, typer.Option("--fps", help="Output video frames per second.")] = 30,
+    width: Annotated[int, typer.Option("--width", help="Output video width.")] = 1920,
+    height: Annotated[int, typer.Option("--height", help="Output video height.")] = 1080,
+    page_gap: Annotated[int, typer.Option("--page-gap", help="Vertical gap between pages after scaling.")] = 40,
+    pdf_dpi: Annotated[int, typer.Option("--pdf-dpi", help="PDF rasterization DPI.")] = 180,
+    background: Annotated[str, typer.Option("--background", help="Page background color.")] = "#ffffff",
+    keep_frames: Annotated[bool, typer.Option("--keep-frames", help="Keep intermediate frame PNG files.")] = False,
+    timeout: Annotated[float, typer.Option("--timeout", help="FFmpeg encode timeout in seconds.")] = 300.0,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Render a timeline-driven scrolling video without browser or OBS."""
+    try:
+        payload = render_offline_video(
+            input_path=input_path,
+            timeline_path=timeline_path,
+            output_path=output_path,
+            work_dir=work_dir,
+            ffmpeg=ffmpeg,
+            pdf_renderer=pdf_renderer,
+            fps=fps,
+            width=width,
+            height=height,
+            page_gap=page_gap,
+            pdf_dpi=pdf_dpi,
+            background=background,
+            keep_frames=keep_frames,
+            encode_timeout=timeout,
+        ).to_dict()
+    except OfflineRenderError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        _print_json(payload)
+        return
+    lines = [
+        f"mode: {payload['mode']}",
+        f"input_kind: {payload['input_kind']}",
+        f"pages: {payload['pages']}",
+        f"frames: {payload['frames']}",
+        f"fps: {payload['fps']}",
+        f"size: {payload['width']}x{payload['height']}",
+        f"output: {payload['output_path']}",
+        f"work_dir: {payload['work_dir']}",
+    ]
+    console.print(Panel("\n".join(lines), title="Offline Render"))
+
+
+@tts_engine_app.command("run")
+def tts_engine_run(
+    chunks_dir: Annotated[Path, typer.Option("--chunks-dir", help="Directory containing chunks/*.txt input files.")] = Path("chunks"),
+    audio_dir: Annotated[Path, typer.Option("--audio-dir", help="Directory for generated audio/*.wav files.")] = Path("audio"),
+    timeline_path: Annotated[Path, typer.Option("--timeline", help="timeline.json output path.")] = Path("timeline.json"),
+    resume: Annotated[bool, typer.Option("--resume", help="Skip existing valid WAV files.")] = False,
+    retries: Annotated[int, typer.Option("--retries", help="Retries per failed segment.")] = 1,
+    api_url: Annotated[str | None, typer.Option("--api-url", help="GPT-SoVITS local API URL.")] = None,
+    api_method: Annotated[str, typer.Option("--api-method", help="API method: GET or POST.")] = "GET",
+    api_param: Annotated[list[str] | None, typer.Option("--api-param", help="Extra GPT-SoVITS API parameter as key=value.")] = None,
+    command: Annotated[
+        str | None,
+        typer.Option(
+            "--command",
+            help="Subprocess command template. Placeholders: {input}, {output}, {text}, {stem}, {index}.",
+        ),
+    ] = None,
+    script: Annotated[Path | None, typer.Option("--script", help="Inference script run as: python <script> --text-file <chunk> --output <wav>.")] = None,
+    python: Annotated[str, typer.Option("--python", help="Python executable for --script mode.")] = "python",
+    timeout: Annotated[float, typer.Option("--timeout", help="Per-segment attempt timeout in seconds.")] = 120.0,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Generate audio/*.wav from chunks/*.txt through GPT-SoVITS."""
+    try:
+        payload = synthesize_chunks(
+            chunks_dir=chunks_dir,
+            audio_dir=audio_dir,
+            timeline_path=timeline_path,
+            resume=resume,
+            retries=retries,
+            api_url=api_url,
+            api_method=api_method,
+            api_params=_key_value_options(api_param),
+            command=command,
+            script=script,
+            python=python,
+            timeout=timeout,
+        ).to_dict()
+    except TtsEngineError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        _print_json(payload)
+    else:
+        lines = [
+            f"ok: {payload['ok']}",
+            f"backend: {payload['backend']}",
+            f"chunks: {payload['chunks']}",
+            f"generated: {payload['generated']}",
+            f"skipped: {payload['skipped']}",
+            f"failed: {payload['failed']}",
+            f"audio_dir: {payload['audio_dir']}",
+            f"timeline: {payload['timeline_path']}",
+        ]
+        console.print(Panel("\n".join(lines), title="TTS Engine"))
+    if payload["failed"]:
+        raise typer.Exit(1)
 
 
 @graph_app.command("export")
@@ -3097,6 +3231,19 @@ def _csv_values(value: str | None) -> list[str] | None:
         return None
     items = [item.strip() for item in value.split(",") if item.strip()]
     return items or None
+
+
+def _key_value_options(values: list[str] | None) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for value in values or []:
+        if "=" not in value:
+            raise typer.BadParameter(f"expected key=value option, got: {value}")
+        key, item = value.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise typer.BadParameter(f"empty key in option: {value}")
+        result[key] = item
+    return result
 
 
 def _resolve_evidence_run(run_id: str) -> tuple[str, Path]:

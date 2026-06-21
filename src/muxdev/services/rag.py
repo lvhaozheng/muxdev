@@ -98,6 +98,9 @@ class LocalRagIndex:
                     "start_line": chunk.start_line,
                     "end_line": chunk.end_line,
                     "score": round(score, 6),
+                    "citation": f"{chunk.path}:{chunk.start_line}-{chunk.end_line}",
+                    "backend": "local-json",
+                    "explain": "tfidf lexical score + deterministic hash embedding cosine similarity",
                     "text": chunk.text[:800],
                 }
             )

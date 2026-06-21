@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from ..core.redaction import redact
+from ..core.standards import event_standard, standard_scores
 from ..models.evidence import ArtifactRef, EvidenceEvaluation, EvidenceEvent, EvidenceManifest
 from ..storage import Blackboard, canonical_hash, sha256_file
 from ..storage.contracts import write_json_artifact
@@ -136,6 +137,10 @@ def verify_run_evidence(run_dir: Path, run_id: str, blackboard: Blackboard | Non
             errors.append("missing artifact: evidence/events.jsonl")
         if manifest and manifest.get("run_id") != run_id:
             errors.append("manifest run_id mismatch")
+        if evaluation is not None:
+            scores = evaluation.get("standard_scores")
+            if not isinstance(scores, dict) or not {"severity", "risk", "evidence"} <= set(scores):
+                errors.append("evaluation standard_scores missing required P/R/E coverage")
         chain = _verify_event_chain(events)
         errors.extend(chain["errors"])
         if manifest:
@@ -209,7 +214,12 @@ def _collect_events(run_dir: Path, run_id: str, blackboard: Blackboard) -> list[
         metrics: dict[str, object] | None = None,
         tags: list[str] | None = None,
         source: str = "muxdev",
+        standard_id: str | None = None,
+        severity: str | None = None,
+        risk_level: str | None = None,
+        evidence_level: str | None = None,
     ) -> None:
+        standard = event_standard(kind, status, metrics, tags)
         events.append(
             EvidenceEvent(
                 id=_event_id(run_id, len(events) + 1, kind),
@@ -220,6 +230,10 @@ def _collect_events(run_dir: Path, run_id: str, blackboard: Blackboard) -> list[
                 claim=redact(claim),
                 status=status,  # type: ignore[arg-type]
                 strength=strength,  # type: ignore[arg-type]
+                standard_id=standard_id or standard.standard_id,
+                severity=severity or standard.severity,  # type: ignore[arg-type]
+                risk_level=risk_level or standard.risk_level,  # type: ignore[arg-type]
+                evidence_level=evidence_level or standard.evidence_level,  # type: ignore[arg-type]
                 subject_hash=subject_hash,
                 artifact_refs=artifact_refs or [],
                 metrics=metrics or {},
@@ -243,6 +257,36 @@ def _collect_events(run_dir: Path, run_id: str, blackboard: Blackboard) -> list[
             status=_status_from_stage(str(row.get("status") or "")),
             strength="B",
             metrics={"role": row.get("role"), "summary": row.get("summary")},
+        )
+
+    for event in _loop_trace_events(run_dir):
+        add(
+            kind="runtime",
+            stage_id=event.get("stage"),
+            claim=f"Loop engineering event: {event.get('type')}",
+            status="blocked" if event.get("type") == "loop_blocked" else "observed",
+            strength="B",
+            metrics=event.get("data") if isinstance(event.get("data"), dict) else {},
+            tags=["loop_engineering"],
+        )
+
+    for event in _policy_trace_events(run_dir):
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        standard = data.get("standard") if isinstance(data.get("standard"), dict) else {}
+        decision = str(data.get("decision") or "observed")
+        status = "passed" if decision.endswith("allow") or decision == "allow" else ("blocked" if decision.endswith("deny") or decision == "deny" else "observed")
+        add(
+            kind="policy",
+            stage_id=event.get("stage"),
+            claim=f"Policy decision for {data.get('approval_type') or data.get('command') or 'runtime gate'}: {decision}",
+            status=status,
+            strength="B",
+            metrics={key: value for key, value in data.items() if key != "standard"},
+            tags=["policy"],
+            standard_id=str(standard.get("standard_id") or "") or None,
+            severity=str(standard.get("severity") or "") or None,
+            risk_level=str(standard.get("risk_level") or "") or None,
+            evidence_level=str(standard.get("evidence_level") or "") or None,
         )
 
     for row in blackboard.table_rows("artifacts", run_id=run_id):
@@ -316,6 +360,24 @@ def _collect_events(run_dir: Path, run_id: str, blackboard: Blackboard) -> list[
             tags=["approval"],
         )
 
+    for row in blackboard.table_rows("provider_actions", run_id=run_id):
+        action_status = str(row.get("status") or "")
+        action_kind = str(row.get("kind") or "provider_action")
+        add(
+            kind="runtime",
+            stage_id=row.get("stage_id"),
+            claim=f"{action_kind} action {action_status}",
+            status="passed" if action_status == "handled" else ("missing" if action_status == "pending" else "observed"),
+            strength="B",
+            metrics={
+                "action_id": row.get("action_id"),
+                "kind": action_kind,
+                "input_kind": row.get("input_kind"),
+                "response_present": bool(row.get("response_json")),
+            },
+            tags=["provider_action", action_kind],
+        )
+
     for row in blackboard.table_rows("error_details", run_id=run_id):
         add(
             kind="runtime",
@@ -340,6 +402,41 @@ def _collect_events(run_dir: Path, run_id: str, blackboard: Blackboard) -> list[
             tags=["semantic_merge"],
         )
 
+    return events
+
+
+def _loop_trace_events(run_dir: Path) -> list[dict[str, object]]:
+    path = run_dir / "trace.jsonl"
+    if not path.exists():
+        return []
+    events: list[dict[str, object]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        event_type = str(payload.get("type") or "")
+        if event_type.startswith("loop_"):
+            events.append(payload)
+    return events
+
+
+def _policy_trace_events(run_dir: Path) -> list[dict[str, object]]:
+    path = run_dir / "trace.jsonl"
+    if not path.exists():
+        return []
+    events: list[dict[str, object]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if str(payload.get("type") or "") in {"policy_decision", "approval_auto_allowed"}:
+            events.append(payload)
     return events
 
 
@@ -369,6 +466,7 @@ def _build_manifest(run_dir: Path, run_id: str, events: list[EvidenceEvent]) -> 
 
 
 def _build_evaluation(run_id: str, events: list[EvidenceEvent], manifest: EvidenceManifest) -> EvidenceEvaluation:
+    scores = standard_scores(events)
     failed_tests = [event for event in events if event.kind == "test" and event.status == "failed"]
     passed_tests = [event for event in events if event.kind == "test" and event.status == "passed"]
     high_blockers = [
@@ -387,6 +485,7 @@ def _build_evaluation(run_id: str, events: list[EvidenceEvent], manifest: Eviden
         "review_security": "fail" if high_blockers or blocked_reviews else "pass",
         "approval_integrity": "fail" if denied_approvals else ("missing" if pending_approvals else "pass"),
         "risk_controls": "fail" if errors else "pass",
+        "standard_coverage": "pass" if scores.get("meets_minimum") else "missing",
     }
     reasons: list[str] = []
     missing = list(manifest.missing_required)
@@ -408,6 +507,8 @@ def _build_evaluation(run_id: str, events: list[EvidenceEvent], manifest: Eviden
     if pending_approvals:
         reasons.append("A required approval is still pending.")
         missing.append("pending approval must be decided")
+    if not scores.get("meets_minimum"):
+        missing.append("E2/E3 verification evidence is required")
     if not reasons:
         reasons.append("Required evidence is present and no blocking findings were recorded.")
 
@@ -428,6 +529,7 @@ def _build_evaluation(run_id: str, events: list[EvidenceEvent], manifest: Eviden
         "traceability_reproducibility": 1.0 if any(event.kind == "change" for event in events) and manifest.head_hash else 0.5,
         "approval_integrity": 0.0 if denied_approvals else (0.5 if pending_approvals else 1.0),
         "risk_controls": 0.0 if errors else 1.0,
+        "standard_evidence": 1.0 if scores.get("meets_minimum") else 0.35,
     }
     confidence = round(sum(components.values()) / len(components), 2)
     if label == "blocked":
@@ -439,6 +541,7 @@ def _build_evaluation(run_id: str, events: list[EvidenceEvent], manifest: Eviden
         confidence=confidence,
         gates=gates,
         components=components,
+        standard_scores=scores,
         reasons=reasons,
         missing_evidence=_dedupe(missing),
         next_actions=next_actions,

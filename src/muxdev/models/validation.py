@@ -78,6 +78,13 @@ class ValidationMetric(BaseModel):
     answer_quality_score: float = 0.0
     process_score: float = 0.0
     safety_score: float = 0.0
+    workflow_engine: str = "native"
+    loop_iterations: int = 0
+    loop_blocked: bool = False
+    retrieval_used: bool = False
+    citation_coverage: float = 0.0
+    retrieval_hit_rate: float = 0.0
+    checkpoint_recovery: float = 1.0
     judge_score: float | None = None
     judge_pass: bool | None = None
     judge_reasons: list[str] = Field(default_factory=list)

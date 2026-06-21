@@ -47,6 +47,7 @@ class HeadlessSubprocessBackend:
         transcript_path: Path | None = None,
         chunks_path: Path | None = None,
         input_text: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> SessionResult:
         """Execute a command, parse stream events, and enforce an idle timeout."""
         try:
@@ -56,7 +57,7 @@ class HeadlessSubprocessBackend:
                 stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                env=_provider_subprocess_env(),
+                env=_provider_subprocess_env(env),
                 **hidden_subprocess_kwargs(),
             )
             events: list[StreamEvent] = []
@@ -300,9 +301,10 @@ def _decode_process_output(data: bytes | str) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def _provider_subprocess_env() -> dict[str, str]:
+def _provider_subprocess_env(overrides: dict[str, str] | None = None) -> dict[str, str]:
     """Keep provider-spawned shells from creating noisy transient Python files."""
     env = os.environ.copy()
+    env.update(overrides or {})
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     pytest_addopts = env.get("PYTEST_ADDOPTS", "")
     cache_flag = "-p no:cacheprovider"

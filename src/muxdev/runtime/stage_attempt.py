@@ -6,7 +6,7 @@ import inspect
 from pathlib import Path
 from typing import Any
 
-from ..clients.stream import StreamAdapter
+from ..clients.stream import StreamAdapter, looks_like_auth_error
 from ..models import ProviderActionKind
 from ..providers.adapters import ProviderAdapter, ProviderStageOutput
 
@@ -78,7 +78,7 @@ def provider_failure_kind(output: ProviderStageOutput) -> str | None:
     text = f"{output.summary}\n{output.content}".lower()
     if output.returncode == 124 or "idle_timeout" in text or "no output for" in text:
         return str(ProviderActionKind.IDLE_TIMEOUT)
-    if "please sign in" in text or ("auth" in text and ("login" in text or "error" in text)):
+    if looks_like_auth_error(text):
         return str(ProviderActionKind.AUTH_REQUIRED)
     if "rate limit" in text or "rate-limit" in text or "too many requests" in text or "quota exceeded" in text:
         return str(ProviderActionKind.RATE_LIMIT)

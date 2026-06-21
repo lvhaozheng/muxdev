@@ -46,6 +46,17 @@ def test_stream_adapter_does_not_treat_status_text_as_approval() -> None:
     assert not any(event.type == StreamEventType.WAITING_EXTERNAL_CONFIRMATION for event in events)
 
 
+def test_stream_adapter_does_not_treat_authoritative_text_as_auth_error() -> None:
+    adapter = StreamAdapter()
+
+    events = adapter.parse_chunk(
+        "I am verifying the modified state rather than treating it as authoritative. "
+        "The code catches sqlite3.Error and reports database status."
+    )
+
+    assert not any(event.type == StreamEventType.AUTH_ERROR for event in events)
+
+
 def test_stream_adapter_idle_and_cli_exit_events() -> None:
     adapter = StreamAdapter()
 
@@ -169,4 +180,7 @@ def test_policy_and_redaction_acceptance_cases() -> None:
 
     assert engine.evaluate_shell("rm -rf /").decision == PolicyDecision.DENY
     assert engine.evaluate_shell("pytest").decision == PolicyDecision.ALLOW
+    assert engine.evaluate_shell("python -m pytest tests").risk_level == "R1"
+    assert engine.evaluate_shell("git push origin main").decision == PolicyDecision.APPROVE
+    assert engine.evaluate_shell("git push origin main").risk_level == "R3"
     assert redact("sk-secret Bearer token.value") == "[REDACTED] [REDACTED]"

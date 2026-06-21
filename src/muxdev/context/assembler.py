@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from ..core.redaction import redact
+from ..services.rag import LocalRagIndex
+from ..services.rag_policy import RagDecision, decide_rag
 from ..storage import TraceWriter, append_ledger_event, sha256_text
 
 
@@ -52,6 +54,9 @@ def write_context_packet(
     skills: list[dict[str, object]],
     automation: dict[str, object],
     trace: TraceWriter,
+    context_sources: list[str] | None = None,
+    rag_query: str | None = None,
+    loop_state: dict[str, object] | None = None,
 ) -> tuple[Path, str]:
     packet = build_context_packet(
         run_id=run_id,
@@ -74,6 +79,9 @@ def write_context_packet(
             if row.get("status") == "handled" and row.get("response") is not None
         ],
         review_blockers=blackboard.table_rows("review_blockers", run_id=run_id),
+        context_sources=context_sources or [],
+        rag_query=rag_query,
+        loop_state=loop_state or {},
     )
     body = redact(json.dumps(packet, ensure_ascii=False, indent=2, sort_keys=True))
     digest = sha256_text(body)
@@ -92,7 +100,8 @@ def write_context_packet(
         payload={"context_packet_hash": digest, "path": str(path), "memory_refs": memory_refs(automation)},
     )
     blackboard.add_ledger_event(event)
-    trace.write("context_packet_written", stage=stage_id, context_packet_hash=digest, path=str(path))
+    rag_decision = packet.get("rag_decision") if isinstance(packet.get("rag_decision"), dict) else {}
+    trace.write("context_packet_written", stage=stage_id, context_packet_hash=digest, path=str(path), rag_decision=rag_decision)
     return path, digest
 
 
@@ -110,9 +119,21 @@ def build_context_packet(
     provider_attempts: list[dict[str, object]],
     provider_action_responses: list[dict[str, object]] | None = None,
     review_blockers: list[dict[str, object]] | None = None,
+    context_sources: list[str] | None = None,
+    rag_query: str | None = None,
+    loop_state: dict[str, object] | None = None,
 ) -> dict[str, object]:
     memory_items = _context_memory_items(automation)
     grouped = _memory_by_layer(memory_items)
+    rag_decision, rag_context = _build_rag_context(
+        task=task,
+        stage_id=stage_id,
+        role=role,
+        worktree=worktree,
+        context_sources=context_sources or [],
+        rag_query=rag_query,
+        memory_items=memory_items,
+    )
     return {
         "schema": "muxdev.context_packet.v1",
         "session": {
@@ -134,6 +155,9 @@ def build_context_packet(
             "task_memory": grouped.get("run", []),
             "review_blockers": review_blockers or [],
         },
+        "loop_state": loop_state or {},
+        "rag_decision": rag_decision.to_dict(),
+        "rag_context": rag_context,
         "branch": {
             "feature_memory": grouped.get("branch", []),
         },
@@ -155,6 +179,71 @@ def build_context_packet(
             "temporary_layers": ["session", "run", "branch"],
             "memory_refs": memory_refs(automation),
         },
+    }
+
+
+def _build_rag_context(
+    *,
+    task: str,
+    stage_id: str,
+    role: str | None,
+    worktree: Path,
+    context_sources: list[str],
+    rag_query: str | None,
+    memory_items: list[dict[str, object]],
+) -> tuple[RagDecision, list[dict[str, object]]]:
+    index = LocalRagIndex(worktree)
+    decision = decide_rag(
+        task=task,
+        stage_id=stage_id,
+        role=role,
+        context_sources=context_sources,
+        rag_query=rag_query,
+        index_path=index.path,
+        memory_items=memory_items,
+    )
+    if not decision.enabled:
+        return decision, []
+    try:
+        rows = index.query(decision.query, limit=decision.top_k)
+    except Exception as exc:
+        return (
+            RagDecision(
+                enabled=False,
+                reason=f"rag retrieval failed: {type(exc).__name__}",
+                query=decision.query,
+                top_k=decision.top_k,
+                context_sources=decision.context_sources,
+                skipped_because="retrieval_failed",
+            ),
+            [],
+        )
+    if not rows:
+        return (
+            RagDecision(
+                enabled=False,
+                reason="rag retrieval returned no confident hits",
+                query=decision.query,
+                top_k=decision.top_k,
+                context_sources=decision.context_sources,
+                skipped_because="no_hits",
+            ),
+            [],
+        )
+    return decision, [_rag_hit(row) for row in rows]
+
+
+def _rag_hit(row: dict[str, object]) -> dict[str, object]:
+    path = str(row.get("path") or "")
+    start = int(row.get("start_line") or 0)
+    end = int(row.get("end_line") or start)
+    return {
+        "path": path,
+        "start_line": start,
+        "end_line": end,
+        "score": row.get("score"),
+        "citation": f"{path}:{start}-{end}" if path else "",
+        "text": row.get("text"),
     }
 
 

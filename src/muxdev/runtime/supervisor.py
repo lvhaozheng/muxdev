@@ -24,7 +24,7 @@ from ..context import memory_refs as _memory_refs
 from ..context import task_with_context_packet as _task_with_context_packet
 from ..context import task_with_memory_context as _task_with_memory_context
 from ..context import write_context_packet as _write_context_packet
-from ..config.runtime import normalize_role
+from ..config.runtime import load_runtime_config, normalize_role
 from ..domain import new_run_id
 from ..providers.adapters import ProviderAdapter, ProviderStageOutput, extract_json_object, get_runtime_provider
 from ..providers.planner import ProviderPlanner
@@ -54,6 +54,7 @@ from .stage_attempt import provider_failure_kind as _provider_failure_kind
 from .stage_attempt import next_provider_attempt as _next_provider_attempt
 from .stage_attempt import run_provider_stage as _run_provider_stage
 from .stage_attempt import run_provider_stage_with_attempts as _run_provider_stage_with_attempts
+from .langgraph_engine import LangGraphWorkflowEngine
 from .worktree import WorktreeManager
 
 
@@ -114,7 +115,13 @@ class SupervisorRuntime:
         worktree = WorktreeManager(self.workspace, self.worktrees_root).prepare(run_id, run_dir)
         blackboard = self._blackboard(run_dir)
         trace = TraceWriter(run_dir, run_id)
-        policy = SafetyPolicyEngine(SafetyPolicy(max_cost_usd=max_cost_usd, approval_types=require_approval or set()))
+        policy = SafetyPolicyEngine(
+            SafetyPolicy(
+                max_cost_usd=max_cost_usd,
+                approval_types=require_approval or set(),
+                strict_approval=bool(require_approval) and gate not in {"auto", "safe"},
+            )
+        )
         workflow = load_workflow(workflow_name)
         # Role-specific providers are optional overrides. The default provider
         # remains the fallback for any workflow role that has no explicit choice.
@@ -140,6 +147,7 @@ class SupervisorRuntime:
             "safety_policy": {
                 "approval_types": sorted(policy.policy.approval_types),
                 "max_cost_usd": policy.policy.max_cost_usd,
+                "strict_approval": policy.policy.strict_approval,
             },
         }
         (run_dir / "task.md").write_text(redact(task) + "\n", encoding="utf-8")
@@ -171,6 +179,23 @@ class SupervisorRuntime:
             skills=[skill.get("name") for skill in skills],
         )
         blackboard.set_run_status(run_id, RunStatus.RUNNING)
+        if _task_requires_clarification(task):
+            action_id = blackboard.create_provider_action(
+                run_id=run_id,
+                stage_id="clarify",
+                provider="muxdev",
+                role="requirements",
+                kind=str(ProviderActionKind.CLARIFICATION_REQUIRED),
+                prompt_text="Please clarify the goal, target behavior, and acceptance criteria before implementation continues.",
+                input_kind="text",
+                auto_policy="manual",
+            )
+            blackboard.upsert_stage(run_id, "clarify", role="requirements", status=StageStatus.RUNNING, summary="waiting for clarification")
+            blackboard.set_run_status(run_id, RunStatus.AWAITING_PROVIDER_ACTION)
+            trace.write("clarification_requested", stage="clarify", action_id=action_id)
+            self._write_run_dashboard(run_dir, run_id, blackboard=blackboard)
+            blackboard.close()
+            return RunResult(run_id, RunStatus.AWAITING_PROVIDER_ACTION, run_dir, None)
         result = self._execute_workflow(
             run_id=run_id,
             run_dir=run_dir,
@@ -239,7 +264,13 @@ class SupervisorRuntime:
             stored_policy = task_context.get("safety_policy", {}) if isinstance(task_context.get("safety_policy"), dict) else {}
             stored_approvals = stored_policy.get("approval_types", []) if isinstance(stored_policy, dict) else []
             approval_types = {str(item) for item in stored_approvals} if isinstance(stored_approvals, list) else set()
-            policy = SafetyPolicyEngine(SafetyPolicy(max_cost_usd=max_cost_usd, approval_types=approval_types))
+            policy = SafetyPolicyEngine(
+                SafetyPolicy(
+                    max_cost_usd=max_cost_usd,
+                    approval_types=approval_types,
+                    strict_approval=bool(stored_policy.get("strict_approval")),
+                )
+            )
             provider_impls = {provider: get_runtime_provider(provider)}
             for role_provider in role_providers.values():
                 provider_impls.setdefault(role_provider, get_runtime_provider(role_provider))
@@ -278,6 +309,70 @@ class SupervisorRuntime:
         return self.resume(run_id, max_cost_usd=max_cost_usd)
 
     def _execute_workflow(
+        self,
+        *,
+        run_id: str,
+        run_dir: Path,
+        blackboard: Blackboard,
+        trace: TraceWriter,
+        task: str,
+        provider: str,
+        workflow_name: str,
+        provider_impls: dict[str, ProviderAdapter],
+        policy: SafetyPolicyEngine,
+        worktree: Path,
+        role_providers: dict[str, str],
+        skills: list[dict[str, object]],
+        ci_block_on_approval: bool,
+        automation: dict[str, object],
+        close_blackboard: bool,
+    ) -> RunResult:
+        workflow = load_workflow(workflow_name)
+        engine_name = _configured_workflow_engine(self.workspace, automation)
+        if engine_name == "native":
+            trace.write("native_runtime_selected", workflow=workflow.name)
+            return self._execute_native_workflow(
+                run_id=run_id,
+                run_dir=run_dir,
+                blackboard=blackboard,
+                trace=trace,
+                task=task,
+                provider=provider,
+                workflow_name=workflow_name,
+                provider_impls=provider_impls,
+                policy=policy,
+                worktree=worktree,
+                role_providers=role_providers,
+                skills=skills,
+                ci_block_on_approval=ci_block_on_approval,
+                automation=automation,
+                close_blackboard=close_blackboard,
+            )
+        return LangGraphWorkflowEngine(self.workspace).execute(
+            workflow=workflow,
+            run_id=run_id,
+            task=task,
+            trace=trace,
+            native_executor=lambda: self._execute_native_workflow(
+                run_id=run_id,
+                run_dir=run_dir,
+                blackboard=blackboard,
+                trace=trace,
+                task=task,
+                provider=provider,
+                workflow_name=workflow_name,
+                provider_impls=provider_impls,
+                policy=policy,
+                worktree=worktree,
+                role_providers=role_providers,
+                skills=skills,
+                ci_block_on_approval=ci_block_on_approval,
+                automation=automation,
+                close_blackboard=close_blackboard,
+            ),
+        )
+
+    def _execute_native_workflow(
         self,
         *,
         run_id: str,
@@ -354,6 +449,7 @@ class SupervisorRuntime:
                         review_stage = _loop_review_stage(stage)
                         blackboard.add_error(run_id, stage.id, "review_blockers", f"{review_stage} blockers remain after {max_loops} revision loop(s)")
                         blackboard.set_run_status(run_id, RunStatus.BLOCKED)
+                        trace.write("loop_blocked", stage=stage.id, review_stage=review_stage, loop=context.get("loop"), max_loops=max_loops, reason="review blockers remain")
                         trace.write("run_blocked", stage=stage.id, reason="review blockers remain", review_stage=review_stage, loop=context.get("loop"), max_loops=max_loops)
                         return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
                     blackboard.upsert_stage(run_id, stage.id, role=stage.role, status=StageStatus.SKIPPED, summary="when condition false")
@@ -449,7 +545,14 @@ class SupervisorRuntime:
 
                 if stage.allow_shell:
                     decision = policy.evaluate_shell("pytest")
-                    trace.write("policy_decision", stage=stage.id, command="pytest", decision=str(decision.decision), reason=decision.reason)
+                    trace.write(
+                        "policy_decision",
+                        stage=stage.id,
+                        command="pytest",
+                        decision=str(decision.decision),
+                        reason=decision.reason,
+                        standard=decision.standard.to_dict() if decision.standard else {},
+                    )
                     if decision.decision == PolicyDecision.DENY:
                         blackboard.set_run_status(run_id, RunStatus.BLOCKED)
                         return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
@@ -496,6 +599,9 @@ class SupervisorRuntime:
                     skills=stage_skills,
                     automation=automation,
                     trace=trace,
+                    context_sources=stage.context_sources,
+                    rag_query=stage.rag_query,
+                    loop_state=_loop_state(stage, context, automation),
                 )
                 output, attempt = _run_provider_stage_with_attempts(
                     blackboard,
@@ -753,10 +859,14 @@ class SupervisorRuntime:
                 trace.write("stage_completed", stage=stage.id, output=str(artifact_path))
                 completed.add(stage.id)
                 if _stage_triggers_review_loop(stage, context):
+                    previous_loop = int(context.get("loop", 0))
                     context["loop"] = int(context.get("loop", 0)) + 1
                     max_loops = _effective_max_loops(stage, automation)
                     review_stage = _loop_review_stage(stage)
+                    if previous_loop == 0:
+                        trace.write("loop_started", stage=stage.id, review_stage=review_stage, max_loops=max_loops, loop_kind="review_fix")
                     trace.write("review_loop_iteration", stage=stage.id, review_stage=review_stage, loop=context["loop"], max_loops=max_loops)
+                    trace.write("loop_iteration_completed", stage=stage.id, review_stage=review_stage, loop=context["loop"], max_loops=max_loops, loop_kind="review_fix")
                     if stage.id == "fix":
                         trace.write("fix_loop_iteration", stage=stage.id, loop=context["loop"], max_loops=max_loops)
                     for reset_stage in _loop_reset_stages(stage):
@@ -768,6 +878,8 @@ class SupervisorRuntime:
                     continue
                 index += 1
 
+            if int(context.get("loop", 0) or 0) > 0:
+                trace.write("loop_stopped", loop=context.get("loop"), reason="workflow conditions satisfied")
             diff_path = self.write_diff(run_dir, worktree)
             blackboard.add_artifact(run_id, None, "diff.patch", diff_path, "diff")
             semantic = _record_semantic_merge_review(blackboard, run_dir=run_dir, run_id=run_id, task=task, patch_text=diff_path.read_text(encoding="utf-8", errors="replace"))
@@ -944,6 +1056,9 @@ class SupervisorRuntime:
                         skills=stage_skills,
                         automation=automation,
                         trace=trace,
+                        context_sources=stage.context_sources,
+                        rag_query=stage.rag_query,
+                        loop_state={},
                     )
                     attempt = _next_provider_attempt(blackboard, run_id, stage.id, stage_provider)
                     blackboard.start_provider_attempt(run_id, stage.id, provider=stage_provider, role=stage.role, attempt=attempt)
@@ -1286,12 +1401,30 @@ class SupervisorRuntime:
                 old_subject_hash=existing.get("subject_hash"),
                 new_subject_hash=subject_hash,
             )
-        if not stale_subject and not existing and not policy.requires_approval(approval_type):
-            trace.write("approval_not_required", stage=stage_id, approval_type=approval_type, subject_hash=subject_hash)
+        decision = policy.evaluate_approval(approval_type, reason=reason, subject=subject or {})
+        trace.write(
+            "policy_decision",
+            stage=stage_id,
+            approval_type=approval_type,
+            decision=str(decision.decision),
+            reason=decision.reason,
+            subject_hash=subject_hash,
+            standard=decision.standard.to_dict() if decision.standard else {},
+        )
+        if not stale_subject and not existing and decision.decision == PolicyDecision.ALLOW:
+            trace.write(
+                "approval_auto_allowed",
+                stage=stage_id,
+                approval_type=approval_type,
+                subject_hash=subject_hash,
+                standard=decision.standard.to_dict() if decision.standard else {},
+            )
             return False
+        if not stale_subject and not existing and decision.decision == PolicyDecision.DENY:
+            raise PermissionError(f"approval denied by policy: {approval_type}")
         approval_id = blackboard.create_approval(run_id, stage_id, approval_type, reason, subject=subject)
         trace.write("approval_requested", stage=stage_id, approval_id=approval_id, approval_type=approval_type, subject_hash=subject_hash)
-        if stale_subject or policy.requires_approval(approval_type):
+        if stale_subject or decision.decision == PolicyDecision.APPROVE:
             return True
         blackboard.decide_approval(approval_id, ApprovalStatus.APPROVED)
         trace.write("approval_decided", stage=stage_id, approval_id=approval_id, status="approved", subject_hash=subject_hash)
@@ -1312,6 +1445,13 @@ def _worktree_diff_text(worktree: Path) -> str:
     diff = result.stdout or ""
     diff += "".join(_untracked_file_diff(worktree, rel) for rel in _iter_untracked_files(worktree))
     return redact(diff)
+
+
+def _task_requires_clarification(task: str) -> bool:
+    normalized = " ".join(task.strip().lower().split())
+    if not normalized:
+        return True
+    return normalized in {"?", "??", "clarify", "needs clarification", "unclear", "tbd"}
 
 
 def _worktree_patch_hash(worktree: Path) -> str:
@@ -1387,6 +1527,8 @@ def _policy_hash(policy: SafetyPolicyEngine) -> str:
         "max_cost_usd": policy.policy.max_cost_usd,
         "shell_allow": sorted(policy.policy.shell_allow),
         "shell_deny": sorted(policy.policy.shell_deny),
+        "strict_approval": policy.policy.strict_approval,
+        "approval_risk_threshold": policy.policy.approval_risk_threshold,
     }
     return canonical_hash(payload)
 
@@ -1987,7 +2129,22 @@ def _loop_stage_exhausted(stage, context: dict[str, object]) -> bool:
     return _review_has_blockers(context, _loop_review_stage(stage))
 
 
+def _loop_state(stage, context: dict[str, object], automation: dict[str, object]) -> dict[str, object]:
+    policy = stage.loop_policy
+    return {
+        "iteration": int(context.get("loop", 0) or 0),
+        "max_iterations": policy.max_iterations if policy and policy.max_iterations is not None else _effective_max_loops(stage, automation),
+        "evaluator": (policy.evaluator if policy else None) or _loop_review_stage(stage),
+        "improver": (policy.improver if policy else None) or stage.id,
+        "stop_conditions": list(policy.stop_conditions if policy else []),
+        "budget_guard": policy.budget_guard if policy else None,
+        "review_has_blockers": _review_has_blockers(context, _loop_review_stage(stage)),
+    }
+
+
 def _effective_max_loops(stage, automation: dict[str, object]) -> int:
+    if stage.loop_policy and stage.loop_policy.max_iterations is not None:
+        return max(0, int(stage.loop_policy.max_iterations))
     if stage.loop_review_stage or stage.id.endswith("_revise"):
         configured = automation.get("max_review_fixes") if isinstance(automation, dict) else None
         try:
@@ -2048,6 +2205,19 @@ def _can_use_parallel_runtime(workflow) -> bool:
         if stage.when or stage.allow_shell or stage.allow_write:
             return False
     return True
+
+
+def _configured_workflow_engine(workspace: Path, automation: dict[str, object]) -> str:
+    value = automation.get("workflow_engine") if isinstance(automation, dict) else None
+    if not value:
+        try:
+            runtime = load_runtime_config(workspace).get("runtime", {})
+            if isinstance(runtime, dict):
+                value = runtime.get("workflow_engine")
+        except Exception:
+            value = None
+    normalized = str(value or "langgraph").strip().lower()
+    return "native" if normalized == "native" else "langgraph"
 
 
 def _approval_wait_status(ci_block_on_approval: bool) -> RunStatus:

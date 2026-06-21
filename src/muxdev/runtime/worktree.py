@@ -56,21 +56,26 @@ class WorktreeManager:
             return WorktreeResult(fallback, "git_worktree_fallback_copy", result.stderr.strip())
 
         worktree_path = run_dir / "worktree"
-        worktree_path.mkdir(parents=True, exist_ok=True)
-        self._init_fallback_git_repo(worktree_path)
-        return WorktreeResult(worktree_path, "temp_git_repo", "workspace is not a git repo; initialized temp repo")
+        shutil.copytree(self.workspace, worktree_path, ignore=self._fallback_copy_ignore(run_dir))
+        self._init_fallback_git_repo(worktree_path, commit_baseline=True)
+        return WorktreeResult(worktree_path, "workspace_copy", "workspace is not a git repository root; copied workspace")
 
     @staticmethod
     def _is_git_repo(path: Path) -> bool:
         result = subprocess.run(
-            ["git", "rev-parse", "--is-inside-work-tree"],
+            ["git", "rev-parse", "--show-toplevel"],
             cwd=path,
             capture_output=True,
             text=True,
             check=False,
             **hidden_subprocess_kwargs(),
         )
-        return result.returncode == 0 and result.stdout.strip() == "true"
+        if result.returncode != 0 or not result.stdout.strip():
+            return False
+        try:
+            return Path(result.stdout.strip()).resolve() == path.resolve()
+        except OSError:
+            return False
 
     def _fallback_copy_ignore(self, run_dir: Path):
         """Exclude muxdev runtime roots from copy fallbacks to prevent recursion."""

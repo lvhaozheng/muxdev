@@ -283,17 +283,15 @@ class TaskManager:
 
     def decide_approval(self, approval_id: str, status: ApprovalStatus) -> dict[str, Any]:
         with self.board() as board:
-            match: dict[str, Any] | None = None
-            for row in board.table_rows("approvals"):
-                if row["approval_id"] == approval_id:
-                    match = row
-                    break
-            if match is None:
-                raise KeyError(f"approval not found: {approval_id}")
-            board.decide_approval(approval_id, status)
-            match["status"] = str(status)
+            match = _resolve_approval(board, approval_id)
+            resolved_id = str(match["approval_id"])
+            board.decide_approval(resolved_id, status)
+            match = next(
+                (row for row in board.list_approvals(run_id=str(match["run_id"])) if row.get("approval_id") == resolved_id),
+                match,
+            )
             match["decided"] = True
-        self.broadcast({"type": "approval_decided", "approval_id": approval_id, "status": str(status)})
+        self.broadcast({"type": "approval_decided", "approval_id": match["approval_id"], "status": str(status)})
         return match
 
     def update_provider_action(self, action_id: str, status: ProviderActionStatus) -> dict[str, Any]:
@@ -623,6 +621,28 @@ def _rows_by_run(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     for row in rows:
         grouped[str(row.get("run_id") or "")].append(row)
     return grouped
+
+
+def _resolve_approval(board: Blackboard, approval_or_run_id: str) -> dict[str, Any]:
+    approvals = board.table_rows("approvals")
+    for row in approvals:
+        if str(row.get("approval_id") or "") == approval_or_run_id:
+            return row
+
+    pending_for_run = [
+        row
+        for row in approvals
+        if str(row.get("run_id") or row.get("task_id") or "") == approval_or_run_id
+        and str(row.get("status") or "") == str(ApprovalStatus.PENDING)
+    ]
+    if len(pending_for_run) == 1:
+        return pending_for_run[0]
+    if len(pending_for_run) > 1:
+        raise KeyError(f"multiple pending approvals for run: {approval_or_run_id}; use an approval id")
+
+    if any(str(row.get("run_id") or "") == approval_or_run_id for row in board.table_rows("runs")):
+        raise KeyError(f"no pending approval for run: {approval_or_run_id}; use continue instead")
+    raise KeyError(f"approval not found: {approval_or_run_id}")
 
 
 def _latest_error(errors: list[dict[str, Any]]) -> dict[str, Any] | None:

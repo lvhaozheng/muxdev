@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import shutil
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -158,6 +159,7 @@ class HeadlessCliProviderAdapter(ProviderAdapter):
             transcript_path=transcript_path,
             chunks_path=chunks_path,
             input_text=input_text,
+            env=_provider_runtime_env(self.id, worktree),
         )
         content = redact((result.stdout or "") + (("\n" + result.stderr) if result.stderr else ""))
         event_lines = "\n".join(f"{event.type}: {event.text}" for event in result.events)
@@ -264,6 +266,48 @@ def _resolve_runtime_executable(primary: str, candidates: list[str]) -> str | No
     if resolved:
         return resolved
     return _which_any(*candidates)
+
+
+def _provider_runtime_env(provider_id: str, worktree: Path) -> dict[str, str]:
+    if provider_id != "codex":
+        return {}
+    codex_home = _prepare_codex_home(worktree)
+    return {"CODEX_HOME": str(codex_home)}
+
+
+def _prepare_codex_home(worktree: Path) -> Path:
+    target = _provider_state_dir("codex", worktree)
+    target.mkdir(parents=True, exist_ok=True)
+    source = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    try:
+        if source.exists() and source.resolve() != target.resolve():
+            _seed_codex_home(source, target)
+    except OSError:
+        pass
+    return target
+
+
+def _provider_state_dir(provider_id: str, worktree: Path) -> Path:
+    muxdev_home = os.environ.get("MUXDEV_HOME")
+    if muxdev_home:
+        return Path(muxdev_home) / "data" / "provider_state" / provider_id
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        return Path(appdata) / "muxdev" / "data" / "provider_state" / provider_id
+    return path_config(worktree, "runtime_root") / "provider_state" / provider_id
+
+
+def _seed_codex_home(source: Path, target: Path) -> None:
+    for name in ("auth.json", "config.toml"):
+        src = source / name
+        dst = target / name
+        if not src.is_file():
+            continue
+        try:
+            if not dst.exists() or src.stat().st_mtime > dst.stat().st_mtime:
+                shutil.copy2(src, dst)
+        except OSError:
+            continue
 
 
 def _command_for_prompt(command: list[str], prompt: str, *, transport: str) -> tuple[list[str], str | None]:

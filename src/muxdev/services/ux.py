@@ -163,6 +163,60 @@ def build_task_ux_summary(payload: dict[str, Any]) -> dict[str, Any]:
         ]
         user_state = "needs_approval"
         risk = "medium"
+    elif status == "awaiting_approval":
+        headline = "Approval state needs reconciliation"
+        why = "The run is marked awaiting approval, but no pending approval record exists. Continue the task to refresh the gate state."
+        next_actions = [
+            NextAction(
+                kind="continue_task",
+                label="Continue",
+                description="Resume the run and let muxdev reconcile the approval gate.",
+                endpoint=f"/api/tasks/{run_id}/continue",
+            ),
+            NextAction(
+                kind="view_report",
+                label="View report",
+                description="Inspect the partial report for context.",
+                endpoint=f"/api/tasks/{run_id}/report",
+                method="GET",
+            ),
+            NextAction(
+                kind="stop_task",
+                label="Stop task",
+                description="Abort this run if it is no longer valid.",
+                endpoint=f"/api/tasks/{run_id}/stop",
+                danger=True,
+            ),
+        ]
+        user_state = "needs_attention"
+        risk = "medium"
+    elif status == "awaiting_provider_action":
+        headline = "Provider action state needs reconciliation"
+        why = "The run is marked awaiting provider action, but no pending provider action record exists. Continue the task to refresh the provider gate state."
+        next_actions = [
+            NextAction(
+                kind="continue_task",
+                label="Continue",
+                description="Resume the run and let muxdev reconcile the provider action gate.",
+                endpoint=f"/api/tasks/{run_id}/continue",
+            ),
+            NextAction(
+                kind="view_report",
+                label="View report",
+                description="Inspect the partial report for context.",
+                endpoint=f"/api/tasks/{run_id}/report",
+                method="GET",
+            ),
+            NextAction(
+                kind="stop_task",
+                label="Stop task",
+                description="Abort this run if it is no longer valid.",
+                endpoint=f"/api/tasks/{run_id}/stop",
+                danger=True,
+            ),
+        ]
+        user_state = "needs_attention"
+        risk = "medium"
     elif status in {"blocked", "aborted"} or errors:
         headline = "Task needs recovery"
         why = _first_error(errors) or "The task stopped before normal delivery."
@@ -283,9 +337,10 @@ def build_ux_overview(
         run_id = str(row.get("run_id") or row.get("task_id") or "")
         action_id = str(row.get("action_id") or "")
         task = task_index.get(run_id, {})
+        kind = "clarification" if _is_clarification_action(row) else "provider_action"
         action_items.append(
             {
-                "kind": "provider_action",
+                "kind": kind,
                 "run_id": run_id,
                 "task_id": run_id,
                 "action_id": action_id,
@@ -319,8 +374,34 @@ def build_ux_overview(
     for task in tasks:
         if not isinstance(task, dict):
             continue
-        if _task_is_planning(task):
-            run_id = str(task.get("task_id") or task.get("run_id") or "")
+        run_id = str(task.get("task_id") or task.get("run_id") or "")
+        if _task_needs_approval_reconcile(task):
+            action_items.append(
+                {
+                    "kind": "approval_reconcile",
+                    "run_id": run_id,
+                    "task_id": run_id,
+                    "headline": "Approval state needs reconciliation",
+                    "why": "The run is marked awaiting approval, but no pending approval record exists.",
+                    "endpoint": task.get("recover_endpoint") or f"/api/tasks/{run_id}/continue",
+                    "secondary_endpoint": task.get("report_endpoint") or f"/api/tasks/{run_id}/report",
+                    **_action_context(task, run_id=run_id, stage_id=str(task.get("current_stage") or "")),
+                }
+            )
+        elif _task_needs_provider_action_reconcile(task):
+            action_items.append(
+                {
+                    "kind": "provider_action_reconcile",
+                    "run_id": run_id,
+                    "task_id": run_id,
+                    "headline": "Provider action state needs reconciliation",
+                    "why": "The run is marked awaiting provider action, but no pending provider action record exists.",
+                    "endpoint": task.get("recover_endpoint") or f"/api/tasks/{run_id}/continue",
+                    "secondary_endpoint": task.get("report_endpoint") or f"/api/tasks/{run_id}/report",
+                    **_action_context(task, run_id=run_id, stage_id=str(task.get("current_stage") or "")),
+                }
+            )
+        elif _task_is_planning(task):
             action_items.append(
                 {
                     "kind": "plan_feedback",
@@ -336,7 +417,6 @@ def build_ux_overview(
         status = str(task.get("status") or "")
         if status not in FAILED_STATUSES and not int(task.get("errors") or 0):
             continue
-        run_id = str(task.get("task_id") or task.get("run_id") or "")
         error = task.get("error_summary") if isinstance(task.get("error_summary"), dict) else {}
         reason = _error_reason(error) or "The task stopped before normal delivery."
         action_items.append(
@@ -353,7 +433,15 @@ def build_ux_overview(
             }
         )
 
-    needs_attention = [task for task in tasks if int(task.get("pending_approvals") or 0) or int(task.get("pending_provider_actions") or 0) or int(task.get("errors") or 0)]
+    needs_attention = [
+        task
+        for task in tasks
+        if int(task.get("pending_approvals") or 0)
+        or int(task.get("pending_provider_actions") or 0)
+        or int(task.get("errors") or 0)
+        or _task_needs_approval_reconcile(task)
+        or _task_needs_provider_action_reconcile(task)
+    ]
     active = [task for task in tasks if str(task.get("status")) not in TERMINAL_STATUSES]
     latest = selected_task or (tasks[0] if tasks else None)
     task_board = _task_board(tasks)
@@ -455,6 +543,8 @@ def _action_context(task: dict[str, Any], *, run_id: str, stage_id: str = "") ->
 
 def _provider_action_headline(row: dict[str, Any]) -> str:
     provider = str(row.get("provider") or "provider")
+    if _is_clarification_action(row):
+        return "muxdev needs clarification"
     if _is_design_provider_action(row):
         return f"{provider} 需要你确认设计风格"
     return f"{provider} is waiting for your action"
@@ -462,12 +552,19 @@ def _provider_action_headline(row: dict[str, Any]) -> str:
 
 def _provider_action_why(row: dict[str, Any], *, overview: bool = False) -> str:
     prompt = str(row.get("prompt_text") or "").strip()
+    if _is_clarification_action(row):
+        base = "The request is missing a decision that affects implementation. Answer the question, then muxdev will continue the same run."
+        return f"{base} {prompt}" if prompt and not overview else base
     if _is_design_provider_action(row):
         base = "Provider 在设计阶段通过自身 CLI/session 请求你的目标用户、视觉风格、参考产品或平台偏好；muxdev 只保存回答并继续原 run。"
         return f"{base} {prompt}" if prompt and not overview else base
     if overview:
         return "Handle the provider CLI prompt, then continue the task."
     return "The external provider CLI/session asked for confirmation, auth, rate-limit handling, or another manual step. muxdev will not answer it for you."
+
+
+def _is_clarification_action(row: dict[str, Any]) -> bool:
+    return str(row.get("kind") or "") == "clarification_required"
 
 
 def _approval_subject_summary(row: dict[str, Any]) -> str:
@@ -533,11 +630,33 @@ def _task_is_planning(task: dict[str, Any]) -> bool:
     status = str(task.get("status") or "")
     if status in TERMINAL_STATUSES:
         return False
+    if _task_needs_approval_reconcile(task):
+        return False
+    if _task_needs_provider_action_reconcile(task):
+        return False
     current = str(task.get("current_stage") or "")
     if _is_planning_stage(current, str(task.get("role") or "")):
         return True
     timeline = task.get("stage_timeline", []) if isinstance(task.get("stage_timeline"), list) else []
     return any(isinstance(row, dict) and str(row.get("status")) == "running" and _is_planning_stage(str(row.get("stage_id") or ""), str(row.get("role") or "")) for row in timeline)
+
+
+def _task_needs_approval_reconcile(task: dict[str, Any]) -> bool:
+    return (
+        str(task.get("status") or "") == "awaiting_approval"
+        and int(task.get("pending_approvals") or 0) == 0
+        and int(task.get("pending_provider_actions") or 0) == 0
+        and int(task.get("errors") or 0) == 0
+    )
+
+
+def _task_needs_provider_action_reconcile(task: dict[str, Any]) -> bool:
+    return (
+        str(task.get("status") or "") == "awaiting_provider_action"
+        and int(task.get("pending_provider_actions") or 0) == 0
+        and int(task.get("pending_approvals") or 0) == 0
+        and int(task.get("errors") or 0) == 0
+    )
 
 
 def _running_why(current_stage: str | None, activity: str, elapsed: object) -> str:
