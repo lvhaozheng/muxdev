@@ -60,28 +60,39 @@ prompt_templates:
     handoff_summary: |
       Summarize what changed, how it was checked, and any remaining risk or follow-up.
     design_plan: |
-      Produce a concise design plan with user goals, constraints, proposed interaction or architecture, acceptance criteria, and open questions.
+      Produce a complete single-file design document, not a short summary. It must cover goal/scope, users/platform, constraints/non-goals, proposed interaction or architecture, UI/states, rules/data, acceptance criteria, test strategy, risks, implementation roadmap, and open questions.
     design_review: |
-      Review the design plan for unclear requirements, risky assumptions, and missing acceptance criteria. Return a ReviewResult JSON object.
+      Review the design plan for unclear requirements, risky assumptions, missing acceptance criteria, missing test strategy, and incomplete single-file design coverage. Block shallow summaries and acceptance criteria that merely say no implementation files were created or runtime verification did not happen. Return a ReviewResult JSON object.
     design_revise: |
-      Revise the design plan from review blockers and any user plan feedback, keeping scope tight.
+      Revise the design plan from review blockers and any user plan feedback. Return a complete single-file design document with all required sections, keeping scope tight.
     design-lite:
       design_brief: |
         This is a user-facing design task. If the task does not specify the desired style, target users, platform/device priorities, references, constraints, or non-goals, ask the user through your native CLI/session interaction before producing the final design. muxdev should only pass through your prompt; do not assume muxdev will ask these questions for you.
 
         If you are running headless and cannot directly ask the user, emit a clear provider action / external confirmation prompt that muxdev can surface, for example: "waiting_external_confirmation: Please confirm target users, visual style, reference products, platform/device priorities, and anything to avoid."
 
-        After the necessary preferences are available, return a clean final JSON object with:
+        If the muxdev Context Packet or the "Previously Handled Provider Actions" section contains provider_action_responses, treat those responses as the user's answer to your previous confirmation request. Do not emit another waiting_external_confirmation for the same missing preferences; continue with the best design JSON using the provided answers and list only genuinely unresolved items in open_questions.
+
+        After the necessary preferences are available, return a clean final JSON object. The resulting docs/design/design.md must be a complete single-file design document, not a short summary. It must cover goal/scope, users/platform, gameplay or interaction, UI/screens/states, rules/data/scoring, acceptance criteria, test strategy, risks, implementation roadmap, and open questions.
+
+        Return:
         - summary
         - design_doc.problem_statement
+        - design_doc.scope, design_doc.constraints, and design_doc.non_goals when relevant
         - design_doc.user_preferences or design_doc.unconfirmed_items
+        - design_doc.audience and design_doc.platform when known
+        - design_doc.core_loop, design_doc.controls, design_doc.ui, design_doc.states, design_doc.rules, and design_doc.scoring for games
         - design_doc.acceptance_criteria
+        - design_doc.test_strategy or design_doc.tests
         - design_doc.proposed_design
         - design_doc.state_model when relevant
         - design_doc.data_flow when relevant
         - design_doc.implementation_sequence
         - design_doc.risks_and_mitigations
         - design_doc.open_questions when anything remains unclear
+
+        Do not use "no implementation files were created", "read-only stage", or "not run/verified" as acceptance criteria. Those are only scope notes or residual risks.
     design:
       problem_statement: |
         Start the design workflow by checking whether the user has specified style, audience, reference products, platform/device priorities, constraints, and non-goals. If important preferences are missing, ask through the provider's native CLI/session interaction first. In headless mode, emit a clear provider action / external confirmation prompt that muxdev can surface.
+        If the muxdev Context Packet or the "Previously Handled Provider Actions" section contains provider_action_responses, use those as the user's answer and do not ask the same confirmation again.

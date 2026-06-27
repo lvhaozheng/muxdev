@@ -1,0 +1,92 @@
+<title>muxdev 五文档交付总览、阅读路径与验收清单</title>
+
+<callout emoji="✅" background-color="light-green" border-color="green">
+  <p><b>交付说明：</b>本次基于当前代码实现和 4 篇参考文档，重新整理为 5 篇新的飞书交付文档。文档集覆盖项目背景与竞品、功能架构源码、简历面试、真实 Provider 演示，以及本文档总览与验收路径。</p>
+</callout>
+
+<h1>1. 五篇文档总览</h1>
+<table>
+  <thead><tr><th background-color="light-gray">序号</th><th background-color="light-gray">文档</th><th background-color="light-gray">核心用途</th><th background-color="light-gray">适合读者</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td>muxdev 五文档交付总览、阅读路径与验收清单</td><td>作为文档集目录、阅读路线和交付验收清单</td><td>项目 owner、评审者、面试准备者</td></tr>
+    <tr><td>1</td><td><a href="https://my.feishu.cn/docx/ZWtSdgipYofLaUxsKsiczh1Onzd">muxdev 项目背景、产品价值与竞品分析对比</a></td><td>解释为什么做、解决什么问题、和竞品差异在哪里</td><td>产品、业务、面试官、项目评审者</td></tr>
+    <tr><td>2</td><td><a href="https://my.feishu.cn/docx/OAAddyYtcoqv0Fxl5vVczXoLnie">muxdev 功能设计、架构实现、源码解读与关键代码设计</a></td><td>解释系统如何实现，按源码路径讲清关键设计</td><td>技术面试官、开发者、维护者</td></tr>
+    <tr><td>3</td><td><a href="https://my.feishu.cn/docx/YBtLdhugZo3mFWxAmTfcW7LTnZO">muxdev 简历表达与面试要点</a></td><td>沉淀项目表述、STAR 案例、高频问题和回答</td><td>候选人、面试准备者</td></tr>
+    <tr><td>4</td><td><a href="https://my.feishu.cn/docx/Qd2IdMSDIol9kLxpqhkcPK6znJg">muxdev 功能介绍与真实 Provider 演示指南</a></td><td>给出可执行演示脚本、真实 provider 路径和兜底方案</td><td>演示者、评审者、试用者</td></tr>
+  </tbody>
+</table>
+
+<h1>2. 推荐阅读路径</h1>
+<whiteboard type="mermaid">flowchart LR
+  A[先读总览] --> B[背景价值竞品]
+  B --> C[功能架构源码]
+  C --> D[演示指南]
+  C --> E[简历面试]
+  D --> F[现场演示]
+  E --> G[面试表达]
+</whiteboard>
+<grid>
+  <column width-ratio="0.5">
+    <h3>如果用于项目评审</h3>
+    <ol>
+      <li seq="auto">先读背景价值竞品，确认产品定位。</li>
+      <li seq="auto">再读功能架构源码，确认实现可信度。</li>
+      <li seq="auto">最后用演示指南跑一遍 mock 或真实 provider。</li>
+    </ol>
+  </column>
+  <column width-ratio="0.5">
+    <h3>如果用于面试准备</h3>
+    <ol>
+      <li seq="auto">先读简历表达与面试要点。</li>
+      <li seq="auto">再用架构源码文档补齐技术细节。</li>
+      <li seq="auto">最后用演示指南准备可操作 demo。</li>
+    </ol>
+  </column>
+</grid>
+
+<h1>3. 当前代码实现校准</h1>
+<p>本次文档没有沿用旧的“手工选择 solo/pair/squad 拓扑”口径，而是按当前实现校准为自动工作流选择与角色化 Provider 路由。</p>
+<table>
+  <thead><tr><th background-color="light-gray">模块</th><th background-color="light-gray">当前实现依据</th><th background-color="light-gray">文档中的表达口径</th></tr></thead>
+  <tbody>
+    <tr><td>产品定位</td><td><code>README.md</code>、<code>docs/product_guide.md</code></td><td>local-first Agentic SDLC Kernel，不是单 provider CLI 包装器</td></tr>
+    <tr><td>自动工作流</td><td><code>src/muxdev/services/automation.py</code></td><td>根据 intent、risk、repo signals 选择 depth、workflow、roles</td></tr>
+    <tr><td>工作流定义</td><td><code>src/muxdev/config/defaults/workflows.yaml</code></td><td>stage DAG 支持 agent、human_gate、delivery_gate、loop repair</td></tr>
+    <tr><td>LangGraph</td><td><code>src/muxdev/runtime/langgraph_engine.py</code>、<code>src/muxdev/services/orchestration.py</code></td><td>LangGraph 是语义控制面目标，执行仍保留 native audited path</td></tr>
+    <tr><td>Provider</td><td><code>src/muxdev/providers/adapters.py</code>、<code>providers.yaml</code></td><td>mock 与 headless CLI provider 统一为 ProviderStageOutput</td></tr>
+    <tr><td>可信交付</td><td><code>services/evidence.py</code>、<code>delivery_gate.py</code>、<code>deliverables.py</code></td><td>Evidence v2、Delivery Gate、Report、Diff、Rollback 形成交付闭环</td></tr>
+    <tr><td>人工介入</td><td><code>runtime/supervisor.py</code>、<code>services/ux.py</code></td><td>Provider Action 与 muxdev Approval 分离展示和处理</td></tr>
+  </tbody>
+</table>
+
+<h1>4. 本次参考输入</h1>
+<table>
+  <thead><tr><th background-color="light-gray">参考文档</th><th background-color="light-gray">主要吸收内容</th></tr></thead>
+  <tbody>
+    <tr><td><a href="https://my.feishu.cn/wiki/MeLJwDsRjiXG9tk6nHQcaj5FnXg">项目背景参考文档</a></td><td>背景、产品定位、竞品对比、评价体系</td></tr>
+    <tr><td><a href="https://my.feishu.cn/wiki/ZUM6wgpZziEHuokUGYXcie2AnK6">架构源码参考文档</a></td><td>技术栈、架构图谱、核心流程、关键文件导读</td></tr>
+    <tr><td><a href="https://my.feishu.cn/wiki/JrXww27VVi38WdkkrAjcPWdfnoc">简历面试参考文档</a></td><td>项目表达、STAR、面试高频问题、岗位角度</td></tr>
+    <tr><td><a href="https://my.feishu.cn/wiki/VTiuwWDIziQeGLkpajiciX1Jnbh">演示指南参考文档</a></td><td>启动路径、provider 体系、可信交付、兜底演示</td></tr>
+  </tbody>
+</table>
+
+<h1>5. 交付物验收清单</h1>
+<checkbox done="true">5 篇新飞书文档均已创建。</checkbox>
+<checkbox done="true">每篇主体文档均包含 front-load callout。</checkbox>
+<checkbox done="true">每篇主体文档均包含表格、代码或命令块、流程/架构画板等结构化 block。</checkbox>
+<checkbox done="true">内容基于当前代码实现校准，覆盖 <code>workflow_to_langgraph</code>、LangGraphWorkflowEngine、SupervisorRuntime、Provider Adapter、Delivery Gate、Deliverables、Evidence、Approval、Provider Action。</checkbox>
+<checkbox done="true">第 5 篇总览文档包含 4 篇主体文档链接和阅读路径。</checkbox>
+
+<h1>6. 后续建议</h1>
+<table>
+  <thead><tr><th background-color="light-gray">动作</th><th background-color="light-gray">建议</th><th background-color="light-gray">收益</th></tr></thead>
+  <tbody>
+    <tr><td>跑一次真实 Provider demo</td><td>优先 Codex 或 Qwen，保留 report/evidence 截图</td><td>让演示指南从“可执行脚本”升级为“实录型材料”</td></tr>
+    <tr><td>补充 benchmark 数字</td><td>记录 mock、Codex、Qwen 在同一任务上的耗时、action 数、evidence confidence</td><td>让竞品和价值分析更量化</td></tr>
+    <tr><td>加一页路线图</td><td>围绕 provider conformance、团队协作、多仓执行、Dashboard 打磨</td><td>让项目从课程交付延展到产品路线</td></tr>
+    <tr><td>沉淀面试 demo 录像</td><td>按演示指南录制 5 到 10 分钟短视频</td><td>面试或答辩时降低现场环境风险</td></tr>
+  </tbody>
+</table>
+
+<h1>7. 最短转述版本</h1>
+<blockquote>这套文档把 muxdev 从“代码实现”整理成“可评审、可演示、可面试表达”的项目资产：先说明为什么需要本地 AI SDLC 控制面，再讲当前架构和关键源码，接着给出简历面试话术，最后提供真实 provider 演示脚本和兜底路径。</blockquote>

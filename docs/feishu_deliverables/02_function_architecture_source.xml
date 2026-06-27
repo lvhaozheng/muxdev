@@ -1,0 +1,212 @@
+<title>muxdev 功能设计、架构实现、源码解读与关键代码设计</title>
+
+<callout emoji="✅" background-color="light-green" border-color="green">
+  <p><b>核心结论：</b>当前 muxdev 的主路径已经形成“CLI/TUI/Dashboard/API → daemon TaskManager → SupervisorRuntime → workflow graph → provider adapter → blackboard/evidence/report”的控制闭环。LangGraph 是工作流语义目标，SupervisorRuntime 仍是稳定执行门面，确保审批、Provider Action、Evidence、回滚与交付物在迁移期保持兼容。</p>
+</callout>
+
+<h1>1. 总体架构</h1>
+<whiteboard type="mermaid">flowchart TB
+  U[User]
+  U --> CLI[CLI 和 TUI]
+  U --> WEB[Dashboard 和 API]
+  CLI --> DC[DaemonClient]
+  WEB --> API[FastAPI App]
+  DC --> API
+  API --> TM[TaskManager]
+  TM --> RT[SupervisorRuntime]
+  RT --> LG[LangGraphWorkflowEngine]
+  RT --> PA[Provider Adapter]
+  PA --> PCLI[Codex Claude Qwen Mock]
+  RT --> BB[Blackboard SQLite]
+  RT --> EV[Evidence v2]
+  RT --> RP[Report Diff Rollback]
+  BB --> DASH[Mission Control]
+  EV --> DASH
+  RP --> DASH
+</whiteboard>
+<p>系统边界非常清晰：CLI/TUI 负责提交和展示，daemon 负责生命周期，runtime 负责编排，provider adapter 负责调用外部 AI CLI，storage/services 负责证据、报告、记忆、交付物和治理。</p>
+
+<h1>2. 用户命令如何落到代码</h1>
+<table>
+  <thead><tr><th background-color="light-gray">步骤</th><th background-color="light-gray">关键模块</th><th background-color="light-gray">职责</th></tr></thead>
+  <tbody>
+    <tr><td>命令入口</td><td><code>src/muxdev/cli/main.py</code></td><td>注册 <code>dev/fix/refactor/review/test/ci/design</code> 等命令</td></tr>
+    <tr><td>任务解析</td><td><code>config/runtime.py</code>、<code>services/automation.py</code></td><td>合并配置，识别 intent/depth/workflow/roles</td></tr>
+    <tr><td>daemon 提交</td><td><code>clients/daemon.py</code>、<code>api/web.py</code></td><td>通过 HTTP API 创建 task</td></tr>
+    <tr><td>生命周期管理</td><td><code>daemon/tasks.py::TaskManager</code></td><td>创建 run、启动 worker、处理 continue/stop/approval/action</td></tr>
+    <tr><td>执行编排</td><td><code>runtime/supervisor.py::SupervisorRuntime</code></td><td>准备 worktree、加载 workflow、运行 stage、写入证据和报告</td></tr>
+    <tr><td>Provider 执行</td><td><code>providers/adapters.py</code></td><td>mock 或 headless CLI 执行，保存 transcript/chunks</td></tr>
+  </tbody>
+</table>
+
+<h1>3. Workflow 与 LangGraph 设计</h1>
+<p>当前工作流定义在 <code>src/muxdev/config/defaults/workflows.yaml</code>，以 stage DAG 表达设计、开发、修复、重构、测试、文档等流程。每个 stage 可以声明 role、deps、type、read_only、allow_write、allow_shell、checkpoint、delivery_targets、loop policy 等元数据。</p>
+<table>
+  <thead><tr><th background-color="light-gray">Stage 类型</th><th background-color="light-gray">示例</th><th background-color="light-gray">执行方式</th></tr></thead>
+  <tbody>
+    <tr><td><code>agent</code></td><td><code>plan</code>、<code>implement</code>、<code>test</code>、<code>review</code></td><td>选择 provider adapter 执行，并记录 provider attempt 与 role result</td></tr>
+    <tr><td><code>human_gate</code></td><td><code>approve_plan</code></td><td>创建 muxdev approval，绑定 subject hash</td></tr>
+    <tr><td><code>delivery_gate</code></td><td><code>plan_verify</code>、<code>delivery_verify</code></td><td>运行本地确定性检查，不调用 provider</td></tr>
+    <tr><td><code>system_step</code></td><td>最终 evidence/report/rollback 产物</td><td>由 runtime 和 service 层写入 artifact</td></tr>
+  </tbody>
+</table>
+
+<pre lang="python" caption="workflow_to_langgraph 入口"><code>def workflow_to_langgraph(name_or_path: str) -&gt; dict[str, Any]:
+    from ..runtime.langgraph_engine import LangGraphWorkflowEngine
+
+    workflow = load_workflow(name_or_path)
+    return LangGraphWorkflowEngine(Path.cwd()).graph_spec(workflow)</code></pre>
+
+<p><code>workflow_to_langgraph</code> 是一个很轻的导出入口：先通过 <code>load_workflow</code> 读取并校验 workflow，再交给 <code>LangGraphWorkflowEngine.graph_spec</code> 输出可被外部编排系统理解的 graph metadata。</p>
+
+<pre lang="python" caption="LangGraphWorkflowEngine 的迁移策略"><code>spec = self.graph_spec(workflow)
+built = self.build_state_graph(workflow)
+trace.write(
+    "langgraph_runtime_selected",
+    backend=spec["backend"],
+    workflow=workflow.name,
+    compiled=bool(built),
+)
+result = native_executor()</code></pre>
+<callout emoji="ℹ️" background-color="light-blue" border-color="blue">
+  <p><b>设计重点：</b>LangGraph 当前负责语义编译、可视化、验证和迁移目标；真正执行仍委托给 muxdev native audited path。这样可以在引入 LangGraph 的同时保住黑板、审批、Provider Action、证据、回滚等已经实现的工程边界。</p>
+</callout>
+
+<h1>4. 自动工作流选择</h1>
+<p><code>services/automation.py</code> 提供 deterministic fallback，不依赖外部模型也能完成任务 intake。它从命令、任务文本、repo markers、测试目录、敏感词中推断 intent、depth、workflow 和角色集合。</p>
+<table>
+  <thead><tr><th background-color="light-gray">输入信号</th><th background-color="light-gray">判断逻辑</th><th background-color="light-gray">结果</th></tr></thead>
+  <tbody>
+    <tr><td>命令类型</td><td><code>dev/fix/refactor/review/test/docs/design</code></td><td>确定基础 intent</td></tr>
+    <tr><td>敏感词</td><td>auth、payment、permission、migration、安全、支付、权限等</td><td>进入 <code>deep</code> 流程</td></tr>
+    <tr><td>简单任务词</td><td>demo、prototype、small、简单、小游戏等</td><td>进入 <code>dev-lite</code> 或 <code>design-lite</code></td></tr>
+    <tr><td>repo markers</td><td><code>pyproject.toml</code>、<code>package.json</code>、<code>tests</code></td><td>保留 test-capable roles</td></tr>
+    <tr><td>workflow template</td><td>读取默认 YAML 或项目配置</td><td>从 stage 中派生模型角色</td></tr>
+  </tbody>
+</table>
+
+<h1>5. SupervisorRuntime 执行主线</h1>
+<whiteboard type="mermaid">sequenceDiagram
+  participant C as CLI or API
+  participant T as TaskManager
+  participant R as SupervisorRuntime
+  participant P as Provider Adapter
+  participant B as Blackboard
+  participant E as Evidence
+  C->>T: submit task
+  T->>R: run workflow
+  R->>B: create run and stages
+  R->>P: run agent stage
+  P-->>R: ProviderStageOutput
+  R->>B: attempts role result artifacts
+  R->>R: delivery gate approval safety
+  R->>E: write evidence run
+  R->>B: final status report diff
+</whiteboard>
+<p><code>SupervisorRuntime</code> 是当前最关键的实现类。它负责创建 run 目录、准备隔离 worktree、加载 workflow、合并 active skills、选择 provider、执行 stage、处理 approval/provider action、生成 evidence、semantic merge、validator、final report 和 rollback。</p>
+
+<h1>6. Provider Adapter 与真实 CLI 接入</h1>
+<p>Provider 层把外部 CLI 行为标准化为 <code>ProviderStageOutput</code>。当前默认支持内置 <code>mock</code> 和 headless CLI provider；provider 的命令、prompt transport、timeout、prompt template 来自配置。</p>
+<table>
+  <thead><tr><th background-color="light-gray">Provider</th><th background-color="light-gray">配置位置</th><th background-color="light-gray">特点</th></tr></thead>
+  <tbody>
+    <tr><td><code>mock</code></td><td><code>config/defaults/providers.yaml</code></td><td>内置 deterministic provider，用于离线演示和测试</td></tr>
+    <tr><td><code>codex</code></td><td>同上</td><td>headless CLI，默认 <code>prompt_transport: stdin</code>，命令包含 <code>exec --json --sandbox workspace-write</code></td></tr>
+    <tr><td><code>claude-code</code></td><td>同上</td><td>通过 <code>claude -p</code> 走 headless prompt</td></tr>
+    <tr><td><code>qwen</code></td><td>同上</td><td>通过 <code>qwen --bare --output-format stream-json -p</code> 运行</td></tr>
+  </tbody>
+</table>
+
+<pre lang="python" caption="ProviderStageOutput 标准化输出"><code>@dataclass(frozen=True)
+class ProviderStageOutput:
+    artifact_name: str
+    content: str
+    summary: str
+    tokens: int = 100
+    cost_usd: float = 0.01
+    returncode: int = 0
+    provider_actions: list[dict[str, Any]] = field(default_factory=list)</code></pre>
+
+<h1>7. Provider Action 与 muxdev Approval 的边界</h1>
+<grid>
+  <column width-ratio="0.5">
+    <h3>Provider Action</h3>
+    <ul>
+      <li>外部 provider CLI 阻塞。</li>
+      <li>例如登录、确认、限流、idle timeout。</li>
+      <li>记录 prompt、choices、transcript、chunks、attach command。</li>
+      <li>用户处理外部 session 后标记 handled。</li>
+    </ul>
+  </column>
+  <column width-ratio="0.5">
+    <h3>muxdev Approval</h3>
+    <ul>
+      <li>muxdev 自己的策略审批。</li>
+      <li>例如 plan、write、shell、merge。</li>
+      <li>绑定 subject_json 与 subject_hash。</li>
+      <li>subject 漂移后旧 approval 不复用。</li>
+    </ul>
+  </column>
+</grid>
+<pre lang="python" caption="approval subject 的最小结构"><code>return {
+    "contract_version": "muxdev.approval_subject.v1",
+    "run_id": run_id,
+    "stage_id": stage_id,
+    "approval_type": approval_type,
+    "policy_hash": policy_hash,
+    "extra": extra or {},
+}</code></pre>
+
+<h1>8. Delivery Gate 与交付物服务</h1>
+<p><code>services/delivery_gate.py</code> 的原则是只检查确定性的本地信号，不调用模型、不产生 token 成本。它从 active skill 的 Delivery Standard 派生规则，并检查 artifact、test、review blocker、runtime error、pending provider action、secret-like terms、设计文档完整性等。</p>
+<table>
+  <thead><tr><th background-color="light-gray">检查项</th><th background-color="light-gray">意义</th></tr></thead>
+  <tbody>
+    <tr><td><code>artifact_nonempty</code></td><td>目标 stage 必须有非空产物</td></tr>
+    <tr><td><code>no_failed_tests</code></td><td>目标 test stage 不应存在失败测试或 coverage blocker</td></tr>
+    <tr><td><code>no_open_blockers</code></td><td>review blocker 未关闭时拒绝交付</td></tr>
+    <tr><td><code>no_runtime_errors</code></td><td>runtime error 未解决时拒绝交付</td></tr>
+    <tr><td><code>no_pending_provider_actions</code></td><td>Provider Action 未处理时拒绝交付</td></tr>
+  </tbody>
+</table>
+<p><code>services/deliverables.py</code> 则把 workflow 结果整理成面向用户的交付物：design pack、project design doc、plan summary、test report、review report、handoff summary、docs report。</p>
+
+<h1>9. 可信交付数据流</h1>
+<table>
+  <thead><tr><th background-color="light-gray">产物</th><th background-color="light-gray">生成位置</th><th background-color="light-gray">用途</th></tr></thead>
+  <tbody>
+    <tr><td><code>task.md</code>、<code>workflow.yaml</code>、<code>task_context.json</code></td><td>run 初始化</td><td>固定任务、工作流、技能、策略上下文</td></tr>
+    <tr><td><code>role_results/*.json</code></td><td>每个 provider stage 完成后</td><td>记录角色结论、发现、artifact、snapshot</td></tr>
+    <tr><td><code>evidence/events.jsonl</code></td><td>Evidence v2</td><td>事件流与 hash 链</td></tr>
+    <tr><td><code>validation/semantic_merge_review.json</code></td><td>最终 diff 后</td><td>阻断冲突标记、明显不相关改动等语义合并风险</td></tr>
+    <tr><td><code>validation/blind_validator_panel.json</code></td><td>最终交付前</td><td>独立验证任务与 patch 是否匹配</td></tr>
+    <tr><td><code>final_report.md</code>、<code>diff.patch</code></td><td>finalize 阶段</td><td>用户审核、交付与回滚依据</td></tr>
+  </tbody>
+</table>
+
+<h1>10. 源码地图</h1>
+<table>
+  <thead><tr><th background-color="light-gray">主题</th><th background-color="light-gray">文件</th><th background-color="light-gray">读法</th></tr></thead>
+  <tbody>
+    <tr><td>入口命令</td><td><code>src/muxdev/cli/main.py</code></td><td>从 <code>dev/fix/design</code> 看任务如何提交</td></tr>
+    <tr><td>API 和 Dashboard</td><td><code>src/muxdev/api/web.py</code></td><td>看 FastAPI endpoint 和 live dashboard HTML</td></tr>
+    <tr><td>任务生命周期</td><td><code>src/muxdev/daemon/tasks.py</code></td><td>看 submit、continue、approval、provider action</td></tr>
+    <tr><td>运行时核心</td><td><code>src/muxdev/runtime/supervisor.py</code></td><td>看 workflow execution、gate、evidence、finalize</td></tr>
+    <tr><td>工作流模型</td><td><code>src/muxdev/workflows/engine.py</code></td><td>看 load、validate DAG、topological order、when expression</td></tr>
+    <tr><td>LangGraph 适配</td><td><code>src/muxdev/runtime/langgraph_engine.py</code></td><td>看 graph spec、StateGraph 构建和 native executor</td></tr>
+    <tr><td>Provider 体系</td><td><code>src/muxdev/providers/</code></td><td>看 registry、planner、adapter、mock</td></tr>
+    <tr><td>交付和质量</td><td><code>src/muxdev/services/delivery_gate.py</code>、<code>deliverables.py</code></td><td>看本地 gate 和交付物发布</td></tr>
+  </tbody>
+</table>
+
+<h1>11. 关键设计取舍</h1>
+<callout emoji="💡" background-color="light-yellow" border-color="yellow">
+  <p><b>面试可讲：</b>项目最重要的工程取舍是“让 Provider 做执行，让 muxdev 掌握状态和交付可信度”。因此外部 Agent 可以替换，内部 blackboard、approval、evidence、delivery gate、rollback、memory 这些控制面能力不能丢。</p>
+</callout>
+<ul>
+  <li><b>LangGraph 不是替换 runtime：</b>先作为语义编译和 introspection 层接入，执行仍走 native audited path。</li>
+  <li><b>Delivery Gate 不调用模型：</b>只拦截确定性问题，避免把主观判断伪装成自动验收。</li>
+  <li><b>Provider Action 不等于 Approval：</b>外部 CLI 卡住是 provider handoff，不是 muxdev 策略审批。</li>
+  <li><b>审批绑定 hash：</b>防止 plan、patch、policy 变化后复用旧审批。</li>
+  <li><b>本地优先：</b>SQLite、run artifacts、worktree、memory 默认在本地，适合开发者和团队渐进采用。</li>
+</ul>

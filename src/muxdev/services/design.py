@@ -11,6 +11,7 @@ from ..models import utc_now
 
 
 USER_DESIGN_DIR = Path("docs") / "design"
+USER_DESIGN_FILENAME = "design.md"
 
 DESIGN_PACK_FILES = [
     "00_problem_statement.md",
@@ -27,6 +28,32 @@ DESIGN_PACK_FILES = [
 ]
 
 DESIGN_WORKFLOWS = {"design", "design-lite"}
+
+DESIGN_DOCUMENT_QUALITY_GROUPS = {
+    "goal and scope": ("目标", "范围", "problem", "scope", "goal", "requirements", "需求"),
+    "users and platform": ("目标用户", "用户", "平台", "audience", "platform", "device", "target user"),
+    "play or interaction": ("玩法", "交互", "控制", "core_loop", "core loop", "controls", "interaction"),
+    "ui and states": ("界面", "状态", "屏幕", "ui", "state", "screen"),
+    "rules and data": ("规则", "数据", "计分", "rules", "data", "scoring", "entities", "api"),
+    "acceptance and tests": ("验收", "测试", "验证", "acceptance", "test", "verify"),
+    "risks": ("风险", "缓解", "risk", "mitigation"),
+    "roadmap": ("实施", "路线", "步骤", "implementation", "roadmap", "sequence"),
+    "open questions": ("待确认", "未确认", "open question", "assumption", "假设"),
+}
+
+NON_DELIVERY_ACCEPTANCE_TERMS = (
+    "no implementation",
+    "not implemented",
+    "no files",
+    "without implementation",
+    "read_only",
+    "read only",
+    "未实现",
+    "没有实现",
+    "未修改",
+    "未运行验证",
+    "只产生",
+)
 
 DESIGN_STAGE_TITLES = {
     "Problem Statement": "问题陈述",
@@ -59,6 +86,8 @@ DESIGN_FIELD_TITLES = {
     "state_model": "状态模型",
     "data_flow": "数据流",
     "api_and_data_model": "API 与数据模型",
+    "test_strategy": "测试策略",
+    "tests": "测试策略",
     "implementation_sequence": "实施步骤",
     "implementation_roadmap": "实施步骤",
     "important_alternatives": "备选方案",
@@ -96,8 +125,11 @@ def write_user_design_document(
     """Write the design deliverable where users expect project files."""
     design_dir = workspace / USER_DESIGN_DIR
     design_dir.mkdir(parents=True, exist_ok=True)
-    path = design_dir / f"{run_id}-design.md"
+    path = design_dir / USER_DESIGN_FILENAME
     body = _user_design_markdown(run_id=run_id, task=task, workflow=workflow, sections=sections)
+    issues = design_document_quality_issues(markdown=body) if workflow in DESIGN_WORKFLOWS else []
+    if issues:
+        raise ValueError("design document incomplete: " + "; ".join(issues))
     path.write_text(body, encoding="utf-8")
     if not path.exists() or path.stat().st_size == 0:
         raise OSError(f"design document missing after write: {path}")
@@ -111,15 +143,22 @@ def write_design_pack(
     task: str,
     workflow: str,
     automation: dict[str, Any] | None = None,
+    sections: list[tuple[str, str]] | None = None,
 ) -> dict[str, object]:
     """Create the design pack files and return an artifact manifest."""
     design_dir = run_dir / "design"
     design_dir.mkdir(parents=True, exist_ok=True)
     automation = automation or {}
+    section_bodies = _design_pack_markdown_sections(
+        run_id=run_id,
+        task=task,
+        workflow=workflow,
+        sections=sections or [],
+        automation=automation,
+    )
     for filename in DESIGN_PACK_FILES:
         path = design_dir / filename
-        if not path.exists():
-            path.write_text(_markdown_for(filename, task, run_id, automation), encoding="utf-8")
+        path.write_text(section_bodies.get(filename) or _markdown_for(filename, task, run_id, automation), encoding="utf-8")
 
     contract = {
         "contract_version": "muxdev.design_contract.v1",
@@ -164,6 +203,65 @@ def latest_design_contract(workspace: Path) -> Path | None:
     return candidates[-1] if candidates else None
 
 
+def design_document_quality_issues(
+    *,
+    markdown: str | None = None,
+    sections: list[tuple[str, str]] | None = None,
+) -> list[str]:
+    """Return deterministic completeness issues for the user-facing design doc."""
+    if markdown is None:
+        if not sections:
+            return ["design document has no source content"]
+        try:
+            markdown = _user_design_markdown(
+                run_id="quality_check",
+                task="quality check",
+                workflow="design-lite",
+                sections=sections,
+            )
+        except Exception as exc:
+            return [f"design document could not be rendered: {exc}"]
+    return _design_markdown_quality_issues(markdown)
+
+
+def _design_markdown_quality_issues(markdown: str) -> list[str]:
+    text = _clean_stage_content(str(markdown)).strip()
+    lowered = text.lower()
+    compact = re.sub(r"\s+", "", text)
+    headings = [line for line in text.splitlines() if line.lstrip().startswith("#")]
+    issues: list[str] = []
+
+    if len(compact) < 800:
+        issues.append("design document is too short for a complete single-file handoff")
+    if len(headings) < 8:
+        issues.append("design document has too few sections")
+
+    missing_groups = [
+        group
+        for group, tokens in DESIGN_DOCUMENT_QUALITY_GROUPS.items()
+        if not any(token.lower() in lowered for token in tokens)
+    ]
+    if missing_groups:
+        issues.append("design document missing coverage for: " + ", ".join(missing_groups))
+
+    if _acceptance_section_mentions_non_delivery(text):
+        issues.append("acceptance criteria cannot be satisfied by stating that no implementation or verification exists")
+    return issues
+
+
+def _acceptance_section_mentions_non_delivery(text: str) -> bool:
+    in_acceptance = False
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        lowered = line.lower()
+        if line.startswith("#"):
+            in_acceptance = any(token in lowered for token in ("acceptance", "验收"))
+            continue
+        if in_acceptance and any(term in lowered for term in NON_DELIVERY_ACCEPTANCE_TERMS):
+            return True
+    return False
+
+
 def _markdown_for(filename: str, task: str, run_id: str, automation: dict[str, Any]) -> str:
     title = filename[3:-3].replace("_", " ").title()
     roles = ", ".join(str(role) for role in automation.get("roles", []) or []) or "design roles"
@@ -175,7 +273,7 @@ def _markdown_for(filename: str, task: str, run_id: str, automation: dict[str, A
             f"- Task: {task}",
             f"- Roles: {roles}",
             "",
-            "This design pack section is generated by muxdev P0 and is ready for role output consolidation.",
+            "本节未在 provider 输出中明确提供；请在实现前复核并补充。",
             "",
         ]
     )
@@ -223,6 +321,9 @@ def _fallback_design_markdown(*, run_id: str, task: str, workflow: str, sections
 
 
 def _structured_design_markdown(*, run_id: str, task: str, workflow: str, payload: dict[str, Any]) -> str:
+    if isinstance(payload.get("design_pack"), dict):
+        return _structured_design_pack_markdown(run_id=run_id, task=task, workflow=workflow, payload=payload)
+
     design_doc = payload.get("design_doc") if isinstance(payload.get("design_doc"), dict) else payload
     if not isinstance(design_doc, dict):
         raise ValueError("structured design payload is not a mapping")
@@ -252,11 +353,13 @@ def _structured_design_markdown(*, run_id: str, task: str, workflow: str, payloa
     emitted: set[str] = set()
     grouped_fields = [
         ("目标与范围", ["problem_statement", "scope", "requirements", "assumptions"]),
+        ("用户与平台", ["audience", "platform", "target_users", "target_platform", "style"]),
+        ("玩法与交互", ["core_loop", "controls", "interactions", "feedback"]),
+        ("界面与状态", ["ui", "screens", "state_model"]),
+        ("规则与数据", ["rules", "scoring", "entities", "data_model", "api_and_data_model", "data_flow"]),
         ("验收标准", ["acceptance_criteria"]),
+        ("测试策略", ["test_strategy", "tests"]),
         ("设计方案", ["proposed_design", "architecture"]),
-        ("状态模型", ["state_model"]),
-        ("数据流", ["data_flow"]),
-        ("API 与数据模型", ["api_and_data_model"]),
         ("实施步骤", ["implementation_sequence", "implementation_roadmap"]),
         ("备选方案", ["important_alternatives"]),
         ("风险与缓解", ["risks_and_mitigations"]),
@@ -320,8 +423,12 @@ def _extract_structured_design_payload(sections: list[tuple[str, str]]) -> dict[
     for _title, content in sections:
         payloads.extend(_payloads_from_text(str(content)))
     for payload in reversed(payloads):
+        if isinstance(payload.get("design_pack"), dict):
+            return payload
         if isinstance(payload.get("design_doc"), dict):
             return payload
+        if _looks_like_design_pack(payload):
+            return {"design_pack": payload}
         if _looks_like_design_doc(payload):
             return {"design_doc": payload}
     return None
@@ -380,8 +487,155 @@ def _looks_like_design_doc(payload: dict[str, Any]) -> bool:
         "data_flow",
         "implementation_sequence",
         "risks_and_mitigations",
+        "user_preferences",
+        "audience",
+        "platform",
+        "core_loop",
+        "controls",
+        "ui",
+        "rules",
+        "test_strategy",
+        "tests",
     }
     return bool(design_keys.intersection(payload))
+
+
+def _looks_like_design_pack(payload: dict[str, Any]) -> bool:
+    design_pack_keys = {
+        "platform",
+        "audience",
+        "style",
+        "core_loop",
+        "controls",
+        "ui",
+        "rules",
+        "states",
+        "acceptance_criteria",
+    }
+    return bool(design_pack_keys.intersection(payload))
+
+
+def _structured_design_pack_markdown(*, run_id: str, task: str, workflow: str, payload: dict[str, Any]) -> str:
+    pack = payload.get("design_pack") if isinstance(payload.get("design_pack"), dict) else payload
+    if not isinstance(pack, dict):
+        raise ValueError("structured design pack payload is not a mapping")
+    lines = [
+        "# 设计文档",
+        "",
+        f"- Run: {run_id}",
+        f"- Workflow: {workflow}",
+        f"- 任务: {task}",
+        "",
+        "## 任务概览",
+        "",
+    ]
+    summary = _scalar_text(payload.get("summary")) or _scalar_text(pack.get("summary")) or _scalar_text(pack.get("name"))
+    lines.append(f"- 摘要: {summary}" if summary else f"- 任务: {task}")
+    for key, label in (("name", "方案名称"), ("platform", "目标平台"), ("audience", "目标用户"), ("style", "视觉风格")):
+        if _has_content(pack.get(key)):
+            lines.append(f"- {label}: {_scalar_text(pack.get(key))}")
+    lines.append("")
+
+    groups = [
+        ("目标与范围", ["goals", "scope", "requirements", "constraints", "non_goals"]),
+        ("玩法与交互", ["core_loop", "controls", "interactions", "feedback"]),
+        ("界面与状态", ["ui", "states", "screens", "state_model"]),
+        ("规则与数据", ["rules", "scoring", "entities", "data_model", "api_and_data_model"]),
+        ("验收标准", ["acceptance_criteria", "tests", "test_strategy"]),
+        ("实施路线", ["implementation_sequence", "implementation_roadmap", "roadmap"]),
+        ("证据与依据", ["claims", "evidence"]),
+        ("风险与缓解", ["risks", "risks_and_mitigations"]),
+        ("待确认问题 / 未确认项", ["open_questions", "unconfirmed_items", "missing_evidence"]),
+    ]
+    emitted = {"summary", "name", "platform", "audience", "style"}
+    for title, keys in groups:
+        values = [(key, pack.get(key)) for key in keys if _has_content(pack.get(key))]
+        if not values:
+            continue
+        lines.extend([f"## {title}", ""])
+        for key, value in values:
+            emitted.add(key)
+            if len(values) > 1:
+                lines.extend([f"### {_field_title(key)}", ""])
+            _append_value(lines, value)
+            lines.append("")
+
+    for key, value in pack.items():
+        if key in emitted or not _has_content(value):
+            continue
+        lines.extend([f"## {_field_title(key)}", ""])
+        _append_value(lines, value)
+        lines.append("")
+
+    body = "\n".join(lines).rstrip() + "\n"
+    if len(body.strip().splitlines()) <= 6:
+        raise ValueError("design pack document has no section content")
+    return body
+
+
+def _design_pack_markdown_sections(
+    *,
+    run_id: str,
+    task: str,
+    workflow: str,
+    sections: list[tuple[str, str]],
+    automation: dict[str, Any],
+) -> dict[str, str]:
+    payload = _extract_structured_design_payload(sections)
+    pack: dict[str, Any] = {}
+    if payload:
+        if isinstance(payload.get("design_pack"), dict):
+            pack = dict(payload["design_pack"])
+        elif isinstance(payload.get("design_doc"), dict):
+            pack = dict(payload["design_doc"])
+    fallback = _combined_stage_text(sections)
+    roles = ", ".join(str(role) for role in automation.get("roles", []) or []) or "design roles"
+    common = [f"- Run: {run_id}", f"- Workflow: {workflow}", f"- Task: {task}", f"- Roles: {roles}", ""]
+
+    mapping = {
+        "00_problem_statement.md": ("问题陈述", ["problem_statement", "summary", "name", "goals", "scope"]),
+        "01_requirements.md": ("需求与约束", ["requirements", "constraints", "audience", "platform", "style", "acceptance_criteria"]),
+        "02_architecture_options.md": ("架构选项", ["architecture_options", "important_alternatives", "platform", "ui", "controls"]),
+        "03_decision_record.md": ("方案决策", ["decision_record", "proposed_design", "core_loop", "rules"]),
+        "04_system_design.md": ("系统设计", ["system_design", "architecture", "states", "state_model", "entities"]),
+        "05_api_and_data_model.md": ("API 与数据模型", ["api_and_data_model", "data_model", "data_flow", "scoring"]),
+        "06_risk_and_threat_model.md": ("风险与威胁模型", ["risks", "risks_and_mitigations", "missing_evidence"]),
+        "07_test_strategy.md": ("测试策略", ["test_strategy", "tests", "acceptance_criteria"]),
+        "08_implementation_roadmap.md": ("实施路线图", ["implementation_sequence", "implementation_roadmap", "roadmap"]),
+        "09_open_questions.md": ("待确认问题", ["open_questions", "unconfirmed_items", "missing_evidence"]),
+        "10_final_design_review.md": ("最终设计评审", ["final_design_review", "claims", "evidence", "acceptance_criteria"]),
+    }
+    rendered: dict[str, str] = {}
+    for filename, (title, keys) in mapping.items():
+        lines = [f"# {title}", "", *common]
+        used = False
+        for key in keys:
+            if not _has_content(pack.get(key)):
+                continue
+            used = True
+            lines.extend([f"## {_field_title(key)}", ""])
+            _append_value(lines, pack.get(key))
+            lines.append("")
+        if not used and fallback:
+            lines.extend(["## Provider 输出摘录", "", fallback, ""])
+        elif not used:
+            lines.extend(["## 待补充", "", "- Provider 未明确给出本节内容，请在实现前复核。", ""])
+        rendered[filename] = "\n".join(lines).rstrip() + "\n"
+    return rendered
+
+
+def _combined_stage_text(sections: list[tuple[str, str]]) -> str:
+    chunks: list[str] = []
+    for title, content in sections:
+        clean = _clean_stage_content(str(content)).strip()
+        if not clean:
+            continue
+        clean_title = _localized_title(str(title).strip() or "Design")
+        chunks.append(f"### {clean_title}\n\n{clean}")
+    text = "\n\n".join(chunks).strip()
+    if len(text) > 4000:
+        return text[:4000].rstrip() + "\n\n..."
+    return text
 
 
 def _clean_stage_content(content: str) -> str:

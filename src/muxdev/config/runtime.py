@@ -17,7 +17,7 @@ from typing import Any
 from ..daemon.paths import DEFAULT_API_PORT, DEFAULT_HOST, DEFAULT_UI_PORT
 from ..providers.registry import ProviderProbe, detect_providers
 from ..storage import MemoryStore
-from .loader import ConfigSource, deep_merge, load_config
+from .loader import deep_merge, load_config
 
 
 DEFAULT_GATE = "safe"

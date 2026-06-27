@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 from .adapters import activated_skill_wrapper
 from .events import append_skill_event

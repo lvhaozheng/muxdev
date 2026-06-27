@@ -145,6 +145,14 @@ def test_live_dashboard_renders_minimal_sections_and_i18n() -> None:
     assert "/dashboard/overview" in html
     assert "terminal?agent=" in html
     assert "feedback-and-continue" in html
+    assert "submitPlanFeedback" in html
+    assert "submitProviderResponse" in html
+    assert "optionalTaskActions" in html
+    assert 'data-feedback-optional="true"' in html
+    assert "auto_submit:!optional" in html
+    assert "data-draft-key" in html
+    assert "refresh_deferred" in html
+    assert "setInterval(()=>refresh(),30000)" in html
     assert "provider-actions" in html
     assert "Validation Experiments" not in html
     assert "Product Experience" not in html
@@ -570,6 +578,105 @@ def test_daemon_provider_actions_api_and_continue_wait(monkeypatch) -> None:
     assert responded["response"] == {"choice": "y"}
     assert handled["action"]["status"] == str(ProviderActionStatus.HANDLED)
     assert handled["continue"]["status"] == "continue_requested"
+
+
+def test_daemon_provider_action_respond_and_continue_starts_resume(monkeypatch) -> None:
+    workspace = _workspace_temp("provider-action-submit")
+    try:
+        manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())
+        with manager.board() as board:
+            board.create_run(
+                run_id="run_provider_action_submit",
+                task="provider action submit smoke",
+                workflow="design-lite",
+                provider="mock",
+                workspace=workspace,
+                worktree=workspace / "worktree",
+            )
+            action_id = board.create_provider_action(
+                run_id="run_provider_action_submit",
+                stage_id="design_brief",
+                provider="codex",
+                role="architect",
+                kind="cli_confirmation",
+                prompt_text="Confirm design preferences",
+                input_kind="text",
+            )
+        resume_calls: list[tuple[str, float]] = []
+
+        def record_resume(task_id: str, _workspace: Path, *, max_cost_usd: float) -> None:
+            resume_calls.append((task_id, max_cost_usd))
+
+        monkeypatch.setattr(manager, "_resume_task", record_resume)
+        client = TestClient(create_app(task_manager=manager))
+
+        result = client.post(
+            f"/api/tasks/run_provider_action_submit/actions/{action_id}/respond-and-continue",
+            json={"response": {"text": "platform=Web; style=cartoon"}},
+        ).json()
+        pending = client.get("/api/tasks/run_provider_action_submit/provider-actions?status=pending").json()
+
+        deadline = time.time() + 1
+        while not resume_calls and time.time() < deadline:
+            time.sleep(0.01)
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    assert result["action"]["status"] == str(ProviderActionStatus.HANDLED)
+    assert result["action"]["response"] == {"text": "platform=Web; style=cartoon"}
+    assert result["continue"]["status"] == "continue_requested"
+    assert pending == []
+    assert resume_calls == [("run_provider_action_submit", 0.5)]
+
+
+def test_daemon_continue_skips_false_positive_provider_action(monkeypatch) -> None:
+    workspace = _workspace_temp("provider-action-false-positive")
+    try:
+        manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())
+        with manager.board() as board:
+            board.create_run(
+                run_id="run_provider_action_false_positive",
+                task="provider action false positive smoke",
+                workflow="design-lite",
+                provider="mock",
+                workspace=workspace,
+                worktree=workspace / "worktree",
+            )
+            action_id = board.create_provider_action(
+                run_id="run_provider_action_false_positive",
+                stage_id="design_brief",
+                provider="codex",
+                role="architect",
+                kind="cli_confirmation",
+                prompt_text=(
+                    '{"task":{"provider_action_responses":[{"prompt_text":"waiting_external_confirmation: old",'
+                    '"response":{"choice":"yes"}}],"context_packet_hash":"sha256:test","worktree":"D:\\\\demo"}}\n'
+                    "D:\\anconda\\Lib\\site-packages\\requests\\__init__.py:113: RequestsDependencyWarning: mismatch\n"
+                    "  warnings.warn(\n"
+                    '{"exit_code":0,"status":"completed"}'
+                ),
+                input_kind="confirmation",
+            )
+        resume_calls: list[str] = []
+
+        def record_resume(task_id: str, _workspace: Path, *, max_cost_usd: float) -> None:
+            resume_calls.append(task_id)
+
+        monkeypatch.setattr(manager, "_resume_task", record_resume)
+        client = TestClient(create_app(task_manager=manager))
+
+        result = client.post("/api/tasks/run_provider_action_false_positive/continue").json()
+        deadline = time.time() + 1
+        while not resume_calls and time.time() < deadline:
+            time.sleep(0.01)
+        actions = client.get("/api/tasks/run_provider_action_false_positive/provider-actions").json()
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    assert result["status"] == "continue_requested"
+    assert action_id in result["dismissed_provider_actions"]
+    assert resume_calls == ["run_provider_action_false_positive"]
+    assert actions[0]["status"] == str(ProviderActionStatus.DISMISSED)
 
 
 def test_daemon_attach_uses_real_provider_attach_command() -> None:

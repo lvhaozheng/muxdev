@@ -8,17 +8,18 @@ provider-specific Python code.
 
 from __future__ import annotations
 
-import shutil
 import json
 import os
 import re
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..clients.sessions import HeadlessSubprocessBackend
 from ..config.loader import load_config, path_config
 from ..core.redaction import redact
-from ..clients.sessions import HeadlessSubprocessBackend
+from ..core.text_cleaning import clean_provider_text
 from .contracts import ProviderCapabilities, ProviderDescriptor, ProviderRuntimeKind
 from .mock import MockProvider
 
@@ -161,7 +162,8 @@ class HeadlessCliProviderAdapter(ProviderAdapter):
             input_text=input_text,
             env=_provider_runtime_env(self.id, worktree),
         )
-        content = redact((result.stdout or "") + (("\n" + result.stderr) if result.stderr else ""))
+        raw_content = (result.stdout or "") + (("\n" + result.stderr) if result.stderr else "")
+        content = redact(clean_provider_text(raw_content, fallback=raw_content))
         event_lines = "\n".join(f"{event.type}: {event.text}" for event in result.events)
         if event_lines:
             content = content + "\n\n# Stream Events\n" + redact(event_lines) + "\n"

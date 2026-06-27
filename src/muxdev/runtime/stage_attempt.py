@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from ..clients.stream import StreamAdapter, looks_like_auth_error
+from ..core.text_cleaning import provider_action_text
 from ..models import ProviderActionKind
 from ..providers.adapters import ProviderAdapter, ProviderStageOutput
 
@@ -93,7 +94,11 @@ def provider_actions_from_output(output: ProviderStageOutput) -> list[dict[str, 
     if output.provider_actions:
         return output.provider_actions
     provider_text = output.content.split("\n\n# Stream Events\n", 1)[0]
-    events = StreamAdapter().parse_chunk(output.summary + "\n" + provider_text)
+    action_text = provider_action_text(output.summary + "\n" + provider_text)
+    if not action_text:
+        events = []
+    else:
+        events = StreamAdapter().parse_chunk(action_text)
     actions = [
         {
             "kind": action.kind,

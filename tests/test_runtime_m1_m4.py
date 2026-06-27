@@ -12,7 +12,42 @@ import pytest
 from muxdev.models import ApprovalStatus, ProviderActionStatus, RunStatus
 from muxdev.runtime import SupervisorRuntime, WorktreeManager
 from muxdev.providers.adapters import ProviderStageOutput
+from muxdev.services.deliverables import workflow_deliverable_status
+from muxdev.services.design import DESIGN_PACK_FILES
 from muxdev.storage import Blackboard
+
+
+def _complete_design_payload(summary: str = "Complete design") -> dict[str, object]:
+    return {
+        "summary": summary,
+        "design_doc": {
+            "problem_statement": "Design a lightweight browser snake game.",
+            "scope": ["Single design document", "Browser game handoff"],
+            "requirements": ["Readable gameplay", "Clear controls", "Restartable end state"],
+            "user_preferences": {"audience": "Casual players", "platform": "Browser", "style": "Simple pixel style"},
+            "audience": "Casual players",
+            "platform": "Desktop and mobile browser",
+            "core_loop": ["Start", "Move", "Eat food", "Score", "Avoid collision", "Restart"],
+            "controls": {"keyboard": "Arrow keys or WASD", "mobile": "Direction pad"},
+            "ui": ["Board", "Score", "Best score", "Pause", "Restart", "Mobile controls"],
+            "states": ["idle", "running", "paused", "gameOver"],
+            "rules": ["No instant reverse", "Food avoids snake cells", "Collision ends the game"],
+            "scoring": "Food adds 10 points and speed increases gradually.",
+            "acceptance_criteria": ["Gameplay is understandable", "Controls and failure conditions are documented", "Restart flow is defined"],
+            "test_strategy": ["Inspect complete design sections", "Future smoke tests cover controls, scoring, pause, restart, and collision"],
+            "proposed_design": {"platform": "Canvas", "modules": ["GameEngine", "Renderer", "InputController"]},
+            "state_model": {"states": ["idle", "running", "paused", "gameOver"]},
+            "data_flow": ["Input", "State update", "Rule evaluation", "Render"],
+            "implementation_sequence": ["Build board", "Implement movement", "Add scoring", "Verify controls"],
+            "risks_and_mitigations": ["Mobile controls need narrow viewport verification."],
+            "open_questions": ["Confirm final board size and speed curve."],
+        },
+    }
+
+
+def _complete_design_stage_output(stage_id: str, summary: str = "complete design") -> ProviderStageOutput:
+    payload = _complete_design_payload(summary)
+    return ProviderStageOutput(f"design/{stage_id}.md", json.dumps(payload, ensure_ascii=False), summary)
 
 
 @pytest.fixture()
@@ -39,7 +74,7 @@ def test_mock_run_creates_m1_artifacts(workspace: Path) -> None:
     assert (workspace / "muxdev_mock_change.txt").exists()
     workspace_apply = json.loads((result.run_dir / "workspace_apply.json").read_text(encoding="utf-8"))
     assert "muxdev_mock_change.txt" in workspace_apply["files"]
-    user_design_doc = workspace / "docs" / "design" / f"{result.run_id}-design.md"
+    user_design_doc = workspace / "docs" / "design" / "design.md"
     assert not user_design_doc.exists()
     design_doc = result.run_dir / "worktree" / "docs" / "design" / f"{result.run_id}-design.md"
     assert not design_doc.exists()
@@ -171,13 +206,13 @@ def test_design_workflow_publishes_user_visible_design_document(workspace: Path)
     result = SupervisorRuntime(workspace).run("设计一个贪吃蛇游戏方案", provider="mock", workflow_name="design")
 
     assert result.status == RunStatus.COMPLETED
-    user_design_doc = workspace / "docs" / "design" / f"{result.run_id}-design.md"
+    user_design_doc = workspace / "docs" / "design" / "design.md"
     assert user_design_doc.exists()
     content = user_design_doc.read_text(encoding="utf-8")
     assert "# 设计文档" in content
     assert "设计一个贪吃蛇游戏方案" in content
-    assert "## Design Plan" in content
-    assert "## Design Pack" in content
+    assert "Mock design plan" in content
+    assert "Mock design output" in content
 
     blackboard = Blackboard(result.run_dir)
     try:
@@ -194,8 +229,18 @@ def test_design_doc_extracts_structured_payload_from_provider_stream(monkeypatch
                 "summary": "已完成贪吃蛇游戏设计。",
                 "design_doc": {
                     "problem_statement": "设计一个轻量级贪吃蛇游戏。",
+                    "scope": ["Design a browser-first snake game document.", "Keep the workflow design-only."],
                     "user_preferences": {"visual_style": "像素风", "platform": "浏览器"},
+                    "audience": "Casual browser players",
+                    "platform": "Desktop and mobile browser",
+                    "core_loop": ["Start", "Move snake", "Eat food", "Grow and score", "Avoid collision", "Restart"],
+                    "controls": {"keyboard": "Arrow keys and WASD", "pause": "Space", "restart": "Enter"},
+                    "ui": ["Board grid", "Score", "Best score", "Pause/restart actions", "Mobile direction pad"],
+                    "states": ["idle", "running", "paused", "gameOver"],
+                    "rules": ["No instant reverse", "Food never appears on the snake", "Wall or self collision ends the game"],
+                    "scoring": "Each food adds 10 points and speed increases gradually.",
                     "acceptance_criteria": ["可以开始、暂停和重新开始。", "撞墙后进入 gameOver。"],
+                    "test_strategy": ["Review required design sections.", "During implementation, smoke test keyboard controls, pause, restart, scoring, and collision."],
                     "proposed_design": {
                         "platform": "Vanilla HTML/CSS/JavaScript + Canvas",
                         "modules": ["GameEngine", "Renderer", "InputController"],
@@ -204,6 +249,7 @@ def test_design_doc_extracts_structured_payload_from_provider_stream(monkeypatch
                     "data_flow": ["用户输入 -> GameEngine.tick() -> Renderer.draw()"],
                     "implementation_sequence": ["搭建页面", "实现核心逻辑", "补充测试"],
                     "risks_and_mitigations": ["移动端手感需后续验证。"],
+                    "open_questions": ["Confirm final visual theme and difficulty tuning."],
                 },
             }
             event = {"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(payload, ensure_ascii=False)}}
@@ -228,7 +274,7 @@ def test_design_doc_extracts_structured_payload_from_provider_stream(monkeypatch
     result = SupervisorRuntime(workspace).run("设计一个贪吃蛇游戏", provider="mock", workflow_name="design-lite")
 
     assert result.status == RunStatus.COMPLETED
-    content = (workspace / "docs" / "design" / f"{result.run_id}-design.md").read_text(encoding="utf-8")
+    content = (workspace / "docs" / "design" / "design.md").read_text(encoding="utf-8")
     assert "# 设计文档" in content
     assert "像素风" in content
     assert "Vanilla HTML/CSS/JavaScript + Canvas" in content
@@ -238,6 +284,150 @@ def test_design_doc_extracts_structured_payload_from_provider_stream(monkeypatch
     assert "Session Archives" not in content
     assert "transcript:" not in content
     assert '{"type":' not in content
+
+
+def test_design_doc_extracts_top_level_design_pack(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
+    class DesignPackProvider:
+        def run_stage(self, *, stage_id: str, task: str, worktree: Path) -> ProviderStageOutput:
+            if stage_id == "design_brief":
+                payload = {
+                    "summary": "完成贪吃蛇小游戏设计。",
+                    "design_pack": {
+                        "name": "贪吃蛇小游戏",
+                        "platform": "Web",
+                        "audience": "儿童休闲玩家",
+                        "style": "像素风",
+                        "goals": ["Create a clear browser snake-game design", "Support keyboard and touch play", "Keep the rules easy for casual players"],
+                        "scope": ["Design-only handoff", "Single-page browser game", "No backend or account system"],
+                        "constraints": ["Responsive board layout", "Readable controls on mobile", "Simple local score state"],
+                        "core_loop": ["移动蛇", "吃食物", "增长身体", "避免碰撞"],
+                        "controls": {"keyboard": "方向键 / WASD"},
+                        "interactions": ["Start from idle", "Pause and resume", "Restart from game over", "Tap mobile direction buttons"],
+                        "feedback": ["Score updates immediately", "Collision shows a clear game-over state", "New food appears after eating"],
+                        "ui": ["分数", "开始", "暂停", "重新开始"],
+                        "screens": ["Start screen", "Running board", "Paused overlay", "Game-over summary"],
+                        "rules": ["撞墙或撞到自己即失败"],
+                        "scoring": "Each food adds 10 points and speed increases over time.",
+                        "entities": ["Snake", "Food", "Board", "Score"],
+                        "data_model": {"snake": "ordered grid cells", "food": "one empty grid cell", "score": "integer points"},
+                        "states": ["idle", "running", "paused", "gameOver"],
+                        "acceptance_criteria": ["可以开始游戏", "失败后可以重新开始"],
+                        "test_strategy": ["Inspect complete design sections.", "Future implementation smoke tests cover start, movement, pause, scoring, collision, and restart."],
+                        "implementation_sequence": ["Build board UI", "Implement movement and food rules", "Add score and speed", "Verify desktop and mobile controls"],
+                        "risks": ["移动端手感需要后续验证"],
+                        "risks_and_mitigations": ["Small mobile screens can crowd controls; reserve a fixed control area below the board."],
+                        "open_questions": ["Confirm exact board size and speed curve."],
+                    },
+                }
+                return ProviderStageOutput("design/design_brief.md", json.dumps(payload, ensure_ascii=False), "done")
+            if stage_id == "design_review":
+                return ProviderStageOutput("design/design_review.md", '{"has_blockers": false, "blockers": []}', "ok")
+            return ProviderStageOutput(f"design/{stage_id}.md", "# stage\n\nok", "ok")
+
+    monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: DesignPackProvider())
+
+    result = SupervisorRuntime(workspace).run("设计一个贪吃蛇游戏", provider="mock", workflow_name="design-lite")
+
+    assert result.status == RunStatus.COMPLETED
+    content = (workspace / "docs" / "design" / "design.md").read_text(encoding="utf-8")
+    assert "贪吃蛇小游戏" in content
+    assert "## 玩法与交互" in content
+    assert "## 验收标准" in content
+    design_dir = result.run_dir / "design"
+    for filename in DESIGN_PACK_FILES:
+        section = (design_dir / filename).read_text(encoding="utf-8")
+        assert "This design pack section is generated by muxdev P0" not in section
+        assert "Provider 输出摘录" in section or "## " in section
+
+
+def test_design_verify_blocks_shallow_design_document(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
+    class ShallowDesignProvider:
+        def run_stage(self, *, stage_id: str, task: str, worktree: Path) -> ProviderStageOutput:
+            if stage_id in {"design_brief", "design_revise"}:
+                payload = {
+                    "summary": "Completed a thin snake design.",
+                    "design_doc": {
+                        "problem_statement": "Design a snake game.",
+                        "acceptance_criteria": ["AC-1: no implementation files were created"],
+                    },
+                }
+                return ProviderStageOutput(f"design/{stage_id}.md", json.dumps(payload, ensure_ascii=False), "thin design")
+            if stage_id == "design_review":
+                return ProviderStageOutput("design/design_review.md", '{"has_blockers": false, "blockers": []}', "review passed")
+            return ProviderStageOutput(f"design/{stage_id}.md", "# stage\n\nok", "ok")
+
+    monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: ShallowDesignProvider())
+
+    result = SupervisorRuntime(workspace).run(
+        "design a snake game",
+        provider="mock",
+        workflow_name="design-lite",
+        require_approval=set(),
+        automation={"max_review_fixes": 1},
+    )
+    gate_payload = json.loads((result.run_dir / "delivery_gates" / "design_verify.json").read_text(encoding="utf-8"))
+
+    assert result.status == RunStatus.BLOCKED
+    assert any(item["type"] == "design_document_incomplete" for item in gate_payload["blockers"])
+
+
+@pytest.mark.parametrize(
+    "workflow",
+    ["design", "design-lite", "dev", "dev-lite", "dev-new", "fix", "refactor", "review", "test", "docs", "software-dev"],
+)
+def test_builtin_workflows_publish_required_deliverables(workspace: Path, workflow: str) -> None:
+    result = SupervisorRuntime(workspace).run(f"audit output for {workflow}", provider="mock", workflow_name=workflow, require_approval=set())
+
+    assert result.status == RunStatus.COMPLETED
+    blackboard = Blackboard(result.run_dir)
+    try:
+        status = workflow_deliverable_status(
+            blackboard,
+            run_dir=result.run_dir,
+            run_id=result.run_id,
+            workflow=workflow,
+            require_report=True,
+        )
+        artifacts = blackboard.table_rows("artifacts", run_id=result.run_id)
+    finally:
+        blackboard.close()
+
+    assert status["missing"] == []
+    kinds = {row["kind"] for row in artifacts}
+    assert "report" in kinds
+    if workflow in {"design", "design-lite"}:
+        assert {"project_design_doc", "design_pack"} <= kinds
+        for filename in DESIGN_PACK_FILES:
+            assert "This design pack section is generated by muxdev P0" not in (result.run_dir / "design" / filename).read_text(encoding="utf-8")
+    if workflow in {"dev", "dev-lite", "dev-new", "fix", "refactor", "software-dev", "test"}:
+        assert "test_report" in kinds
+    if workflow in {"dev", "dev-lite", "dev-new", "fix", "refactor", "software-dev", "test", "review", "docs"}:
+        assert "review_report" in kinds
+    if workflow in {"dev-lite", "dev-new"}:
+        assert "handoff_summary" in kinds
+    if workflow == "docs":
+        assert "docs_report" in kinds
+
+
+def test_completed_continue_repairs_missing_design_deliverables_without_provider(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
+    runtime = SupervisorRuntime(workspace)
+    result = runtime.run("设计一个贪吃蛇游戏", provider="mock", workflow_name="design-lite")
+    assert result.status == RunStatus.COMPLETED
+    user_doc = workspace / "docs" / "design" / "design.md"
+    user_doc.write_text("", encoding="utf-8")
+    for filename in DESIGN_PACK_FILES:
+        (result.run_dir / "design" / filename).write_text("This design pack section is generated by muxdev P0\n", encoding="utf-8")
+
+    def fail_provider(_name: str):
+        raise AssertionError("completed deliverable repair should not call provider")
+
+    monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", fail_provider)
+
+    repaired = runtime.resume(result.run_id)
+
+    assert repaired.status == RunStatus.COMPLETED
+    assert user_doc.exists()
+    assert "This design pack section is generated by muxdev P0" not in (result.run_dir / "design" / "00_problem_statement.md").read_text(encoding="utf-8")
 
 
 def test_design_provider_question_pauses_and_response_reaches_next_context(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
@@ -273,11 +463,22 @@ def test_design_provider_question_pauses_and_response_reaches_next_context(monke
                 "summary": "根据用户偏好完成设计。",
                 "design_doc": {
                     "problem_statement": "设计一个贪吃蛇游戏。",
+                    "scope": ["Design a browser snake game handoff.", "Keep this run design-only."],
                     "user_preferences": {"style": preference},
+                    "audience": "Children and casual browser players",
+                    "platform": "Browser desktop and mobile",
+                    "core_loop": ["Start", "Move snake", "Eat food", "Grow", "Avoid collision", "Restart"],
+                    "controls": {"keyboard": "Arrow keys or WASD", "mobile": "On-screen direction pad"},
+                    "ui": ["Grid board", "Score", "Best score", "Pause", "Restart", "Mobile controls"],
+                    "states": ["idle", "running", "paused", "gameOver"],
+                    "rules": ["No instant reverse", "Food avoids snake cells", "Collision ends the game"],
+                    "scoring": "Food adds 10 points and speed increases gradually.",
                     "acceptance_criteria": ["风格符合用户偏好。"],
+                    "test_strategy": ["Inspect section completeness.", "Future smoke tests cover controls, pause, restart, scoring, and collision."],
                     "proposed_design": {"platform": "Canvas", "modules": ["GameEngine", "Renderer"]},
                     "implementation_sequence": ["实现核心玩法", "打磨像素风表现"],
                     "risks_and_mitigations": ["儿童用户需要更清晰的失败反馈。"],
+                    "open_questions": ["Confirm final visual theme and difficulty tuning."],
                 },
             }
             return ProviderStageOutput("design/design_brief.md", json.dumps(payload, ensure_ascii=False), "done")
@@ -295,7 +496,7 @@ def test_design_provider_question_pauses_and_response_reaches_next_context(monke
         blackboard.close()
 
     resumed = runtime.resume(paused.run_id)
-    content = (workspace / "docs" / "design" / f"{paused.run_id}-design.md").read_text(encoding="utf-8")
+    content = (workspace / "docs" / "design" / "design.md").read_text(encoding="utf-8")
 
     assert paused.status == RunStatus.AWAITING_PROVIDER_ACTION
     assert resumed.status == RunStatus.COMPLETED
@@ -350,6 +551,8 @@ def test_design_review_blockers_drive_revision_loop(monkeypatch: pytest.MonkeyPa
             self.revise_count = 0
 
         def run_stage(self, *, stage_id: str, task: str, worktree: Path) -> ProviderStageOutput:
+            if stage_id in {"design_plan", "design_brief"}:
+                return _complete_design_stage_output(stage_id, "design loop base")
             if stage_id == "design_review":
                 self.review_count += 1
                 if self.review_count == 1:
@@ -378,6 +581,8 @@ def test_design_review_blockers_drive_revision_loop(monkeypatch: pytest.MonkeyPa
 def test_design_blocks_after_max_review_fixes(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
     class BlockingDesignProvider:
         def run_stage(self, *, stage_id: str, task: str, worktree: Path) -> ProviderStageOutput:
+            if stage_id in {"design_plan", "design_brief"}:
+                return _complete_design_stage_output(stage_id, "blocking design base")
             if stage_id == "design_review":
                 return ProviderStageOutput(
                     "design/design_review.md",
@@ -415,7 +620,7 @@ def test_design_workflow_blocks_when_user_visible_design_document_cannot_be_writ
     def fail_user_design_doc(*_args, **_kwargs):
         raise OSError("cannot write user design doc")
 
-    monkeypatch.setattr("muxdev.runtime.supervisor.write_user_design_document", fail_user_design_doc)
+    monkeypatch.setattr("muxdev.services.deliverables.write_user_design_document", fail_user_design_doc)
 
     result = SupervisorRuntime(workspace).run("设计一个贪吃蛇游戏方案", provider="mock", workflow_name="design")
 
@@ -425,19 +630,15 @@ def test_design_workflow_blocks_when_user_visible_design_document_cannot_be_writ
         errors = blackboard.table_rows("error_details")
     finally:
         blackboard.close()
-    assert errors[0]["type"] == "missing_design_document"
+    assert errors[0]["type"] == "missing_deliverable"
     assert "cannot write user design doc" in errors[0]["message"]
 
 
-def test_software_dev_does_not_require_design_document_write(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
-    def fail_design_doc(*_args, **_kwargs):
-        raise OSError("cannot write design doc")
-
-    monkeypatch.setattr("muxdev.runtime.supervisor._record_project_design_doc", fail_design_doc)
-
+def test_software_dev_does_not_require_design_document_write(workspace: Path) -> None:
     result = SupervisorRuntime(workspace).run("design doc failure", provider="mock")
 
     assert result.status == RunStatus.COMPLETED
+    report = (result.run_dir / "final_report.md").read_text(encoding="utf-8")
     blackboard = Blackboard(result.run_dir)
     try:
         stages = {row["stage_id"]: row for row in blackboard.table_rows("stages")}
@@ -448,6 +649,7 @@ def test_software_dev_does_not_require_design_document_write(monkeypatch: pytest
     assert stages["plan"]["status"] == "completed"
     assert not errors
     assert not [row for row in artifacts if row["kind"] == "project_design_doc"]
+    assert "software-dev requires a project design document" not in report
 
 
 def test_blackboard_schema_records_run_stage_approval_and_results(workspace: Path) -> None:
@@ -577,6 +779,9 @@ def test_review_blockers_drive_fix_loop(monkeypatch: pytest.MonkeyPatch, workspa
             self.review_count = 0
 
         def run_stage(self, *, stage_id: str, task: str, worktree: Path) -> ProviderStageOutput:
+            if stage_id == "implement":
+                (worktree / "fix_loop.txt").write_text("initial implementation\n", encoding="utf-8")
+                return ProviderStageOutput("session/implement.log", "implemented", "implemented")
             if stage_id == "review":
                 self.review_count += 1
                 if self.review_count == 1:
@@ -591,6 +796,7 @@ def test_review_blockers_drive_fix_loop(monkeypatch: pytest.MonkeyPatch, workspa
                     )
                 return ProviderStageOutput("review.md", '{"has_blockers": false, "blockers": []}', "no blockers")
             if stage_id == "fix":
+                (worktree / "fix_loop.txt").write_text("fixed blocker\n", encoding="utf-8")
                 return ProviderStageOutput("session/fix.log", "fixed blocker", "fixed blocker")
             return ProviderStageOutput(f"{stage_id}.md", "{}", f"{stage_id} ok")
 
@@ -643,6 +849,9 @@ def test_provider_action_must_be_handled_before_resume(monkeypatch: pytest.Monke
             self.calls += 1
             if self.calls == 1:
                 return ProviderStageOutput("session/external.log", "Apply this change? [y/N]", "needs confirmation")
+            if stage_id == "implement":
+                (worktree / "provider_action_resume.txt").write_text("implemented after provider action\n", encoding="utf-8")
+                return ProviderStageOutput("session/implement.log", "implemented", "implemented")
             return ProviderStageOutput(f"{stage_id}.md", "{}", "ok")
 
     provider = ExternalPromptProvider()

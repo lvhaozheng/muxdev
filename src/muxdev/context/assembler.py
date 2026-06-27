@@ -29,15 +29,25 @@ def task_with_memory_context(task: str, automation: dict[str, object]) -> str:
 
 
 def task_with_context_packet(task: str, packet_path: Path, packet_hash: str) -> str:
-    return "\n".join(
-        [
-            task,
-            "",
-            "# muxdev Context Packet",
-            f"- path: {packet_path}",
-            f"- hash: {packet_hash}",
-        ]
-    )
+    lines = [
+        task,
+        "",
+        "# muxdev Context Packet",
+        f"- path: {packet_path}",
+        f"- hash: {packet_hash}",
+        "- Read this packet before acting when you need prior attempts, memory, review blockers, or human responses.",
+    ]
+    handled_responses = _handled_provider_response_lines(packet_path)
+    if handled_responses:
+        lines.extend(
+            [
+                "",
+                "# Previously Handled Provider Actions",
+                "Use these human responses as authoritative input for this stage. Continue the workflow and do not ask the same confirmation again.",
+                *handled_responses,
+            ]
+        )
+    return "\n".join(lines)
 
 
 def write_context_packet(
@@ -301,6 +311,52 @@ def _provider_action_response(row: dict[str, object]) -> dict[str, object]:
         "prompt_text": row.get("prompt_text"),
         "response": row.get("response"),
     }
+
+
+def _handled_provider_response_lines(packet_path: Path, *, limit: int = 5) -> list[str]:
+    try:
+        packet = json.loads(packet_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(packet, dict):
+        return []
+    task = packet.get("task")
+    if not isinstance(task, dict):
+        return []
+    responses = task.get("provider_action_responses")
+    if not isinstance(responses, list):
+        return []
+    lines: list[str] = []
+    for row in responses[-limit:]:
+        if not isinstance(row, dict):
+            continue
+        response = _compact_provider_response(row.get("response"))
+        if not response:
+            continue
+        stage = str(row.get("stage_id") or "stage")
+        kind = str(row.get("kind") or row.get("input_kind") or "provider_action")
+        lines.append(f"- {stage} / {kind}: {response}")
+    return lines
+
+
+def _compact_provider_response(value: object, *, max_chars: int = 1200) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        if value.get("text") is not None:
+            text = str(value.get("text") or "")
+        elif value.get("choice") is not None:
+            text = f"choice={value.get('choice')}"
+        else:
+            text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    elif isinstance(value, (list, tuple)):
+        text = json.dumps(value, ensure_ascii=False)
+    else:
+        text = str(value)
+    text = redact(" ".join(text.split()))
+    if len(text) > max_chars:
+        return text[: max_chars - 1].rstrip() + "..."
+    return text
 
 
 def _memory_by_layer(memory_items: list[dict[str, object]]) -> dict[str, list[dict[str, object]]]:

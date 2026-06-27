@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from muxdev.core.safety import PolicyDecision, SafetyPolicyEngine, redact
+from muxdev.core.text_cleaning import clean_provider_text
 from muxdev.clients.sessions import HeadlessSubprocessBackend, TmuxBackend
 from muxdev.clients.stream import StreamAdapter, StreamEventType
 from muxdev.workflows import load_workflow, ordered_stage_ids, validate_dag
@@ -35,6 +36,62 @@ def test_stream_adapter_extracts_provider_action_options() -> None:
     assert actions[0].options == [{"label": "Yes", "value": "y"}, {"label": "No", "value": "n", "default": True}]
     assert "Apply this change" in actions[0].prompt_text
     assert auth_actions[0].kind == "auth_required"
+
+
+def test_stream_adapter_detects_codex_agent_confirmation_json() -> None:
+    adapter = StreamAdapter()
+    chunk = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": "waiting_external_confirmation: 请确认目标平台和视觉风格",
+            },
+        },
+        ensure_ascii=False,
+    )
+
+    actions = adapter.provider_actions(adapter.parse_chunk(chunk))
+
+    assert actions[0].kind == "cli_confirmation"
+    assert actions[0].prompt_text == "请确认目标平台和视觉风格"
+
+
+def test_stream_adapter_ignores_context_packet_confirmation_echo() -> None:
+    adapter = StreamAdapter()
+    chunk = json.dumps(
+        {
+            "task": {
+                "provider_action_responses": [
+                    {
+                        "prompt_text": "waiting_external_confirmation: old question",
+                        "response": {"choice": "yes"},
+                    }
+                ],
+                "context_packet_hash": "sha256:test",
+            }
+        }
+    )
+
+    events = adapter.parse_chunk(chunk)
+
+    assert not any(event.type == StreamEventType.WAITING_EXTERNAL_CONFIRMATION for event in events)
+    assert adapter.provider_actions(events) == []
+
+
+def test_provider_text_cleaning_removes_warning_and_repairs_mojibake() -> None:
+    text = (
+        "è¯·ç®åè®¾è®¡ä¸ä¸ªè´ªåèæ¸¸æ\\r\\n"
+        "D:\\anconda\\Lib\\site-packages\\requests\\__init__.py:113: RequestsDependencyWarning: urllib3 mismatch\\r\\n"
+        "  warnings.warn(\\r\\n"
+        '{"exit_code":0,"status":"completed"}'
+    )
+
+    cleaned = clean_provider_text(text)
+
+    assert "请简单设计一个贪吃蛇游戏" in cleaned
+    assert "RequestsDependencyWarning" not in cleaned
+    assert "exit_code" not in cleaned
 
 
 def test_stream_adapter_does_not_treat_status_text_as_approval() -> None:
@@ -114,7 +171,10 @@ def test_headless_backend_sets_quiet_python_test_environment(monkeypatch: pytest
             "-c",
             "import json, os; print(json.dumps({"
             "'dont_write': os.getenv('PYTHONDONTWRITEBYTECODE'), "
-            "'addopts': os.getenv('PYTEST_ADDOPTS')"
+            "'addopts': os.getenv('PYTEST_ADDOPTS'), "
+            "'io_encoding': os.getenv('PYTHONIOENCODING'), "
+            "'python_utf8': os.getenv('PYTHONUTF8'), "
+            "'warnings': os.getenv('PYTHONWARNINGS')"
             "}))",
         ],
         cwd=Path.cwd(),
@@ -124,6 +184,9 @@ def test_headless_backend_sets_quiet_python_test_environment(monkeypatch: pytest
     env = json.loads(result.stdout)
     assert env["dont_write"] == "1"
     assert env["addopts"] == "--strict-markers -p no:cacheprovider"
+    assert env["io_encoding"] == "utf-8"
+    assert env["python_utf8"] == "1"
+    assert "ignore:urllib3.*:Warning:requests" in env["warnings"]
 
 
 def test_headless_backend_decodes_windows_cli_output() -> None:

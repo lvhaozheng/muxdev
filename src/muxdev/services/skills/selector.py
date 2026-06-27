@@ -9,7 +9,7 @@ from pathlib import Path
 from ...config.runtime import normalize_role
 from .adapters import injection_mode
 from .catalog import build_skill_catalog
-from .discovery import load_skills_config, role_bindings, scan_skills, skill_from_file
+from .discovery import load_skills_config, role_bindings, skill_from_file
 from .model import ActivatedSkill, SkillInfo, SkillSelection
 from .trust import can_auto_activate, can_manual_activate
 

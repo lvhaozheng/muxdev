@@ -20,6 +20,7 @@ from ..models import ApprovalStatus, PolicyDecision, ProviderActionKind, Provide
 from ..clients.stream import StreamAdapter, StreamEventType
 from ..core.platforms import hidden_subprocess_kwargs
 from ..core.redaction import redact
+from ..core.text_cleaning import has_external_confirmation
 from ..context import memory_refs as _memory_refs
 from ..context import task_with_context_packet as _task_with_context_packet
 from ..context import task_with_memory_context as _task_with_memory_context
@@ -30,7 +31,8 @@ from ..providers.adapters import ProviderAdapter, ProviderStageOutput, extract_j
 from ..providers.planner import ProviderPlanner
 from ..services.dashboard_run import write_run_dashboard
 from ..services.delivery_gate import evaluate_delivery_gate
-from ..services.design import write_design_pack, write_user_design_document
+from ..services.deliverables import publish_workflow_deliverables, workflow_deliverable_status
+from ..services.design import write_design_pack
 from ..services.advanced_parallel import planned_stage_writes_from_automation, record_parallel_conflicts, write_parallel_conflict_report
 from ..services.provider_learning import refresh_provider_learning
 from ..services.provider_scores import recommend_provider
@@ -136,7 +138,8 @@ class SupervisorRuntime:
             provider_impls.setdefault(role_provider, get_runtime_provider(role_provider))
 
         task_context = {
-            "workflow_name": workflow.name,
+            "workflow_name": workflow_name,
+            "workflow_resolved_name": workflow.name,
             "gate": gate,
             "depth": depth,
             "skills": skills,
@@ -260,6 +263,21 @@ class SupervisorRuntime:
             }
             skills = task_context.get("skills", []) if isinstance(task_context.get("skills"), list) else []
             automation = task_context.get("automation", {}) if isinstance(task_context.get("automation"), dict) else {}
+            workflow_for_resume = str(task_context.get("workflow_name") or run["workflow"])
+            if str(run.get("status") or "") == str(RunStatus.COMPLETED) and not _run_has_incomplete_stages(blackboard, run_id):
+                result = _repair_completed_run_deliverables(
+                    blackboard,
+                    trace,
+                    run_dir=run_dir,
+                    run_id=run_id,
+                    workspace=self.workspace,
+                    worktree=worktree,
+                    task=str(run["task"]),
+                    workflow=workflow_for_resume,
+                    automation=automation,
+                )
+                self._write_run_dashboard(run_dir, run_id, blackboard=blackboard)
+                return result
             stored_policy = task_context.get("safety_policy", {}) if isinstance(task_context.get("safety_policy"), dict) else {}
             stored_approvals = stored_policy.get("approval_types", []) if isinstance(stored_policy, dict) else []
             approval_types = {str(item) for item in stored_approvals} if isinstance(stored_approvals, list) else set()
@@ -282,7 +300,7 @@ class SupervisorRuntime:
                 trace=trace,
                 task=str(run["task"]),
                 provider=provider,
-                workflow_name=str(task_context.get("workflow_name") or run["workflow"]),
+                workflow_name=workflow_for_resume,
                 provider_impls=provider_impls,
                 policy=policy,
                 worktree=worktree,
@@ -326,7 +344,7 @@ class SupervisorRuntime:
         automation: dict[str, object],
         close_blackboard: bool,
     ) -> RunResult:
-        workflow = load_workflow(workflow_name)
+        workflow = _load_workflow_for_run(workflow_name, run_dir)
         engine_name = _configured_workflow_engine(self.workspace, automation)
         if engine_name == "native":
             trace.write("native_runtime_selected", workflow=workflow.name)
@@ -396,7 +414,7 @@ class SupervisorRuntime:
         easiest-to-audit behavior. Only workflows proven safe by
         _can_use_parallel_runtime are delegated to the parallel executor.
         """
-        workflow = load_workflow(workflow_name)
+        workflow = _load_workflow_for_run(workflow_name, run_dir)
         bound_task = _task_with_memory_context(task, automation)
         task_hash = sha256_text(redact(task))
         workflow_hash = sha256_file(run_dir / "workflow.yaml") if (run_dir / "workflow.yaml").exists() else sha256_text(workflow.model_dump_json())
@@ -404,7 +422,6 @@ class SupervisorRuntime:
 
         context: dict[str, object] = _initial_workflow_context(blackboard, run_id, workflow)
         by_id = {stage.id: stage for stage in workflow.stages}
-        report_path: Path | None = None
         try:
             # Resume/retry support starts by reading persisted stage state, so
             # reruns skip already completed or intentionally skipped stages.
@@ -870,24 +887,6 @@ class SupervisorRuntime:
                     blackboard.set_run_status(run_id, RunStatus.BLOCKED)
                     trace.write("stage_failed", stage=stage.id, reason="read_only_write_violation")
                     return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
-                if workflow.name == "software-dev" and stage.id == "design":
-                    try:
-                        design_doc = _record_project_design_doc(
-                            blackboard,
-                            run_id=run_id,
-                            stage_id=stage.id,
-                            workspace=self.workspace,
-                            worktree=worktree,
-                            content=output.content,
-                        )
-                    except Exception as exc:
-                        message = f"required design document was not created: {exc}"
-                        blackboard.upsert_stage(run_id, stage.id, role=stage.role, status=StageStatus.FAILED, output_path=str(artifact_path), summary=message)
-                        blackboard.add_error(run_id, stage.id, "missing_design_document", message)
-                        blackboard.set_run_status(run_id, RunStatus.BLOCKED)
-                        trace.write("stage_failed", stage=stage.id, reason="missing_design_document", error=redact(str(exc)))
-                        return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
-                    trace.write("project_design_doc_written", stage=stage.id, path=str(design_doc))
                 findings: list[dict[str, object]] = []
                 decision_text = "accept"
                 if stage.output_schema == "TestResult" or stage.id == "test":
@@ -1007,30 +1006,17 @@ class SupervisorRuntime:
                 workspace=self.workspace,
                 worktree=worktree,
             )
-            blackboard.set_run_status(run_id, RunStatus.COMPLETED)
-            if workflow.name in {"design", "design-lite"}:
-                try:
-                    _record_design_deliverables(
-                        blackboard,
-                        run_dir=run_dir,
-                        run_id=run_id,
-                        workspace=self.workspace,
-                        task=task,
-                        workflow=workflow.name,
-                        automation=automation,
-                    )
-                except Exception as exc:
-                    message = f"required design document was not created: {exc}"
-                    blackboard.set_run_status(run_id, RunStatus.BLOCKED)
-                    blackboard.add_error(run_id, None, "missing_design_document", message)
-                    trace.write("run_blocked", reason="missing_design_document", error=redact(str(exc)))
-                    return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
-            _record_evidence_run(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
-            report_path = generate_final_report(run_dir, run_id, blackboard)
-            _refresh_provider_learning(blackboard, run_id)
-            _record_ledger(blackboard, run_dir, run_id, "run_completed", payload={"report": str(report_path), "patch_hash": sha256_file(diff_path)})
-            trace.write("run_completed", report=str(report_path))
-            return RunResult(run_id, RunStatus.COMPLETED, run_dir, report_path)
+            return _finalize_workflow_success(
+                blackboard,
+                trace,
+                run_dir=run_dir,
+                run_id=run_id,
+                workspace=self.workspace,
+                task=task,
+                workflow=workflow.name,
+                automation=automation,
+                diff_path=diff_path,
+            )
         except Exception as exc:
             blackboard.set_run_status(run_id, RunStatus.BLOCKED)
             blackboard.add_error(run_id, None, "exception", str(exc))
@@ -1407,30 +1393,17 @@ class SupervisorRuntime:
             workspace=self.workspace,
             worktree=worktree,
         )
-        blackboard.set_run_status(run_id, RunStatus.COMPLETED)
-        if workflow.name in {"design", "design-lite"}:
-            try:
-                _record_design_deliverables(
-                    blackboard,
-                    run_dir=run_dir,
-                    run_id=run_id,
-                    workspace=self.workspace,
-                    task=task,
-                    workflow=workflow.name,
-                    automation=automation,
-                )
-            except Exception as exc:
-                message = f"required design document was not created: {exc}"
-                blackboard.set_run_status(run_id, RunStatus.BLOCKED)
-                blackboard.add_error(run_id, None, "missing_design_document", message)
-                trace.write("run_blocked", reason="missing_design_document", error=redact(str(exc)))
-                return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
-        _record_evidence_run(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
-        report_path = generate_final_report(run_dir, run_id, blackboard)
-        _refresh_provider_learning(blackboard, run_id)
-        _record_ledger(blackboard, run_dir, run_id, "run_completed", payload={"report": str(report_path), "patch_hash": sha256_file(diff_path)})
-        trace.write("run_completed", report=str(report_path))
-        return RunResult(run_id, RunStatus.COMPLETED, run_dir, report_path)
+        return _finalize_workflow_success(
+            blackboard,
+            trace,
+            run_dir=run_dir,
+            run_id=run_id,
+            workspace=self.workspace,
+            task=task,
+            workflow=workflow.name,
+            automation=automation,
+            diff_path=diff_path,
+        )
 
     @staticmethod
     def write_diff(run_dir: Path, worktree: Path) -> Path:
@@ -1845,66 +1818,6 @@ def _approval_subject(
     }
 
 
-def _record_project_design_doc(
-    blackboard: Blackboard,
-    *,
-    run_id: str,
-    stage_id: str,
-    workspace: Path,
-    worktree: Path,
-    content: str,
-) -> Path:
-    body = redact(content).strip()
-    if not body:
-        raise ValueError("design stage output was empty")
-    user_path = write_user_design_document(
-        workspace=workspace,
-        run_id=run_id,
-        task=_task_for_run(blackboard, run_id),
-        workflow="software-dev",
-        sections=[("Software Design", body)],
-    )
-
-    # Keep a copy in the execution worktree so diff/evidence tooling can still
-    # reason about the generated deliverable without asking users to inspect it.
-    design_dir = worktree / "docs" / "design"
-    design_dir.mkdir(parents=True, exist_ok=True)
-    path = design_dir / f"{run_id}-design.md"
-    path.write_text(
-        user_path.read_text(encoding="utf-8"),
-        encoding="utf-8",
-    )
-    if not path.exists() or path.stat().st_size == 0:
-        raise OSError(f"design document missing after write: {path}")
-    blackboard.add_artifact(run_id, stage_id, "Design Document", user_path, "project_design_doc")
-    blackboard.add_artifact(run_id, stage_id, "Execution Worktree Design Copy", path, "run_design_doc")
-    return user_path
-
-
-def _record_user_design_document_from_stage_outputs(
-    blackboard: Blackboard,
-    *,
-    run_id: str,
-    workspace: Path,
-    task: str,
-    workflow: str,
-) -> Path:
-    sections: list[tuple[str, str]] = []
-    for row in blackboard.table_rows("artifacts", run_id=run_id):
-        if row.get("kind") != "stage_output":
-            continue
-        path = Path(str(row.get("path") or ""))
-        if not path.exists() or not path.is_file():
-            continue
-        title = str(row.get("stage_id") or path.stem).replace("_", " ").title()
-        sections.append((title, path.read_text(encoding="utf-8", errors="replace")))
-    if not sections:
-        raise ValueError("no design stage outputs available")
-    path = write_user_design_document(workspace=workspace, run_id=run_id, task=task, workflow=workflow, sections=sections)
-    blackboard.add_artifact(run_id, None, "Design Document", path, "project_design_doc")
-    return path
-
-
 def _task_for_run(blackboard: Blackboard, run_id: str) -> str:
     try:
         return str(blackboard.get_run(run_id).get("task") or "")
@@ -1964,15 +1877,23 @@ def _record_design_pack(
     workflow: str,
     automation: dict[str, object],
 ) -> None:
-    manifest = write_design_pack(run_dir=run_dir, run_id=run_id, task=task, workflow=workflow, automation=automation)
+    sections = []
+    for row in blackboard.table_rows("artifacts", run_id=run_id):
+        if row.get("kind") != "stage_output":
+            continue
+        path = Path(str(row.get("path") or ""))
+        if path.exists() and path.is_file():
+            sections.append((str(row.get("stage_id") or path.stem), path.read_text(encoding="utf-8", errors="replace")))
+    manifest = write_design_pack(run_dir=run_dir, run_id=run_id, task=task, workflow=workflow, automation=automation, sections=sections)
     blackboard.add_artifact(run_id, None, "design_contract.json", Path(str(manifest["contract"])), "design_contract")
     blackboard.add_artifact(run_id, None, "memory_proposals.json", Path(str(manifest["memory_proposals"])), "memory_proposals")
     for path in manifest.get("files", []):
         blackboard.add_artifact(run_id, None, Path(str(path)).name, Path(str(path)), "design_pack")
 
 
-def _record_design_deliverables(
+def _finalize_workflow_success(
     blackboard: Blackboard,
+    trace: TraceWriter,
     *,
     run_dir: Path,
     run_id: str,
@@ -1980,15 +1901,113 @@ def _record_design_deliverables(
     task: str,
     workflow: str,
     automation: dict[str, object],
-) -> Path:
-    _record_design_pack(blackboard, run_dir=run_dir, run_id=run_id, task=task, workflow=workflow, automation=automation)
-    return _record_user_design_document_from_stage_outputs(
-        blackboard,
-        run_id=run_id,
-        workspace=workspace,
-        task=task,
-        workflow=workflow,
-    )
+    diff_path: Path,
+) -> RunResult:
+    blackboard.set_run_status(run_id, RunStatus.COMPLETED)
+    try:
+        status = publish_workflow_deliverables(
+            blackboard,
+            run_dir=run_dir,
+            run_id=run_id,
+            workspace=workspace,
+            task=task,
+            workflow=workflow,
+            automation=automation,
+        )
+    except Exception as exc:
+        return _block_missing_deliverables(
+            blackboard,
+            trace,
+            run_dir=run_dir,
+            run_id=run_id,
+            missing=[f"publish_error: {redact(str(exc))}"],
+        )
+    missing = [str(item) for item in status.get("missing", [])]
+    if missing:
+        return _block_missing_deliverables(blackboard, trace, run_dir=run_dir, run_id=run_id, missing=missing)
+
+    _record_evidence_run(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
+    report_path = generate_final_report(run_dir, run_id, blackboard)
+    final_status = workflow_deliverable_status(blackboard, run_dir=run_dir, run_id=run_id, workflow=workflow, require_report=True)
+    final_missing = [str(item) for item in final_status.get("missing", [])]
+    if final_missing:
+        return _block_missing_deliverables(blackboard, trace, run_dir=run_dir, run_id=run_id, missing=final_missing)
+    _refresh_provider_learning(blackboard, run_id)
+    _record_ledger(blackboard, run_dir, run_id, "run_completed", payload={"report": str(report_path), "patch_hash": sha256_file(diff_path)})
+    trace.write("run_completed", report=str(report_path))
+    return RunResult(run_id, RunStatus.COMPLETED, run_dir, report_path)
+
+
+def _repair_completed_run_deliverables(
+    blackboard: Blackboard,
+    trace: TraceWriter,
+    *,
+    run_dir: Path,
+    run_id: str,
+    workspace: Path,
+    worktree: Path,
+    task: str,
+    workflow: str,
+    automation: dict[str, object],
+) -> RunResult:
+    _ensure_diff_artifact(blackboard, run_dir=run_dir, run_id=run_id, worktree=worktree)
+    try:
+        publish_workflow_deliverables(
+            blackboard,
+            run_dir=run_dir,
+            run_id=run_id,
+            workspace=workspace,
+            task=task,
+            workflow=workflow,
+            automation=automation,
+        )
+    except Exception as exc:
+        return _block_missing_deliverables(
+            blackboard,
+            trace,
+            run_dir=run_dir,
+            run_id=run_id,
+            missing=[f"publish_error: {redact(str(exc))}"],
+        )
+    report_path = generate_final_report(run_dir, run_id, blackboard)
+    status = workflow_deliverable_status(blackboard, run_dir=run_dir, run_id=run_id, workflow=workflow, require_report=True)
+    missing = [str(item) for item in status.get("missing", [])]
+    if missing:
+        return _block_missing_deliverables(blackboard, trace, run_dir=run_dir, run_id=run_id, missing=missing)
+    blackboard.set_run_status(run_id, RunStatus.COMPLETED)
+    trace.write("completed_run_deliverables_repaired", report=str(report_path))
+    return RunResult(run_id, RunStatus.COMPLETED, run_dir, report_path)
+
+
+def _run_has_incomplete_stages(blackboard: Blackboard, run_id: str) -> bool:
+    terminal = {str(StageStatus.COMPLETED), str(StageStatus.SKIPPED)}
+    return any(str(row.get("status") or "") not in terminal for row in blackboard.table_rows("stages", run_id=run_id))
+
+
+def _block_missing_deliverables(
+    blackboard: Blackboard,
+    trace: TraceWriter,
+    *,
+    run_dir: Path,
+    run_id: str,
+    missing: list[str],
+) -> RunResult:
+    message = "missing required deliverables: " + ", ".join(missing)
+    blackboard.set_run_status(run_id, RunStatus.BLOCKED)
+    blackboard.add_error(run_id, None, "missing_deliverable", message)
+    trace.write("run_blocked", reason="missing_deliverable", missing=missing)
+    _record_evidence_run(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
+    report_path = generate_final_report(run_dir, run_id, blackboard)
+    return RunResult(run_id, RunStatus.BLOCKED, run_dir, report_path)
+
+
+def _ensure_diff_artifact(blackboard: Blackboard, *, run_dir: Path, run_id: str, worktree: Path) -> Path:
+    path = run_dir / "diff.patch"
+    if not path.exists():
+        path.write_text(redact(_worktree_diff_text(worktree)), encoding="utf-8")
+    if not any(row.get("kind") == "diff" and str(row.get("path") or "") == str(path) for row in blackboard.table_rows("artifacts", run_id=run_id)):
+        blackboard.add_artifact(run_id, None, "diff.patch", path, "diff")
+    return path
 
 
 def _record_evidence_run(
@@ -2064,8 +2083,7 @@ def _parse_review_result(content: str) -> ReviewResult:
 
 def _has_external_confirmation_prompt(content: str) -> bool:
     provider_text = content.split("\n\n# Stream Events\n", 1)[0]
-    lowered = provider_text.lower()
-    if "waiting_external_confirmation" in lowered or "approval_prompt_detected" in lowered:
+    if has_external_confirmation(provider_text):
         return True
     events = StreamAdapter().parse_chunk(provider_text)
     prompt_types = {StreamEventType.APPROVAL_PROMPT_DETECTED, StreamEventType.WAITING_EXTERNAL_CONFIRMATION}
@@ -2195,11 +2213,16 @@ def _record_provider_actions(
                 auto_policy=str(action.get("auto_policy") or "manual"),
                 transcript_path=str(action.get("transcript_path") or "") or None,
                 chunks_path=str(action.get("chunks_path") or "") or None,
-                attach_command=str(action.get("attach_command") or "") or None,
+                attach_command=str(action.get("attach_command") or "") or _default_attach_command(run_id, role, stage_id),
                 source_event_hash=source_hash,
             )
         )
     return action_ids
+
+
+def _default_attach_command(run_id: str, role: str | None, stage_id: str) -> str:
+    agent = role or stage_id or "provider"
+    return f"muxdev attach {run_id} --agent {agent}"
 
 
 def _initial_workflow_context(blackboard: Blackboard, run_id: str, workflow) -> dict[str, object]:
@@ -2399,6 +2422,16 @@ def _configured_workflow_engine(workspace: Path, automation: dict[str, object]) 
             value = None
     normalized = str(value or "langgraph").strip().lower()
     return "native" if normalized == "native" else "langgraph"
+
+
+def _load_workflow_for_run(workflow_name: str, run_dir: Path):
+    try:
+        return load_workflow(workflow_name)
+    except ValueError as exc:
+        archived = run_dir / "workflow.yaml"
+        if archived.is_file():
+            return load_workflow(str(archived))
+        raise exc
 
 
 def _approval_wait_status(ci_block_on_approval: bool) -> RunStatus:

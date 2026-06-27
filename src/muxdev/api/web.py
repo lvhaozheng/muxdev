@@ -736,19 +736,22 @@ def create_app(*, task_manager: object | None = None, paths: object | None = Non
         tasks = manager.list_tasks()
         approvals = manager.approvals(status=str(ApprovalStatus.PENDING))
         actions = manager.provider_actions(status=str(ProviderActionStatus.PENDING))
+        provider_health = _provider_health_payload() if include_global_config else _deferred_provider_health_payload()
+        ecosystem = manager.ecosystem_state() if include_global_config else {}
+        memory_governance = _memory_governance_payload(root) if include_global_config else {}
         return build_dashboard_overview(
             root,
             daemon=manager.daemon_status(),
             tasks=tasks,
             approvals=approvals,
             provider_actions=actions,
-            provider_health=_provider_health_payload(),
-            ecosystem=manager.ecosystem_state(),
+            provider_health=provider_health,
+            ecosystem=ecosystem,
             hidden_projects=load_hidden_projects(_dashboard_project_store()),
             hidden_tasks=load_hidden_tasks(_dashboard_task_store()),
             include_hidden=include_hidden,
             include_global_config=include_global_config,
-            memory_governance=_memory_governance_payload(root),
+            memory_governance=memory_governance,
         )
 
     @app.get("/api/daemon/status")
@@ -1191,6 +1194,10 @@ def create_app(*, task_manager: object | None = None, paths: object | None = Non
 
 def _provider_health_payload() -> dict[str, object]:
     return build_provider_health([probe.to_dict() for probe in detect_providers()])
+
+
+def _deferred_provider_health_payload() -> dict[str, object]:
+    return {"ready": [], "partial": [], "unavailable": [], "total": 0, "providers": [], "deferred": True}
 
 
 def _memory_governance_payload(workspace: Path) -> dict[str, object]:

@@ -44,3 +44,17 @@ def test_output_contracts_include_delivery_evidence_and_gaps() -> None:
         assert "delivery decision" in lowered
         assert "evidence" in lowered
         assert "gap" in lowered or "missing evidence" in lowered
+
+
+def test_design_lite_prompt_requires_complete_design_md() -> None:
+    prompt = render_stage_prompt(
+        "design a snake game",
+        workflow="design-lite",
+        stage=WorkflowStage(id="design_brief", role="architect", read_only=True, output_schema="PlanArtifact"),
+    )
+    lowered = prompt.text.lower()
+
+    assert "docs/design/design.md" in prompt.text
+    assert "complete single-file design document" in lowered
+    assert "test strategy" in lowered
+    assert "no implementation files" in lowered

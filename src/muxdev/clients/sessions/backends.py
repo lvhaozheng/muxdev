@@ -306,8 +306,16 @@ def _provider_subprocess_env(overrides: dict[str, str] | None = None) -> dict[st
     env = os.environ.copy()
     env.update(overrides or {})
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("PYTHONUTF8", "1")
     pytest_addopts = env.get("PYTEST_ADDOPTS", "")
     cache_flag = "-p no:cacheprovider"
     if cache_flag not in pytest_addopts:
         env["PYTEST_ADDOPTS"] = f"{pytest_addopts} {cache_flag}".strip()
+    warning_filter = "ignore:urllib3.*:Warning:requests"
+    python_warnings = env.get("PYTHONWARNINGS", "")
+    filters = [item.strip() for item in python_warnings.split(",") if item.strip()]
+    if warning_filter not in filters:
+        filters.append(warning_filter)
+        env["PYTHONWARNINGS"] = ",".join(filters)
     return env

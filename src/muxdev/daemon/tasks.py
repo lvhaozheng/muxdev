@@ -16,10 +16,12 @@ from ..application import TaskRuntimeService
 from ..clients.sessions import TmuxBackend
 from ..config.loader import path_config
 from ..core.platforms import follow_file_command, hidden_subprocess_kwargs
+from ..core.text_cleaning import is_false_positive_provider_action
 from ..domain import RunSpec
 from ..models import ApprovalStatus, ProviderActionStatus, RunStatus
 from ..runtime import SupervisorRuntime, new_run_id
 from ..services.dashboard_run import build_run_dashboard_payload, startup_dashboard_payload
+from ..services.deliverables import workflow_deliverable_status
 from ..services.feedback import route_feedback
 from ..services.progress import enrich_provider_attempts, enrich_stages, progress_summary
 from ..services.provider_learning import refresh_provider_learning
@@ -33,6 +35,19 @@ from .queue import TaskQueue
 
 
 TERMINAL_STATUSES = {str(RunStatus.COMPLETED), str(RunStatus.BLOCKED), str(RunStatus.ABORTED)}
+
+
+def _dismiss_false_positive_provider_actions(board: Blackboard, run_id: str) -> list[str]:
+    dismissed: list[str] = []
+    for row in board.list_provider_actions(status=str(ProviderActionStatus.PENDING), run_id=run_id):
+        if not is_false_positive_provider_action(row):
+            continue
+        action_id = str(row.get("action_id") or "")
+        if not action_id:
+            continue
+        board.update_provider_action_status(action_id, ProviderActionStatus.DISMISSED)
+        dismissed.append(action_id)
+    return dismissed
 
 
 def _terminal_handoff_for_run(board: Blackboard, run_dir: Path, run_id: str, agent: str) -> dict[str, Any]:
@@ -204,6 +219,7 @@ class TaskManager:
         run = self.get_run(resolved)
         workspace = Path(run["workspace"])
         with self.board() as board:
+            dismissed_actions = _dismiss_false_positive_provider_actions(board, resolved)
             pending_actions = ProviderActionsRepository(board).list_pending(resolved)
             if pending_actions:
                 board.set_run_status(resolved, RunStatus.AWAITING_PROVIDER_ACTION)
@@ -212,6 +228,7 @@ class TaskManager:
                     "run_id": resolved,
                     "status": str(RunStatus.AWAITING_PROVIDER_ACTION),
                     "provider_actions": pending_actions,
+                    "dismissed_provider_actions": dismissed_actions,
                 }
         thread = threading.Thread(
             target=self._resume_task,
@@ -223,7 +240,7 @@ class TaskManager:
         if not self.queue.start_if_idle(resolved, thread):
             return {"task_id": resolved, "run_id": resolved, "status": "already_running"}
         self.broadcast({"type": "task_continue_requested", "task_id": resolved})
-        return {"task_id": resolved, "run_id": resolved, "status": "continue_requested"}
+        return {"task_id": resolved, "run_id": resolved, "status": "continue_requested", "dismissed_provider_actions": dismissed_actions}
 
     def stop_task(self, task_id: str) -> dict[str, Any]:
         resolved = self.resolve_task_id(task_id)
@@ -671,6 +688,13 @@ class TaskManager:
             usage=usage,
             errors=errors,
         )
+        deliverable_status = workflow_deliverable_status(
+            board,
+            run_dir=self._run_dir(run_id, run=run),
+            run_id=run_id,
+            workflow=str(run.get("workflow") or ""),
+            require_report=str(run.get("status") or "") == str(RunStatus.COMPLETED),
+        )
         return {
             **run,
             "task_id": run_id,
@@ -688,6 +712,7 @@ class TaskManager:
             "errors": len(errors),
             "error_summary": latest_error,
             "delivery_confidence": delivery_confidence,
+            "deliverable_status": deliverable_status,
             "evidence_summary": delivery_confidence["evidence_summary"],
             "gate": context.get("gate"),
             "depth": context.get("depth"),

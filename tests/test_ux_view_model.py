@@ -89,6 +89,27 @@ def test_ux_overview_collects_action_center_items() -> None:
     assert overview["task_board"][2]["tasks"][0]["task_id"] == "run_ux"
     assert "provider" in overview["filters"]
     assert "final_report" in overview["artifact_center"]["kinds"]
+    assert "test_report" in overview["artifact_center"]["kinds"]
+
+
+def test_ux_overview_surfaces_missing_completed_deliverables() -> None:
+    overview = build_ux_overview(
+        daemon={"status": "running", "tasks": 1},
+        tasks=[
+            {
+                "task_id": "run_missing",
+                "task": "ship docs",
+                "status": "completed",
+                "deliverable_status": {"missing": ["docs_report"], "required": ["docs_report"], "ready": []},
+            }
+        ],
+        approvals=[],
+        provider_actions=[],
+    )
+
+    assert overview["counts"]["needs_attention"] == 1
+    assert overview["action_center"][0]["kind"] == "missing_deliverable"
+    assert "docs_report" in overview["action_center"][0]["why"]
 
 
 def test_ux_overview_labels_design_provider_action() -> None:
@@ -117,6 +138,7 @@ def test_ux_overview_labels_design_provider_action() -> None:
 
     item = overview["action_center"][0]
     assert item["kind"] == "provider_action"
+    assert [row["kind"] for row in overview["action_center"]] == ["provider_action"]
     assert item["headline"] == "codex 需要你确认设计风格"
     assert "设计阶段" in item["why"]
 
@@ -197,6 +219,7 @@ def test_task_ux_summary_surfaces_plan_feedback_and_elapsed_time() -> None:
     ux = build_task_ux_summary(payload)
 
     assert ux["next_actions"][0]["kind"] == "plan_feedback"
+    assert ux["next_actions"][0]["optional"] is True
     assert "--run-id run_plan" in ux["next_actions"][0]["command"]
     assert "1h 1m" in ux["why"]
 
@@ -258,7 +281,7 @@ def test_task_ux_summary_surfaces_design_document_deliverable() -> None:
             {
                 "kind": "project_design_doc",
                 "name": "Design Document",
-                "path": "docs/design/run_design-design.md",
+                "path": "docs/design/design.md",
             }
         ],
         "trace": [],
@@ -269,12 +292,12 @@ def test_task_ux_summary_surfaces_design_document_deliverable() -> None:
     assert ux["deliverables"][0] == {
         "kind": "project_design_doc",
         "label": "Design document",
-        "path": "docs/design/run_design-design.md",
+        "path": "docs/design/design.md",
         "ready": True,
     }
 
 
-def test_ux_overview_surfaces_planning_feedback_action() -> None:
+def test_ux_overview_surfaces_planning_feedback_as_optional_action() -> None:
     overview = build_ux_overview(
         daemon={"status": "running", "tasks": 1},
         tasks=[
@@ -291,8 +314,12 @@ def test_ux_overview_surfaces_planning_feedback_action() -> None:
         provider_actions=[],
     )
 
-    assert overview["action_center"][0]["kind"] == "plan_feedback"
-    assert "--run-id run_plan" in overview["action_center"][0]["command"]
+    assert overview["action_center"] == []
+    assert overview["counts"]["needs_attention"] == 0
+    assert overview["headline"] == "1 task(s) are running"
+    assert overview["optional_actions"][0]["kind"] == "plan_feedback"
+    assert overview["optional_actions"][0]["optional"] is True
+    assert "--run-id run_plan" in overview["optional_actions"][0]["command"]
 
 
 def test_ux_overview_reconciles_awaiting_approval_without_pending_record() -> None:

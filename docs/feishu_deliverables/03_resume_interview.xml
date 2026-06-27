@@ -1,0 +1,149 @@
+<title>muxdev 简历表达与面试要点</title>
+
+<callout emoji="✅" background-color="light-green" border-color="green">
+  <p><b>推荐定位：</b>这是一个面向多 AI Coding Agent 的本地 SDLC 控制内核项目。面试时不要只讲“我做了一个多 Agent 工具”，要讲清楚你解决的是“AI 代码交付如何可验证、可审批、可恢复、可治理”的工程问题。</p>
+</callout>
+
+<h1>1. 简历项目标题</h1>
+<table>
+  <thead><tr><th background-color="light-gray">版本</th><th background-color="light-gray">表达</th><th background-color="light-gray">适用场景</th></tr></thead>
+  <tbody>
+    <tr><td>标准版</td><td>muxdev：本地优先的多 AI Coding Agent SDLC 控制平台</td><td>后端、平台工程、AI Infra、开发者工具岗位</td></tr>
+    <tr><td>工程可信版</td><td>面向 AI 编码交付的可验证工作流、审批、证据与回滚系统</td><td>工程效率、DevOps、研发平台岗位</td></tr>
+    <tr><td>Agent 平台版</td><td>基于 LangGraph 语义的多 Provider Agentic 软件研发内核</td><td>LLM 应用、Agent 工程、AI Platform 岗位</td></tr>
+  </tbody>
+</table>
+
+<h1>2. 一段式项目经历</h1>
+<blockquote>独立设计并实现 muxdev，一个本地优先的 Agentic SDLC Kernel，将 Codex、Claude Code、Qwen 等 Provider CLI 统一纳入角色化工作流，通过 daemon blackboard、LangGraph 语义编译、Provider Action handoff、Evidence v2、Approval Subject Hash、Delivery Gate、rollback snapshot 和 Dashboard/TUI/API，实现 AI 编码任务从设计、开发、测试、审查到可信交付的闭环。</blockquote>
+
+<h1>3. 可直接放入简历的 Bullet</h1>
+<table>
+  <thead><tr><th background-color="light-gray">方向</th><th background-color="light-gray">Bullet</th><th background-color="light-gray">突出能力</th></tr></thead>
+  <tbody>
+    <tr><td>架构设计</td><td>设计 CLI/TUI/Dashboard/API 到 daemon TaskManager、SupervisorRuntime、Provider Adapter、SQLite blackboard 的分层架构，实现任务生命周期统一管理。</td><td>系统设计、边界划分</td></tr>
+    <tr><td>工作流编排</td><td>实现 workflow DAG 校验、stage 拓扑排序、human gate、delivery gate、loop repair，并通过 LangGraphWorkflowEngine 输出可迁移 graph spec。</td><td>Agent 编排、LangGraph、状态机</td></tr>
+    <tr><td>Provider 接入</td><td>抽象 mock 与 headless CLI provider，支持 Codex/Claude/Qwen 风格命令配置、prompt transport、transcript/chunks 归档与 Provider Action 解析。</td><td>多 Provider、终端自动化</td></tr>
+    <tr><td>可信交付</td><td>构建 Evidence v2、hash ledger、RoleResultContract、Blind Validator、Semantic Merge Review、Delivery Gate、final report 和 diff 产物链。</td><td>质量体系、可审计交付</td></tr>
+    <tr><td>审批安全</td><td>实现 Approval Subject Hash，将 plan、patch、policy、validator、semantic review 绑定到审批对象，防止审批漂移。</td><td>安全治理、策略引擎</td></tr>
+    <tr><td>产品体验</td><td>提供一行安装、项目初始化、provider setup、mock demo、Mission Control Dashboard、TUI Action Center 和 UX overview API。</td><td>开发者体验、产品化</td></tr>
+  </tbody>
+</table>
+
+<h1>4. 面试讲述框架</h1>
+<whiteboard type="mermaid">mindmap
+  root((muxdev))
+    背景
+      多 Provider CLI 碎片化
+      AI 交付不可直接信任
+    架构
+      Daemon
+      SupervisorRuntime
+      Provider Adapter
+      Blackboard
+    可信交付
+      Evidence v2
+      Approval Hash
+      Delivery Gate
+      Rollback
+    产品体验
+      CLI
+      Dashboard
+      TUI
+      API
+</whiteboard>
+
+<h2>4.1 30 秒版本</h2>
+<p>我做了一个叫 muxdev 的本地 AI 研发控制内核。它不是再做一个 AI 编码助手，而是把 Codex、Claude Code、Qwen 这类工具作为 provider backend，统一放进设计、开发、测试、审查、审批、证据、回滚的工作流里。它的重点是让 AI 写完代码后，系统能回答改了什么、谁验证了、证据在哪里、审批绑定了什么、失败后怎么恢复。</p>
+
+<h2>4.2 2 分钟版本</h2>
+<p>项目背景是 AI Coding CLI 越来越多，但真实工程交付需要的不只是生成代码，还需要流程、验证、审查、审批、报告和恢复。我设计了一个本地 daemon 驱动的控制面：CLI/TUI/Dashboard/API 提交任务，TaskManager 管生命周期，SupervisorRuntime 加载 workflow DAG 并调度角色 stage，Provider Adapter 调用不同 AI CLI，Blackboard 和 artifacts 记录全过程。为了可信交付，我实现了 Evidence v2、hash ledger、Delivery Gate、Blind Validator、Semantic Merge Review 和 Approval Subject Hash。Provider CLI 如果需要登录、确认或限流恢复，会进入 Provider Action，不和 muxdev 自己的审批混淆。</p>
+
+<h2>4.3 5 分钟深入版本</h2>
+<ol>
+  <li seq="auto">先讲问题：多 AI Provider 的能力差异、权限差异、日志差异，以及自然语言完成声明不可信。</li>
+  <li seq="auto">再讲架构：daemon 是状态边界，runtime 是执行编排，provider adapter 是外部执行桥，blackboard 是可审计状态库。</li>
+  <li seq="auto">讲工作流：YAML 定义 stage DAG，支持 agent stage、human gate、delivery gate、loop repair、checkpoint 和 read-only 策略。</li>
+  <li seq="auto">讲可信：每个 stage 有 contract，最终有 evidence manifest/evaluation、validator、semantic merge、report、diff、rollback。</li>
+  <li seq="auto">讲产品：用户入口保持简单，自动选择 dev-lite/dev/deep/refactor/test/design 等流程，Dashboard/TUI 解释为什么这么跑。</li>
+  <li seq="auto">讲边界：当前是 local-first 工程内核，真实 provider 稳定性和团队协作权限仍需要继续打磨。</li>
+</ol>
+
+<h1>5. STAR 案例模板</h1>
+<table>
+  <thead><tr><th background-color="light-gray">场景</th><th background-color="light-gray">讲法</th></tr></thead>
+  <tbody>
+    <tr><td>Situation</td><td>AI Coding 工具很多，但它们各自运行，团队很难统一验证、审批、恢复和记忆沉淀。</td></tr>
+    <tr><td>Task</td><td>我要做一个本地控制面，把多个 Provider CLI 编排成可审计的软件交付系统。</td></tr>
+    <tr><td>Action</td><td>设计 daemon blackboard、workflow DAG、SupervisorRuntime、Provider Adapter、Evidence v2、Approval Subject Hash、Provider Action、Delivery Gate 和 Dashboard/TUI。</td></tr>
+    <tr><td>Result</td><td>当前已跑通 mock 离线闭环，支持真实 CLI provider 配置，能够产出 diff、report、evidence、deliverables、rollback snapshot，并在 UI 中区分 approvals 和 provider actions。</td></tr>
+  </tbody>
+</table>
+
+<h1>6. 高频面试问题与回答要点</h1>
+<table>
+  <thead><tr><th background-color="light-gray">问题</th><th background-color="light-gray">回答重点</th></tr></thead>
+  <tbody>
+    <tr><td>为什么不直接用 Codex 或 Claude Code？</td><td>直接用 provider 解决的是“谁写代码”，muxdev 解决的是“多 provider 如何按角色交付、如何验证、审批、恢复和沉淀”。</td></tr>
+    <tr><td>LangGraph 在项目里做什么？</td><td>当前作为 workflow control-plane target，把 WorkflowDefinition 编译成 graph spec，并在可用时构建 StateGraph；执行仍走 native audited path，保证现有证据和审批体系稳定。</td></tr>
+    <tr><td>Provider Action 和 Approval 为什么分开？</td><td>Provider Action 是外部 CLI 卡住，例如登录、确认、限流；Approval 是 muxdev 对 plan/write/shell/merge 的策略审批。混在一起会导致 UI 误导和审计边界不清。</td></tr>
+    <tr><td>怎么保证 AI 输出可信？</td><td>不只看模型文字，而是通过 contract、stage artifact、test result、review blocker、delivery gate、Evidence v2、semantic merge、blind validator、hash ledger 形成证据链。</td></tr>
+    <tr><td>审批漂移怎么防？</td><td>approval 绑定 subject_json 和 canonical hash，subject 中包含 policy hash、patch hash、validator hash、semantic review hash 等；对象变化后旧审批不复用。</td></tr>
+    <tr><td>如果 provider 修改了只读 stage 怎么办？</td><td>runtime 在 read-only stage 前后比较 worktree patch hash，发现修改会记录 read_only_write_violation、session capsule 和 error，run blocked。</td></tr>
+    <tr><td>Delivery Gate 为什么不用 LLM？</td><td>它只做确定性本地检查，避免用主观模型判断伪装成自动验收；复杂质量判断交给 review stage 和 validator。</td></tr>
+    <tr><td>当前项目不足是什么？</td><td>真实 provider conformance 还需更多场景验证，Dashboard 需要更成熟的团队协作体验，多仓目前偏计划和审计，还未默认自动跨仓写代码。</td></tr>
+  </tbody>
+</table>
+
+<h1>7. 技术关键词速查</h1>
+<grid>
+  <column width-ratio="0.33">
+    <h3>AI Agent</h3>
+    <ul>
+      <li>LangGraph</li>
+      <li>Workflow DAG</li>
+      <li>Role-aware routing</li>
+      <li>Loop repair</li>
+      <li>Provider conformance</li>
+    </ul>
+  </column>
+  <column width-ratio="0.33">
+    <h3>工程可信</h3>
+    <ul>
+      <li>Evidence v2</li>
+      <li>Hash ledger</li>
+      <li>Approval subject hash</li>
+      <li>Semantic merge</li>
+      <li>Rollback snapshot</li>
+    </ul>
+  </column>
+  <column width-ratio="0.34">
+    <h3>平台实现</h3>
+    <ul>
+      <li>FastAPI</li>
+      <li>Typer</li>
+      <li>SQLite blackboard</li>
+      <li>Headless subprocess</li>
+      <li>Dashboard/TUI/API</li>
+    </ul>
+  </column>
+</grid>
+
+<h1>8. 代码讲解顺序</h1>
+<table>
+  <thead><tr><th background-color="light-gray">讲解阶段</th><th background-color="light-gray">文件</th><th background-color="light-gray">讲什么</th></tr></thead>
+  <tbody>
+    <tr><td>入口</td><td><code>cli/main.py</code></td><td>命令如何变成 daemon task payload</td></tr>
+    <tr><td>自动决策</td><td><code>services/automation.py</code></td><td>如何选择 intent/depth/workflow/roles</td></tr>
+    <tr><td>工作流</td><td><code>config/defaults/workflows.yaml</code></td><td>stage DAG、human gate、delivery gate、loop repair</td></tr>
+    <tr><td>运行时</td><td><code>runtime/supervisor.py</code></td><td>执行主循环、provider stage、approval、evidence、finalize</td></tr>
+    <tr><td>Provider</td><td><code>providers/adapters.py</code></td><td>ProviderStageOutput、headless CLI、transcript/chunks、provider action</td></tr>
+    <tr><td>交付</td><td><code>delivery_gate.py</code>、<code>deliverables.py</code></td><td>本地验收和面向用户的交付物发布</td></tr>
+    <tr><td>LangGraph</td><td><code>services/orchestration.py</code>、<code>runtime/langgraph_engine.py</code></td><td>workflow_to_langgraph 和 StateGraph 迁移策略</td></tr>
+  </tbody>
+</table>
+
+<h1>9. 面试收尾表达</h1>
+<callout emoji="💡" background-color="light-yellow" border-color="yellow">
+  <p>这个项目让我最有收获的是：Agent 应用不是把模型接上就结束，真正难的是把模型输出放进可靠的工程流程。muxdev 的设计核心就是让 provider 能替换、流程能追踪、证据能验证、审批能防漂移、失败能恢复。</p>
+</callout>

@@ -1,0 +1,162 @@
+<title>muxdev 功能介绍与真实 Provider 演示指南</title>
+
+<callout emoji="✅" background-color="light-green" border-color="green">
+  <p><b>演示目标：</b>让观众在 15 到 30 分钟内看到 muxdev 如何从安装、初始化、Provider 发现、mock 离线闭环、真实 provider 角色路由、Provider Action 接管，到 Evidence/Report/Diff/Rollback 完成一条可信 AI 编码交付链路。</p>
+</callout>
+
+<h1>1. 演示前准备</h1>
+<table>
+  <thead><tr><th background-color="light-gray">项目</th><th background-color="light-gray">要求</th><th background-color="light-gray">说明</th></tr></thead>
+  <tbody>
+    <tr><td>Python</td><td><code>&gt;=3.11</code></td><td><code>pyproject.toml</code> 声明的运行版本</td></tr>
+    <tr><td>本地安装</td><td><code>python -m pip install -e ".[test]"</code></td><td>从当前仓库开发演示时使用</td></tr>
+    <tr><td>项目初始化</td><td><code>muxdev setup --project</code></td><td>写入项目配置和 <code>MUXDEV.md</code></td></tr>
+    <tr><td>Provider</td><td>至少 mock 可用；真实演示建议 Codex 或 Qwen</td><td>mock 能离线跑通完整生命周期；真实 provider 展示 Provider Action 和 role routing</td></tr>
+    <tr><td>Daemon</td><td><code>muxdev serve --restart</code></td><td>Dashboard 和 API 默认端口分别是 8787 和 8788</td></tr>
+  </tbody>
+</table>
+
+<h1>2. 演示总流程</h1>
+<whiteboard type="mermaid">flowchart LR
+  A[安装和 setup] --> B[Provider detect]
+  B --> C[mock demo]
+  C --> D[Dashboard Mission Control]
+  D --> E[真实 provider dev]
+  E --> F[Provider Action handoff]
+  E --> G[Evidence Report Diff]
+  G --> H[Rollback or ship dry-run]
+  H --> I[面试或产品总结]
+</whiteboard>
+
+<h1>3. 快速启动脚本</h1>
+<pre lang="powershell" caption="从当前仓库演示"><code>cd D:\jianzhi\lyuShao\muxdev
+python -m pip install -e ".[test]"
+muxdev setup --project
+muxdev provider setup
+muxdev demo --mock
+muxdev serve --restart
+muxdev dashboard</code></pre>
+<p>如果只想用最短路径展示完整闭环，优先跑 <code>muxdev demo --mock</code> 或一个 mock provider 的 dev 任务。这样不依赖外部账号，也能看到 run、stage、evidence、diff、report、dashboard。</p>
+
+<h1>4. Provider 发现与诊断</h1>
+<pre lang="powershell" caption="Provider 探测"><code>muxdev provider detect
+muxdev provider list
+muxdev provider doctor codex --json
+muxdev provider account codex
+muxdev provider install codex</code></pre>
+<table>
+  <thead><tr><th background-color="light-gray">命令</th><th background-color="light-gray">讲解点</th></tr></thead>
+  <tbody>
+    <tr><td><code>provider detect</code></td><td>静态探测 provider CLI，不直接发起模型调用</td></tr>
+    <tr><td><code>provider doctor</code></td><td>检查 CLI、版本、headless/json/approval/attach 等能力线索</td></tr>
+    <tr><td><code>provider setup</code></td><td>展示安装、登录、诊断步骤，让用户知道下一步做什么</td></tr>
+    <tr><td><code>provider install</code></td><td>默认 dry-run，避免未经确认修改环境</td></tr>
+  </tbody>
+</table>
+
+<h1>5. Mock 离线完整闭环演示</h1>
+<pre lang="powershell" caption="离线可信交付"><code>muxdev dev "add a small smoke feature" --provider mock --json
+muxdev status latest --json
+muxdev report latest
+muxdev diff latest
+muxdev evidence latest
+muxdev evidence verify latest --json</code></pre>
+<callout emoji="ℹ️" background-color="light-blue" border-color="blue">
+  <p><b>讲解重点：</b>mock provider 不是玩具，它用于稳定展示完整生命周期：workflow stage、role output、test/review、delivery gate、Evidence v2、report、diff、rollback。真实 provider 的能力差异被隔离在 Provider Adapter 层。</p>
+</callout>
+
+<h1>6. 真实 Provider 演示路径</h1>
+<p>真实 provider 演示建议从 Codex 或 Qwen 选一个可用 CLI。当前默认 provider 配置在 <code>src/muxdev/config/defaults/providers.yaml</code>：Codex 使用 <code>exec --json --sandbox workspace-write</code> 且 prompt 走 stdin；Qwen 使用 stream-json 风格输出。</p>
+<pre lang="powershell" caption="真实 provider 任务"><code>muxdev dev "add a small README note and update a targeted test if needed" --provider codex --json
+muxdev status latest --json
+muxdev actions --status pending --json
+muxdev approvals --status pending --json
+muxdev continue latest --json</code></pre>
+<p>如果 provider CLI 出现登录、确认、限流、卡住，muxdev 会创建 Provider Action。演示时强调：Dashboard/TUI 不替用户输入 yes/no；用户去 attach/session 处理外部 provider，再回到 muxdev 标记 handled 并 continue。</p>
+
+<h1>7. 角色路由演示</h1>
+<pre lang="powershell" caption="显式角色覆盖"><code>muxdev dev "implement a safe config change" `
+  --provider mock `
+  --role plan=codex `
+  --role code=qwen `
+  --role review=claude-code `
+  --json</code></pre>
+<table>
+  <thead><tr><th background-color="light-gray">讲解点</th><th background-color="light-gray">当前实现</th></tr></thead>
+  <tbody>
+    <tr><td>默认 provider</td><td>作为 workflow role 的 fallback provider</td></tr>
+    <tr><td>角色覆盖</td><td><code>ProviderPlanner</code> 优先使用 <code>role_providers</code></td></tr>
+    <tr><td>Provider learning</td><td>没有显式覆盖时可走 recommender，基于 provider scores 推荐</td></tr>
+    <tr><td>trace 可见</td><td>runtime 写入 <code>provider_route_decision</code></td></tr>
+  </tbody>
+</table>
+
+<h1>8. Dashboard 与 TUI 讲解点</h1>
+<table>
+  <thead><tr><th background-color="light-gray">界面</th><th background-color="light-gray">入口</th><th background-color="light-gray">展示重点</th></tr></thead>
+  <tbody>
+    <tr><td>Dashboard</td><td><code>muxdev dashboard</code></td><td>Mission Control、Projects、Workflows、Activity、Artifacts、Config、Action Center</td></tr>
+    <tr><td>TUI</td><td><code>muxdev tui</code> 或 <code>muxdev</code></td><td>自然语言任务、slash commands、provider actions、approvals、report、diff</td></tr>
+    <tr><td>API</td><td><code>http://127.0.0.1:8788</code></td><td>tasks、approvals、provider actions、provider scores、learning、parallel conflicts</td></tr>
+  </tbody>
+</table>
+<pre lang="powershell" caption="UX API"><code>Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8788/api/ux/overview
+Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8788/api/dashboard/overview
+Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8788/api/providers/health</code></pre>
+
+<h1>9. 可信交付演示</h1>
+<whiteboard type="mermaid">flowchart TB
+  A[Stage Output] --> B[Role Result Contract]
+  B --> C[Delivery Gate]
+  C --> D[Diff Patch]
+  D --> E[Semantic Merge Review]
+  E --> F[Blind Validator]
+  F --> G[Evidence v2]
+  G --> H[Final Report]
+  H --> I[Rollback Snapshot]
+</whiteboard>
+<table>
+  <thead><tr><th background-color="light-gray">能力</th><th background-color="light-gray">演示命令</th><th background-color="light-gray">话术</th></tr></thead>
+  <tbody>
+    <tr><td>Evidence</td><td><code>muxdev evidence latest --events</code></td><td>不是相信模型说法，而是看事件、manifest、evaluation</td></tr>
+    <tr><td>Report</td><td><code>muxdev report latest</code></td><td>用户最终读的交付摘要，包含证据评价和风险</td></tr>
+    <tr><td>Diff</td><td><code>muxdev diff latest</code></td><td>真实改动可审阅</td></tr>
+    <tr><td>Rollback</td><td><code>muxdev rollback latest --to-stage implement --json</code></td><td>失败或不满意时回到某个 stage snapshot</td></tr>
+    <tr><td>Approval</td><td><code>muxdev approvals --status pending --json</code></td><td>审批绑定 subject hash，防漂移</td></tr>
+  </tbody>
+</table>
+
+<h1>10. LangGraph 与外部编排演示</h1>
+<p>如果观众关注 Agent framework，可以展示 <code>workflow_to_langgraph</code> 和 <code>deep_agent_task_pack</code>。它们把 muxdev workflow 导出为外部编排系统可理解的 graph 和 agent task pack。</p>
+<pre lang="powershell" caption="源码入口"><code>python -c "from muxdev.services.orchestration import workflow_to_langgraph; import json; print(json.dumps(workflow_to_langgraph('dev'), ensure_ascii=False, indent=2))"</code></pre>
+<p>话术：LangGraph 是控制面目标，但 muxdev 不把已有工程可信能力丢掉。迁移期采用 graph spec + native audited execution 的组合。</p>
+
+<h1>11. 现场演示顺序建议</h1>
+<ol>
+  <li seq="auto">先用一句话定位：muxdev 是 AI Coding Agent 之上的本地可信 SDLC 控制面。</li>
+  <li seq="auto">跑 <code>muxdev provider detect</code>，展示多 provider 统一探测。</li>
+  <li seq="auto">跑 mock dev/demo，展示完整闭环和 Dashboard。</li>
+  <li seq="auto">切到真实 provider，展示 role routing 或 Provider Action handoff。</li>
+  <li seq="auto">打开 evidence、report、diff、rollback，证明不是只看模型输出。</li>
+  <li seq="auto">最后展示 workflow_to_langgraph，连接到 Agent 编排和 Loop Engineering 话题。</li>
+</ol>
+
+<h1>12. 兜底路径</h1>
+<table>
+  <thead><tr><th background-color="light-gray">问题</th><th background-color="light-gray">兜底方案</th></tr></thead>
+  <tbody>
+    <tr><td>真实 provider 未登录</td><td>转为 mock 演示完整闭环，同时展示 Provider Action 设计</td></tr>
+    <tr><td>daemon 端口占用</td><td>执行 <code>muxdev serve --restart</code> 或检查 8787/8788</td></tr>
+    <tr><td>外部 CLI 卡住</td><td>展示 actions、attach command、handled-and-continue，而不是现场硬等</td></tr>
+    <tr><td>任务没有产生 diff</td><td>换成明确的小修改任务，例如 README 增补或测试修复</td></tr>
+    <tr><td>Dashboard 未刷新</td><td>用 CLI/API 输出作为主证据，Dashboard 作为可视化补充</td></tr>
+  </tbody>
+</table>
+
+<h1>13. 演示验收清单</h1>
+<checkbox done="false">能解释 muxdev 与单一 Provider CLI 的区别。</checkbox>
+<checkbox done="false">能跑通 mock 离线任务并展示 report、diff、evidence。</checkbox>
+<checkbox done="false">能展示 provider detect/doctor/setup。</checkbox>
+<checkbox done="false">能说明 Provider Action 与 muxdev Approval 的区别。</checkbox>
+<checkbox done="false">能展示 Dashboard/TUI/API 至少一个产品化入口。</checkbox>
+<checkbox done="false">能说清 LangGraph 当前是语义控制面目标，执行仍保留 native audited path。</checkbox>

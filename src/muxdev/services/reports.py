@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..storage import Blackboard
+from .deliverables import workflow_deliverable_status
 
 
 def generate_final_report(run_dir: Path, run_id: str, blackboard: Blackboard) -> Path:
@@ -21,6 +22,13 @@ def generate_final_report(run_dir: Path, run_id: str, blackboard: Blackboard) ->
     validators = blackboard.table_rows("validator_panels", run_id=run_id)
     manifests = blackboard.table_rows("evidence_manifests", run_id=run_id)
     evaluations = blackboard.table_rows("evidence_evaluations", run_id=run_id)
+    deliverable_status = workflow_deliverable_status(
+        blackboard,
+        run_dir=run_dir,
+        run_id=run_id,
+        workflow=str(run.get("workflow") or ""),
+        require_report=False,
+    )
     lines = [
         f"# muxdev final report: {run_id}",
         "",
@@ -50,10 +58,12 @@ def generate_final_report(run_dir: Path, run_id: str, blackboard: Blackboard) ->
     if design_artifacts:
         for artifact in design_artifacts:
             lines.append(f"- {artifact['name']}: {artifact['path']}")
-    elif run.get("workflow") == "software-dev":
-        lines.append("- missing: software-dev requires a project design document")
     else:
         lines.append("- none")
+    lines.extend(["", "## Workflow Deliverables"])
+    for item in deliverable_status.get("required", []):
+        marker = "ready" if item in deliverable_status.get("ready", []) else "missing"
+        lines.append(f"- {item}: {marker}")
     lines.extend(["", "## Stage Timeline"])
     for stage in stages:
         lines.append(f"- {stage['stage_id']}: {stage['status']} - {stage['summary'] or ''}")
@@ -108,7 +118,12 @@ def _artifact_sort_key(row: dict[str, object]) -> tuple[int, str, str]:
         "project_design_doc": 0,
         "report": 1,
         "diff": 2,
-        "stage_output": 3,
+        "plan_summary": 3,
+        "test_report": 4,
+        "review_report": 5,
+        "handoff_summary": 6,
+        "docs_report": 7,
+        "stage_output": 10,
         "task": 90,
         "context": 91,
     }

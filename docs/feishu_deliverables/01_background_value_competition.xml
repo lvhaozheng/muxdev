@@ -1,0 +1,148 @@
+<title>muxdev 项目背景、产品价值与竞品分析对比</title>
+
+<callout emoji="✅" background-color="light-green" border-color="green">
+  <p><b>核心结论：</b>muxdev 的价值不在于替代 Codex、Claude Code、Qwen 等 AI Coding Agent，而是把多个 provider CLI 纳入一个本地优先、可验证、可审批、可回滚、可治理的 Agentic SDLC 控制面。当前代码已经实现自动工作流选择、角色化 Provider 路由、Evidence v2、Provider Action、Delivery Gate、交付物发布、Dashboard/TUI/API 等闭环能力。</p>
+</callout>
+
+<h1>1. 项目背景：AI Coding 从单工具进入多 Provider 阶段</h1>
+<p>AI 编码工具正在快速分化：有的强在代码生成，有的强在长上下文规划，有的适合终端自动化，有的适合 IDE 内协作。真实工程交付并不会因为“模型更强”而自动可信，团队仍然需要计划、实现、测试、审查、安全、审批、报告和回滚。</p>
+<table>
+  <thead><tr><th background-color="light-gray">行业变化</th><th background-color="light-gray">带来的问题</th><th background-color="light-gray">muxdev 的回答</th></tr></thead>
+  <tbody>
+    <tr><td>Provider CLI 增多</td><td>Codex、Claude、Qwen、Kimi、Gemini 风格工具各有入口、权限和日志</td><td>Provider registry、静态探测、角色化路由、Provider Action 统一管理</td></tr>
+    <tr><td>Agent 输出不可直接信任</td><td>自然语言说“完成了”不足以进入工程交付</td><td>StageContract、RoleResult、Evidence v2、Blind Validator、Semantic Merge</td></tr>
+    <tr><td>人工审批容易漂移</td><td>审批常常只绑定一句话，不绑定实际 plan 或 patch</td><td>Approval Subject Hash 绑定 policy、plan、patch、validator、semantic review</td></tr>
+    <tr><td>长期上下文污染</td><td>过期记忆、低置信经验可能反复注入 Provider</td><td>证据支撑的 Memory、矛盾检测、自动 quarantine</td></tr>
+    <tr><td>失败恢复成本高</td><td>认证、限流、卡住、误写文件后缺少恢复机制</td><td>isolated worktree、session capsule、handoff patch、rollback snapshot</td></tr>
+  </tbody>
+</table>
+
+<whiteboard type="mermaid">flowchart LR
+  A[多个 AI Coding CLI] --> B[Provider Registry]
+  B --> C[角色路由]
+  C --> D[Workflow Runtime]
+  D --> E[Evidence v2]
+  D --> F[Approval 和 Provider Action]
+  D --> G[Rollback 和 Report]
+  E --> H[可信交付]
+  F --> H
+  G --> H
+</whiteboard>
+
+<h1>2. 产品定位：本地优先的 Agentic SDLC Kernel</h1>
+<p>muxdev 可以用一句话概括：</p>
+<blockquote>让多个 AI Coding Agent 在本地变成一个可信的软件交付系统。</blockquote>
+<grid>
+  <column width-ratio="0.5">
+    <h3>它不是</h3>
+    <ul>
+      <li>不是另一个单 Agent 聊天式代码助手。</li>
+      <li>不是只负责打开多个终端的 Provider 管理器。</li>
+      <li>不是用自然语言报告替代工程证据。</li>
+    </ul>
+  </column>
+  <column width-ratio="0.5">
+    <h3>它是</h3>
+    <ul>
+      <li>本地 daemon 驱动的 SDLC 控制平面。</li>
+      <li>角色、工作流、审批、证据、回滚、记忆的编排内核。</li>
+      <li>Provider CLI 之上的可信交付层。</li>
+    </ul>
+  </column>
+</grid>
+
+<h1>3. 当前实现带来的产品价值</h1>
+<table>
+  <thead><tr><th background-color="light-gray">价值主张</th><th background-color="light-gray">对应实现</th><th background-color="light-gray">用户收益</th></tr></thead>
+  <tbody>
+    <tr><td>入口简单</td><td><code>muxdev dev/fix/refactor/review/test/ci</code>、TUI、Dashboard、HTTP API</td><td>用户用自然语言提交任务，不需要先理解内部 DAG</td></tr>
+    <tr><td>自动决策</td><td><code>services/automation.py</code> 根据 intent、风险词、repo signals 选择 depth 和 workflow</td><td>小任务走轻量流程，高风险任务走深度验证流程</td></tr>
+    <tr><td>多 Provider 可控</td><td><code>providers/registry.py</code>、<code>providers/planner.py</code>、<code>providers/adapters.py</code></td><td>不同角色可以分配给不同 provider，并可基于 learning 推荐</td></tr>
+    <tr><td>交付可验证</td><td>Evidence v2、Delivery Gate、Blind Validator、Semantic Merge Review</td><td>回答“改了什么、怎么验证、剩余风险是什么、能否回滚”</td></tr>
+    <tr><td>人工介入清晰</td><td>muxdev Approval 与 Provider Action 分离</td><td>策略审批和外部 CLI 确认不混淆，避免 UI 误导</td></tr>
+    <tr><td>失败可恢复</td><td>isolated worktree、snapshot、session capsule、handoff patch</td><td>卡住或失败时可以接管、继续、回滚，而不是重跑丢状态</td></tr>
+  </tbody>
+</table>
+
+<h1>4. 典型用户与使用场景</h1>
+<table>
+  <thead><tr><th background-color="light-gray">用户</th><th background-color="light-gray">痛点</th><th background-color="light-gray">典型 muxdev 用法</th></tr></thead>
+  <tbody>
+    <tr><td>个人开发者</td><td>想快速使用多个 AI CLI，但又要保留 diff、report、rollback</td><td><code>muxdev dev "add Redis rate limiting"</code> 后查看 report 和 evidence</td></tr>
+    <tr><td>工程团队</td><td>需要统一 AI 研发规范、角色分工和审批口径</td><td>在项目配置中固定 roles、gates、skills、memory policy</td></tr>
+    <tr><td>高风险代码库维护者</td><td>认证、支付、权限、迁移变更不能只靠模型自信</td><td><code>--deep</code>、strict gate、secure/review/test、approval subject hash</td></tr>
+    <tr><td>工具平台开发者</td><td>希望把 AI 研发能力接入自己的 UI 或自动化平台</td><td>调用 FastAPI、Dashboard API、MCP JSON-RPC、web/IDE extension hints</td></tr>
+  </tbody>
+</table>
+
+<h1>5. 竞品与相近产品对比</h1>
+<table>
+  <thead><tr><th background-color="light-gray">类别</th><th background-color="light-gray">代表产品</th><th background-color="light-gray">强项</th><th background-color="light-gray">muxdev 差异</th></tr></thead>
+  <tbody>
+    <tr><td>单 Provider Coding CLI</td><td>Codex CLI、Claude Code、Qwen Code、Gemini CLI</td><td>直接生成、修改、解释代码</td><td>muxdev 不替代它们，而是把它们作为 role backend 纳入工作流、证据和审批体系</td></tr>
+    <tr><td>AI 结对编程与代码修改工具</td><td>Aider、OpenCode 风格工具</td><td>围绕 diff 与提交的开发体验较直接</td><td>muxdev 更强调多角色、多 provider、daemon 状态、rollback、evidence 和治理</td></tr>
+    <tr><td>IDE Agent</td><td>Cline、Continue、Cursor 风格工具</td><td>IDE 内上下文强、交互低摩擦</td><td>muxdev 是本地 SDLC 控制平面，可给 IDE 提供状态和交付 API，而不是只做编辑器插件</td></tr>
+    <tr><td>通用 Agent Framework</td><td>LangGraph、CrewAI、AutoGen、MetaGPT</td><td>编排抽象强，适合构建 Agent 应用</td><td>muxdev 当前已提供 LangGraph 语义桥接，但保留黑板、审批、provider actions、evidence、回滚等工程交付边界</td></tr>
+    <tr><td>CI 自动修复</td><td>GitHub Actions 自动化、PR Bot</td><td>围绕 CI 失败和 PR 反馈闭环</td><td>muxdev 把 CI rescue 作为本地可信交付的一部分，统一进入 feedback、test、review、evidence</td></tr>
+  </tbody>
+</table>
+
+<h1>6. 差异化护城河</h1>
+<grid>
+  <column width-ratio="0.33">
+    <h3>可信交付</h3>
+    <ul>
+      <li>Evidence v2 event stream</li>
+      <li>hash ledger</li>
+      <li>validator panel</li>
+      <li>semantic merge review</li>
+    </ul>
+  </column>
+  <column width-ratio="0.33">
+    <h3>本地控制</h3>
+    <ul>
+      <li>daemon-owned state</li>
+      <li>isolated worktrees</li>
+      <li>local SQLite blackboard</li>
+      <li>project memory DB</li>
+    </ul>
+  </column>
+  <column width-ratio="0.34">
+    <h3>Provider 治理</h3>
+    <ul>
+      <li>role-aware routing</li>
+      <li>Provider Action handoff</li>
+      <li>provider scores</li>
+      <li>cross-run learning</li>
+    </ul>
+  </column>
+</grid>
+
+<h1>7. 风险与现实边界</h1>
+<callout emoji="⚠️" background-color="light-red" border-color="red">
+  <p><b>需要诚实表达：</b>muxdev 当前版本更像“可运行的本地 AI SDLC 内核原型”，不是已经完成商业化打磨的企业平台。真实 provider 的稳定性、跨平台终端能力、团队权限模型、云端协作、多仓自动执行、复杂 UI 体验仍需要继续演进。</p>
+</callout>
+<table>
+  <thead><tr><th background-color="light-gray">风险</th><th background-color="light-gray">当前缓解</th><th background-color="light-gray">后续方向</th></tr></thead>
+  <tbody>
+    <tr><td>真实 Provider CLI 行为差异大</td><td>Headless adapter、stream parser、Provider Action、session archive</td><td>更细 provider conformance suite 和真实场景回归</td></tr>
+    <tr><td>交付标准可能过于本地确定性</td><td>Delivery Gate 只检查可确定信号，复杂判断交给 review</td><td>引入可配置策略和更强验证矩阵</td></tr>
+    <tr><td>Dashboard 仍偏工程化</td><td>Mission Control、Action Center、Artifacts Center 已有雏形</td><td>完善项目级信息架构和团队协作视图</td></tr>
+    <tr><td>多仓当前以计划为主</td><td>生成可审计 multi-repo orchestration plan</td><td>在强审批和回滚前提下推进跨仓执行</td></tr>
+  </tbody>
+</table>
+
+<h1>8. 基于代码的证据点</h1>
+<table>
+  <thead><tr><th background-color="light-gray">论点</th><th background-color="light-gray">代码证据</th><th background-color="light-gray">说明</th></tr></thead>
+  <tbody>
+    <tr><td>自动流程选择已实现</td><td><code>src/muxdev/services/automation.py</code></td><td>根据 intent、risk signals、repo markers 决定 depth/workflow/roles</td></tr>
+    <tr><td>LangGraph 语义桥接已实现</td><td><code>src/muxdev/runtime/langgraph_engine.py</code>、<code>src/muxdev/services/orchestration.py</code></td><td>可将 workflow 编译为 graph spec，并在可用时构建 StateGraph</td></tr>
+    <tr><td>Provider 抽象已实现</td><td><code>src/muxdev/providers/adapters.py</code>、<code>src/muxdev/config/defaults/providers.yaml</code></td><td>支持 mock 与 headless CLI，Codex 默认 stdin prompt transport</td></tr>
+    <tr><td>交付物与验收闭环已实现</td><td><code>src/muxdev/services/deliverables.py</code>、<code>src/muxdev/services/delivery_gate.py</code></td><td>发布 plan/test/review/handoff/design deliverables，并以本地 gate 拦截缺失交付物</td></tr>
+    <tr><td>审批完整性已实现</td><td><code>runtime/supervisor.py::_approval_gate</code>、<code>_approval_subject</code></td><td>subject hash 漂移会触发新的 pending approval</td></tr>
+  </tbody>
+</table>
+
+<h1>9. 一句话总结</h1>
+<p>如果把 Codex、Claude Code、Qwen 等看作“会写代码的执行引擎”，muxdev 要解决的是“这些执行引擎怎么在真实工程里被调度、验证、审批、恢复和沉淀”。这也是它区别于单一 AI Coding 工具和通用 Agent Framework 的关键产品价值。</p>

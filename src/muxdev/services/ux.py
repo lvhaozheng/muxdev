@@ -11,6 +11,8 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from ..core.text_cleaning import clean_provider_text
+
 
 TERMINAL_STATUSES = {"completed", "blocked", "aborted"}
 WAITING_STATUSES = {"awaiting_approval", "awaiting_provider_action", "paused_budget"}
@@ -35,6 +37,7 @@ class NextAction:
     endpoint: str | None = None
     method: str = "POST"
     danger: bool = False
+    optional: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -330,6 +333,7 @@ def build_ux_overview(
 ) -> dict[str, Any]:
     """Build an action-first dashboard overview."""
     action_items: list[dict[str, Any]] = []
+    optional_actions: list[dict[str, Any]] = []
     task_index = {_task_id(task): task for task in tasks if isinstance(task, dict) and _task_id(task)}
     for row in provider_actions:
         if not isinstance(row, dict):
@@ -375,6 +379,8 @@ def build_ux_overview(
         if not isinstance(task, dict):
             continue
         run_id = str(task.get("task_id") or task.get("run_id") or "")
+        deliverable_status = task.get("deliverable_status") if isinstance(task.get("deliverable_status"), dict) else {}
+        missing_deliverables = [str(item) for item in deliverable_status.get("missing", []) if item]
         if _task_needs_approval_reconcile(task):
             action_items.append(
                 {
@@ -401,8 +407,21 @@ def build_ux_overview(
                     **_action_context(task, run_id=run_id, stage_id=str(task.get("current_stage") or "")),
                 }
             )
-        elif _task_is_planning(task):
+        elif str(task.get("status") or "") == "completed" and missing_deliverables:
             action_items.append(
+                {
+                    "kind": "missing_deliverable",
+                    "run_id": run_id,
+                    "task_id": run_id,
+                    "headline": "Delivery artifacts need repair",
+                    "why": "Missing required deliverables: " + ", ".join(missing_deliverables),
+                    "endpoint": task.get("recover_endpoint") or f"/api/tasks/{run_id}/continue",
+                    "secondary_endpoint": task.get("report_endpoint") or f"/api/tasks/{run_id}/report",
+                    **_action_context(task, run_id=run_id, stage_id=str(task.get("current_stage") or "")),
+                }
+            )
+        elif _task_is_planning(task):
+            optional_actions.append(
                 {
                     "kind": "plan_feedback",
                     "run_id": run_id,
@@ -411,6 +430,7 @@ def build_ux_overview(
                     "why": task.get("current_activity") or f"muxdev is working on {task.get('current_stage') or 'planning'}.",
                     "command": f'muxdev feedback add manual_feedback "<your feedback>" --run-id {run_id}',
                     "endpoint": "/api/feedback",
+                    "optional": True,
                     **_action_context(task, run_id=run_id, stage_id=str(task.get("current_stage") or "")),
                 }
             )
@@ -439,6 +459,7 @@ def build_ux_overview(
         if int(task.get("pending_approvals") or 0)
         or int(task.get("pending_provider_actions") or 0)
         or int(task.get("errors") or 0)
+        or bool((task.get("deliverable_status") if isinstance(task.get("deliverable_status"), dict) else {}).get("missing"))
         or _task_needs_approval_reconcile(task)
         or _task_needs_provider_action_reconcile(task)
     ]
@@ -457,6 +478,7 @@ def build_ux_overview(
             "provider_actions": len(provider_actions),
         },
         "action_center": action_items,
+        "optional_actions": optional_actions,
         "task_board": task_board,
         "filters": _task_filters(tasks),
         "artifact_center": _overview_artifact_center(tasks),
@@ -551,7 +573,7 @@ def _provider_action_headline(row: dict[str, Any]) -> str:
 
 
 def _provider_action_why(row: dict[str, Any], *, overview: bool = False) -> str:
-    prompt = str(row.get("prompt_text") or "").strip()
+    prompt = clean_provider_text(row.get("prompt_text") or "").strip()
     if _is_clarification_action(row):
         base = "The request is missing a decision that affects implementation. Answer the question, then muxdev will continue the same run."
         return f"{base} {prompt}" if prompt and not overview else base
@@ -618,6 +640,7 @@ def _planning_feedback_action(run_id: str, stages: list[dict[str, Any]]) -> Next
         description="Add constraints, corrections, or preferences for the planning/design stages.",
         command=f'muxdev feedback add manual_feedback "<your feedback>" --run-id {run_id}',
         endpoint="/api/feedback",
+        optional=True,
     )
 
 
@@ -633,6 +656,8 @@ def _task_is_planning(task: dict[str, Any]) -> bool:
     if _task_needs_approval_reconcile(task):
         return False
     if _task_needs_provider_action_reconcile(task):
+        return False
+    if int(task.get("pending_approvals") or 0) or int(task.get("pending_provider_actions") or 0):
         return False
     current = str(task.get("current_stage") or "")
     if _is_planning_stage(current, str(task.get("role") or "")):
@@ -690,9 +715,14 @@ def _deliverables(payload: dict[str, Any], run_id: str) -> list[dict[str, Any]]:
     deliverables: list[dict[str, Any]] = []
     for kind, label in (
         ("project_design_doc", "Design document"),
+        ("design_pack", "Design pack"),
+        ("plan_summary", "Plan summary"),
         ("plan", "Plan"),
         ("diff", "Diff"),
-        ("test", "Test report"),
+        ("test_report", "Test report"),
+        ("review_report", "Review report"),
+        ("handoff_summary", "Handoff summary"),
+        ("docs_report", "Docs report"),
         ("report", "Final report"),
         ("dashboard", "Dashboard"),
     ):
@@ -843,12 +873,31 @@ def _overview_artifact_center(tasks: list[dict[str, Any]]) -> dict[str, Any]:
             }
             for task in completed[:8]
         ],
-        "kinds": ["project_design_doc", "final_report", "diff", "test_result", "provider_transcript", "stage_contract", "snapshot", "rollback_point", "semantic_merge_result"],
+        "kinds": [
+            "project_design_doc",
+            "design_pack",
+            "plan_summary",
+            "test_report",
+            "review_report",
+            "handoff_summary",
+            "docs_report",
+            "final_report",
+            "diff",
+            "test_result",
+            "provider_transcript",
+            "stage_contract",
+            "snapshot",
+            "rollback_point",
+            "semantic_merge_result",
+        ],
     }
 
 
 def _task_risk(task: dict[str, Any]) -> str:
     status = str(task.get("status") or "")
+    deliverable_status = task.get("deliverable_status") if isinstance(task.get("deliverable_status"), dict) else {}
+    if deliverable_status.get("missing"):
+        return "high" if status in DONE_STATUSES else "medium"
     if status in FAILED_STATUSES or int(task.get("errors") or 0) > 0:
         return "high"
     if int(task.get("pending_approvals") or 0) or int(task.get("pending_provider_actions") or 0):

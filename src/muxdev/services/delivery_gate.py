@@ -14,6 +14,7 @@ from typing import Any
 from ..models import ProviderActionStatus, StageStatus, utc_now
 from ..storage import Blackboard, canonical_hash
 from ..storage.contracts import sha256_text, write_json_artifact
+from .design import design_document_quality_issues
 
 
 COMMON_CHECKS = (
@@ -132,6 +133,9 @@ def evaluate_delivery_gate(
 
     if "no_secret_terms" in checks:
         blockers.extend(_secret_term_blockers(blackboard, run_id, target_stage_ids))
+
+    if "design_document_complete" in checks:
+        blockers.extend(_design_document_complete_blockers(blackboard, run_id, target_stage_ids))
 
     payload = {
         "schema": "muxdev.delivery_gate.v1",
@@ -288,6 +292,32 @@ def _secret_term_blockers(blackboard: Blackboard, run_id: str, target_stage_ids:
     return blockers
 
 
+def _design_document_complete_blockers(blackboard: Blackboard, run_id: str, target_stage_ids: list[str]) -> list[dict[str, object]]:
+    design_stage_ids = set(target_stage_ids)
+    if any(stage_id.startswith("design") for stage_id in design_stage_ids):
+        design_stage_ids.add("design_revise")
+    sections: list[tuple[str, str]] = []
+    for row in blackboard.table_rows("artifacts", run_id=run_id):
+        if row.get("kind") != "stage_output":
+            continue
+        stage_id = str(row.get("stage_id") or "")
+        if stage_id not in design_stage_ids:
+            continue
+        path = Path(str(row.get("path") or ""))
+        if not path.exists() or not path.is_file():
+            continue
+        sections.append((stage_id, path.read_text(encoding="utf-8", errors="replace")))
+    issues = design_document_quality_issues(sections=sections)
+    return [
+        _blocker(
+            "design_document_incomplete",
+            "high",
+            issue,
+        )
+        for issue in issues
+    ]
+
+
 def _latest_role_decision(blackboard: Blackboard, run_id: str, stage_id: str) -> str | None:
     rows = [
         row
@@ -318,6 +348,16 @@ def _derive_checks(section: dict[str, str], skill: dict[str, object]) -> list[st
         checks.append("no_open_blockers")
     if any(token in text for token in ("secret", "password", "token", "private key")):
         checks.append("no_secret_terms")
+    skill_name = str(skill.get("name") or "").lower()
+    skill_stage = str(skill.get("stage") or "").lower()
+    skill_role = str(skill.get("role") or "").lower()
+    is_design_rule = (
+        skill_stage.startswith("design")
+        or skill_name == "default-architect"
+        or (skill_role in {"architect", "plan"} and "design" in text)
+    )
+    if is_design_rule and any(token in text for token in ("design document", "design_doc", "complete design", "设计文档")):
+        checks.append("design_document_complete")
     return _dedupe(checks)
 
 

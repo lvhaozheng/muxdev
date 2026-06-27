@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 from enum import StrEnum
 
+from ..core.text_cleaning import clean_provider_text, has_external_confirmation, provider_action_text
 from ..models import ProviderActionKind
 
 
@@ -53,16 +54,18 @@ class StreamAdapter:
 
     def parse_chunk(self, text: str) -> list[StreamEvent]:
         clean = ANSI_RE.sub("", text)
-        events = [StreamEvent(StreamEventType.OUTPUT, clean)]
-        lowered = clean.lower()
-        if "waiting_external_confirmation" in lowered:
-            events.append(StreamEvent(StreamEventType.WAITING_EXTERNAL_CONFIRMATION, clean))
-        if looks_like_auth_error(clean):
-            events.append(StreamEvent(StreamEventType.AUTH_ERROR, clean))
-        if re.search(r"\brate[- ]limit(?:ed|s)?\b", lowered) or "too many requests" in lowered or "quota exceeded" in lowered:
-            events.append(StreamEvent(StreamEventType.RATE_LIMIT, clean))
-        if any(pattern.search(clean) for pattern in self.APPROVAL_PATTERNS):
-            events.append(StreamEvent(StreamEventType.APPROVAL_PROMPT_DETECTED, clean))
+        display = clean_provider_text(clean, fallback=clean)
+        action_text = provider_action_text(clean)
+        events = [StreamEvent(StreamEventType.OUTPUT, display)]
+        lowered = action_text.lower()
+        if has_external_confirmation(action_text):
+            events.append(StreamEvent(StreamEventType.WAITING_EXTERNAL_CONFIRMATION, action_text))
+        if looks_like_auth_error(action_text):
+            events.append(StreamEvent(StreamEventType.AUTH_ERROR, action_text))
+        if action_text and (re.search(r"\brate[- ]limit(?:ed|s)?\b", lowered) or "too many requests" in lowered or "quota exceeded" in lowered):
+            events.append(StreamEvent(StreamEventType.RATE_LIMIT, action_text))
+        if action_text and any(pattern.search(action_text) for pattern in self.APPROVAL_PATTERNS):
+            events.append(StreamEvent(StreamEventType.APPROVAL_PROMPT_DETECTED, action_text))
         return events
 
     def provider_actions(self, events: list[StreamEvent]) -> list[ProviderActionRequest]:
@@ -105,7 +108,9 @@ def looks_like_auth_error(text: str) -> bool:
 
 
 def _prompt_excerpt(text: str, *, max_chars: int = 1200) -> str:
-    lines = [line.rstrip() for line in ANSI_RE.sub("", text).splitlines() if line.strip()]
+    visible = clean_provider_text(ANSI_RE.sub("", text), fallback=ANSI_RE.sub("", text))
+    visible = re.sub(r"(?im)^\s*waiting_external_confirmation\s*[:：]\s*", "", visible)
+    lines = [line.rstrip() for line in visible.splitlines() if line.strip()]
     excerpt = "\n".join(lines[-8:]) if lines else ANSI_RE.sub("", text).strip()
     if len(excerpt) <= max_chars:
         return excerpt

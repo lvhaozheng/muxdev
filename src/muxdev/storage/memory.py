@@ -14,7 +14,6 @@ import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
 from uuid import uuid4
 
 from ..config.loader import path_config
