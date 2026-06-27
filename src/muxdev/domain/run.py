@@ -15,6 +15,7 @@ class SkillRef:
 
     name: str
     role: str | None = None
+    stage: str | None = None
     path: str | None = None
     injection: str = "prompt"
     reason: str | None = None
@@ -25,6 +26,7 @@ class SkillRef:
         return cls(
             name=str(payload.get("name") or payload.get("id") or "skill"),
             role=str(payload["role"]) if payload.get("role") else None,
+            stage=str(payload["stage"]) if payload.get("stage") else None,
             path=str(payload.get("path") or payload.get("skill_file") or "") or None,
             injection=str(payload.get("injection") or "prompt"),
             reason=str(payload["reason"]) if payload.get("reason") else None,
@@ -35,6 +37,8 @@ class SkillRef:
         payload: dict[str, object] = {"name": self.name, "injection": self.injection}
         if self.role:
             payload["role"] = self.role
+        if self.stage:
+            payload["stage"] = self.stage
         if self.path:
             payload["path"] = self.path
         if self.reason:
@@ -149,13 +153,11 @@ class RunSpec:
 
     def task_context(self) -> dict[str, object]:
         return {
-            "profile": self.profile,
             "gate": self.gate,
             "skills": [skill.to_payload() for skill in self.skills],
             "role_providers": dict(self.role_providers),
             "ci_block_on_approval": self.ci_block_on_approval,
             "depth": self.depth,
-            "topology": self.topology,
             "automation": self.automation.to_payload(),
             "safety_policy": self.policy.to_payload(),
         }
@@ -168,11 +170,9 @@ class RunSpec:
             "max_cost_usd": self.policy.max_cost_usd,
             "role_providers": dict(self.role_providers),
             "run_id": self.run_id,
-            "profile": self.profile,
             "gate": self.gate,
             "skills": [skill.to_payload() for skill in self.skills],
             "ci_block_on_approval": self.ci_block_on_approval,
             "depth": self.depth,
-            "topology": self.topology,
             "automation": self.automation.to_payload(),
         }

@@ -2,6 +2,7 @@ version = 1
 
 [activation]
 roles = ["review", "reviewer"]
+stages = ["plan_review", "design_review", "light_review", "impact_check", "review", "review_test_result", "docs_review", "final_design_review"]
 auto = true
 
 [permissions]

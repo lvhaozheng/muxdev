@@ -537,3 +537,13 @@ builtin < global < project < task < CLI options
 $env:PYTHONDONTWRITEBYTECODE = "1"
 python -m pytest -q
 ```
+## 2026-06 Architecture Update
+
+- Runtime topology profiles have been removed from the active submit path.
+  Automation compiles task `intent`, `depth`, selected `workflow`, model
+  `roles`, and human-readable `reasons`.
+- Workflow stage kind is explicit in dashboard read models:
+  `model_role`, `human_gate`, `delivery_gate`, or `system_step`.
+- Provider routing is role-based configuration from setup/runtime config, not
+  a per-command topology selector. Legacy `profile/topology` data may exist in
+  old run artifacts but is not written for new tasks.

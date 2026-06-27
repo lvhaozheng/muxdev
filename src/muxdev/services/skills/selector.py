@@ -25,6 +25,7 @@ def select_skills(
     provider: str = "mock",
     env: dict[str, str] | None = None,
     budget: int | None = None,
+    auto: bool = True,
 ) -> SkillSelection:
     config = load_skills_config(workspace, env=env)
     catalog = build_skill_catalog(workspace, budget=budget)
@@ -32,7 +33,7 @@ def select_skills(
     selected: list[ActivatedSkill] = []
     rejected: list[dict[str, object]] = []
     warnings: list[str] = []
-    selected_keys: set[tuple[str, str | None]] = set()
+    selected_keys: set[tuple[str, str | None, str | None]] = set()
 
     for spec in explicit or []:
         role, name = _parse_skill_spec(spec)
@@ -55,11 +56,15 @@ def select_skills(
             if not can_manual_activate(skill):
                 rejected.append(_rejection(skill, score=-1000, reasons=["quarantined"], role=normalized_role))
                 continue
+            if not _stage_compatible(skill, stage):
+                continue
             score, reasons = _score_skill(skill, task=task, roles=[normalized_role], stage=stage, changed_files=changed_files)
             _append(selected, selected_keys, skill, normalized_role, stage, provider, score + 500, ["role_binding", *reasons])
 
-    if bool(config.get("auto", True)):
+    if auto and bool(config.get("auto", True)):
         for skill in available.values():
+            if not _stage_compatible(skill, stage):
+                continue
             score, reasons = _score_skill(skill, task=task, roles=roles or [], stage=stage, changed_files=changed_files)
             if skill.trust == "quarantined":
                 rejected.append(_rejection(skill, score=-1000, reasons=["quarantined"], role=None))
@@ -111,9 +116,13 @@ def _score_skill(
     return score, reasons
 
 
+def _stage_compatible(skill: SkillInfo, stage: str | None) -> bool:
+    return not stage or not skill.stages or stage in skill.stages
+
+
 def _append(
     selected: list[ActivatedSkill],
-    keys: set[tuple[str, str | None]],
+    keys: set[tuple[str, str | None, str | None]],
     skill: SkillInfo,
     role: str | None,
     stage: str | None,
@@ -121,7 +130,7 @@ def _append(
     score: int,
     reasons: list[str],
 ) -> None:
-    key = (skill.name, role)
+    key = (skill.name, role if stage is None else None, stage)
     if key in keys:
         return
     keys.add(key)

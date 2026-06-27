@@ -21,7 +21,7 @@ from muxdev.storage import MemoryStore
 runner = CliRunner()
 
 
-def test_auto_request_compiles_sensitive_dev_to_deep_squad(monkeypatch) -> None:
+def test_auto_request_compiles_sensitive_dev_to_deep_workflow(monkeypatch) -> None:
     workspace = _workspace_temp("auto")
     monkeypatch.setattr(runtime_config, "detect_providers", lambda: [_probe("mock", ProviderStatus.READY)])
     try:
@@ -37,13 +37,14 @@ def test_auto_request_compiles_sensitive_dev_to_deep_squad(monkeypatch) -> None:
 
     assert request["workflow"] == "dev"
     assert request["depth"] == "deep"
-    assert request["topology"] == "squad"
+    assert "profile" not in request
+    assert "topology" not in request
     assert request["automation"]["intent"] == "dev"
     assert "task:auth" in request["automation"]["repo"]["sensitive_hits"]
-    assert list(request["runtime_roles"]) == ["plan", "code", "test", "review"]
+    assert list(request["runtime_roles"]) == ["requirements", "plan", "review", "code", "test"]
 
 
-def test_auto_design_snake_routes_to_lite_solo(monkeypatch) -> None:
+def test_auto_design_snake_routes_to_lite_workflow(monkeypatch) -> None:
     workspace = _workspace_temp("design_simple")
     monkeypatch.setattr(runtime_config, "detect_providers", lambda: [_probe("mock", ProviderStatus.READY)])
     try:
@@ -59,10 +60,10 @@ def test_auto_design_snake_routes_to_lite_solo(monkeypatch) -> None:
 
     assert request["workflow"] == "design-lite"
     assert request["depth"] == "simple"
-    assert request["topology"] == "solo"
+    assert "topology" not in request
     assert request["automation"]["intent"] == "design"
-    assert request["automation"]["roles"] == ["architect"]
-    assert request["runtime_roles"] == {"architect": "auto"}
+    assert request["automation"]["roles"] == ["requirements", "architect", "review", "docs"]
+    assert request["runtime_roles"] == {"requirements": "auto", "architect": "auto", "review": "auto", "docs": "auto"}
 
 
 def test_cli_design_submits_automation_payload(monkeypatch) -> None:
@@ -101,8 +102,8 @@ def test_cli_design_simple_override_submits_lite_payload(monkeypatch) -> None:
     payload = submitted[0]
     assert payload["workflow"] == "design-lite"
     assert payload["depth"] == "simple"
-    assert payload["topology"] == "solo"
-    assert payload["automation"]["roles"] == ["architect"]
+    assert "topology" not in payload
+    assert payload["automation"]["roles"] == ["requirements", "architect", "review", "docs"]
 
 
 def test_design_runtime_writes_pack_and_memory_proposal_file_without_auto_memory() -> None:
@@ -113,14 +114,11 @@ def test_design_runtime_writes_pack_and_memory_proposal_file_without_auto_memory
             provider="mock",
             workflow_name="design",
             require_approval=set(),
-            profile="squad",
             gate="auto",
             depth="deep",
-            topology="squad",
             automation={
                 "intent": "design",
                 "depth": "deep",
-                "topology": "squad",
                 "roles": ["requirements", "architect", "test_strategy", "review", "docs", "memory_curator"],
             },
         )
@@ -145,15 +143,12 @@ def test_design_lite_runtime_writes_design_pack_metadata() -> None:
             provider="mock",
             workflow_name="design-lite",
             require_approval=set(),
-            profile="solo",
             gate="auto",
             depth="simple",
-            topology="solo",
             automation={
                 "intent": "design",
                 "depth": "simple",
-                "topology": "solo",
-                "roles": ["architect"],
+                "roles": ["requirements", "architect", "review", "docs"],
             },
         )
         contract = json.loads((result.run_dir / "design" / "design_contract.json").read_text(encoding="utf-8"))
@@ -163,8 +158,8 @@ def test_design_lite_runtime_writes_design_pack_metadata() -> None:
     assert result.status == RunStatus.COMPLETED
     assert contract["workflow"] == "design-lite"
     assert contract["depth"] == "simple"
-    assert contract["topology"] == "solo"
-    assert contract["roles"] == ["architect"]
+    assert "topology" not in contract
+    assert contract["roles"] == ["requirements", "architect", "review", "docs"]
 
 
 def _probe(name: str, status: ProviderStatus) -> ProviderProbe:

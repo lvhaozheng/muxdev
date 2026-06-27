@@ -2,6 +2,7 @@ version = 1
 
 [activation]
 roles = ["code", "implementer"]
+stages = ["implement", "scaffold", "code", "refactor", "fix"]
 auto = true
 
 [permissions]

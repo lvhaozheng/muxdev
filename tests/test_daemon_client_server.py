@@ -79,6 +79,8 @@ def test_daemon_api_task_lifecycle_and_websocket() -> None:
     assert "daemon api smoke" in report["content"]
     assert report["path"].startswith(str(project_run_dir))
     assert attach["handoff"]["command"]
+    assert attach["handoff"]["mode"] == "transcript"
+    assert attach["handoff"]["fallback_reason"]
     assert rollback["status"] in {"rolled_back", "failed"}
     assert "muxdev Shareable Run Review" in review_page
     assert "Sensitive transcript hidden" in review_page
@@ -89,6 +91,11 @@ def test_daemon_api_task_lifecycle_and_websocket() -> None:
     assert "<title>muxdev Dashboard</title>" in english_page
     assert "Command Palette" in english_page
     assert f'data-task-id="{task_id}"' in task_english_page
+    assert "Copy tmux command" not in english_page
+    assert "design-memory" not in english_page
+    assert "design-v2" not in task_english_page
+    assert "dev-light" not in task_english_page
+    assert "data-clamp" in task_english_page
     assert hello["type"] == "hello"
 
 
@@ -124,90 +131,31 @@ def test_daemon_legacy_global_run_remains_readable() -> None:
     assert report["content"] == "legacy report"
 
 
-def test_live_dashboard_renders_workbench_sections_and_i18n() -> None:
+def test_live_dashboard_renders_minimal_sections_and_i18n() -> None:
     from muxdev.api.web import render_live_dashboard_html
 
     html = render_live_dashboard_html("run_demo")
     english = render_live_dashboard_html("run_demo", lang="en")
 
-    assert "muxdev 控制台" in html
     assert 'lang="zh-CN"' in html
     assert 'data-task-id="run_demo"' in html
-    assert "命令面板" in html
-    assert "资源管理器" in html
-    assert "总览" in html
-    assert "项目" in html
-    assert "运行列表" in html
-    assert "工作流" in html
-    assert "验证实验" in html
-    assert "证据与产物" in html
-    assert "系统治理" in html
-    assert "当前状态" in html
-    assert "行动中心" in html
-    assert "交付可信度" in html
-    assert "可信交付标准" in html
-    assert "验证标准" in html
-    assert "治理标准" in html
-    assert "配置标准" in html
-    assert "当前值" in html
-    assert "目标值" in html
-    assert "建议操作" in html
-    assert "学习与治理" in html
-    assert "决策条" in html
-    assert "交付焦点" in html
-    assert "优先队列" in html
-    assert "运行流" in html
-    assert "最近证据" in html
-    assert "详情检查器" in html
-    assert "支撑信号" in html
-    assert "问题" in html
-    assert "输出" in html
-    assert "证据" in html
-    assert "操作" in html
-    assert "attention-strip" in html
-    assert "detail-inspector" in html
-    assert "bottom-panel" not in html
-    assert "setBottomPanel" not in html
-    assert "localStorage.setItem('muxdev.dashboard.lang'" in html
-    assert "switchLanguage()" in html
-    assert "MCP" in html
-    assert "任务看板" in html
-    assert "project-name" in html
+    assert 'data-view-button="overview"' in html
+    assert 'data-view-button="projects"' in html
+    assert 'data-view-button="config"' in html
     assert "/dashboard/overview" in html
-    assert "复制接管命令" in html
-    assert "提交响应" in html
-    assert "已处理并继续" in html
-    assert "/dashboard/tasks/" in html
-    assert "String.fromCharCode(10)" in html
-    assert "state.events.join('\n')" not in html
-    assert "低风险批量操作" in html
-    assert "提供方学习趋势" in html
-    assert "工作流模板预览" in html
-    assert "并行冲突图" in html
-    assert "多仓编排图" in html
-    assert "分享审查" in html
-    assert "/review/" in html
-    assert "/product/experience" in html
-    assert "Mission Control" not in html
+    assert "terminal?agent=" in html
+    assert "feedback-and-continue" in html
+    assert "provider-actions" in html
+    assert "Validation Experiments" not in html
+    assert "Product Experience" not in html
     assert "Command Palette" not in html
-    assert "Project Workspace" not in html
-    assert "System Center" not in html
-    assert not any(marker in html for marker in ("�", "鎺", "浠", "椤", "楠", "琛", "褰"))
     assert "<title>muxdev Dashboard</title>" in english
     assert 'lang="en"' in english
-    assert "Command Palette" in english
-    assert "Explorer" in english
-    assert "Decision Rail" in english
-    assert "Delivery Focus" in english
-    assert "Priority Queue" in english
-    assert "Run Stream" in english
-    assert "Recent Evidence" in english
-    assert "Detail Inspector" in english
-    assert "System Governance" in english
-    assert "Trusted Delivery Standards" in english
-    assert "Validation Standards" in english
-    assert "Governance Standards" in english
-    assert "Configuration Standards" in english
+    assert "Ready CLI Tools" in english
+    assert "Needs My Action" in english
+    assert "Workflow Templates" in english
+    assert "Model Role / CLI Routing" in english
+    assert "data-fold" in english
 
 
 def test_dashboard_overview_groups_projects_workflows_roles(monkeypatch) -> None:
@@ -222,20 +170,20 @@ def test_dashboard_overview_groups_projects_workflows_roles(monkeypatch) -> None
             run_dir = manager.paths.runs_dir / run_id
             run_dir.mkdir(parents=True, exist_ok=True)
             (run_dir / "task_context.json").write_text(
-                json.dumps({"profile": "squad", "gate": "safe", "role_providers": {"code": "mock"}, "skills": [{"name": "docs-update", "role": "docs"}]}),
+                json.dumps({"gate": "safe", "role_providers": {"code": "mock"}, "skills": [{"name": "docs-update", "role": "docs"}]}),
                 encoding="utf-8",
             )
             with manager.board() as board:
                 board.create_run(run_id=run_id, task=task, workflow="dev", provider="mock", workspace=project, worktree=project / ".muxdev" / run_id)
                 board.set_run_status(run_id, "running")
-                board.upsert_stage(run_id, "code", role="code", status="running", summary="coding")
+                board.upsert_stage(run_id, "implement", role="code", status="running", summary="coding")
                 if run_id == "run_dash_1":
                     snapshot = project / "snapshot.patch"
                     snapshot.write_text("diff --git a/app.py b/app.py\n", encoding="utf-8")
-                    board.add_test_result(run_id, "code", True, "pytest", "passed")
-                    board.add_snapshot(run_id, "code", path=snapshot, patch_hash="sha256:test")
+                    board.add_test_result(run_id, "implement", True, "pytest", "passed")
+                    board.add_snapshot(run_id, "implement", path=snapshot, patch_hash="sha256:test")
                 if run_id == "run_dash_2":
-                    board.add_error(run_id, "code", "provider_exit", "temporary network error")
+                    board.add_error(run_id, "implement", "provider_exit", "temporary network error")
 
         with manager.board() as board:
             board.upsert_provider_learning(provider="mock", role="code", run_id="run_dash_1", attempts=2, successes=2, failures=0, human_actions=0, score=1.0)
@@ -287,7 +235,7 @@ def test_dashboard_overview_groups_projects_workflows_roles(monkeypatch) -> None
     assert {task["task_id"] for task in code_group["tasks"]} == {"run_dash_1", "run_dash_2"}
     first = next(task for task in code_group["tasks"] if task["task_id"] == "run_dash_1")
     assert first["diff_endpoint"] == "/api/tasks/run_dash_1/diff"
-    assert first["current_activity"] == "running stage code"
+    assert first["current_activity"] == "running stage implement"
     assert first["elapsed_seconds"] is not None
     assert first["stage_timeline"][0]["elapsed_seconds"] is not None
     assert first["delivery_confidence"]["tests"]["status"] == "passed"
@@ -323,9 +271,12 @@ def test_dashboard_overview_groups_projects_workflows_roles(monkeypatch) -> None
     assert payload["governance_summary"]["parallel_control"]["open_conflicts"] == 1
     assert payload["governance_summary"]["multi_repo"]["count"] == 1
     assert payload["governance_summary"]["memory"]["counts"]["contradictions"] >= 1
-    assert payload["global_config"]["role_templates"]
+    assert payload["global_config"]["role_routes"]
+    assert all(route["role"] not in {"human_gate", "delivery_gate", "gate"} for route in payload["global_config"]["role_routes"])
     assert "plugin_market" not in payload["global_config"]
     assert payload["global_config"]["workflow_templates"]["templates"]
+    assert payload["global_config"]["workflow_templates"]["templates"][0]["best_for"]
+    assert all(not {"human_gate", "delivery_gate", "gate"} & set(row.get("roles", [])) for row in payload["global_config"]["workflow_templates"]["definitions"])
     assert "catalog" in payload["global_config"]["skills_catalog"]
     assert light_payload["global_config"] == {}
     assert light_payload["global_config_deferred"] is True
@@ -524,12 +475,49 @@ def test_daemon_approvals_and_continue() -> None:
     assert continued["status"] == "continue_requested"
 
 
+def test_daemon_plan_feedback_revises_and_requests_new_approval() -> None:
+    workspace = _workspace_temp("approval-feedback")
+    try:
+        manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())
+        client = TestClient(create_app(task_manager=manager))
+        submitted = client.post(
+            "/api/tasks",
+            json={
+                "task": "daemon approval feedback smoke",
+                "workspace": str(workspace),
+                "provider": "mock",
+                "require_approval": ["plan"],
+            },
+        ).json()
+        task_id = submitted["task_id"]
+        _wait_for_status(client, task_id, "awaiting_approval")
+        original = client.get("/api/approvals?status=pending").json()[0]
+
+        feedback = client.post(
+            f"/api/approvals/{original['approval_id']}/feedback-and-continue",
+            json={"feedback": "Please simplify the plan before coding."},
+        ).json()
+        _wait_for_status(client, task_id, "awaiting_approval")
+        detail = client.get(f"/api/tasks/{task_id}").json()
+        approvals = client.get("/api/approvals?status=pending").json()
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    assert feedback["approval"]["status"] == str(ApprovalStatus.FEEDBACK)
+    assert "plan_revise" in feedback["approval"]["reset_stages"]
+    assert feedback["continue"]["status"] == "continue_requested"
+    assert approvals[0]["approval_id"] != original["approval_id"]
+    stages = {row["stage_id"]: row["status"] for row in detail["stages"]}
+    assert stages["approve_plan"] == "running"
+
+
 def test_daemon_provider_actions_api_and_continue_wait(monkeypatch) -> None:
     workspace = _workspace_temp("provider-action")
     try:
         manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())
         run_dir = manager.paths.runs_dir / "run_provider_action"
         run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "trace.jsonl").write_text('{"type":"trace event","data":{"message":"hello cli"}}\n', encoding="utf-8")
         with manager.board() as board:
             board.create_run(
                 run_id="run_provider_action",
@@ -559,6 +547,7 @@ def test_daemon_provider_actions_api_and_continue_wait(monkeypatch) -> None:
         detail = client.get("/api/tasks/run_provider_action").json()
         task_ux = client.get("/api/tasks/run_provider_action/ux").json()
         overview = client.get("/api/ux/overview").json()
+        terminal = client.get("/tasks/run_provider_action/terminal?agent=designer")
         continued = client.post("/api/tasks/run_provider_action/continue").json()
         responded = client.post(f"/api/provider-actions/{action_id}/response", json={"choice": "y"}).json()
         handled = client.post(f"/api/tasks/run_provider_action/actions/{action_id}/handled-and-continue").json()
@@ -572,10 +561,45 @@ def test_daemon_provider_actions_api_and_continue_wait(monkeypatch) -> None:
     assert detail["ux"]["user_state"] == "needs_action"
     assert task_ux["next_actions"][1]["kind"] == "mark_handled_continue"
     assert overview["action_center"][0]["kind"] == "provider_action"
+    assert terminal.status_code == 200
+    assert "Transcript fallback" in terminal.text
+    assert "provider action smoke" in terminal.text
+    assert "agent designer" in terminal.text
+    assert "trace event" in terminal.text
     assert continued["status"] == "awaiting_provider_action"
     assert responded["response"] == {"choice": "y"}
     assert handled["action"]["status"] == str(ProviderActionStatus.HANDLED)
     assert handled["continue"]["status"] == "continue_requested"
+
+
+def test_daemon_attach_uses_real_provider_attach_command() -> None:
+    workspace = _workspace_temp("native-attach")
+    try:
+        manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())
+        with manager.board() as board:
+            board.create_run(
+                run_id="run_native_attach",
+                task="native attach smoke",
+                workflow="dev",
+                provider="codex",
+                workspace=workspace,
+                worktree=workspace / "worktree",
+            )
+            board.create_provider_action(
+                run_id="run_native_attach",
+                stage_id="plan",
+                provider="codex",
+                role="plan",
+                kind="cli_confirmation",
+                prompt_text="Continue?",
+                attach_command="codex session attach abc123",
+            )
+        handoff = manager.attach_command("run_native_attach", agent="plan")["handoff"]
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    assert handoff["mode"] == "native_cli"
+    assert handoff["command"] == "codex session attach abc123"
 
 
 def test_daemon_continue_does_not_start_duplicate_worker(monkeypatch) -> None:

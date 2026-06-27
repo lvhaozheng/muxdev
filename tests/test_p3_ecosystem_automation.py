@@ -262,13 +262,13 @@ def test_dashboard_renders_p3_ecosystem_sections() -> None:
     assert "CAS Cache" in html
     assert "Skill Lock" in html
     assert "Plugin Manifest" not in html
-    assert "记忆上下文" in live
-    assert "角色会话" in live
-    assert "工作流模板" in live
+    assert "记忆上下文" not in live
+    assert "角色会话" not in live
     english_live = render_live_dashboard_html(lang="en")
-    assert "Memory Context" in english_live
-    assert "Role Sessions" in english_live
+    assert "Memory Context" not in english_live
+    assert "Role Sessions" not in english_live
     assert "Workflow Templates" in english_live
+    assert "Role and CLI/provider Mapping" in english_live
 
 
 def _workspace_temp(prefix: str) -> Path:

@@ -35,6 +35,86 @@ from .queue import TaskQueue
 TERMINAL_STATUSES = {str(RunStatus.COMPLETED), str(RunStatus.BLOCKED), str(RunStatus.ABORTED)}
 
 
+def _terminal_handoff_for_run(board: Blackboard, run_dir: Path, run_id: str, agent: str) -> dict[str, Any]:
+    native = _native_cli_handoff(board, run_id, agent)
+    if native:
+        return native
+    transcript = _transcript_path_for_agent(board, run_dir, run_id, agent)
+    return {
+        "mode": "transcript",
+        "command": follow_file_command(transcript),
+        "path": str(transcript),
+        "fallback_reason": "no native provider CLI session is recorded for this run",
+    }
+
+
+def _native_cli_handoff(board: Blackboard, run_id: str, agent: str) -> dict[str, Any] | None:
+    for action in board.list_provider_actions(run_id=run_id):
+        if not _agent_matches(agent, action):
+            continue
+        command = str(action.get("attach_command") or "").strip()
+        if not _is_real_attach_command(command):
+            continue
+        return {
+            "mode": "native_cli",
+            "command": command,
+            "provider": action.get("provider"),
+            "role": action.get("role"),
+            "stage_id": action.get("stage_id"),
+            "source": "provider_action",
+        }
+    tmux = TmuxBackend()
+    for row in board.table_rows("agents", run_id=run_id):
+        if str(row.get("role") or "") != agent:
+            continue
+        session = str(row.get("session_id") or "")
+        if session.startswith("tmux:") and tmux.available:
+            session_name = session.split(":", 1)[1]
+            return {
+                "mode": "tmux",
+                "command": tmux.attach_command(session_name),
+                "session": session_name,
+                "raw_session": session,
+                "source": "agent_session",
+            }
+    return None
+
+
+def _transcript_path_for_agent(board: Blackboard, run_dir: Path, run_id: str, agent: str) -> Path:
+    for action in board.list_provider_actions(run_id=run_id):
+        if not _agent_matches(agent, action):
+            continue
+        transcript = _existing_run_path(run_dir, str(action.get("transcript_path") or ""))
+        if transcript:
+            return transcript
+    candidates: list[Path] = []
+    for folder, pattern in ((run_dir / "provider_sessions", "*.transcript.log"), (run_dir / "session", f"*{agent}*.log")):
+        if folder.exists():
+            candidates.extend(path for path in folder.glob(pattern) if path.is_file())
+    if candidates:
+        return max(candidates, key=lambda path: path.stat().st_mtime)
+    return run_dir / "trace.jsonl"
+
+
+def _existing_run_path(run_dir: Path, value: str) -> Path | None:
+    if not value:
+        return None
+    path = Path(value)
+    if not path.is_absolute():
+        path = run_dir / path
+    return path if path.exists() else None
+
+
+def _agent_matches(agent: str, row: dict[str, Any]) -> bool:
+    return agent in {str(row.get("role") or ""), str(row.get("stage_id") or ""), str(row.get("provider") or "")}
+
+
+def _is_real_attach_command(command: str) -> bool:
+    if not command:
+        return False
+    return not command.startswith("muxdev attach ")
+
+
 @dataclass
 class TaskManager:
     """Own all daemon-side writes to task state and artifacts."""
@@ -114,10 +194,8 @@ class TaskManager:
             "run_id": task_id,
             "status": str(RunStatus.CREATED),
             "dashboard_url": f"/tasks/{task_id}",
-            "profile": spec.profile,
             "gate": spec.gate,
             "depth": spec.depth,
-            "topology": spec.topology,
             "skills": [skill.name for skill in spec.skills],
         }
 
@@ -249,7 +327,6 @@ class TaskManager:
                 workspace=workspace,
                 provider=provider,
                 workflow=routed.workflow,
-                profile="ci" if kind in {"ci_failed", "local_test_failure"} else None,
                 gate="ci" if kind in {"ci_failed", "local_test_failure"} else None,
                 require_approval=set(),
                 max_cost_usd=0.5,
@@ -257,7 +334,6 @@ class TaskManager:
                 skills=[],
                 ci_block_on_approval=kind in {"ci_failed", "local_test_failure"},
                 depth="ci" if kind in {"ci_failed", "local_test_failure"} else None,
-                topology="ci" if kind in {"ci_failed", "local_test_failure"} else None,
                 automation={"intent": "ci" if kind in {"ci_failed", "local_test_failure"} else "feedback", "feedback_id": routed.feedback_id, "route_to": routed.route_to},
             )
             result["submitted"] = submitted
@@ -293,6 +369,45 @@ class TaskManager:
             match["decided"] = True
         self.broadcast({"type": "approval_decided", "approval_id": match["approval_id"], "status": str(status)})
         return match
+
+    def plan_feedback(self, approval_id: str, feedback: str) -> dict[str, Any]:
+        content = feedback.strip()
+        if not content:
+            raise ValueError("feedback is required")
+        with self.board() as board:
+            match = _resolve_approval(board, approval_id)
+            resolved_id = str(match["approval_id"])
+            run_id = str(match["run_id"])
+            approval_type = str(match.get("type") or "")
+            if approval_type not in {"plan", "design"}:
+                raise ValueError(f"feedback is only supported for plan approvals, got: {approval_type}")
+            feedback_id = board.add_feedback_event(
+                run_id=run_id,
+                source="user",
+                kind="plan_feedback",
+                severity="medium",
+                status="pending",
+                route_to="plan",
+                content=content,
+                payload={
+                    "approval_id": resolved_id,
+                    "stage_id": match.get("stage_id"),
+                    "approval_type": approval_type,
+                },
+            )
+            board.decide_approval(resolved_id, ApprovalStatus.FEEDBACK)
+            reset_stages = _plan_feedback_reset_stages(board, run_id)
+            for stage_id in reset_stages:
+                board.reset_stage(run_id, stage_id)
+            board.set_run_status(run_id, RunStatus.RUNNING)
+            updated = next(
+                (row for row in board.list_approvals(run_id=run_id) if row.get("approval_id") == resolved_id),
+                match,
+            )
+            updated["feedback_id"] = feedback_id
+            updated["reset_stages"] = reset_stages
+        self.broadcast({"type": "approval_feedback", "approval_id": resolved_id, "run_id": run_id, "feedback_id": feedback_id})
+        return updated
 
     def update_provider_action(self, action_id: str, status: ProviderActionStatus) -> dict[str, Any]:
         with self.board() as board:
@@ -428,19 +543,19 @@ class TaskManager:
 
     def attach_command(self, task_id: str, *, agent: str = "implementer") -> dict[str, Any]:
         resolved = self.resolve_task_id(task_id)
-        tmux = TmuxBackend()
-        session_name = f"muxdev-{resolved}-{agent}".replace(":", "-").replace("_", "-")
-        if tmux.available:
-            handoff = {"mode": "tmux", "command": tmux.attach_command(session_name), "session": session_name}
-        else:
-            run_dir = self._run_dir(resolved)
-            candidates = sorted((run_dir / "session").glob(f"*{agent}*.log")) if (run_dir / "session").exists() else []
-            transcript = candidates[-1] if candidates else run_dir / "trace.jsonl"
-            handoff = {"mode": "transcript", "command": follow_file_command(transcript), "path": str(transcript)}
+        run_dir = self._run_dir(resolved)
         with self.board() as board:
             run = board.get_run(resolved)
-            board.upsert_agent(resolved, agent, str(run["provider"]), session_id=f"{resolved}:{agent}", status="attached")
-        return {"task_id": resolved, "run_id": resolved, "agent": agent, "session_id": f"{resolved}:{agent}", "status": "attached", "handoff": handoff}
+            handoff = _terminal_handoff_for_run(board, run_dir, resolved, agent)
+            status = "attached" if handoff.get("mode") in {"native_cli", "tmux"} else "transcript"
+            board.upsert_agent(
+                resolved,
+                agent,
+                str(run["provider"]),
+                session_id=str(handoff.get("raw_session") or handoff.get("session") or f"{resolved}:{agent}"),
+                status=status,
+            )
+        return {"task_id": resolved, "run_id": resolved, "agent": agent, "session_id": f"{resolved}:{agent}", "status": str(handoff.get("mode") or "transcript"), "handoff": handoff}
 
     def daemon_status(self) -> dict[str, Any]:
         tasks = self.list_tasks()
@@ -574,10 +689,8 @@ class TaskManager:
             "error_summary": latest_error,
             "delivery_confidence": delivery_confidence,
             "evidence_summary": delivery_confidence["evidence_summary"],
-            "profile": context.get("profile"),
             "gate": context.get("gate"),
             "depth": context.get("depth"),
-            "topology": context.get("topology"),
             "role_providers": context.get("role_providers", {}) if isinstance(context.get("role_providers"), dict) else {},
             "skills": [skill.get("name") for skill in context.get("skills", []) if isinstance(skill, dict)],
             "recover_endpoint": f"/api/tasks/{run_id}/continue",
@@ -643,6 +756,23 @@ def _resolve_approval(board: Blackboard, approval_or_run_id: str) -> dict[str, A
     if any(str(row.get("run_id") or "") == approval_or_run_id for row in board.table_rows("runs")):
         raise KeyError(f"no pending approval for run: {approval_or_run_id}; use continue instead")
     raise KeyError(f"approval not found: {approval_or_run_id}")
+
+
+def _plan_feedback_reset_stages(board: Blackboard, run_id: str) -> list[str]:
+    stage_ids = {str(row.get("stage_id") or "") for row in board.table_rows("stages", run_id=run_id)}
+    reset: list[str] = []
+    if "plan_revise" in stage_ids:
+        reset.extend(["plan_revise", "approve_plan"])
+    elif "design_revise" in stage_ids:
+        reset.extend(["design_revise", "approve_plan", "human_design_approval"])
+    else:
+        for stage_id in ("quick_plan", "scaffold_plan", "design_brief", "design_plan", "plan", "design"):
+            if stage_id in stage_ids:
+                reset.append(stage_id)
+        for stage_id in ("plan_review", "design_review", "approve_plan", "human_design_approval"):
+            if stage_id in stage_ids:
+                reset.append(stage_id)
+    return [stage_id for index, stage_id in enumerate(reset) if stage_id in stage_ids and stage_id not in reset[:index]]
 
 
 def _latest_error(errors: list[dict[str, Any]]) -> dict[str, Any] | None:

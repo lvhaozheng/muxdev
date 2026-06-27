@@ -37,12 +37,34 @@ prompt_templates:
       Propose durable project memory only when it is evidence-backed, reusable, low-risk, and not a secret or transient run detail.
   schemas:
     PlanArtifact: |
-      Return a concise plan with a summary and ordered steps. Include acceptance criteria and risks when they affect implementation.
+      Return a concise plan with a summary, ordered steps, acceptance criteria, verification approach, risks, delivery decision, evidence, and gaps.
     TestResult: |
-      Return whether verification passed, the command or method used, and a short summary. If tests were not run, say why.
+      Return whether verification passed, the command or method used, acceptance criteria covered, relevant output summary, configured coverage result when available, skipped checks, delivery decision, evidence, and gaps. If tests were not run, say why.
     ReviewResult: |
-      Return whether blockers exist. Each blocker should include type, severity, file or line when known, and a concrete suggestion.
+      Return whether blockers exist, missing evidence, delivery decision, and residual risk. Each blocker should include type, severity, evidence, file or line when known, and a concrete suggestion.
   stages:
+    task_intake: |
+      Classify the task using muxdev's intake contract. If missing information would materially change implementation, ask 1-3 concise questions with selectable options when possible; otherwise summarize the chosen workflow, risk flags, and acceptance criteria.
+    quick_plan: |
+      Produce a compact implementation plan optimized for speed. Include only the necessary steps, expected files or modules, smoke check, and risks that would change the path.
+    scaffold_plan: |
+      Produce a zero-to-one project scaffold plan with stack assumptions, initial file layout, run command, smoke check, and what should be intentionally deferred.
+    plan_review: |
+      Review the plan before implementation. Block only for unclear requirements, unsafe choices, missing verification, or scope that should be routed to a heavier workflow.
+    plan_revise: |
+      Revise the plan using review blockers and any user plan feedback. Keep the revised plan concise and make changed decisions explicit.
+    smoke_check: |
+      Run or describe a lightweight verification suitable for the task. Return a TestResult JSON object.
+    light_review: |
+      Review the lightweight change for obvious bugs, regressions, and unmet acceptance criteria. Return a ReviewResult JSON object.
+    handoff_summary: |
+      Summarize what changed, how it was checked, and any remaining risk or follow-up.
+    design_plan: |
+      Produce a concise design plan with user goals, constraints, proposed interaction or architecture, acceptance criteria, and open questions.
+    design_review: |
+      Review the design plan for unclear requirements, risky assumptions, and missing acceptance criteria. Return a ReviewResult JSON object.
+    design_revise: |
+      Revise the design plan from review blockers and any user plan feedback, keeping scope tight.
     design-lite:
       design_brief: |
         This is a user-facing design task. If the task does not specify the desired style, target users, platform/device priorities, references, constraints, or non-goals, ask the user through your native CLI/session interaction before producing the final design. muxdev should only pass through your prompt; do not assume muxdev will ask these questions for you.
@@ -60,11 +82,6 @@ prompt_templates:
         - design_doc.implementation_sequence
         - design_doc.risks_and_mitigations
         - design_doc.open_questions when anything remains unclear
-    design-v2:
-      design: |
-        This is a user-facing design task. Use provider-native interaction to ask for missing style, audience, reference, platform, and constraint preferences before finalizing the design. In headless mode, emit a muxdev-detectable provider action / external confirmation prompt instead of silently assuming those preferences.
-
-        The final answer must include a structured design_doc JSON object. If preferences are still missing, list them under design_doc.unconfirmed_items and design_doc.open_questions.
     design:
       problem_statement: |
         Start the design workflow by checking whether the user has specified style, audience, reference products, platform/device priorities, constraints, and non-goals. If important preferences are missing, ask through the provider's native CLI/session interaction first. In headless mode, emit a clear provider action / external confirmation prompt that muxdev can surface.

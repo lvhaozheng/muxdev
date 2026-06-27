@@ -146,6 +146,8 @@ def _node_spec(stage: WorkflowStage) -> dict[str, object]:
             "loop_policy": stage.loop_policy.model_dump() if stage.loop_policy else None,
             "context_sources": list(stage.context_sources),
             "rag_query": stage.rag_query,
+            "delivery_targets": list(stage.delivery_targets),
+            "delivery_skill_sources": list(stage.delivery_skill_sources),
             "max_loops": stage.max_loops,
             "loop_review_stage": stage.loop_review_stage,
             "loop_restart_stage": stage.loop_restart_stage,
@@ -185,4 +187,3 @@ def _langgraph_available() -> bool:
     except Exception:
         return False
     return True
-

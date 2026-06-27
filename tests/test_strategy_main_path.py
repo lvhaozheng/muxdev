@@ -43,7 +43,7 @@ def test_setup_check_does_not_write_and_yes_writes_toml(monkeypatch) -> None:
         shutil.rmtree(workspace, ignore_errors=True)
 
     assert written["written"] is True
-    assert effective["profile"] == "squad"
+    assert "profile" not in effective
     assert effective["gate"] == "safe"
     assert (home / "config.toml").exists()
     assert (home / "cache" / "providers.json").exists()
@@ -67,7 +67,8 @@ def test_resolve_task_request_maps_new_and_legacy_roles(monkeypatch) -> None:
         shutil.rmtree(workspace, ignore_errors=True)
 
     assert request["workflow"] == "dev"
-    assert request["profile"] == "squad"
+    assert "profile" not in request
+    assert "topology" not in request
     assert request["gate"] == "strict"
     assert request["role_providers"]["code"] == "mock"
     assert request["role_providers"]["implementer"] == "mock"
@@ -93,6 +94,96 @@ def test_safe_gate_does_not_require_low_risk_approvals(monkeypatch) -> None:
     assert request["require_approval"] == []
 
 
+def test_dev_auto_routes_high_confidence_lightweight_task(monkeypatch) -> None:
+    workspace = _workspace_temp("dev-lite")
+    monkeypatch.setattr(runtime_config, "detect_providers", lambda: [_probe("mock", ProviderStatus.READY)])
+    try:
+        request = resolve_task_request(
+            workspace=workspace,
+            task="build a tiny todo prototype",
+            command_workflow="dev",
+            provider="mock",
+        )
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    assert request["workflow"] == "dev-lite"
+    assert request["depth"] == "simple"
+    assert request["require_approval"] == []
+
+
+def test_dev_light_flag_overrides_risk_classifier(monkeypatch) -> None:
+    workspace = _workspace_temp("dev-lite-forced")
+    monkeypatch.setattr(runtime_config, "detect_providers", lambda: [_probe("mock", ProviderStatus.READY)])
+    try:
+        request = resolve_task_request(
+            workspace=workspace,
+            task="prototype auth permission screen",
+            command_workflow="dev",
+            provider="mock",
+            depth="light",
+        )
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    assert request["workflow"] == "dev-lite"
+    assert request["depth"] == "simple"
+
+
+def test_legacy_dev_light_workflow_alias_resolves_to_dev_lite(monkeypatch) -> None:
+    workspace = _workspace_temp("legacy-dev-light")
+    monkeypatch.setattr(runtime_config, "detect_providers", lambda: [_probe("mock", ProviderStatus.READY)])
+    try:
+        request = resolve_task_request(
+            workspace=workspace,
+            task="adjust a tiny widget",
+            command_workflow="dev",
+            provider="mock",
+            workflow="dev-light",
+        )
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    assert request["workflow"] == "dev-lite"
+
+
+def test_low_confidence_lightweight_classifier_falls_back_to_standard(monkeypatch) -> None:
+    from muxdev.services import automation as automation_service
+
+    workspace = _workspace_temp("dev-low-confidence")
+    monkeypatch.setattr(runtime_config, "detect_providers", lambda: [_probe("mock", ProviderStatus.READY)])
+
+    def low_confidence_intake(**_: object) -> automation_service.TaskIntakeDecision:
+        return automation_service.TaskIntakeDecision(
+            clarity="clear",
+            intent="dev",
+            complexity="light",
+            recommended_flow="dev_light",
+            is_lightweight_dev=True,
+            confidence=0.4,
+            reason="test low confidence",
+        )
+
+    monkeypatch.setattr(automation_service, "classify_task_intake", low_confidence_intake)
+    try:
+        request = resolve_task_request(
+            workspace=workspace,
+            task="adjust widget behavior",
+            command_workflow="dev",
+            provider="mock",
+        )
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    assert request["workflow"] == "dev"
+    assert request["depth"] == "safe"
+
+
+def test_redesigned_command_map_has_no_ci_aliases() -> None:
+    assert "ci" not in runtime_config.WORKFLOW_ALIASES
+    assert "ci-fix" not in runtime_config.WORKFLOW_ALIASES
+
+
 def test_skill_scan_priority_and_role_binding() -> None:
     workspace = _workspace_temp("skills")
     try:
@@ -113,7 +204,7 @@ def test_skill_scan_priority_and_role_binding() -> None:
     assert "content" not in active[0]
 
 
-def test_daemon_api_persists_profile_gate_and_skills() -> None:
+def test_daemon_api_persists_gate_and_skills_without_profile_topology() -> None:
     workspace = _workspace_temp("daemon-context")
     try:
         manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())
@@ -125,7 +216,6 @@ def test_daemon_api_persists_profile_gate_and_skills() -> None:
                 "workspace": str(workspace),
                 "provider": "mock",
                 "workflow": "review",
-                "profile": "squad",
                 "gate": "auto",
                 "skills": [{"name": "demo", "role": "review", "content": "# demo"}],
             },
@@ -137,10 +227,11 @@ def test_daemon_api_persists_profile_gate_and_skills() -> None:
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 
-    assert detail["context"]["profile"] == "squad"
+    assert "profile" not in detail["context"]
+    assert "topology" not in detail["context"]
     assert detail["context"]["gate"] == "auto"
     assert detail["context"]["skills"][0]["name"] == "demo"
-    assert tasks[0]["profile"] == "squad"
+    assert "profile" not in tasks[0]
     assert tasks[0]["skills"][0] == "demo"
     assert "default-review" in tasks[0]["skills"]
 
@@ -157,9 +248,11 @@ def test_cli_dev_submits_resolved_daemon_payload(monkeypatch) -> None:
         def submit_task(self, payload: dict[str, object]) -> dict[str, object]:
             assert payload["task"] == "cli main path"
             assert payload["workflow"] == "dev"
-            assert payload["profile"] == "pair"
+            assert "profile" not in payload
+            assert "topology" not in payload
             assert payload["gate"] == "auto"
             assert payload["role_providers"]["code"] == "mock"
+            assert payload["skills"] == []
             return {"task_id": "task-1", "run_id": "task-1", "status": "created"}
 
     cli_main_module = importlib.import_module("muxdev.cli.main")
@@ -167,7 +260,7 @@ def test_cli_dev_submits_resolved_daemon_payload(monkeypatch) -> None:
     try:
         result = runner.invoke(
             app,
-            ["dev", "cli main path", "-p", "pair", "-g", "auto", "--role", "code=mock", "--provider", "mock", "--json"],
+            ["dev", "cli main path", "-g", "auto", "--role", "code=mock", "--provider", "mock", "--json"],
         )
     finally:
         shutil.rmtree(workspace, ignore_errors=True)

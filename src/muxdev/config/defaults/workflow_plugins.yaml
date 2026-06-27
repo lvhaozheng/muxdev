@@ -11,6 +11,9 @@ command_dialects:
 workflow_plugins:
   void:
     description: Plain provider session with no spec-driven command injection.
+    best_for:
+      - Direct provider sessions where the human already knows the exact next step.
+      - Low ceremony exploration that still keeps muxdev safety and evidence boundaries.
     phases: [running]
     supported_providers: [mock, codex, claude-code, qwen, kimi, trae, antigravity]
     commands:
@@ -22,6 +25,9 @@ workflow_plugins:
     notes: Inspired by agtx's void workflow template for full human control.
   muxdev:
     description: Default muxdev design, approve, implement, test, review workflow.
+    best_for:
+      - Standard implementation work that benefits from plan, approval, test, review, and fix loops.
+      - Risk-aware delivery where evidence and blocker handling should be explicit.
     phases: [design, implement, test, review, fix]
     supported_providers: [mock, codex, claude-code, qwen, kimi]
     commands:
@@ -49,6 +55,9 @@ workflow_plugins:
     notes: Maps muxdev's built-in DAG to a reusable phase catalog.
   spec-lite:
     description: Small spec-driven workflow for projects that want planning artifacts before implementation.
+    best_for:
+      - Small to medium tasks where a concise spec should exist before code changes.
+      - Repository changes that need research notes, acceptance criteria, and a final review trail.
     phases: [research, planning, running, review]
     supported_providers: [codex, claude-code, qwen, kimi]
     commands:
@@ -73,6 +82,9 @@ workflow_plugins:
     notes: A compact local analogue to spec-driven workflow templates such as spec-kit/OpenSpec.
   review-only:
     description: Read-only review workflow for parallel reviewer agents.
+    best_for:
+      - Independent read-only review of an existing change or plan.
+      - Parallel reviewer fan-out where no agent should write to the workspace.
     phases: [review]
     supported_providers: [codex, claude-code, qwen, kimi]
     commands:

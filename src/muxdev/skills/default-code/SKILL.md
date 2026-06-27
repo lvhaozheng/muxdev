@@ -1,6 +1,6 @@
 ---
 name: default-code
-description: Default muxdev coding role skill for scoped implementation that follows local project patterns and preserves user changes.
+description: Default muxdev coding role skill for implementation, fixes, scaffolding, and refactors that follow local project patterns and preserve user changes.
 keywords: [code, implement, refactor, fix]
 metadata:
   compatible_roles: [code, implementer]
@@ -16,7 +16,7 @@ Use this skill when the stage is allowed to modify workspace files.
 - Keep changes scoped to the task and avoid unrelated cleanup.
 - Preserve user changes and generated artifacts that are unrelated to the task.
 - Prefer structured parsers and local helper APIs over brittle string edits.
-- Update tests or docs when behavior changes and risk justifies it.
+- Update tests or docs when behavior changes and the workflow has not delegated that work elsewhere.
 
 ## Output Shape
 
@@ -24,3 +24,10 @@ Use this skill when the stage is allowed to modify workspace files.
 - Behavior changed
 - Verification performed
 - Remaining risk
+
+## Delivery Standard
+
+- Required deliverable: runnable code, changed behavior summary, impact area, verification performed, and residual risk.
+- Pass when the implementation satisfies acceptance criteria, follows local patterns, and remains reviewable.
+- Block when code does not run, breaks expected behavior, lacks necessary tests, or includes unrelated changes.
+- Evidence: diff, changed files, local run or test results, and noted gaps.

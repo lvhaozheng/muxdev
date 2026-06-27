@@ -432,3 +432,15 @@ System Center 从当前 Global Config 演进而来，建议拆成 6 个模块。
 - 如果要配置系统，我去哪里看。
 
 这会让 muxdev 从“多 agent 运行记录页”变成“本地 AI 交付控制塔”。
+## 2026-06 Dashboard Implementation Update
+
+- All dashboard lists default to three visible items with an expand/collapse
+  control: Needs My Action, running tasks, project buckets, provider readiness,
+  workflow templates, and role routing.
+- Dashboard separates model roles from gates. `human_gate` and `delivery_gate`
+  are rendered as workflow stage types, not roles.
+- Config now presents workflow template readability:
+  best-for scenarios, stage flow, model roles, human review points, internal
+  delivery gates, and supported providers.
+- Role/provider display is route-oriented: configured provider, fallback
+  provider, effective provider, readiness, and setup/doctor hints.

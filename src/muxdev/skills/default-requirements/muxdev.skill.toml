@@ -1,7 +1,8 @@
 version = 1
 
 [activation]
-roles = ["requirements", "plan", "architect"]
+roles = ["requirements"]
+stages = ["task_intake", "project_brief"]
 auto = true
 
 [permissions]

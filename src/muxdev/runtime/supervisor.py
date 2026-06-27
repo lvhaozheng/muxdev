@@ -29,6 +29,7 @@ from ..domain import new_run_id
 from ..providers.adapters import ProviderAdapter, ProviderStageOutput, extract_json_object, get_runtime_provider
 from ..providers.planner import ProviderPlanner
 from ..services.dashboard_run import write_run_dashboard
+from ..services.delivery_gate import evaluate_delivery_gate
 from ..services.design import write_design_pack, write_user_design_document
 from ..services.advanced_parallel import planned_stage_writes_from_automation, record_parallel_conflicts, write_parallel_conflict_report
 from ..services.provider_learning import refresh_provider_learning
@@ -135,11 +136,9 @@ class SupervisorRuntime:
             provider_impls.setdefault(role_provider, get_runtime_provider(role_provider))
 
         task_context = {
-            "workflow_name": workflow_name,
-            "profile": profile,
+            "workflow_name": workflow.name,
             "gate": gate,
             "depth": depth,
-            "topology": topology,
             "skills": skills,
             "role_providers": role_providers,
             "ci_block_on_approval": ci_block_on_approval,
@@ -171,28 +170,28 @@ class SupervisorRuntime:
             provider=provider,
             worktree=str(worktree.path),
             strategy=worktree.strategy,
-            profile=profile,
             gate=gate,
             depth=depth,
-            topology=topology,
             intent=(automation or {}).get("intent"),
             skills=[skill.get("name") for skill in skills],
         )
         blackboard.set_run_status(run_id, RunStatus.RUNNING)
-        if _task_requires_clarification(task):
+        clarification = _task_intake_clarification(automation or {}, task)
+        if clarification:
             action_id = blackboard.create_provider_action(
                 run_id=run_id,
-                stage_id="clarify",
+                stage_id=str(clarification.get("stage_id") or "task_intake"),
                 provider="muxdev",
                 role="requirements",
                 kind=str(ProviderActionKind.CLARIFICATION_REQUIRED),
-                prompt_text="Please clarify the goal, target behavior, and acceptance criteria before implementation continues.",
-                input_kind="text",
+                prompt_text=str(clarification.get("prompt_text") or "Please clarify the task before implementation continues."),
+                input_kind=str(clarification.get("input_kind") or "text"),
+                choices=[choice for choice in clarification.get("choices", []) if isinstance(choice, dict)],
                 auto_policy="manual",
             )
-            blackboard.upsert_stage(run_id, "clarify", role="requirements", status=StageStatus.RUNNING, summary="waiting for clarification")
+            blackboard.upsert_stage(run_id, str(clarification.get("stage_id") or "task_intake"), role="requirements", status=StageStatus.RUNNING, summary="waiting for clarification")
             blackboard.set_run_status(run_id, RunStatus.AWAITING_PROVIDER_ACTION)
-            trace.write("clarification_requested", stage="clarify", action_id=action_id)
+            trace.write("clarification_requested", stage=str(clarification.get("stage_id") or "task_intake"), action_id=action_id)
             self._write_run_dashboard(run_dir, run_id, blackboard=blackboard)
             blackboard.close()
             return RunResult(run_id, RunStatus.AWAITING_PROVIDER_ACTION, run_dir, None)
@@ -459,14 +458,18 @@ class SupervisorRuntime:
                 blackboard.add_checkpoint(run_id, stage.id, "stage_started")
                 blackboard.upsert_stage(run_id, stage.id, role=stage.role, status=StageStatus.RUNNING)
                 trace.write("stage_started", stage=stage.id, role=stage.role, type=stage.type)
-                stage_provider = _stage_provider_for(
-                    blackboard,
-                    trace,
-                    stage_id=stage.id,
-                    role=stage.role,
-                    fallback=provider,
-                    role_providers=role_providers,
-                )
+                if stage.type == "delivery_gate":
+                    stage_provider = "muxdev"
+                    trace.write("provider_route_decision", stage=stage.id, role=stage.role, selected=stage_provider, reason="delivery_gate")
+                else:
+                    stage_provider = _stage_provider_for(
+                        blackboard,
+                        trace,
+                        stage_id=stage.id,
+                        role=stage.role,
+                        fallback=provider,
+                        role_providers=role_providers,
+                    )
                 snapshot = _record_stage_snapshot(blackboard, run_dir=run_dir, run_id=run_id, stage_id=stage.id, worktree=worktree)
                 stage_contract_path, stage_contract_hash, _ = write_stage_contract(
                     run_dir,
@@ -488,6 +491,82 @@ class SupervisorRuntime:
                     stage_id=stage.id,
                     payload={"contract_hash": stage_contract_hash, "snapshot": snapshot},
                 )
+
+                if stage.type == "delivery_gate":
+                    target_stage_ids = _delivery_targets(stage)
+                    gate_skills = _delivery_target_skills(skills, workflow, target_stage_ids, getattr(stage, "delivery_skill_sources", []) or [])
+                    trace.write(
+                        "delivery_gate_started",
+                        stage=stage.id,
+                        targets=target_stage_ids,
+                        skills=[skill.get("name") for skill in gate_skills if isinstance(skill, dict)],
+                    )
+                    artifact_path, artifact_hash, gate_payload = evaluate_delivery_gate(
+                        blackboard,
+                        run_dir=run_dir,
+                        run_id=run_id,
+                        stage_id=stage.id,
+                        target_stage_ids=target_stage_ids,
+                        skills=gate_skills,
+                    )
+                    blackboard.add_artifact(run_id, stage.id, artifact_path.name, artifact_path, "delivery_gate")
+                    blockers: list[dict[str, object]] = [item for item in gate_payload.get("blockers", []) if isinstance(item, dict)]
+                    for blocker in blockers:
+                        blackboard.add_review_blocker(
+                            run_id,
+                            stage.id,
+                            type=str(blocker.get("type") or "delivery_gate"),
+                            file=str(blocker.get("file")) if blocker.get("file") else None,
+                            line=int(blocker["line"]) if blocker.get("line") is not None else None,
+                            severity=str(blocker.get("severity") or "medium"),
+                            suggestion=str(blocker.get("suggestion") or "Delivery gate failed."),
+                        )
+                    review = ReviewResult(
+                        has_blockers=bool(blockers),
+                        blockers=[ReviewBlocker.model_validate(blocker) for blocker in blockers],
+                    )
+                    context[stage.id] = review.model_dump()
+                    if stage.id == "review":
+                        context["review"] = review.model_dump()
+                    decision_text = "reject" if blockers else "accept"
+                    summary = (
+                        f"delivery gate rejected {len(blockers)} blocker(s)"
+                        if blockers
+                        else f"delivery gate accepted {', '.join(target_stage_ids) or 'dependencies'}"
+                    )
+                    _record_role_result(
+                        blackboard,
+                        run_dir=run_dir,
+                        run_id=run_id,
+                        stage_id=stage.id,
+                        role=stage.role,
+                        provider=stage_provider,
+                        decision=decision_text,
+                        summary=summary,
+                        findings=blockers,
+                        artifact_path=artifact_path,
+                        worktree=worktree,
+                        snapshot_ref=str(snapshot["path"]),
+                    )
+                    blackboard.upsert_stage(run_id, stage.id, role=stage.role, status=StageStatus.COMPLETED, output_path=str(artifact_path), summary=summary)
+                    blackboard.add_checkpoint(run_id, stage.id, "stage_completed")
+                    trace.write(
+                        "delivery_gate_completed",
+                        stage=stage.id,
+                        decision=decision_text,
+                        blockers=len(blockers),
+                        artifact=str(artifact_path),
+                        artifact_hash=artifact_hash,
+                    )
+                    trace.write("stage_completed", stage=stage.id, output=str(artifact_path))
+                    completed.add(stage.id)
+                    if blockers and not _has_downstream_delivery_repair(stage, workflow):
+                        blackboard.add_error(run_id, stage.id, "delivery_gate_blockers", f"{stage.id} blockers remain with no automatic repair stage")
+                        blackboard.set_run_status(run_id, RunStatus.BLOCKED)
+                        trace.write("run_blocked", stage=stage.id, reason="delivery gate blockers remain")
+                        return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
+                    index += 1
+                    continue
 
                 if stage.type == "human_gate":
                     approval_type = stage.approval_type or "plan"
@@ -811,7 +890,7 @@ class SupervisorRuntime:
                     trace.write("project_design_doc_written", stage=stage.id, path=str(design_doc))
                 findings: list[dict[str, object]] = []
                 decision_text = "accept"
-                if stage.id == "test":
+                if stage.output_schema == "TestResult" or stage.id == "test":
                     parsed = extract_json_object(output.content) or {}
                     test_result = TestResult(
                         passed=bool(parsed.get("passed", True)),
@@ -858,6 +937,7 @@ class SupervisorRuntime:
                 blackboard.add_checkpoint(run_id, stage.id, "stage_completed")
                 trace.write("stage_completed", stage=stage.id, output=str(artifact_path))
                 completed.add(stage.id)
+                feedback_loop = _stage_triggers_plan_feedback_loop(stage, context)
                 if _stage_triggers_review_loop(stage, context):
                     previous_loop = int(context.get("loop", 0))
                     context["loop"] = int(context.get("loop", 0)) + 1
@@ -873,6 +953,8 @@ class SupervisorRuntime:
                         if reset_stage in by_id:
                             blackboard.reset_stage(run_id, reset_stage)
                             completed.discard(reset_stage)
+                    if feedback_loop and isinstance(context.get("plan_feedback"), dict):
+                        context["plan_feedback"] = {**context["plan_feedback"], "has_feedback": False, "consumed": True}  # type: ignore[operator]
                     restart = stage.loop_restart_stage or ("test" if stage.id == "fix" and "test" in by_id else review_stage)
                     index = ordered.index(restart)
                     continue
@@ -926,7 +1008,7 @@ class SupervisorRuntime:
                 worktree=worktree,
             )
             blackboard.set_run_status(run_id, RunStatus.COMPLETED)
-            if workflow.name in {"design", "design-lite", "design-v2"}:
+            if workflow.name in {"design", "design-lite"}:
                 try:
                     _record_design_deliverables(
                         blackboard,
@@ -1454,6 +1536,42 @@ def _task_requires_clarification(task: str) -> bool:
     return normalized in {"?", "??", "clarify", "needs clarification", "unclear", "tbd"}
 
 
+def _task_intake_clarification(automation: dict[str, object], task: str) -> dict[str, object] | None:
+    intake = automation.get("intake") if isinstance(automation, dict) else None
+    if isinstance(intake, dict) and str(intake.get("clarity") or "clear") == "unclear":
+        questions = [item for item in intake.get("questions", []) if isinstance(item, dict)]
+        if questions:
+            prompt_lines = [str(item.get("question") or "").strip() for item in questions if str(item.get("question") or "").strip()]
+            first = questions[0]
+            choices = _intake_question_choices(first)
+            return {
+                "stage_id": "task_intake",
+                "prompt_text": "\n".join(prompt_lines[:3]) or "Please clarify the task before implementation continues.",
+                "input_kind": "choice" if choices and str(first.get("kind") or "") in {"single_choice", "multi_choice"} else "text",
+                "choices": choices,
+            }
+    if _task_requires_clarification(task):
+        return {
+            "stage_id": "task_intake",
+            "prompt_text": "Please clarify the goal, target behavior, and acceptance criteria before implementation continues.",
+            "input_kind": "text",
+            "choices": [],
+        }
+    return None
+
+
+def _intake_question_choices(question: dict[str, object]) -> list[dict[str, object]]:
+    choices: list[dict[str, object]] = []
+    for option in question.get("options", []):
+        if not isinstance(option, dict):
+            continue
+        label = str(option.get("label") or option.get("value") or "").strip()
+        value = str(option.get("value") or option.get("label") or "").strip()
+        if label or value:
+            choices.append({"label": label or value, "value": value or label})
+    return choices
+
+
 def _worktree_patch_hash(worktree: Path) -> str:
     return sha256_text(_worktree_diff_text(worktree))
 
@@ -1795,7 +1913,20 @@ def _task_for_run(blackboard: Blackboard, run_id: str) -> str:
 
 
 def _latest_planning_hash(blackboard: Blackboard, run_id: str) -> str | None:
-    planning_stages = {"plan", "design", "problem_statement", "requirements", "architecture_options", "system_design"}
+    planning_stages = {
+        "plan",
+        "quick_plan",
+        "scaffold_plan",
+        "plan_revise",
+        "design",
+        "design_brief",
+        "design_plan",
+        "design_revise",
+        "problem_statement",
+        "requirements",
+        "architecture_options",
+        "system_design",
+    }
     artifacts = [
         row
         for row in blackboard.table_rows("artifacts", run_id=run_id)
@@ -2034,7 +2165,6 @@ def _record_provider_actions(
         kind = str(action.get("kind") or ProviderActionKind.PROVIDER_BLOCKED)
         options = action.get("options") if isinstance(action.get("options"), list) else []
         choices = action.get("choices") if isinstance(action.get("choices"), list) else options
-        attach_agent = role or stage_id
         source_hash = sha256_text(
             json.dumps(
                 {
@@ -2065,7 +2195,7 @@ def _record_provider_actions(
                 auto_policy=str(action.get("auto_policy") or "manual"),
                 transcript_path=str(action.get("transcript_path") or "") or None,
                 chunks_path=str(action.get("chunks_path") or "") or None,
-                attach_command=f"muxdev attach {run_id} --agent {attach_agent}",
+                attach_command=str(action.get("attach_command") or "") or None,
                 source_event_hash=source_hash,
             )
         )
@@ -2074,6 +2204,12 @@ def _record_provider_actions(
 
 def _initial_workflow_context(blackboard: Blackboard, run_id: str, workflow) -> dict[str, object]:
     context: dict[str, object] = {"loop": 0, "review": {"has_blockers": False}}
+    plan_feedback = [
+        row
+        for row in blackboard.table_rows("feedback_events", run_id=run_id)
+        if str(row.get("kind") or "") == "plan_feedback" and str(row.get("status") or "") in {"pending", "routed"}
+    ]
+    context["plan_feedback"] = {"has_feedback": bool(plan_feedback), "count": len(plan_feedback), "items": plan_feedback}
     blockers_by_stage: dict[str, list[dict[str, object]]] = {}
     for row in blackboard.table_rows("review_blockers", run_id=run_id):
         blockers_by_stage.setdefault(str(row.get("stage_id") or "review"), []).append(row)
@@ -2120,7 +2256,14 @@ def _loop_reset_stages(stage) -> tuple[str, ...]:
 def _stage_triggers_review_loop(stage, context: dict[str, object]) -> bool:
     if not (stage.loop_review_stage or stage.id == "fix" or stage.id.endswith("_revise")):
         return False
-    return _review_has_blockers(context, _loop_review_stage(stage))
+    return _review_has_blockers(context, _loop_review_stage(stage)) or _stage_triggers_plan_feedback_loop(stage, context)
+
+
+def _stage_triggers_plan_feedback_loop(stage, context: dict[str, object]) -> bool:
+    if stage.id not in {"plan_revise", "design_revise"}:
+        return False
+    feedback = context.get("plan_feedback", {})
+    return bool(feedback.get("has_feedback")) if isinstance(feedback, dict) else False
 
 
 def _loop_stage_exhausted(stage, context: dict[str, object]) -> bool:
@@ -2207,6 +2350,44 @@ def _can_use_parallel_runtime(workflow) -> bool:
     return True
 
 
+def _delivery_targets(stage) -> list[str]:
+    explicit = [str(item).strip() for item in getattr(stage, "delivery_targets", []) or [] if str(item).strip()]
+    if explicit:
+        return explicit
+    return [str(item).strip() for item in getattr(stage, "deps", []) or [] if str(item).strip()]
+
+
+def _delivery_target_skills(
+    skills: list[dict[str, object]],
+    workflow,
+    target_stage_ids: list[str],
+    delivery_skill_sources: list[str],
+) -> list[dict[str, object]]:
+    by_id = {stage.id: stage for stage in workflow.stages}
+    selected: list[dict[str, object]] = []
+    for target in target_stage_ids:
+        target_stage = by_id.get(target)
+        if not target_stage:
+            continue
+        selected.extend(_skills_for_stage(skills, role=target_stage.role, stage_id=target_stage.id))
+    source_names = {str(name).strip() for name in delivery_skill_sources if str(name).strip()}
+    if source_names:
+        selected.extend(skill for skill in skills if isinstance(skill, dict) and str(skill.get("name") or "") in source_names)
+    return _merge_skill_payloads(selected)
+
+
+def _has_downstream_delivery_repair(stage, workflow) -> bool:
+    marker = f"{stage.id}.has_blockers"
+    for candidate in workflow.stages:
+        if candidate.id == stage.id:
+            continue
+        if candidate.loop_review_stage == stage.id:
+            return True
+        if marker in str(candidate.when or ""):
+            return True
+    return False
+
+
 def _configured_workflow_engine(workspace: Path, automation: dict[str, object]) -> str:
     value = automation.get("workflow_engine") if isinstance(automation, dict) else None
     if not value:
@@ -2230,6 +2411,11 @@ def _skills_for_stage(skills: list[dict[str, object]], *, role: str | None, stag
     for skill in skills:
         if not isinstance(skill, dict):
             continue
+        skill_stage = str(skill.get("stage")) if skill.get("stage") else None
+        if skill_stage:
+            if skill_stage == stage_id:
+                selected.append(skill)
+            continue
         skill_role = skill.get("role")
         normalized_skill_role = normalize_role(str(skill_role)) if skill_role else None
         if skill_role in {None, "", role, stage_id} or normalized_skill_role in {normalized_role, stage_id}:
@@ -2250,13 +2436,32 @@ def _resolve_workflow_role_skills(
     workflow,
     provider: str,
 ) -> list[dict[str, object]]:
-    roles = sorted({role for stage in workflow.stages for role in _stage_skill_roles(stage)})
-    if not roles:
-        return []
-    try:
-        return resolve_active_skills(workspace, task=task, roles=roles, provider=provider, include_content=True)
-    except Exception:
-        return []
+    resolved: list[dict[str, object]] = []
+    for stage in workflow.stages:
+        if stage.type == "delivery_gate":
+            roles = []
+            explicit = [str(item).strip() for item in getattr(stage, "delivery_skill_sources", []) or [] if str(item).strip()]
+        else:
+            roles = sorted(_stage_skill_roles(stage))
+            explicit = _stage_default_skill_specs(stage)
+        if not roles and not explicit:
+            continue
+        try:
+            rows = resolve_active_skills(
+                workspace,
+                task=task,
+                roles=roles,
+                stage=stage.id,
+                provider=provider,
+                explicit=explicit,
+                include_content=True,
+            )
+        except Exception:
+            continue
+        for row in rows:
+            row.setdefault("stage", stage.id)
+        resolved.extend(rows)
+    return _merge_skill_payloads(resolved)
 
 
 def _stage_skill_roles(stage) -> set[str]:
@@ -2268,6 +2473,10 @@ def _stage_skill_roles(stage) -> set[str]:
         if isinstance(skill_spec, str) and "=" in skill_spec:
             roles.add(normalize_role(skill_spec.split("=", 1)[0]))
     return {role for role in roles if role}
+
+
+def _stage_default_skill_specs(stage) -> list[str]:
+    return [str(item).strip() for item in getattr(stage, "default_skills", []) or [] if str(item).strip()]
 
 
 def _merge_skill_payloads(*groups: list[dict[str, object]]) -> list[dict[str, object]]:

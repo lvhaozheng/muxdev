@@ -107,6 +107,46 @@ def test_builtin_role_skills_are_trusted_and_auto_selected() -> None:
         shutil.rmtree(workspace, ignore_errors=True)
 
 
+def test_stage_limited_builtin_skills_only_activate_on_matching_stage() -> None:
+    workspace = _workspace_temp("builtin-stage-skills")
+    try:
+        test_stage = resolve_active_skills(workspace, task="verify behavior", roles=["test"], stage="test", provider="mock")
+        strategy_stage = resolve_active_skills(workspace, task="plan verification", roles=["test_strategy"], stage="test_strategy", provider="mock")
+        explicit = resolve_active_skills(
+            workspace,
+            task="force strategy skill",
+            roles=[],
+            stage="test",
+            provider="mock",
+            explicit=["test_strategy=default-test-strategy"],
+            include_content=False,
+            auto=False,
+        )
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    assert "default-test" in {row["name"] for row in test_stage}
+    assert "default-test-strategy" not in {row["name"] for row in test_stage}
+    assert "default-test-strategy" in {row["name"] for row in strategy_stage}
+    assert explicit[0]["name"] == "default-test-strategy"
+    assert explicit[0]["role"] == "test_strategy"
+    assert explicit[0]["stage"] == "test"
+
+
+def test_builtin_default_skills_define_delivery_standards() -> None:
+    skill_root = Path("src/muxdev/skills")
+    skill_dirs = sorted(path for path in skill_root.glob("default-*") if path.is_dir())
+
+    assert skill_dirs
+    for skill_dir in skill_dirs:
+        content = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+        assert "## Delivery Standard" in content, skill_dir.name
+        assert "- Required deliverable:" in content, skill_dir.name
+        assert "- Pass when" in content, skill_dir.name
+        assert "- Block when" in content, skill_dir.name
+        assert "- Evidence:" in content, skill_dir.name
+
+
 def test_skill_lock_v2_detects_script_drift() -> None:
     workspace = _workspace_temp("skill-lock")
     try:

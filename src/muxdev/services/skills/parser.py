@@ -125,6 +125,14 @@ def skill_permissions(policy: dict[str, Any]) -> SkillPermissions:
     )
 
 
+def skill_delivery_gate(policy: dict[str, Any]) -> dict[str, list[str]]:
+    delivery_gate = policy.get("delivery_gate", {}) if isinstance(policy.get("delivery_gate"), dict) else {}
+    return {
+        "checks": string_list(delivery_gate.get("checks")),
+        "required_evidence": string_list(delivery_gate.get("required_evidence")),
+    }
+
+
 def skill_auto(policy: dict[str, Any], policy_override: dict[str, Any]) -> bool:
     activation = policy.get("activation", {}) if isinstance(policy.get("activation"), dict) else {}
     if "auto" in policy_override:

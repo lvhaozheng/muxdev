@@ -34,8 +34,8 @@ from ..config.runtime import (
     set_runtime_config_value,
     setup_muxdev,
     write_full_presets,
-    PROFILES,
     GATES,
+    PUBLIC_WORKFLOWS,
     WORKFLOW_ALIASES,
     dumps_toml,
 )
@@ -142,7 +142,7 @@ app = typer.Typer(
 policy_app = typer.Typer(help="Safety policy tools")
 trace_app = typer.Typer(help="Trace inspection tools")
 skill_app = typer.Typer(help="Skill registry tools")
-preset_app = typer.Typer(help="Built-in profile, gate, and workflow presets")
+preset_app = typer.Typer(help="Built-in gate and workflow presets")
 mcp_app = typer.Typer(help="MCP server tools")
 session_app = typer.Typer(help="Long-lived provider session tools")
 rag_app = typer.Typer(help="Local retrieval index tools")
@@ -161,7 +161,6 @@ memory_app = typer.Typer(help="Explicit project memory tools")
 parallel_app = typer.Typer(help="Advanced parallel-squad tools")
 learning_app = typer.Typer(help="Long-term learning tools")
 multirepo_app = typer.Typer(help="Multi-repo orchestration tools")
-ci_app = typer.Typer(help="CI rescue commands")
 evidence_app = typer.Typer(help="Evidence v2 event, manifest, and evaluation tools")
 action_app = typer.Typer(help="Provider action handoff tools")
 feedback_app = typer.Typer(help="External feedback routing tools")
@@ -187,7 +186,6 @@ app.add_typer(memory_app, name="memory")
 app.add_typer(parallel_app, name="parallel")
 app.add_typer(learning_app, name="learning")
 app.add_typer(multirepo_app, name="multirepo")
-app.add_typer(ci_app, name="ci")
 app.add_typer(evidence_app, name="evidence")
 app.add_typer(action_app, name="action")
 app.add_typer(feedback_app, name="feedback")
@@ -440,11 +438,9 @@ def demo(
         provider=provider,
         workflow_name="dev",
         require_approval=set(),
-        profile="solo",
         gate="auto",
         depth="simple",
-        topology="solo",
-        automation={"intent": "dev", "depth": "simple", "topology": "solo", "roles": ["code", "test", "review"]},
+        automation={"intent": "dev", "depth": "simple", "workflow": "dev-lite", "roles": ["requirements", "plan", "code", "test", "review"]},
     )
     payload = {
         "run_id": result.run_id,
@@ -548,7 +544,6 @@ def _print_doctor_checks(payload: dict[str, object]) -> None:
         f"valid: {payload['valid']}",
         f"errors: {len(payload.get('errors', []))}",
         f"warnings: {len(payload.get('warnings', []))}",
-        f"profile: {payload.get('effective', {}).get('profile', '-') if isinstance(payload.get('effective'), dict) else '-'}",
         f"gate: {payload.get('effective', {}).get('gate', '-') if isinstance(payload.get('effective'), dict) else '-'}",
     ]
     if payload.get("errors"):
@@ -564,9 +559,12 @@ def _print_doctor_checks(payload: dict[str, object]) -> None:
 @app.command()
 def dev(
     task: Annotated[str | None, typer.Argument(help="Development task to submit.")] = None,
-    profile: Annotated[str | None, typer.Option("-p", "--profile", help="Profile: solo, pair, squad, ci.")] = None,
+    profile: Annotated[str | None, typer.Option("-p", "--profile", hidden=True)] = None,
     gate: Annotated[str | None, typer.Option("-g", "--gate", help="Gate: auto, safe, strict, ci.")] = None,
     simple: Annotated[bool, typer.Option("--simple", help="Force simple auto flow depth.")] = False,
+    light: Annotated[bool, typer.Option("--light", help="Alias for --simple; force lightweight dev flow.")] = False,
+    new_project: Annotated[bool, typer.Option("--new", help="Force zero-to-one project scaffolding flow.")] = False,
+    from_zero: Annotated[bool, typer.Option("--from-zero", help="Alias for --new.")] = False,
     safe_depth: Annotated[bool, typer.Option("--safe", help="Force safe auto flow depth.")] = False,
     deep: Annotated[bool, typer.Option("--deep", help="Force deep auto flow depth.")] = False,
     parallel: Annotated[bool, typer.Option("--parallel", help="Force parallel auto flow depth.")] = False,
@@ -577,6 +575,8 @@ def dev(
     provider: Annotated[str | None, typer.Option("--provider", help="Fallback provider for all roles.")] = None,
     workflow: Annotated[str | None, typer.Option("--workflow", help="Workflow name or YAML path.")] = None,
     require_approval: Annotated[str, typer.Option("--require-approval", help="Comma-separated extra approval types.")] = "",
+    plan: Annotated[bool, typer.Option("--plan", help="Require manual plan approval; shorthand for --approve-plan manual.")] = False,
+    approve_plan: Annotated[str, typer.Option("--approve-plan", help="Plan approval mode: auto or manual.")] = "auto",
     max_cost_usd: Annotated[float, typer.Option("--max-cost-usd", help="Budget limit for this task.")] = 0.5,
     bg: Annotated[bool, typer.Option("--bg", help="Compatibility flag; daemon tasks always run in the background.")] = False,
     host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
@@ -589,14 +589,16 @@ def dev(
         task=task,
         profile=profile,
         gate=gate,
-        depth=_depth_override(simple=simple, safe=safe_depth, deep=deep, parallel=parallel),
+        depth=_depth_override(simple=(simple or light), safe=safe_depth, deep=deep, parallel=parallel),
         role=role,
         skill=skill,
         task_file=task_file,
         from_design=from_design,
         provider=provider,
-        workflow=workflow,
+        workflow=workflow or ("dev-new" if (new_project or from_zero) else None),
         require_approval=require_approval,
+        approve_plan=approve_plan,
+        plan=plan,
         max_cost_usd=max_cost_usd,
         host=host,
         port=port,
@@ -608,7 +610,7 @@ def dev(
 @app.command()
 def fix(
     task: Annotated[str | None, typer.Argument(help="Issue or bug to fix.")] = None,
-    profile: Annotated[str | None, typer.Option("-p", "--profile", help="Profile: solo, pair, squad, ci.")] = None,
+    profile: Annotated[str | None, typer.Option("-p", "--profile", hidden=True)] = None,
     gate: Annotated[str | None, typer.Option("-g", "--gate", help="Gate: auto, safe, strict, ci.")] = None,
     role: Annotated[list[str] | None, typer.Option("--role", help="Role provider override.")] = None,
     skill: Annotated[list[str] | None, typer.Option("-s", "--skill", help="Skill activation.")] = None,
@@ -620,13 +622,13 @@ def fix(
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     """Submit a focused fix task."""
-    _submit_main_task("fix", task=task, profile=profile, gate=gate, role=role, skill=skill, task_file=task_file, provider=provider, workflow="fix", require_approval="", max_cost_usd=max_cost_usd, host=host, port=port, json_output=json_output, title="muxdev fix")
+    _submit_main_task("fix", task=task, profile=profile, gate=gate, role=role, skill=skill, task_file=task_file, provider=provider, workflow="fix", require_approval="", approve_plan=approve_plan, plan=plan, max_cost_usd=max_cost_usd, host=host, port=port, json_output=json_output, title="muxdev fix")
 
 
 @app.command()
 def review(
     task: Annotated[str | None, typer.Argument(help="Review task description.")] = None,
-    profile: Annotated[str | None, typer.Option("-p", "--profile", help="Profile: solo, pair, squad, ci.")] = None,
+    profile: Annotated[str | None, typer.Option("-p", "--profile", hidden=True)] = None,
     gate: Annotated[str | None, typer.Option("-g", "--gate", help="Gate: auto, safe, strict, ci.")] = None,
     role: Annotated[list[str] | None, typer.Option("--role", help="Role provider override.")] = None,
     skill: Annotated[list[str] | None, typer.Option("-s", "--skill", help="Skill activation.")] = None,
@@ -644,25 +646,27 @@ def review(
 @app.command("test")
 def test_command(
     task: Annotated[str | None, typer.Argument(help="Test task description.")] = None,
-    profile: Annotated[str | None, typer.Option("-p", "--profile", help="Profile: solo, pair, squad, ci.")] = None,
+    profile: Annotated[str | None, typer.Option("-p", "--profile", hidden=True)] = None,
     gate: Annotated[str | None, typer.Option("-g", "--gate", help="Gate: auto, safe, strict, ci.")] = None,
     role: Annotated[list[str] | None, typer.Option("--role", help="Role provider override.")] = None,
     skill: Annotated[list[str] | None, typer.Option("-s", "--skill", help="Skill activation.")] = None,
     task_file: Annotated[Path | None, typer.Option("-f", "--file", help="Task TOML file.")] = None,
     provider: Annotated[str | None, typer.Option("--provider", help="Fallback provider.")] = None,
+    plan: Annotated[bool, typer.Option("--plan", help="Require manual plan approval; shorthand for --approve-plan manual.")] = False,
+    approve_plan: Annotated[str, typer.Option("--approve-plan", help="Plan approval mode: auto or manual.")] = "auto",
     max_cost_usd: Annotated[float, typer.Option("--max-cost-usd", help="Budget limit for this task.")] = 0.5,
     host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
     port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     """Submit a test-only task."""
-    _submit_main_task("test", task=task, profile=profile, gate=gate, role=role, skill=skill, task_file=task_file, provider=provider, workflow="test", require_approval="", max_cost_usd=max_cost_usd, host=host, port=port, json_output=json_output, title="muxdev test")
+    _submit_main_task("test", task=task, profile=profile, gate=gate, role=role, skill=skill, task_file=task_file, provider=provider, workflow="test", require_approval="", approve_plan=approve_plan, plan=plan, max_cost_usd=max_cost_usd, host=host, port=port, json_output=json_output, title="muxdev test")
 
 
 @app.command()
 def design(
     task: Annotated[str | None, typer.Argument(help="Design task to submit.")] = None,
-    profile: Annotated[str | None, typer.Option("-p", "--profile", help="Profile: auto, solo, pair, squad, ci.")] = None,
+    profile: Annotated[str | None, typer.Option("-p", "--profile", hidden=True)] = None,
     gate: Annotated[str | None, typer.Option("-g", "--gate", help="Gate: auto, safe, strict, ci.")] = None,
     simple: Annotated[bool, typer.Option("--simple", help="Force simple auto flow depth.")] = False,
     safe_depth: Annotated[bool, typer.Option("--safe", help="Force safe auto flow depth.")] = False,
@@ -671,8 +675,10 @@ def design(
     skill: Annotated[list[str] | None, typer.Option("-s", "--skill", help="Skill activation.")] = None,
     task_file: Annotated[Path | None, typer.Option("-f", "--file", help="Task TOML file.")] = None,
     provider: Annotated[str | None, typer.Option("--provider", help="Fallback provider.")] = None,
-    workflow: Annotated[str | None, typer.Option("--workflow", help="Workflow name or YAML path, e.g. design-v2.")] = None,
-    max_review_fixes: Annotated[int, typer.Option("--max-review-fixes", help="Maximum design review revision loops for design-v2.")] = 2,
+    workflow: Annotated[str | None, typer.Option("--workflow", help="Workflow name or YAML path, e.g. design-lite.")] = None,
+    plan: Annotated[bool, typer.Option("--plan", help="Require manual plan approval; shorthand for --approve-plan manual.")] = False,
+    approve_plan: Annotated[str, typer.Option("--approve-plan", help="Plan approval mode: auto or manual.")] = "auto",
+    max_review_fixes: Annotated[int, typer.Option("--max-review-fixes", help="Maximum design review revision loops for design workflows.")] = 2,
     max_cost_usd: Annotated[float, typer.Option("--max-cost-usd", help="Budget limit for this task.")] = 0.5,
     host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
     port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
@@ -689,7 +695,9 @@ def design(
         task_file=task_file,
         provider=provider,
         workflow=workflow,
-        require_approval="design" if workflow == "design-v2" and (gate or "auto") != "auto" else "",
+        require_approval="",
+        approve_plan=approve_plan,
+        plan=plan,
         max_cost_usd=max_cost_usd,
         host=host,
         port=port,
@@ -703,7 +711,7 @@ def design(
 @app.command()
 def refactor(
     task: Annotated[str | None, typer.Argument(help="Refactor task to submit.")] = None,
-    profile: Annotated[str | None, typer.Option("-p", "--profile", help="Profile: auto, solo, pair, squad, ci.")] = None,
+    profile: Annotated[str | None, typer.Option("-p", "--profile", hidden=True)] = None,
     gate: Annotated[str | None, typer.Option("-g", "--gate", help="Gate: auto, safe, strict, ci.")] = None,
     simple: Annotated[bool, typer.Option("--simple", help="Force simple auto flow depth.")] = False,
     safe_depth: Annotated[bool, typer.Option("--safe", help="Force safe auto flow depth.")] = False,
@@ -713,58 +721,15 @@ def refactor(
     skill: Annotated[list[str] | None, typer.Option("-s", "--skill", help="Skill activation.")] = None,
     task_file: Annotated[Path | None, typer.Option("-f", "--file", help="Task TOML file.")] = None,
     provider: Annotated[str | None, typer.Option("--provider", help="Fallback provider.")] = None,
+    plan: Annotated[bool, typer.Option("--plan", help="Require manual plan approval; shorthand for --approve-plan manual.")] = False,
+    approve_plan: Annotated[str, typer.Option("--approve-plan", help="Plan approval mode: auto or manual.")] = "auto",
     max_cost_usd: Annotated[float, typer.Option("--max-cost-usd", help="Budget limit for this task.")] = 0.5,
     host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
     port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     """Submit a refactor task through the auto-orchestrated dev workflow."""
-    _submit_main_task("refactor", task=task, profile=profile, gate=gate, role=role, skill=skill, task_file=task_file, provider=provider, workflow="dev", require_approval="", max_cost_usd=max_cost_usd, host=host, port=port, json_output=json_output, title="muxdev refactor", depth=_depth_override(simple=simple, safe=safe_depth, deep=deep, parallel=parallel))
-
-
-@ci_app.command("fix")
-def ci_fix(
-    task: Annotated[str | None, typer.Argument(help="CI failure description.")] = None,
-    role: Annotated[list[str] | None, typer.Option("--role", help="Role provider override.")] = None,
-    skill: Annotated[list[str] | None, typer.Option("-s", "--skill", help="Skill activation.")] = None,
-    task_file: Annotated[Path | None, typer.Option("-f", "--file", help="Task TOML file.")] = None,
-    provider: Annotated[str | None, typer.Option("--provider", help="Fallback provider.")] = None,
-    max_cost_usd: Annotated[float, typer.Option("--max-cost-usd", help="Budget limit for this task.")] = 0.5,
-    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
-    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
-    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
-) -> None:
-    """Submit a non-interactive CI rescue task."""
-    _submit_main_task("ci", task=task or "fix CI failures", profile="ci", gate="ci", role=role, skill=skill, task_file=task_file, provider=provider, workflow="dev", require_approval="", max_cost_usd=max_cost_usd, host=host, port=port, json_output=json_output, title="muxdev ci fix", depth="ci")
-
-
-@ci_app.command("rescue")
-def ci_rescue(
-    content: Annotated[str, typer.Argument(help="CI log, failure summary, or URL.")],
-    source: Annotated[str, typer.Option("--source", help="Feedback source label.")] = "ci",
-    run_id: Annotated[str | None, typer.Option("--run-id", help="Related muxdev run id.")] = None,
-    provider: Annotated[str, typer.Option("--provider", help="Provider for the rescue task.")] = "mock",
-    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
-    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
-    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
-) -> None:
-    """Route CI failure feedback and auto-submit a rescue task."""
-    payload = _daemon_client(host, port).feedback(
-        {
-            "kind": "ci_failed",
-            "source": source,
-            "content": content,
-            "workspace": str(Path.cwd()),
-            "run_id": run_id,
-            "severity": "high",
-            "provider": provider,
-            "auto_submit": True,
-        }
-    )
-    if json_output:
-        _print_json(payload)
-        return
-    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="CI Rescue"))
+    _submit_main_task("refactor", task=task, profile=profile, gate=gate, role=role, skill=skill, task_file=task_file, provider=provider, workflow="refactor", require_approval="", approve_plan=approve_plan, plan=plan, max_cost_usd=max_cost_usd, host=host, port=port, json_output=json_output, title="muxdev refactor", depth=_depth_override(simple=simple, safe=safe_depth, deep=deep, parallel=parallel))
 
 
 @feedback_app.command("add")
@@ -1626,6 +1591,29 @@ def deny(
     console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Deny"))
 
 
+@app.command("plan-feedback")
+def plan_feedback(
+    approval_id: Annotated[str, typer.Argument(help="Plan approval id, or run id when exactly one plan approval is pending.")],
+    feedback: Annotated[str, typer.Argument(help="Feedback for plan revision.")],
+    continue_: Annotated[bool, typer.Option("--continue/--no-continue", help="Resume the task after recording feedback.")] = True,
+    max_cost_usd: Annotated[float, typer.Option("--max-cost-usd", help="Budget limit when continuing.")] = 0.5,
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Send feedback to a pending plan approval and route through plan revise."""
+    payload = _daemon_client(host, port).approval_feedback(
+        approval_id,
+        feedback,
+        max_cost_usd=max_cost_usd,
+        continue_task=continue_,
+    )
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Plan Feedback"))
+
+
 @app.command()
 def attach(
     run_id: Annotated[str, typer.Argument(help="Run id, or 'latest'.")] = "latest",
@@ -1788,11 +1776,10 @@ def config_validate(
 def preset_list(
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
-    """List built-in profiles, gates, and workflows."""
+    """List built-in gates and workflows."""
     payload = {
-        "profiles": sorted(PROFILES),
         "gates": sorted(GATES),
-        "workflows": sorted(WORKFLOW_ALIASES),
+        "workflows": list(PUBLIC_WORKFLOWS),
     }
     if json_output:
         _print_json(payload)
@@ -1802,7 +1789,7 @@ def preset_list(
 
 @preset_app.command("show")
 def preset_show(
-    kind: Annotated[str, typer.Argument(help="profile, gate, or workflow.")],
+    kind: Annotated[str, typer.Argument(help="gate or workflow.")],
     name: Annotated[str, typer.Argument(help="Preset name.")],
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
@@ -1816,7 +1803,7 @@ def preset_show(
 
 @preset_app.command("copy")
 def preset_copy(
-    kind: Annotated[str, typer.Argument(help="profile, gate, or workflow.")],
+    kind: Annotated[str, typer.Argument(help="gate or workflow.")],
     name: Annotated[str, typer.Argument(help="Preset name.")],
     project: Annotated[bool, typer.Option("--project", help="Copy into project .muxdev/presets.")] = True,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
@@ -1831,7 +1818,7 @@ def preset_copy(
 
 @preset_app.command("edit")
 def preset_edit(
-    kind: Annotated[str, typer.Argument(help="profile, gate, or workflow.")],
+    kind: Annotated[str, typer.Argument(help="gate or workflow.")],
     name: Annotated[str, typer.Argument(help="Preset name.")],
     project: Annotated[bool, typer.Option("--project", help="Use project .muxdev/presets.")] = True,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
@@ -3013,6 +3000,13 @@ def _depth_override(*, simple: bool = False, safe: bool = False, deep: bool = Fa
     return selected[0] if selected else None
 
 
+def _approve_plan_mode(value: str | None, *, plan: bool = False) -> str:
+    mode = "manual" if plan else str(value or "auto").strip().lower()
+    if mode not in {"auto", "manual"}:
+        raise typer.BadParameter("--approve-plan must be auto or manual")
+    return mode
+
+
 def _task_with_design_contract(task: str | None, from_design: str | None) -> str | None:
     if not from_design:
         return task
@@ -3091,9 +3085,15 @@ def _submit_main_task(
     depth: str | None = None,
     from_design: str | None = None,
     max_review_fixes: int | None = None,
+    approve_plan: str = "auto",
+    plan: bool = False,
 ) -> None:
     try:
         task = _task_with_design_contract(task, from_design)
+        approve_plan_mode = _approve_plan_mode(approve_plan, plan=plan)
+        approval_types = _parse_csv(require_approval)
+        if approve_plan_mode == "manual":
+            approval_types.add("plan")
         request = resolve_task_request(
             workspace=Path.cwd(),
             task=task,
@@ -3106,19 +3106,27 @@ def _submit_main_task(
             role_overrides=role,
             skill_specs=skill,
             task_file=task_file,
-            require_approval=_parse_csv(require_approval),
+            require_approval=approval_types,
         )
+        automation = request.get("automation", {})
+        if isinstance(automation, dict):
+            automation["approve_plan_mode"] = approve_plan_mode
         if max_review_fixes is not None:
-            automation = request.get("automation", {})
             if isinstance(automation, dict):
                 automation["max_review_fixes"] = max_review_fixes
-        active_skills = resolve_active_skills(
-            Path.cwd(),
-            task=str(request["task"]),
-            roles=list(request.get("runtime_roles", {}).keys()),
-            provider=str(request["provider"]),
-            explicit=list(request.get("skill_specs", [])),
-            include_content=True,
+        explicit_skills = list(request.get("skill_specs", []))
+        active_skills = (
+            resolve_active_skills(
+                Path.cwd(),
+                task=str(request["task"]),
+                roles=[],
+                provider=str(request["provider"]),
+                explicit=explicit_skills,
+                include_content=True,
+                auto=False,
+            )
+            if explicit_skills
+            else []
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -3128,10 +3136,8 @@ def _submit_main_task(
             "workspace": request["workspace"],
             "provider": request["provider"],
             "workflow": request["workflow"],
-            "profile": request["profile"],
             "gate": request["gate"],
             "depth": request["depth"],
-            "topology": request["topology"],
             "require_approval": request["require_approval"],
             "max_cost_usd": max_cost_usd,
             "role_providers": request["role_providers"],
@@ -3140,17 +3146,15 @@ def _submit_main_task(
             "automation": request["automation"],
         }
     )
-    payload.setdefault("profile", request["profile"])
     payload.setdefault("gate", request["gate"])
     payload.setdefault("depth", request["depth"])
-    payload.setdefault("topology", request["topology"])
     payload.setdefault("skills", [skill_payload.get("name") for skill_payload in active_skills])
     if json_output:
         _print_json(payload)
         return
     lines = [
         f"Task submitted: {payload['task_id']}",
-        f"profile: {request['profile']}  gate: {request['gate']}  depth: {request['depth']}  topology: {request['topology']}  workflow: {request['workflow']}",
+        f"workflow: {request['workflow']}  intent: {request['automation'].get('intent', '-')}  depth: {request['depth']}  gate: {request['gate']}",
         f"provider: {request['provider']}",
         f"skills: {', '.join(str(item) for item in payload.get('skills', [])) or '-'}",
         f"Use 'muxdev status {payload['task_id']}' to track progress",
@@ -3161,8 +3165,6 @@ def _submit_main_task(
 
 def _preset_payload(kind: str, name: str) -> dict[str, object]:
     kind = kind.rstrip("s")
-    if kind == "profile" and name in PROFILES:
-        return {"kind": "profile", "name": name, **PROFILES[name]}
     if kind == "gate" and name in GATES:
         return {"kind": "gate", "name": name, **GATES[name]}
     if kind == "workflow" and name in WORKFLOW_ALIASES:
@@ -3372,14 +3374,33 @@ def _set_agent_session(run_id: str, agent: str, *, session_id: str, status: str)
 
 
 def _terminal_handoff(run_id: str, agent: str) -> dict[str, object]:
-    tmux = TmuxBackend()
-    session_name = f"muxdev-{run_id}-{agent}".replace(":", "-").replace("_", "-")
-    if tmux.available:
-        return {"mode": "tmux", "command": tmux.attach_command(session_name), "session": session_name}
     run_dir = RunStore(Path.cwd()).find_run_dir(run_id)
-    transcript_candidates = sorted((run_dir / "session").glob(f"*{agent}*.log")) if (run_dir / "session").exists() else []
+    blackboard = Blackboard(run_dir)
+    try:
+        for action in blackboard.list_provider_actions(run_id=run_id):
+            if agent not in {str(action.get("role") or ""), str(action.get("stage_id") or ""), str(action.get("provider") or "")}:
+                continue
+            attach_command = str(action.get("attach_command") or "").strip()
+            if attach_command and not attach_command.startswith("muxdev attach "):
+                return {"mode": "native_cli", "command": attach_command, "source": "provider_action"}
+        tmux = TmuxBackend()
+        for row in blackboard.table_rows("agents", run_id=run_id):
+            if str(row.get("role") or "") != agent:
+                continue
+            session = str(row.get("session_id") or "")
+            if session.startswith("tmux:") and tmux.available:
+                session_name = session.split(":", 1)[1]
+                return {"mode": "tmux", "command": tmux.attach_command(session_name), "session": session_name}
+    finally:
+        blackboard.close()
+    transcript_candidates = sorted((run_dir / "provider_sessions").glob("*.transcript.log")) if (run_dir / "provider_sessions").exists() else []
     transcript = transcript_candidates[-1] if transcript_candidates else run_dir / "trace.jsonl"
-    return {"mode": "transcript", "command": follow_file_command(transcript), "path": str(transcript)}
+    return {
+        "mode": "transcript",
+        "command": follow_file_command(transcript),
+        "path": str(transcript),
+        "fallback_reason": "no native provider CLI session is recorded for this run",
+    }
 
 
 def _clean_worktree_without_git(worktree: Path) -> list[str]:

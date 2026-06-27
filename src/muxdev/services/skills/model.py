@@ -55,6 +55,7 @@ class SkillInfo:
     file_patterns: list[str] = field(default_factory=list)
     risk_level: str = "medium"
     permissions: SkillPermissions = field(default_factory=SkillPermissions)
+    delivery_gate: dict[str, list[str]] = field(default_factory=dict)
     auto: bool = True
     source_path: str | None = None
     validation_errors: list[str] = field(default_factory=list)
@@ -144,6 +145,7 @@ def public_skill_payload(skill: SkillInfo) -> dict[str, object]:
         "disabled": skill.disabled,
         "auto": skill.auto,
         "permissions": skill.permissions.to_dict(),
+        "delivery_gate": skill.delivery_gate,
         "validation_errors": list(skill.validation_errors),
         "validation_warnings": list(skill.validation_warnings),
     }

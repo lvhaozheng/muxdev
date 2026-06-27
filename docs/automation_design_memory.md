@@ -96,3 +96,15 @@ python -B -m pytest -q
 ```
 
 Windows 上如果 `.pytest_cache` 写入失败，通常只是权限 warning，不影响功能结果。
+## 2026-06 Automation Model Update
+
+- Automation now records `intent`, `depth`, `workflow`, `roles`, `reasons`,
+  repository signals, and memory references.
+- It no longer records `profile` or `topology` for new tasks. Legacy runs can
+  still be read, but dashboard and CLI do not present `solo`, `pair`, `squad`,
+  or `ci` as runtime choices.
+- Model roles are capabilities used by LLM stages only:
+  `requirements`, `plan`, `architect`, `code`, `test_strategy`, `test`,
+  `review`, `secure`, `docs`, and `memory_curator`.
+- `human_gate`, `delivery_gate`, and other system gates are stages, not roles.
+  Dashboard renders them separately from model roles.

@@ -2,6 +2,7 @@ version = 1
 
 [activation]
 roles = ["docs"]
+stages = ["design_pack", "handoff_summary", "review_summary", "docs_update", "docs_fix"]
 auto = true
 
 [permissions]

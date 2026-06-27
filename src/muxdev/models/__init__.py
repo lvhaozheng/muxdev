@@ -42,6 +42,7 @@ class ApprovalStatus(StrEnum):
     PENDING = "pending"
     APPROVED = "approved"
     DENIED = "denied"
+    FEEDBACK = "feedback"
 
 
 class ProviderActionStatus(StrEnum):
@@ -127,6 +128,8 @@ class WorkflowStage(BaseModel):
     prompt: str | None = None
     prompt_template: str | None = None
     default_skills: list[str] = Field(default_factory=list)
+    delivery_targets: list[str] = Field(default_factory=list)
+    delivery_skill_sources: list[str] = Field(default_factory=list)
     context_sources: list[str] = Field(default_factory=list)
     rag_query: str | None = None
     loop_policy: LoopPolicy | None = None

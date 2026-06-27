@@ -1,8 +1,8 @@
 version = 1
 
 [activation]
-roles = ["architect", "plan"]
-stages = ["design", "design_plan", "design_brief", "design_revise"]
+roles = ["plan", "architect"]
+stages = ["plan", "quick_plan", "scaffold_plan", "plan_revise"]
 auto = true
 
 [permissions]

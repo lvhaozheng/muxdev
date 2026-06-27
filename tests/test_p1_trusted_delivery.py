@@ -30,7 +30,7 @@ def test_run_writes_trusted_delivery_evidence() -> None:
 
         assert result.status == RunStatus.COMPLETED
         assert (result.run_dir / "ledger.jsonl").exists()
-        assert (result.run_dir / "contracts" / "design.stage_contract.json").exists()
+        assert (result.run_dir / "contracts" / "plan.stage_contract.json").exists()
         assert (result.run_dir / "contracts" / "implement.role_result.json").exists()
         assert (result.run_dir / "evidence" / "events.jsonl").exists()
         assert (result.run_dir / "evidence" / "manifest.json").exists()
@@ -63,7 +63,7 @@ def test_approval_subject_drift_requires_new_approval() -> None:
             plan_artifact = next(
                 row
                 for row in blackboard.table_rows("artifacts", run_id=paused.run_id)
-                if row["stage_id"] == "design" and row["kind"] == "stage_output"
+                if row["stage_id"] in {"plan", "quick_plan", "scaffold_plan", "design_plan", "design"} and row["kind"] == "stage_output"
             )
             plan_path = Path(str(plan_artifact["path"]))
             plan_path.write_text(plan_path.read_text(encoding="utf-8") + "\nchanged after approval request\n", encoding="utf-8")

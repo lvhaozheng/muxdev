@@ -26,7 +26,7 @@ DESIGN_PACK_FILES = [
     "10_final_design_review.md",
 ]
 
-DESIGN_WORKFLOWS = {"design", "design-lite", "design-v2"}
+DESIGN_WORKFLOWS = {"design", "design-lite"}
 
 DESIGN_STAGE_TITLES = {
     "Problem Statement": "问题陈述",
@@ -129,7 +129,6 @@ def write_design_pack(
         "created_at": utc_now(),
         "intent": automation.get("intent", "design"),
         "depth": automation.get("depth", "deep"),
-        "topology": automation.get("topology", "squad"),
         "roles": automation.get("roles", []),
         "artifacts": DESIGN_PACK_FILES,
         "memory_proposals": "memory_proposals.json",

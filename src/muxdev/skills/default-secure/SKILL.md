@@ -1,13 +1,13 @@
 ---
 name: default-secure
-description: Default muxdev security role skill for reviewing auth, permissions, secrets, privacy, supply-chain, and abuse risk.
+description: Default muxdev security role skill for explicit security review stages covering auth, permissions, secrets, privacy, supply-chain, and abuse risk.
 keywords: [security, secure, privacy, threat, secrets]
 metadata:
   compatible_roles: [secure]
 ---
 # Default Secure Skill
 
-Use this skill when a stage needs a security or privacy review.
+Use this skill when a stage explicitly needs a security or privacy review.
 
 ## Operating Rules
 
@@ -24,3 +24,10 @@ Use this skill when a stage needs a security or privacy review.
 - Affected files or surfaces
 - Mitigation
 - Residual risk
+
+## Delivery Standard
+
+- Required deliverable: threats or findings, severity, affected surfaces, mitigation, and residual risk.
+- Pass when no unmitigated high-risk security or privacy issue remains.
+- Block when secrets, authorization, privacy, supply-chain, logging, or input handling risk is high and unmitigated.
+- Evidence: security findings, affected files or surfaces, and mitigations.

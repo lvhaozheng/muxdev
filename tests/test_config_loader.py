@@ -23,7 +23,7 @@ def test_default_config_is_valid(monkeypatch) -> None:
 
     assert validate_config(config)["valid"] is True
     assert list(config["providers"])[:7] == ["mock", "codex", "claude-code", "qwen", "kimi", "trae", "antigravity"]
-    assert config["workflows"]["software-dev"]["stages"][0]["id"] == "design"
+    assert config["workflows"]["software-dev"]["stages"][0]["id"] == "task_intake"
 
 
 def test_config_precedence_user_project_env(monkeypatch) -> None:

@@ -1,13 +1,13 @@
 ---
 name: default-memory-curator
-description: Default muxdev memory curator role skill for proposing durable evidence-grounded project memory.
+description: Default muxdev memory curator role skill for memory proposal stages that promote durable, evidence-grounded, non-secret project knowledge.
 keywords: [memory, curator, knowledge, evidence]
 metadata:
-  compatible_roles: [memory_curator, plan]
+  compatible_roles: [memory_curator]
 ---
 # Default Memory Curator Skill
 
-Use this skill when the stage proposes reusable project memory.
+Use this skill when the stage proposes reusable project memory after a design or delivery decision.
 
 ## Operating Rules
 
@@ -24,3 +24,10 @@ Use this skill when the stage proposes reusable project memory.
 - Evidence reference
 - Roles affected
 - Promotion recommendation
+
+## Delivery Standard
+
+- Required deliverable: reusable memory item, scope, evidence reference, affected roles, and promotion recommendation.
+- Pass when the claim is stable, non-sensitive, evidence-backed, and reusable.
+- Block when the proposal contains secrets, personal data, transient state, or unsupported inference.
+- Evidence: source evidence and promotion recommendation.

@@ -1,13 +1,13 @@
 ---
 name: default-docs
-description: Default muxdev documentation role skill for accurate user-facing and maintainer-facing docs updates.
+description: Default muxdev documentation role skill for docs updates, design packs, review summaries, handoff summaries, and accurate user-facing or maintainer-facing documentation.
 keywords: [docs, documentation, readme, guide]
 metadata:
   compatible_roles: [docs]
 ---
 # Default Docs Skill
 
-Use this skill when the stage updates or reviews documentation.
+Use this skill when the stage writes documentation, a design pack, a handoff summary, or a review summary.
 
 ## Operating Rules
 
@@ -23,3 +23,10 @@ Use this skill when the stage updates or reviews documentation.
 - Behavior documented
 - Examples or commands updated
 - Known gaps
+
+## Delivery Standard
+
+- Required deliverable: accurate reader-facing documentation, commands, behavior changes, and known limitations.
+- Pass when documentation matches the current implementation and enables the intended reader to proceed.
+- Block when documentation is misleading or omits required migration, setup, or run information.
+- Evidence: docs diff, updated commands or examples, and known gaps.

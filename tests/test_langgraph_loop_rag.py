@@ -16,10 +16,11 @@ def test_langgraph_graph_spec_preserves_loop_metadata() -> None:
     spec = LangGraphWorkflowEngine(Path.cwd()).graph_spec(workflow)
 
     assert spec["runtime"] == "langgraph"
+    assert workflow.name == "design"
     assert "design_revise" in spec["ordered_stage_ids"]
     loop_edges = [edge for edge in spec["edges"] if edge.get("kind") == "conditional_loop"]
     assert loop_edges
-    assert loop_edges[0]["condition"] == "design_review.has_blockers && loop < max_loops"
+    assert loop_edges[0]["condition"] == "design_verify.has_blockers && loop < max_loops || plan_feedback.has_feedback"
 
 
 def test_context_packet_records_rag_decision_and_citations() -> None:
@@ -68,4 +69,3 @@ def _workspace_temp(prefix: str) -> Path:
     path = Path(".test_workspaces") / f"{prefix}_{uuid.uuid4().hex}"
     path.mkdir(parents=True, exist_ok=True)
     return path.resolve()
-

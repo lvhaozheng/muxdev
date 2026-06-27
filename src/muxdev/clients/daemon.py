@@ -138,6 +138,10 @@ class DaemonClient:
     def deny(self, approval_id: str) -> dict[str, Any]:
         return self._request("POST", f"/api/approvals/{approval_id}/deny")
 
+    def approval_feedback(self, approval_id: str, feedback: str, *, max_cost_usd: float = 0.5, continue_task: bool = True) -> dict[str, Any]:
+        path = f"/api/approvals/{approval_id}/feedback-and-continue" if continue_task else f"/api/approvals/{approval_id}/feedback"
+        return self._request("POST", path, json={"feedback": feedback, "max_cost_usd": max_cost_usd})
+
     def diff(self, task_id: str) -> dict[str, Any]:
         return self._request("GET", f"/api/tasks/{task_id}/diff")
 

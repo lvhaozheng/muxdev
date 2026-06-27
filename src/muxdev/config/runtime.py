@@ -20,16 +20,12 @@ from ..storage import MemoryStore
 from .loader import ConfigSource, deep_merge, load_config
 
 
-DEFAULT_PROFILE = "squad"
 DEFAULT_GATE = "safe"
 DEFAULT_WORKFLOW = "dev"
 
-PROFILES = {
-    "solo": {"workflow": "fix", "roles": ["code"]},
-    "pair": {"workflow": "fix", "roles": ["code", "review"]},
-    "squad": {"workflow": "dev", "roles": ["plan", "code", "test", "review"]},
-    "ci": {"workflow": "dev", "roles": ["plan", "code", "test", "review"], "non_interactive": True},
-}
+# Kept as an empty compatibility symbol for older imports. Runtime topology is
+# now selected from task intent/depth/workflow, not from profile presets.
+PROFILES: dict[str, dict[str, object]] = {}
 
 GATES = {
     "auto": {"require_approval": []},
@@ -41,17 +37,29 @@ GATES = {
 WORKFLOW_ALIASES = {
     "design": "design",
     "design-lite": "design-lite",
-    "design-v2": "design-v2",
+    "design-v2": "design",
     "dev": "dev",
+    "dev-light": "dev-lite",
+    "dev-lite": "dev-lite",
+    "dev-new": "dev-new",
     "fix": "fix",
-    "refactor": "dev",
+    "refactor": "refactor",
     "review": "review",
     "test": "test",
-    "ci": "dev",
-    "ci-fix": "dev",
     "docs": "docs",
     "software-dev": "software-dev",
 }
+
+PUBLIC_WORKFLOWS = (
+    "design",
+    "design-lite",
+    "dev",
+    "dev-lite",
+    "dev-new",
+    "fix",
+    "test",
+    "docs",
+)
 
 ROLE_ALIASES = {
     "supervisor": "lead",
@@ -79,11 +87,9 @@ RUNTIME_ROLE_TO_LEGACY_ROLE = {
 
 BUILTIN_RUNTIME_CONFIG: dict[str, Any] = {
     "version": 2,
-    "profile": DEFAULT_PROFILE,
     "gate": DEFAULT_GATE,
     "automation": {
         "mode": "auto",
-        "profile": "auto",
         "depth": "auto",
         "allow_parallel": True,
     },
@@ -179,10 +185,8 @@ def load_runtime_config(
 
 def normalize_runtime_config(config: dict[str, Any]) -> dict[str, Any]:
     result = deepcopy(config)
-    result["profile"] = str(result.get("profile") or DEFAULT_PROFILE)
+    result.pop("profile", None)
     result["gate"] = str(result.get("gate") or DEFAULT_GATE)
-    if result["profile"] not in PROFILES:
-        result["profile"] = DEFAULT_PROFILE
     if result["gate"] not in GATES:
         result["gate"] = DEFAULT_GATE
     roles = result.get("roles", {})
@@ -197,7 +201,7 @@ def normalize_runtime_config(config: dict[str, Any]) -> dict[str, Any]:
 def load_task_file(path: Path) -> dict[str, Any]:
     data = _read_toml(path)
     task_config: dict[str, Any] = {}
-    for key in ("profile", "gate"):
+    for key in ("gate",):
         if key in data:
             task_config[key] = data[key]
     if isinstance(data.get("roles"), dict):
@@ -283,10 +287,7 @@ def resolve_task_request(
         workflow=workflow,
         depth=requested_depth,
     )
-    selected_profile = automation.profile if automation.profile in PROFILES else DEFAULT_PROFILE
     selected_workflow = automation.workflow
-    if selected_workflow == "profile":
-        selected_workflow = str(PROFILES[selected_profile]["workflow"])
     selected_workflow = WORKFLOW_ALIASES.get(selected_workflow, selected_workflow)
 
     configured_roles = {
@@ -326,10 +327,8 @@ def resolve_task_request(
         "workspace": str(workspace),
         "provider": default_provider,
         "workflow": selected_workflow,
-        "profile": selected_profile,
         "gate": selected_gate,
         "depth": automation.depth,
-        "topology": automation.topology,
         "require_approval": sorted(approvals),
         "role_providers": role_providers,
         "runtime_roles": {role: roles.get(role, "auto") for role in automation.roles},
@@ -464,8 +463,6 @@ def config_check(
     effective = load_runtime_config(workspace)
     warnings: list[str] = []
     errors: list[str] = []
-    if effective["profile"] not in PROFILES:
-        errors.append(f"unknown profile: {effective['profile']}")
     if effective["gate"] not in GATES:
         errors.append(f"unknown gate: {effective['gate']}")
     legacy = load_config(workspace)

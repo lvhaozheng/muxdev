@@ -1,5 +1,16 @@
 # muxdev Product Guide
 
+## 2026-06 Product Model Update
+
+- muxdev no longer asks users to choose `solo`, `pair`, `squad`, or `ci`
+  runtime profiles. The product model is automatic workflow selection based on
+  task size, type, risk, and requested command.
+- `muxdev setup` and `[roles]` own provider routing for model capabilities.
+  Task commands should stay focused on task text, provider fallback, gate,
+  depth, skills, and explicit `--role role=provider` overrides.
+- Dashboard explains why the workflow was selected, which model roles are used,
+  which human gates need action, and which delivery gates are internal checks.
+
 ## Positioning
 
 muxdev 是一个本地优先的 AI 软件研发控制内核，面向多 AI Coding Agent 时代。

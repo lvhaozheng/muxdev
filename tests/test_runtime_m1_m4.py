@@ -40,11 +40,9 @@ def test_mock_run_creates_m1_artifacts(workspace: Path) -> None:
     workspace_apply = json.loads((result.run_dir / "workspace_apply.json").read_text(encoding="utf-8"))
     assert "muxdev_mock_change.txt" in workspace_apply["files"]
     user_design_doc = workspace / "docs" / "design" / f"{result.run_id}-design.md"
-    assert user_design_doc.exists()
-    assert "设计文档" in user_design_doc.read_text(encoding="utf-8")
+    assert not user_design_doc.exists()
     design_doc = result.run_dir / "worktree" / "docs" / "design" / f"{result.run_id}-design.md"
-    assert design_doc.exists()
-    assert "设计文档" in design_doc.read_text(encoding="utf-8")
+    assert not design_doc.exists()
 
     trace_types = [
         json.loads(line)["type"]
@@ -53,7 +51,7 @@ def test_mock_run_creates_m1_artifacts(workspace: Path) -> None:
     assert "run_started" in trace_types
     assert "stage_started" in trace_types
     assert "stage_completed" in trace_types
-    assert "project_design_doc_written" in trace_types
+    assert "project_design_doc_written" not in trace_types
     assert "run_completed" in trace_types
 
     blackboard = Blackboard(result.run_dir)
@@ -61,13 +59,28 @@ def test_mock_run_creates_m1_artifacts(workspace: Path) -> None:
         design_artifacts = [row for row in blackboard.table_rows("artifacts") if row["kind"] == "project_design_doc"]
     finally:
         blackboard.close()
-    assert design_artifacts[0]["name"] == "Design Document"
-    design_artifact_path = Path(design_artifacts[0]["path"])
-    assert design_artifact_path.name == f"{result.run_id}-design.md"
-    assert design_artifact_path.parent.name == "design"
-    assert design_artifact_path.parent.parent.name == "docs"
-    assert design_artifact_path == user_design_doc
-    assert "## Design Deliverables" in (result.run_dir / "final_report.md").read_text(encoding="utf-8")
+    assert design_artifacts == []
+
+
+def test_runtime_binds_default_skills_to_workflow_stages(workspace: Path) -> None:
+    result = SupervisorRuntime(workspace).run("stage skill routing", provider="mock", workflow_name="software-dev")
+
+    assert result.status == RunStatus.COMPLETED
+    context = json.loads((result.run_dir / "task_context.json").read_text(encoding="utf-8"))
+    by_stage: dict[str, set[str]] = {}
+    for skill in context["skills"]:
+        by_stage.setdefault(str(skill.get("stage")), set()).add(str(skill.get("name")))
+
+    assert "default-requirements" in by_stage["task_intake"]
+    assert "default-plan" in by_stage["plan"]
+    assert "default-review" in by_stage["plan_review"]
+    assert "default-plan" in by_stage["plan_revise"]
+    assert "default-code" in by_stage["implement"]
+    assert "default-test" in by_stage["test"]
+    assert "default-review" in by_stage["review"]
+    assert "default-code" in by_stage["fix"]
+    assert all("default-test-strategy" not in names for names in by_stage.values())
+    assert all("delivery_rules" in skill and skill.get("delivery_rule_hash") for skill in context["skills"])
 
 
 def test_git_worktree_fallback_baselines_no_head_repo_and_ignores_generated_files(
@@ -163,8 +176,8 @@ def test_design_workflow_publishes_user_visible_design_document(workspace: Path)
     content = user_design_doc.read_text(encoding="utf-8")
     assert "# 设计文档" in content
     assert "设计一个贪吃蛇游戏方案" in content
-    assert "## 问题陈述" in content
-    assert "## 最终设计评审" in content
+    assert "## Design Plan" in content
+    assert "## Design Pack" in content
 
     blackboard = Blackboard(result.run_dir)
     try:
@@ -291,7 +304,7 @@ def test_design_provider_question_pauses_and_response_reaches_next_context(monke
     assert "## 用户偏好" in content
 
 
-def test_design_v2_completes_review_gate_and_design_pack(workspace: Path) -> None:
+def test_legacy_design_v2_alias_completes_review_gate_and_design_pack(workspace: Path) -> None:
     result = SupervisorRuntime(workspace).run("design reviewed flow", provider="mock", workflow_name="design-v2", require_approval=set())
 
     assert result.status == RunStatus.COMPLETED
@@ -299,19 +312,21 @@ def test_design_v2_completes_review_gate_and_design_pack(workspace: Path) -> Non
     assert (result.run_dir / "design" / "memory_proposals.json").exists()
     blackboard = Blackboard(result.run_dir)
     try:
+        run = blackboard.get_run(result.run_id)
         stages = {row["stage_id"]: row["status"] for row in blackboard.table_rows("stages")}
         approvals = blackboard.table_rows("approvals")
     finally:
         blackboard.close()
     assert stages["design_review"] == "completed"
     assert stages["design_revise"] == "skipped"
-    assert stages["human_design_approval"] == "completed"
+    assert stages["approve_plan"] == "completed"
     assert approvals == []
+    assert run["workflow"] == "design"
 
 
-def test_design_v2_pauses_for_design_approval_with_subject_hash(workspace: Path) -> None:
+def test_design_pauses_for_design_approval_with_subject_hash(workspace: Path) -> None:
     runtime = SupervisorRuntime(workspace)
-    paused = runtime.run("design approval subject", provider="mock", workflow_name="design-v2", require_approval={"design"})
+    paused = runtime.run("design approval subject", provider="mock", workflow_name="design-v2", require_approval={"plan"})
 
     assert paused.status == RunStatus.AWAITING_APPROVAL
     blackboard = Blackboard(paused.run_dir)
@@ -322,14 +337,13 @@ def test_design_v2_pauses_for_design_approval_with_subject_hash(workspace: Path)
     finally:
         blackboard.close()
 
-    assert approval["type"] == "design"
-    assert subject["extra"]["design_contract_hash"]
-    assert subject["extra"]["review_result_hash"]
+    assert approval["type"] == "plan"
+    assert subject["extra"]["plan_hash"]
     resumed = runtime.resume(paused.run_id)
     assert resumed.status == RunStatus.COMPLETED
 
 
-def test_design_v2_review_blockers_drive_revision_loop(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
+def test_design_review_blockers_drive_revision_loop(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
     class DesignReviewProvider:
         def __init__(self) -> None:
             self.review_count = 0
@@ -361,7 +375,7 @@ def test_design_v2_review_blockers_drive_revision_loop(monkeypatch: pytest.Monke
     assert "review_loop_iteration" in (result.run_dir / "trace.jsonl").read_text(encoding="utf-8")
 
 
-def test_design_v2_blocks_after_max_review_fixes(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
+def test_design_blocks_after_max_review_fixes(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
     class BlockingDesignProvider:
         def run_stage(self, *, stage_id: str, task: str, worktree: Path) -> ProviderStageOutput:
             if stage_id == "design_review":
@@ -391,7 +405,7 @@ def test_design_v2_blocks_after_max_review_fixes(monkeypatch: pytest.MonkeyPatch
     finally:
         blackboard.close()
     assert errors[-1]["type"] == "review_blockers"
-    assert "design_review blockers remain" in errors[-1]["message"]
+    assert "design_verify blockers remain" in errors[-1]["message"]
 
 
 def test_design_workflow_blocks_when_user_visible_design_document_cannot_be_written(
@@ -415,7 +429,7 @@ def test_design_workflow_blocks_when_user_visible_design_document_cannot_be_writ
     assert "cannot write user design doc" in errors[0]["message"]
 
 
-def test_software_dev_blocks_when_design_document_cannot_be_written(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
+def test_software_dev_does_not_require_design_document_write(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
     def fail_design_doc(*_args, **_kwargs):
         raise OSError("cannot write design doc")
 
@@ -423,7 +437,7 @@ def test_software_dev_blocks_when_design_document_cannot_be_written(monkeypatch:
 
     result = SupervisorRuntime(workspace).run("design doc failure", provider="mock")
 
-    assert result.status == RunStatus.BLOCKED
+    assert result.status == RunStatus.COMPLETED
     blackboard = Blackboard(result.run_dir)
     try:
         stages = {row["stage_id"]: row for row in blackboard.table_rows("stages")}
@@ -431,8 +445,8 @@ def test_software_dev_blocks_when_design_document_cannot_be_written(monkeypatch:
         artifacts = blackboard.table_rows("artifacts")
     finally:
         blackboard.close()
-    assert stages["design"]["status"] == "failed"
-    assert errors[0]["type"] == "missing_design_document"
+    assert stages["plan"]["status"] == "completed"
+    assert not errors
     assert not [row for row in artifacts if row["kind"] == "project_design_doc"]
 
 

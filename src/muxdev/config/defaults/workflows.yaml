@@ -3,202 +3,711 @@ workflows:
     name: design
     max_parallel: 1
     stages:
-      - id: problem_statement
+      - id: task_intake
         role: requirements
+        default_skills: ["requirements=default-requirements"]
         deps: []
         read_only: true
-      - id: requirements
-        role: requirements
-        deps: [problem_statement]
-        read_only: true
-      - id: architecture_options
+      - id: design_plan
         role: architect
-        deps: [requirements]
+        default_skills: ["plan=default-architect"]
+        deps: [task_intake]
         read_only: true
-      - id: decision_record
-        role: architect
-        deps: [architecture_options]
-        read_only: true
-      - id: system_design
-        role: architect
-        deps: [decision_record]
-        read_only: true
-      - id: api_and_data_model
-        role: architect
-        deps: [system_design]
-        read_only: true
-      - id: risk_and_threat_model
-        role: secure
-        deps: [api_and_data_model]
-        read_only: true
-      - id: test_strategy
-        role: test_strategy
-        deps: [risk_and_threat_model]
-        read_only: true
-      - id: implementation_roadmap
-        role: architect
-        deps: [test_strategy]
-        read_only: true
-      - id: final_design_review
+        output_schema: PlanArtifact
+      - id: design_review
         role: review
-        deps: [implementation_roadmap]
+        default_skills: ["review=default-review"]
+        deps: [design_plan]
         read_only: true
-      - id: memory_proposals
-        role: memory_curator
-        deps: [final_design_review]
+        output_schema: ReviewResult
+      - id: design_verify
+        type: delivery_gate
+        role: review
+        deps: [design_review]
+        read_only: true
+        output_schema: ReviewResult
+        delivery_targets: [design_plan, design_review]
+      - id: design_revise
+        role: architect
+        default_skills: ["plan=default-architect"]
+        deps: [design_verify]
+        read_only: true
+        when: design_verify.has_blockers && loop < max_loops || plan_feedback.has_feedback
+        max_loops: 2
+        loop_review_stage: design_verify
+        loop_reset_stages: [design_review, design_verify, design_revise]
+        loop_restart_stage: design_review
+      - id: approve_plan
+        type: human_gate
+        deps: [design_verify, design_revise]
+        approval_type: plan
+        approval_reason: approve reviewed design plan
+      - id: design_pack
+        role: docs
+        default_skills: ["docs=default-docs"]
+        deps: [approve_plan]
         read_only: true
   design-lite:
     name: design-lite
     max_parallel: 1
     stages:
-      - id: design_brief
-        role: architect
+      - id: task_intake
+        role: requirements
+        default_skills: ["requirements=default-requirements"]
         deps: []
         read_only: true
-  design-v2:
-    name: design-v2
-    max_parallel: 1
-    stages:
-      - id: design
+      - id: design_brief
         role: architect
-        deps: []
+        default_skills: ["plan=default-architect"]
+        deps: [task_intake]
         read_only: true
         output_schema: PlanArtifact
       - id: design_review
         role: review
-        deps: [design]
+        default_skills: ["review=default-review"]
+        deps: [design_brief]
         read_only: true
         output_schema: ReviewResult
-      - id: design_revise
-        role: architect
+      - id: design_verify
+        type: delivery_gate
+        role: review
         deps: [design_review]
         read_only: true
-        when: design_review.has_blockers && loop < max_loops
+        output_schema: ReviewResult
+        delivery_targets: [design_brief, design_review]
+      - id: design_revise
+        role: architect
+        default_skills: ["plan=default-architect"]
+        deps: [design_verify]
+        read_only: true
+        when: design_verify.has_blockers && loop < max_loops || plan_feedback.has_feedback
         max_loops: 2
-        loop_review_stage: design_review
-        loop_reset_stages: [design_review, design_revise]
+        loop_review_stage: design_verify
+        loop_reset_stages: [design_review, design_verify, design_revise]
         loop_restart_stage: design_review
-      - id: human_design_approval
+      - id: approve_plan
         type: human_gate
-        deps: [design_review, design_revise]
-        approval_type: design
-        approval_reason: approve reviewed design contract
-      - id: memory_proposals
-        role: memory_curator
-        deps: [human_design_approval]
+        deps: [design_verify, design_revise]
+        approval_type: plan
+        approval_reason: approve lightweight design brief
+      - id: design_pack
+        role: docs
+        default_skills: ["docs=default-docs"]
+        deps: [approve_plan]
         read_only: true
   dev:
     name: dev
     max_parallel: 1
     stages:
-      - id: plan
-        role: plan
+      - id: task_intake
+        role: requirements
+        default_skills: ["requirements=default-requirements"]
         deps: []
         read_only: true
+      - id: plan
+        role: plan
+        default_skills: ["plan=default-plan"]
+        deps: [task_intake]
+        read_only: true
         output_schema: PlanArtifact
+      - id: plan_review
+        role: review
+        default_skills: ["review=default-review"]
+        deps: [plan]
+        read_only: true
+        output_schema: ReviewResult
+      - id: plan_verify
+        type: delivery_gate
+        role: review
+        deps: [plan_review]
+        read_only: true
+        output_schema: ReviewResult
+        delivery_targets: [plan, plan_review]
+      - id: plan_revise
+        role: plan
+        default_skills: ["plan=default-plan"]
+        deps: [plan_verify]
+        read_only: true
+        when: plan_verify.has_blockers && loop < max_loops || plan_feedback.has_feedback
+        max_loops: 2
+        loop_review_stage: plan_verify
+        loop_reset_stages: [plan_review, plan_verify, plan_revise]
+        loop_restart_stage: plan_review
       - id: approve_plan
         type: human_gate
-        deps: [plan]
-      - id: code
+        deps: [plan_verify, plan_revise]
+        approval_type: plan
+        approval_reason: approve reviewed implementation plan
+      - id: implement
         role: code
+        default_skills: ["code=default-code"]
         deps: [approve_plan]
         allow_write: true
         checkpoint: true
       - id: test
         role: test
-        deps: [code]
+        default_skills: ["test=default-test"]
+        deps: [implement]
         allow_shell: true
         output_schema: TestResult
       - id: review
         role: review
+        default_skills: ["review=default-review"]
         deps: [test]
         read_only: true
         output_schema: ReviewResult
+      - id: delivery_verify
+        type: delivery_gate
+        role: review
+        deps: [review]
+        read_only: true
+        output_schema: ReviewResult
+        delivery_targets: [implement, test, review]
       - id: fix
         role: code
-        deps: [review]
-        when: review.has_blockers && loop < 2
+        default_skills: ["code=default-code"]
+        deps: [delivery_verify]
+        when: delivery_verify.has_blockers && loop < 2
         allow_write: true
         max_loops: 2
+        loop_review_stage: delivery_verify
+        loop_reset_stages: [test, review, delivery_verify, fix]
+        loop_restart_stage: test
+  dev-lite:
+    name: dev-lite
+    max_parallel: 1
+    stages:
+      - id: task_intake
+        role: requirements
+        default_skills: ["requirements=default-requirements"]
+        deps: []
+        read_only: true
+      - id: quick_plan
+        role: plan
+        default_skills: ["plan=default-plan"]
+        deps: [task_intake]
+        read_only: true
+        output_schema: PlanArtifact
+      - id: plan_verify
+        type: delivery_gate
+        role: review
+        deps: [quick_plan]
+        read_only: true
+        output_schema: ReviewResult
+        delivery_targets: [quick_plan]
+      - id: approve_plan
+        type: human_gate
+        deps: [plan_verify]
+        approval_type: plan
+        approval_reason: approve lightweight implementation plan
+      - id: implement
+        role: code
+        default_skills: ["code=default-code"]
+        deps: [approve_plan]
+        allow_write: true
+        checkpoint: true
+      - id: smoke_check
+        role: test
+        default_skills: ["test=default-test"]
+        deps: [implement]
+        allow_shell: true
+        output_schema: TestResult
+      - id: light_review
+        role: review
+        default_skills: ["review=default-review"]
+        deps: [smoke_check]
+        read_only: true
+        output_schema: ReviewResult
+      - id: delivery_verify
+        type: delivery_gate
+        role: review
+        deps: [light_review]
+        read_only: true
+        output_schema: ReviewResult
+        delivery_targets: [implement, smoke_check, light_review]
+      - id: fix
+        role: code
+        default_skills: ["code=default-code"]
+        deps: [delivery_verify]
+        when: delivery_verify.has_blockers && loop < max_loops
+        allow_write: true
+        max_loops: 1
+        loop_review_stage: delivery_verify
+        loop_reset_stages: [smoke_check, light_review, delivery_verify, fix]
+        loop_restart_stage: smoke_check
+      - id: handoff_summary
+        role: docs
+        default_skills: ["docs=default-docs"]
+        deps: [delivery_verify, fix]
+        read_only: true
+  dev-new:
+    name: dev-new
+    max_parallel: 1
+    stages:
+      - id: task_intake
+        role: requirements
+        default_skills: ["requirements=default-requirements"]
+        deps: []
+        read_only: true
+      - id: project_brief
+        role: requirements
+        default_skills: ["requirements=default-requirements"]
+        deps: [task_intake]
+        read_only: true
+      - id: scaffold_plan
+        role: plan
+        default_skills: ["plan=default-plan"]
+        deps: [project_brief]
+        read_only: true
+        output_schema: PlanArtifact
+      - id: plan_verify
+        type: delivery_gate
+        role: review
+        deps: [scaffold_plan]
+        read_only: true
+        output_schema: ReviewResult
+        delivery_targets: [scaffold_plan]
+      - id: approve_plan
+        type: human_gate
+        deps: [plan_verify]
+        approval_type: plan
+        approval_reason: approve scaffold plan
+      - id: scaffold
+        role: code
+        default_skills: ["code=default-code"]
+        deps: [approve_plan]
+        allow_write: true
+        checkpoint: true
+      - id: run_smoke
+        role: test
+        default_skills: ["test=default-test"]
+        deps: [scaffold]
+        allow_shell: true
+        output_schema: TestResult
+      - id: light_review
+        role: review
+        default_skills: ["review=default-review"]
+        deps: [run_smoke]
+        read_only: true
+        output_schema: ReviewResult
+      - id: delivery_verify
+        type: delivery_gate
+        role: review
+        deps: [light_review]
+        read_only: true
+        output_schema: ReviewResult
+        delivery_targets: [scaffold, run_smoke, light_review]
+      - id: fix
+        role: code
+        default_skills: ["code=default-code"]
+        deps: [delivery_verify]
+        when: delivery_verify.has_blockers && loop < max_loops
+        allow_write: true
+        max_loops: 1
+        loop_review_stage: delivery_verify
+        loop_reset_stages: [run_smoke, light_review, delivery_verify, fix]
+        loop_restart_stage: run_smoke
+      - id: handoff_summary
+        role: docs
+        default_skills: ["docs=default-docs"]
+        deps: [delivery_verify, fix]
+        read_only: true
   fix:
     name: fix
     max_parallel: 1
     stages:
+      - id: task_intake
+        role: requirements
+        default_skills: ["requirements=default-requirements"]
+        deps: []
+        read_only: true
+      - id: plan
+        role: plan
+        default_skills: ["plan=default-plan"]
+        deps: [task_intake]
+        read_only: true
+        output_schema: PlanArtifact
+      - id: plan_review
+        role: review
+        default_skills: ["review=default-review"]
+        deps: [plan]
+        read_only: true
+        output_schema: ReviewResult
+      - id: plan_verify
+        type: delivery_gate
+        role: review
+        deps: [plan_review]
+        read_only: true
+        output_schema: ReviewResult
+        delivery_targets: [plan, plan_review]
+      - id: plan_revise
+        role: plan
+        default_skills: ["plan=default-plan"]
+        deps: [plan_verify]
+        read_only: true
+        when: plan_verify.has_blockers && loop < max_loops || plan_feedback.has_feedback
+        max_loops: 2
+        loop_review_stage: plan_verify
+        loop_reset_stages: [plan_review, plan_verify, plan_revise]
+        loop_restart_stage: plan_review
+      - id: approve_plan
+        type: human_gate
+        deps: [plan_verify, plan_revise]
+        approval_type: plan
+        approval_reason: approve fix plan
       - id: code
         role: code
-        deps: []
+        default_skills: ["code=default-code"]
+        deps: [approve_plan]
         allow_write: true
         checkpoint: true
-      - id: test
+      - id: targeted_test
         role: test
+        default_skills: ["test=default-test"]
         deps: [code]
         allow_shell: true
         output_schema: TestResult
       - id: review
         role: review
+        default_skills: ["review=default-review"]
+        deps: [targeted_test]
+        read_only: true
+        output_schema: ReviewResult
+      - id: delivery_verify
+        type: delivery_gate
+        role: review
+        deps: [review]
+        read_only: true
+        output_schema: ReviewResult
+        delivery_targets: [code, targeted_test, review]
+      - id: fix
+        role: code
+        default_skills: ["code=default-code"]
+        deps: [delivery_verify]
+        when: delivery_verify.has_blockers && loop < 2
+        allow_write: true
+        max_loops: 2
+        loop_review_stage: delivery_verify
+        loop_reset_stages: [targeted_test, review, delivery_verify, fix]
+        loop_restart_stage: targeted_test
+  refactor:
+    name: refactor
+    max_parallel: 1
+    stages:
+      - id: task_intake
+        role: requirements
+        default_skills: ["requirements=default-requirements"]
+        deps: []
+        read_only: true
+      - id: plan
+        role: plan
+        default_skills: ["plan=default-plan"]
+        deps: [task_intake]
+        read_only: true
+        output_schema: PlanArtifact
+      - id: plan_review
+        role: review
+        default_skills: ["review=default-review"]
+        deps: [plan]
+        read_only: true
+        output_schema: ReviewResult
+      - id: plan_verify
+        type: delivery_gate
+        role: review
+        deps: [plan_review]
+        read_only: true
+        output_schema: ReviewResult
+        delivery_targets: [plan, plan_review]
+      - id: plan_revise
+        role: plan
+        default_skills: ["plan=default-plan"]
+        deps: [plan_verify]
+        read_only: true
+        when: plan_verify.has_blockers && loop < max_loops || plan_feedback.has_feedback
+        max_loops: 2
+        loop_review_stage: plan_verify
+        loop_reset_stages: [plan_review, plan_verify, plan_revise]
+        loop_restart_stage: plan_review
+      - id: approve_plan
+        type: human_gate
+        deps: [plan_verify, plan_revise]
+        approval_type: plan
+        approval_reason: approve refactor plan
+      - id: impact_check
+        role: review
+        default_skills: ["review=default-review"]
+        deps: [approve_plan]
+        read_only: true
+      - id: refactor
+        role: code
+        default_skills: ["code=default-code"]
+        deps: [impact_check]
+        allow_write: true
+        checkpoint: true
+      - id: test
+        role: test
+        default_skills: ["test=default-test"]
+        deps: [refactor]
+        allow_shell: true
+        output_schema: TestResult
+      - id: review
+        role: review
+        default_skills: ["review=default-review"]
         deps: [test]
         read_only: true
         output_schema: ReviewResult
+      - id: delivery_verify
+        type: delivery_gate
+        role: review
+        deps: [review]
+        read_only: true
+        output_schema: ReviewResult
+        delivery_targets: [refactor, test, review]
+      - id: fix
+        role: code
+        default_skills: ["code=default-code"]
+        deps: [delivery_verify]
+        when: delivery_verify.has_blockers && loop < 2
+        allow_write: true
+        max_loops: 2
+        loop_review_stage: delivery_verify
+        loop_reset_stages: [test, review, delivery_verify, fix]
+        loop_restart_stage: test
   review:
     name: review
     max_parallel: 1
     stages:
       - id: review
         role: review
+        default_skills: ["review=default-review"]
         deps: []
         read_only: true
         output_schema: ReviewResult
+      - id: delivery_verify
+        type: delivery_gate
+        role: review
+        deps: [review]
+        read_only: true
+        output_schema: ReviewResult
+        delivery_targets: [review]
+      - id: review_summary
+        role: docs
+        default_skills: ["docs=default-docs"]
+        deps: [delivery_verify]
+        read_only: true
   test:
     name: test
     max_parallel: 1
     stages:
+      - id: task_intake
+        role: requirements
+        default_skills: ["requirements=default-requirements"]
+        deps: []
+        read_only: true
+      - id: plan
+        role: plan
+        default_skills: ["plan=default-plan"]
+        deps: [task_intake]
+        read_only: true
+        output_schema: PlanArtifact
+      - id: plan_review
+        role: review
+        default_skills: ["review=default-review"]
+        deps: [plan]
+        read_only: true
+        output_schema: ReviewResult
+      - id: plan_verify
+        type: delivery_gate
+        role: review
+        deps: [plan_review]
+        read_only: true
+        output_schema: ReviewResult
+        delivery_targets: [plan, plan_review]
+      - id: plan_revise
+        role: plan
+        default_skills: ["plan=default-plan"]
+        deps: [plan_verify]
+        read_only: true
+        when: plan_verify.has_blockers && loop < max_loops || plan_feedback.has_feedback
+        max_loops: 2
+        loop_review_stage: plan_verify
+        loop_reset_stages: [plan_review, plan_verify, plan_revise]
+        loop_restart_stage: plan_review
+      - id: approve_plan
+        type: human_gate
+        deps: [plan_verify, plan_revise]
+        approval_type: plan
+        approval_reason: approve test plan
+      - id: test_strategy
+        role: test_strategy
+        default_skills: ["test_strategy=default-test-strategy"]
+        deps: [approve_plan]
+        read_only: true
       - id: test
         role: test
-        deps: []
+        default_skills: ["test=default-test"]
+        deps: [test_strategy]
         allow_shell: true
         output_schema: TestResult
+      - id: review_test_result
+        role: review
+        default_skills: ["review=default-review"]
+        deps: [test]
+        read_only: true
+        output_schema: ReviewResult
+      - id: delivery_verify
+        type: delivery_gate
+        role: review
+        deps: [review_test_result]
+        read_only: true
+        output_schema: ReviewResult
+        delivery_targets: [test_strategy, test, review_test_result]
   docs:
     name: docs
     max_parallel: 1
     stages:
-      - id: docs
-        role: docs
+      - id: task_intake
+        role: requirements
+        default_skills: ["requirements=default-requirements"]
         deps: []
-        allow_write: true
-      - id: review
-        role: review
-        deps: [docs]
         read_only: true
+      - id: plan
+        role: plan
+        default_skills: ["plan=default-plan"]
+        deps: [task_intake]
+        read_only: true
+        output_schema: PlanArtifact
+      - id: plan_review
+        role: review
+        default_skills: ["review=default-review"]
+        deps: [plan]
+        read_only: true
+        output_schema: ReviewResult
+      - id: plan_verify
+        type: delivery_gate
+        role: review
+        deps: [plan_review]
+        read_only: true
+        output_schema: ReviewResult
+        delivery_targets: [plan, plan_review]
+      - id: plan_revise
+        role: plan
+        default_skills: ["plan=default-plan"]
+        deps: [plan_verify]
+        read_only: true
+        when: plan_verify.has_blockers && loop < max_loops || plan_feedback.has_feedback
+        max_loops: 2
+        loop_review_stage: plan_verify
+        loop_reset_stages: [plan_review, plan_verify, plan_revise]
+        loop_restart_stage: plan_review
+      - id: approve_plan
+        type: human_gate
+        deps: [plan_verify, plan_revise]
+        approval_type: plan
+        approval_reason: approve docs plan
+      - id: docs_update
+        role: docs
+        default_skills: ["docs=default-docs"]
+        deps: [approve_plan]
+        allow_write: true
+      - id: docs_review
+        role: review
+        default_skills: ["review=default-review"]
+        deps: [docs_update]
+        read_only: true
+        output_schema: ReviewResult
+      - id: docs_verify
+        type: delivery_gate
+        role: review
+        deps: [docs_review]
+        read_only: true
+        output_schema: ReviewResult
+        delivery_targets: [docs_update, docs_review]
+      - id: docs_fix
+        role: docs
+        default_skills: ["docs=default-docs"]
+        deps: [docs_verify]
+        when: docs_verify.has_blockers && loop < max_loops
+        allow_write: true
+        max_loops: 1
+        loop_review_stage: docs_verify
+        loop_reset_stages: [docs_review, docs_verify, docs_fix]
+        loop_restart_stage: docs_review
   software-dev:
     name: software-dev
     max_parallel: 1
     stages:
-      - id: design
-        role: architect
+      - id: task_intake
+        role: requirements
+        default_skills: ["requirements=default-requirements"]
         deps: []
         read_only: true
+      - id: plan
+        role: architect
+        default_skills: ["plan=default-plan"]
+        deps: [task_intake]
+        read_only: true
         output_schema: PlanArtifact
+      - id: plan_review
+        role: reviewer
+        default_skills: ["review=default-review"]
+        deps: [plan]
+        read_only: true
+        output_schema: ReviewResult
+      - id: plan_verify
+        type: delivery_gate
+        role: reviewer
+        deps: [plan_review]
+        read_only: true
+        output_schema: ReviewResult
+        delivery_targets: [plan, plan_review]
+      - id: plan_revise
+        role: architect
+        default_skills: ["plan=default-plan"]
+        deps: [plan_verify]
+        read_only: true
+        when: plan_verify.has_blockers && loop < max_loops || plan_feedback.has_feedback
+        max_loops: 2
+        loop_review_stage: plan_verify
+        loop_reset_stages: [plan_review, plan_verify, plan_revise]
+        loop_restart_stage: plan_review
       - id: approve_plan
         type: human_gate
-        deps: [design]
+        deps: [plan_verify, plan_revise]
+        approval_type: plan
+        approval_reason: approve reviewed implementation plan
       - id: implement
         role: implementer
+        default_skills: ["code=default-code"]
         deps: [approve_plan]
         allow_write: true
         checkpoint: true
       - id: test
         role: tester
+        default_skills: ["test=default-test"]
         deps: [implement]
         allow_shell: true
         output_schema: TestResult
       - id: review
         role: reviewer
+        default_skills: ["review=default-review"]
         deps: [test]
         read_only: true
         output_schema: ReviewResult
+      - id: delivery_verify
+        type: delivery_gate
+        role: reviewer
+        deps: [review]
+        read_only: true
+        output_schema: ReviewResult
+        delivery_targets: [implement, test, review]
       - id: fix
         role: implementer
-        deps: [review]
-        when: review.has_blockers && loop < 2
+        default_skills: ["code=default-code"]
+        deps: [delivery_verify]
+        when: delivery_verify.has_blockers && loop < 2
         allow_write: true
         max_loops: 2
+        loop_review_stage: delivery_verify
+        loop_reset_stages: [test, review, delivery_verify, fix]
+        loop_restart_stage: test

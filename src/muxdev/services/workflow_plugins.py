@@ -18,6 +18,7 @@ class WorkflowPlugin:
     name: str
     description: str
     phases: tuple[str, ...]
+    best_for: tuple[str, ...] = field(default_factory=tuple)
     supported_providers: tuple[str, ...] = field(default_factory=tuple)
     commands: dict[str, str] = field(default_factory=dict)
     prompts: dict[str, str] = field(default_factory=dict)
@@ -26,6 +27,7 @@ class WorkflowPlugin:
 
     def to_dict(self) -> dict[str, object]:
         data = asdict(self)
+        data["best_for"] = list(self.best_for)
         data["phases"] = list(self.phases)
         data["supported_providers"] = list(self.supported_providers)
         return data
@@ -83,6 +85,7 @@ def _plugin_from_config(name: str, data: dict[str, object]) -> WorkflowPlugin:
     return WorkflowPlugin(
         name=name,
         description=str(data.get("description", "")),
+        best_for=tuple(str(item) for item in data.get("best_for", [])),
         phases=tuple(str(item) for item in data.get("phases", [])),
         supported_providers=tuple(str(item) for item in data.get("supported_providers", [])),
         commands={str(key): str(value) for key, value in (data.get("commands", {}) or {}).items()},

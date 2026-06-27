@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from .live_dashboard import render_live_dashboard_html as render_workbench_dashboard_html
+from .minimal_dashboard import render_minimal_dashboard_html as render_workbench_dashboard_html
 from ..models import ApprovalStatus, ProviderActionStatus
 from ..providers import detect_providers
 from ..presentation.dashboard import (
@@ -328,6 +328,80 @@ def render_run_review_html(payload: dict[str, Any]) -> str:
 </html>"""
 
 
+def render_task_terminal_html(payload: dict[str, Any], handoff: dict[str, Any], *, agent: str = "implementer") -> str:
+    """Render a read-only browser view of a task's CLI transcript or trace."""
+    run = payload.get("run") if isinstance(payload.get("run"), dict) else {}
+    run_id = str(run.get("run_id") or handoff.get("run_id") or handoff.get("task_id") or "")
+    task = str(run.get("task") or run_id or "muxdev task")
+    handoff_payload = handoff.get("handoff") if isinstance(handoff.get("handoff"), dict) else {}
+    command = _terminal_command_text(handoff_payload.get("command"))
+    mode = str(handoff_payload.get("mode") or "trace")
+    session = str(handoff_payload.get("session") or "")
+    fallback_reason = str(handoff_payload.get("fallback_reason") or "")
+    transcript_path = str(handoff_payload.get("path") or handoff_payload.get("transcript_path") or "")
+    transcript = _read_terminal_tail(transcript_path)
+    source = transcript_path if transcript else "trace.jsonl"
+    if not transcript:
+        trace = payload.get("trace") if isinstance(payload.get("trace"), list) else []
+        transcript = _trace_tail(trace)
+    if not transcript:
+        transcript = "No transcript or trace output is available yet."
+    live_mode = mode in {"native_cli", "tmux"}
+    title = "Live model CLI" if live_mode else "Transcript fallback"
+    command_label = "Attach command" if live_mode else "Transcript command"
+    command_block = f"<code>{_escape(command)}</code>" if command else "<span class=\"muted\">No attach command is available.</span>"
+    session_block = f"<span class=\"pill\">session {_escape(session)}</span>" if session else ""
+    fallback_block = f"<span class=\"pill\">{_escape(fallback_reason)}</span>" if fallback_reason else ""
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="3">
+  <title>{_escape(title)}</title>
+  <style>
+    :root {{ --bg:#0e1116; --panel:#151a22; --ink:#e5e7eb; --muted:#9ca3af; --line:#2d3440; --accent:#2dd4bf; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 ui-sans-serif,system-ui,"Segoe UI",sans-serif; }}
+    header {{ padding:16px 20px; background:var(--panel); border-bottom:1px solid var(--line); position:sticky; top:0; }}
+    h1 {{ margin:0; font-size:18px; letter-spacing:0; }}
+    main {{ padding:16px 20px 28px; display:grid; gap:12px; }}
+    .meta,.muted {{ color:var(--muted); overflow-wrap:anywhere; }}
+    .panel {{ border:1px solid var(--line); border-radius:8px; background:var(--panel); padding:12px; }}
+    .toolbar {{ display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }}
+    .pill {{ border:1px solid var(--line); border-radius:999px; padding:2px 8px; color:var(--accent); }}
+    code {{ background:#0b0f14; border:1px solid var(--line); border-radius:5px; padding:2px 6px; overflow-wrap:anywhere; }}
+    pre {{ margin:0; white-space:pre-wrap; overflow-wrap:anywhere; font:13px/1.45 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace; }}
+    a {{ color:var(--accent); }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>{_escape(title)}</h1>
+    <div class="meta">{_escape(task)}</div>
+    <div class="toolbar">
+      <span class="pill">run {_escape(run_id)}</span>
+      <span class="pill">agent {_escape(agent)}</span>
+      <span class="pill">mode {_escape(mode)}</span>
+      {session_block}
+      {fallback_block}
+      <a href="/tasks/{_escape(run_id)}">dashboard</a>
+    </div>
+  </header>
+  <main>
+    <section class="panel">
+      <div class="meta">{_escape(command_label)}</div>
+      {command_block}
+    </section>
+    <section class="panel">
+      <div class="meta">Model execution output from {_escape(source)}</div>
+      <pre>{_escape(transcript)}</pre>
+    </section>
+  </main>
+</body>
+</html>"""
+
+
 def write_dashboard(path: Path, payload: dict[str, Any]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(render_dashboard_html(payload), encoding="utf-8")
@@ -505,6 +579,37 @@ def _escape(value: object) -> str:
     return html.escape(str(value), quote=True)
 
 
+def _terminal_command_text(command: object) -> str:
+    if isinstance(command, list):
+        return " ".join(str(part) for part in command)
+    if isinstance(command, tuple):
+        return " ".join(str(part) for part in command)
+    return str(command or "")
+
+
+def _read_terminal_tail(path: str, *, max_bytes: int = 96_000) -> str:
+    if not path:
+        return ""
+    try:
+        transcript = Path(path)
+        if not transcript.exists() or not transcript.is_file():
+            return ""
+        with transcript.open("rb") as handle:
+            size = transcript.stat().st_size
+            if size > max_bytes:
+                handle.seek(size - max_bytes)
+            return handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _trace_tail(rows: object, *, limit: int = 120) -> str:
+    if not isinstance(rows, list):
+        return ""
+    tail = rows[-limit:]
+    return "\n".join(json.dumps(row, ensure_ascii=False, default=str) for row in tail if isinstance(row, dict))
+
+
 def _number(value: object) -> int:
     try:
         return max(0, min(100, int(float(value))))
@@ -534,6 +639,11 @@ class TaskCreateRequest(BaseModel):
 
 
 class ContinueRequest(BaseModel):
+    max_cost_usd: float = 0.5
+
+
+class ApprovalFeedbackRequest(BaseModel):
+    feedback: str
     max_cost_usd: float = 0.5
 
 
@@ -591,6 +701,17 @@ def create_app(*, task_manager: object | None = None, paths: object | None = Non
     @app.get("/tasks/{task_id}", response_class=HTMLResponse)
     def task_page(task_id: str, lang: str | None = None) -> str:
         return render_live_dashboard_html(task_id=task_id, lang=lang)
+
+    @app.get("/tasks/{task_id}/terminal", response_class=HTMLResponse)
+    def task_terminal_page(task_id: str, agent: str = "implementer") -> str:
+        try:
+            detail = manager.task_detail(task_id)
+            handoff = manager.attach_command(task_id, agent=agent)
+            return render_task_terminal_html(detail, handoff, agent=agent)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/review/{task_id}", response_class=HTMLResponse)
     def task_review_page(task_id: str) -> str:
@@ -1029,6 +1150,30 @@ def create_app(*, task_manager: object | None = None, paths: object | None = Non
             return manager.decide_approval(approval_id, ApprovalStatus.DENIED)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/approvals/{approval_id}/feedback")
+    def approval_feedback(approval_id: str, request: ApprovalFeedbackRequest) -> dict[str, object]:
+        try:
+            return manager.plan_feedback(approval_id, request.feedback)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/approvals/{approval_id}/feedback-and-continue")
+    def approval_feedback_and_continue(approval_id: str, request: ApprovalFeedbackRequest) -> dict[str, object]:
+        try:
+            feedback = manager.plan_feedback(approval_id, request.feedback)
+            continued = manager.continue_task(str(feedback.get("run_id")), max_cost_usd=request.max_cost_usd)
+            return {
+                "approval": feedback,
+                "continue": continued,
+                "status": continued.get("status"),
+            }
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     async def _events(websocket: WebSocket) -> None:
         await websocket.accept()

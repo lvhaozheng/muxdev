@@ -168,7 +168,6 @@ temporary run details belong in Memory Inbox or run artifacts.
 
 ## Rules And Gates
 
-- Profile: {config.get("profile", "squad")}
 - Gate: {config.get("gate", "safe")}
 - Approvals: plan/write/shell/merge gates are reviewed in Mission Control.
 - Provider actions: muxdev never types yes/no into provider CLIs.
@@ -235,7 +234,7 @@ def git_safety_panel(workspace: Path) -> dict[str, Any]:
 
 
 def rules_skills_panel(workspace: Path) -> dict[str, Any]:
-    from ..config.runtime import GATES, PROFILES, load_runtime_config
+    from ..config.runtime import GATES, load_runtime_config
     from ..services.skills import scan_skills
 
     config = load_runtime_config(workspace)
@@ -244,9 +243,7 @@ def rules_skills_panel(workspace: Path) -> dict[str, Any]:
     except Exception:
         skills = []
     return {
-        "profile": config.get("profile"),
         "gate": config.get("gate"),
-        "profiles": sorted(PROFILES),
         "gates": sorted(GATES),
         "roles": config.get("roles", {}),
         "skills": skills,

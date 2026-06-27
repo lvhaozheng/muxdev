@@ -240,11 +240,8 @@ def test_validation_api_and_live_dashboard_surface_experiments(monkeypatch) -> N
         assert rows[0]["muxdev_delta"]["score"] == 0.3
         assert rows[0]["metrics_summary"]["score"] == 0.8
         assert detail["comparison"]["winner"] == "muxdev_multi_cli"
-        assert "验证实验" in html
-        assert "验证标准" in html
-        assert "Validation Experiments" in render_live_dashboard_html(lang="en")
-        assert "Validation Standards" in render_live_dashboard_html(lang="en")
-        assert "/api/validation/experiments" in html or "validation.experiments" in html
+        assert "Validation Experiments" not in render_live_dashboard_html(lang="en")
+        assert "/api/validation/experiments" not in html
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 

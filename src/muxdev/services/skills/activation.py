@@ -11,6 +11,7 @@ from .lock import skill_tree_hash
 from .model import ActivatedSkill
 from .selector import select_skills
 from .validation import find_skill
+from ..delivery_gate import delivery_rule_for_skill_payload
 
 
 def activate_skill(
@@ -55,6 +56,7 @@ def resolve_active_skills(
     explicit: list[str] | None = None,
     env: dict[str, str] | None = None,
     include_content: bool = False,
+    auto: bool = True,
 ) -> list[dict[str, object]]:
     """Compatibility API used by older CLI/runtime code."""
     selection = select_skills(
@@ -66,6 +68,7 @@ def resolve_active_skills(
         explicit=explicit,
         provider=provider,
         env=env,
+        auto=auto,
     )
     rows: list[dict[str, object]] = []
     for item in selection.selected:
@@ -94,7 +97,13 @@ def resolve_active_skills(
         )
         if include_content:
             _record_activation(workspace, activated, run_id=None, tree_hash=tree_hash)
-        rows.append(activated.to_dict(include_content=include_content))
+        payload = activated.to_dict(include_content=include_content)
+        if include_content:
+            rule = delivery_rule_for_skill_payload(payload)
+            if rule:
+                payload["delivery_rules"] = rule
+                payload["delivery_rule_hash"] = rule.get("delivery_rule_hash")
+        rows.append(payload)
     return rows
 
 

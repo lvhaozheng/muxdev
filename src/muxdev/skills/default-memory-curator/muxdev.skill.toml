@@ -1,7 +1,8 @@
 version = 1
 
 [activation]
-roles = ["memory_curator", "plan"]
+roles = ["memory_curator"]
+stages = ["memory_proposals"]
 auto = true
 
 [permissions]

@@ -1,7 +1,8 @@
 version = 1
 
 [activation]
-roles = ["test_strategy", "test", "tester"]
+roles = ["test_strategy"]
+stages = ["test_strategy"]
 auto = true
 
 [permissions]

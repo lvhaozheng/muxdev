@@ -154,10 +154,90 @@ def test_tmux_backend_reports_missing_binary() -> None:
     assert "tmux command not found" in result.stderr
 
 
-def test_workflow_loads_dag_ready_order() -> None:
-    workflow = load_workflow("software-dev")
+@pytest.mark.parametrize(
+    ("workflow_name", "expected"),
+    [
+        (
+            "dev",
+            [
+                "task_intake",
+                "plan",
+                "plan_review",
+                "plan_verify",
+                "plan_revise",
+                "approve_plan",
+                "implement",
+                "test",
+                "review",
+                "delivery_verify",
+                "fix",
+            ],
+        ),
+        (
+            "dev-lite",
+            [
+                "task_intake",
+                "quick_plan",
+                "plan_verify",
+                "approve_plan",
+                "implement",
+                "smoke_check",
+                "light_review",
+                "delivery_verify",
+                "fix",
+                "handoff_summary",
+            ],
+        ),
+        (
+            "dev-new",
+            [
+                "task_intake",
+                "project_brief",
+                "scaffold_plan",
+                "plan_verify",
+                "approve_plan",
+                "scaffold",
+                "run_smoke",
+                "light_review",
+                "delivery_verify",
+                "fix",
+                "handoff_summary",
+            ],
+        ),
+        (
+            "design",
+            [
+                "task_intake",
+                "design_plan",
+                "design_review",
+                "design_verify",
+                "design_revise",
+                "approve_plan",
+                "design_pack",
+            ],
+        ),
+        (
+            "software-dev",
+            [
+                "task_intake",
+                "plan",
+                "plan_review",
+                "plan_verify",
+                "plan_revise",
+                "approve_plan",
+                "implement",
+                "test",
+                "review",
+                "delivery_verify",
+                "fix",
+            ],
+        ),
+    ],
+)
+def test_workflow_loads_expected_dag_ready_order(workflow_name: str, expected: list[str]) -> None:
+    workflow = load_workflow(workflow_name)
 
-    assert ordered_stage_ids(workflow) == ["design", "approve_plan", "implement", "test", "review", "fix"]
+    assert ordered_stage_ids(workflow) == expected
 
 
 def test_workflow_cycle_is_rejected() -> None:

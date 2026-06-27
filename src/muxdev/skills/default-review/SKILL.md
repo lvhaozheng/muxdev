@@ -1,13 +1,13 @@
 ---
 name: default-review
-description: Default muxdev review role skill for finding bugs, regressions, safety issues, missing tests, and contract drift.
+description: Default muxdev review role skill for plan, design, implementation, test, and docs review stages that find bugs, regressions, safety issues, missing tests, and contract drift.
 keywords: [review, blocker, regression, correctness]
 metadata:
   compatible_roles: [review, reviewer]
 ---
 # Default Review Skill
 
-Use this skill when the stage reviews a patch, plan, test result, or delivery claim.
+Use this skill when the stage reviews a plan, design, patch, test result, documentation update, or delivery claim.
 
 ## Operating Rules
 
@@ -23,3 +23,10 @@ Use this skill when the stage reviews a patch, plan, test result, or delivery cl
 - Non-blocking concerns
 - Missing evidence
 - Decision
+
+## Delivery Standard
+
+- Required deliverable: findings ordered by severity, evidence, suggestions, missing evidence, decision, and residual risk.
+- Pass when no blocking issue remains.
+- Block when high severity defects, unmet acceptance criteria, missing critical tests, or unresolved safety or compatibility risk remain.
+- Evidence: review result with file or line references when available.

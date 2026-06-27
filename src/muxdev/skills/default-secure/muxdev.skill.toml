@@ -2,6 +2,7 @@ version = 1
 
 [activation]
 roles = ["secure"]
+stages = ["secure_review", "risk_and_threat_model"]
 auto = true
 
 [permissions]

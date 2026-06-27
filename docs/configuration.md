@@ -561,3 +561,18 @@ muxdev skill doctor --json
 2. task file 是否指定了 gate。
 3. `--require-approval` 是否额外添加了 gate。
 4. 是否存在 pending provider action，导致 `continue` 返回 `awaiting_provider_action`。
+## 2026-06 Runtime Model Update
+
+This section supersedes older profile/topology references that may still appear
+elsewhere in this document.
+
+- `solo`, `pair`, `squad`, and `ci` are no longer public runtime topology
+  choices. New tasks do not write `profile` or `topology` into task context.
+- muxdev now selects workflow templates from task `intent`, `depth`, repository
+  risk signals, and the requested command. CI is represented as `intent=ci`,
+  `depth=ci`, and/or `gate=ci`, not as a topology.
+- Configure model-role routing in `muxdev setup` or `[roles]`:
+  `requirements`, `plan`, `architect`, `code`, `test_strategy`, `test`,
+  `review`, `secure`, `docs`, and `memory_curator`.
+- Per-task commands should use `--provider`, `--role role=provider`, `--gate`,
+  and depth flags such as `--simple`, `--safe`, `--deep`, or `--parallel`.

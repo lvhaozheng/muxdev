@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ...config.loader import load_config
-from ...config.runtime import GATES, PROFILES, load_runtime_config
+from ...config.runtime import GATES, PUBLIC_WORKFLOWS, load_runtime_config
 from ...services.product_experience import budget_panel, git_safety_panel, project_context_status, rules_skills_panel
 from ...services.skills import build_skill_catalog, verify_skill_lock
 from ...services.standards import EVIDENCE_LEVELS, RISK_LEVELS, SEVERITY_LEVELS, catalog_payload
@@ -23,6 +23,20 @@ _DEFAULT_STANDARD_MARKERS = {
     "ready": ("P3", "R1", "E1"),
     "watch": ("P2", "R2", "E1"),
     "blocked": ("P0", "R3", "E1"),
+}
+MODEL_ROLE_ORDER = ["requirements", "plan", "architect", "code", "test_strategy", "test", "review", "secure", "docs", "memory_curator"]
+MODEL_ROLE_ALIASES = {"implementer": "code", "tester": "test", "reviewer": "review", "security": "secure", "doc_writer": "docs"}
+MODEL_ROLE_DESCRIPTIONS = {
+    "requirements": "Clarifies scope, constraints, and acceptance criteria.",
+    "plan": "Turns requirements into implementation steps and risk controls.",
+    "architect": "Designs architecture, interfaces, and system tradeoffs.",
+    "code": "Implements changes and repairs blockers.",
+    "test_strategy": "Chooses verification strategy and coverage priorities.",
+    "test": "Runs focused checks and reports evidence.",
+    "review": "Finds regressions, blockers, and missing tests.",
+    "secure": "Reviews security, auth, secrets, and policy-sensitive changes.",
+    "docs": "Updates docs, release notes, and handoff summaries.",
+    "memory_curator": "Curates durable project memory from reviewed evidence.",
 }
 
 
@@ -340,13 +354,17 @@ def _workflow_groups(project: Path, tasks: list[dict[str, Any]]) -> list[dict[st
         workflow_tasks = [task for task in tasks if str(task.get("workflow") or "software-dev") == name]
         stages = _stage_rows(definition)
         role_groups = _role_groups(stages, workflow_tasks)
+        model_roles = _model_roles_from_stages(stages)
         groups.append(
             {
                 "id": name,
                 "name": str(definition.get("name") or name) if isinstance(definition, dict) else name,
                 "task_count": len(workflow_tasks),
                 "stage_count": len(stages),
-                "roles": [row["role"] for row in role_groups],
+                "roles": model_roles,
+                "model_roles": model_roles,
+                "human_gates": _human_gates_from_stages(stages),
+                "delivery_gates": _delivery_gates_from_stages(stages),
                 "stages": stages,
                 "role_groups": role_groups,
             }
@@ -356,34 +374,97 @@ def _workflow_groups(project: Path, tasks: list[dict[str, Any]]) -> list[dict[st
 
 def _stage_rows(definition: object) -> list[dict[str, Any]]:
     stages = definition.get("stages", []) if isinstance(definition, dict) else []
+    stage_rows = stages if isinstance(stages, list) else []
     rows = []
-    for stage in stages if isinstance(stages, list) else []:
+    for stage in stage_rows:
         if not isinstance(stage, dict):
             continue
+        raw_role = str(stage.get("role") or "").strip()
+        stage_type = str(stage.get("type") or "agent")
+        model_role = _model_role(raw_role) if stage_type == "agent" else ""
+        actor_kind = _stage_actor_kind(stage_type, model_role)
         rows.append(
             {
                 "id": stage.get("id"),
-                "role": stage.get("role") or stage.get("type") or "gate",
-                "type": stage.get("type", "agent"),
+                "role": model_role,
+                "model_role": model_role,
+                "raw_role": raw_role,
+                "type": stage_type,
+                "actor_kind": actor_kind,
+                "actor_label": _stage_actor_label(actor_kind, model_role),
                 "deps": stage.get("deps", []),
                 "read_only": bool(stage.get("read_only")),
                 "allow_write": bool(stage.get("allow_write")),
                 "allow_shell": bool(stage.get("allow_shell")),
+                "approval_type": stage.get("approval_type"),
+                "approval_reason": stage.get("approval_reason"),
             }
         )
     return rows
 
 
+def _model_role(role: str) -> str:
+    normalized = str(role or "").strip().replace("-", "_")
+    normalized = MODEL_ROLE_ALIASES.get(normalized, normalized)
+    return normalized if normalized in MODEL_ROLE_DESCRIPTIONS else ""
+
+
+def _stage_actor_kind(stage_type: str, model_role: str) -> str:
+    if stage_type == "human_gate":
+        return "human_gate"
+    if stage_type == "delivery_gate":
+        return "delivery_gate"
+    if stage_type == "agent" and model_role:
+        return "model_role"
+    return "system_step"
+
+
+def _stage_actor_label(actor_kind: str, model_role: str) -> str:
+    if actor_kind == "model_role":
+        return model_role
+    if actor_kind == "human_gate":
+        return "human review"
+    if actor_kind == "delivery_gate":
+        return "delivery gate"
+    return "system step"
+
+
+def _model_roles_from_stages(stages: list[dict[str, Any]]) -> list[str]:
+    roles: list[str] = []
+    for stage in stages:
+        role = str(stage.get("model_role") or "")
+        if role and role not in roles:
+            roles.append(role)
+    return roles
+
+
+def _human_gates_from_stages(stages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    gates: list[dict[str, Any]] = []
+    for stage in stages:
+        if stage.get("actor_kind") != "human_gate":
+            continue
+        gates.append({"stage": stage.get("id"), "type": stage.get("approval_type") or stage.get("id"), "reason": stage.get("approval_reason") or ""})
+    return gates
+
+
+def _delivery_gates_from_stages(stages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    gates: list[dict[str, Any]] = []
+    for stage in stages:
+        if stage.get("actor_kind") == "delivery_gate":
+            gates.append({"stage": stage.get("id"), "type": "delivery_gate", "reason": "internal evidence and blocker verification"})
+    return gates
+
+
 def _role_groups(stages: list[dict[str, Any]], tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     roles = []
     for stage in stages:
-        role = str(stage.get("role") or "task")
-        if role not in roles:
+        role = str(stage.get("model_role") or "")
+        if role and role not in roles:
             roles.append(role)
     task_cards = []
     for task in tasks:
         role = _task_role(task, stages)
-        if role not in roles:
+        if role and role not in roles:
             roles.append(role)
         task_cards.append(_task_card(task, role))
     return [{"role": role, "tasks": [card for card in task_cards if card["role"] == role]} for role in roles]
@@ -391,12 +472,16 @@ def _role_groups(stages: list[dict[str, Any]], tasks: list[dict[str, Any]]) -> l
 
 def _task_card(task: dict[str, Any], role: str) -> dict[str, Any]:
     task_id = str(task.get("task_id") or task.get("run_id") or "")
+    stage_context = task.get("stage_context") if isinstance(task.get("stage_context"), dict) else {}
     return {
         "task_id": task_id,
         "run_id": task_id,
         "title": str(task.get("task") or task_id or "muxdev task"),
         "status": task.get("status"),
         "role": role,
+        "model_role": role if role in MODEL_ROLE_DESCRIPTIONS else "",
+        "stage_actor_kind": stage_context.get("actor_kind") or "",
+        "stage_actor_label": stage_context.get("actor_label") or "",
         "workflow": task.get("workflow"),
         "provider": task.get("provider"),
         "current_stage": task.get("current_stage") or "",
@@ -420,7 +505,6 @@ def _task_card(task: dict[str, Any], role: str) -> dict[str, Any]:
         "pending_provider_actions": task.get("pending_provider_actions", 0),
         "errors": task.get("errors", 0),
         "error_summary": task.get("error_summary"),
-        "profile": task.get("profile") or "",
         "gate": task.get("gate") or "",
         "skills": task.get("skills") or [],
         "recover_endpoint": task.get("recover_endpoint") or f"/api/tasks/{task_id}/continue",
@@ -433,25 +517,40 @@ def _task_card(task: dict[str, Any], role: str) -> dict[str, Any]:
 
 def _task_role(task: dict[str, Any], stages: list[dict[str, Any]]) -> str:
     current = str(task.get("current_stage") or "")
-    for stage in stages:
+    current_index = -1
+    for index, stage in enumerate(stages):
         if str(stage.get("id") or "") == current:
-            return str(stage.get("role") or "task")
+            current_index = index
+            role = str(stage.get("model_role") or "")
+            if role:
+                task["stage_context"] = {"actor_kind": stage.get("actor_kind"), "actor_label": stage.get("actor_label")}
+                return role
+            task["stage_context"] = {"actor_kind": stage.get("actor_kind"), "actor_label": stage.get("actor_label")}
+            break
+    if current_index >= 0:
+        for stage in reversed(stages[:current_index]):
+            role = str(stage.get("model_role") or "")
+            if role:
+                return role
+        for stage in stages[current_index + 1 :]:
+            role = str(stage.get("model_role") or "")
+            if role:
+                return role
     status = str(task.get("status") or "")
     if status == "completed":
-        return "done"
+        return next((str(stage.get("model_role")) for stage in reversed(stages) if stage.get("model_role")), "")
     if status in {"blocked", "aborted", "failed"} or int(task.get("errors") or 0):
-        return "recovery"
-    return str(stages[0].get("role") or "task") if stages else "task"
+        return next((str(stage.get("model_role")) for stage in stages if stage.get("model_role")), "")
+    return next((str(stage.get("model_role")) for stage in stages if stage.get("model_role")), "")
 
 
 def _project_config(project: Path, tasks: list[dict[str, Any]]) -> dict[str, Any]:
     try:
         rules = rules_skills_panel(project)
     except Exception as exc:  # pragma: no cover - defensive for broken project configs
-        rules = {"error": str(exc), "profile": "", "gate": "", "roles": {}, "skills": [], "commands": []}
+        rules = {"error": str(exc), "gate": "", "roles": {}, "skills": [], "commands": []}
     return {
         "roles": rules.get("roles", {}),
-        "profile": rules.get("profile"),
         "gate": rules.get("gate"),
         "skills": rules.get("skills", []),
         "project_context": project_context_status(project),
@@ -468,13 +567,12 @@ def _global_config(workspace: Path, tasks: list[dict[str, Any]], provider_health
     runtime = _runtime_config(workspace)
     return {
         "mcp": _mcp_summary(workspace, ecosystem),
-        "role_templates": _role_templates(workspace, runtime),
-        "workflow_templates": _workflow_templates(),
+        "role_routes": _role_routes(workspace, runtime, provider_health),
+        "workflow_templates": _workflow_templates(workspace),
         "skills_catalog": _skills_catalog(workspace),
         "providers": provider_health,
         "budget": budget_panel(tasks),
         "safety": {
-            "profile": runtime.get("profile"),
             "gate": runtime.get("gate"),
             "gates": GATES,
             "git": git_safety_panel(workspace),
@@ -841,7 +939,7 @@ def _configuration_standards(workspace: Path, projects: list[dict[str, Any]]) ->
     workflow_count = sum(len(project.get("workflows") or []) for project in projects)
     role_count = len(runtime.get("roles") or {}) if isinstance(runtime.get("roles"), dict) else 0
     items = [
-        _standard_item("profile_gate", "Profile and gate", "ready" if runtime.get("profile") and runtime.get("gate") else "watch", {"profile": runtime.get("profile") or "", "gate": runtime.get("gate") or ""}, "profile and gate configured", evidence="muxdev config", action="configure_project"),
+        _standard_item("gate", "Gate policy", "ready" if runtime.get("gate") else "watch", {"gate": runtime.get("gate") or ""}, "gate configured", evidence="muxdev config", action="configure_project"),
         _standard_item("workflow_template", "Workflow template", "ready" if workflow_count else "watch", workflow_count, ">= 1 workflow template visible", evidence=_default_workflow(workspace), action="configure_project"),
         _standard_item("role_template", "Role providers", "ready" if role_count else "watch", role_count, "role providers configured or auto", evidence=runtime.get("roles") or {}, action="configure_project"),
         _standard_item("project_context", "Project context", "ready" if context.get("exists") else "watch", context.get("path") or "missing", "project context exists", evidence=context.get("preview") or "", action="configure_project"),
@@ -1143,38 +1241,90 @@ def _runtime_config(workspace: Path) -> dict[str, Any]:
     try:
         config = load_runtime_config(workspace)
     except Exception:
-        return {"profile": "", "gate": "", "roles": {}}
-    return config if isinstance(config, dict) else {"profile": "", "gate": "", "roles": {}}
+        return {"gate": "", "roles": {}}
+    return config if isinstance(config, dict) else {"gate": "", "roles": {}}
 
 
-def _role_templates(workspace: Path, runtime: dict[str, Any]) -> list[dict[str, Any]]:
+def _role_routes(workspace: Path, runtime: dict[str, Any], provider_health: dict[str, Any]) -> list[dict[str, Any]]:
     configured_roles = runtime.get("roles", {}) if isinstance(runtime.get("roles"), dict) else {}
-    workflows = load_config(workspace).get("workflows", {})
+    cli = runtime.get("cli", {}) if isinstance(runtime.get("cli"), dict) else {}
+    fallback = [str(item) for item in cli.get("fallback", [])] if isinstance(cli.get("fallback"), list) else ["mock"]
+    fallback_provider = next((provider for provider in fallback if provider), "mock")
+    ready = _provider_names(provider_health.get("ready"))
+    partial = _provider_names(provider_health.get("partial"))
+    unavailable = _provider_names(provider_health.get("unavailable"))
     rows = []
-    for name, profile in PROFILES.items():
-        workflow_name = str(profile.get("workflow") or "")
-        workflow = workflows.get(workflow_name, {}) if isinstance(workflows, dict) else {}
-        stages = _stage_rows(workflow)
-        roles = [str(role) for role in profile.get("roles", []) if role]
+    for role in MODEL_ROLE_ORDER:
+        configured = str(configured_roles.get(role) or "").strip()
+        provider = configured or fallback_provider
+        status = "ready" if provider in ready or provider == "mock" else ("partial" if provider in partial else ("unavailable" if provider in unavailable else "unknown"))
         rows.append(
             {
-                "name": name,
-                "workflow": workflow_name,
-                "roles": roles,
-                "providers": {role: configured_roles.get(role, "auto") for role in roles},
-                "stages": [stage["id"] for stage in stages],
-                "non_interactive": bool(profile.get("non_interactive")),
+                "role": role,
+                "label": role.replace("_", " "),
+                "ability": MODEL_ROLE_DESCRIPTIONS[role],
+                "configured_provider": configured or "auto",
+                "fallback_provider": fallback_provider,
+                "provider": provider,
+                "readiness": status,
+                "ready": status == "ready",
+                "setup_hint": f"muxdev setup --project then set roles.{role} = <provider>",
+                "doctor_hint": "muxdev provider doctor",
+                "config_key": f"roles.{role}",
             }
         )
     return rows
 
 
-def _workflow_templates() -> dict[str, Any]:
+def _provider_names(value: object) -> set[str]:
+    names: set[str] = set()
+    rows = value if isinstance(value, list) else []
+    for row in rows:
+        if isinstance(row, dict):
+            provider = str(row.get("provider") or row.get("name") or "").strip()
+        else:
+            provider = str(row or "").strip()
+        if provider:
+            names.add(provider)
+    return names
+
+
+def _workflow_templates(workspace: Path) -> dict[str, Any]:
     return {
         "templates": [plugin.to_dict() for plugin in list_workflow_plugins()],
+        "definitions": _workflow_definitions(workspace),
         "config_key": "workflow_plugins",
-        "sources": ["builtin workflow templates", "project workflow_plugins config"],
+        "sources": ["builtin workflow templates", "project workflow_plugins config", "configured workflow definitions"],
     }
+
+
+def _workflow_definitions(workspace: Path) -> list[dict[str, Any]]:
+    workflows = load_config(workspace).get("workflows", {})
+    rows: list[dict[str, Any]] = []
+    if not isinstance(workflows, dict):
+        return rows
+    for name, definition in workflows.items():
+        if str(name) not in PUBLIC_WORKFLOWS:
+            continue
+        if not isinstance(definition, dict):
+            continue
+        stages = _stage_rows(definition)
+        roles = _model_roles_from_stages(stages)
+        rows.append(
+            {
+                "id": str(name),
+                "name": str(definition.get("name") or name),
+                "description": str(definition.get("description") or ""),
+                "best_for": _workflow_best_for(str(name)),
+                "stage_count": len(stages),
+                "roles": roles,
+                "model_roles": roles,
+                "stages": stages,
+                "human_gates": _human_gates_from_stages(stages),
+                "delivery_gates": _delivery_gates_from_stages(stages),
+            }
+        )
+    return rows
 
 
 def _skills_catalog(workspace: Path) -> dict[str, Any]:
@@ -1190,11 +1340,23 @@ def _skills_catalog(workspace: Path) -> dict[str, Any]:
 
 
 def _default_workflow(workspace: Path) -> str:
-    config = _runtime_config(workspace)
-    profile = str(config.get("profile") or "squad")
-    if profile in PROFILES:
-        return str(PROFILES[profile].get("workflow") or "dev")
     return "dev"
+
+
+def _workflow_best_for(name: str) -> list[str]:
+    return {
+        "design": ["Full design planning", "Reviewed design contracts before implementation"],
+        "dev-lite": ["Small, low-risk code changes", "Prototype tasks with smoke-test verification"],
+        "design-lite": ["Lightweight design briefs", "Early architecture clarification"],
+        "dev": ["Standard implementation work", "Plan-review-test-delivery gated changes"],
+        "dev-new": ["New project scaffolding", "Zero-to-one implementation setup"],
+        "fix": ["Bug fixes with targeted tests", "Regression repair"],
+        "refactor": ["Risk-aware restructuring", "Behavior-preserving cleanup"],
+        "review": ["Read-only quality review", "Blocker and regression checks"],
+        "test": ["Verification-focused tasks", "Test strategy and evidence collection"],
+        "docs": ["Documentation updates", "Handoff and release note work"],
+        "software-dev": ["Legacy software development workflow", "Compatibility with older run data"],
+    }.get(name, ["General muxdev workflow execution"])
 
 
 def _task_workspace(task: dict[str, Any], fallback: Path) -> Path:

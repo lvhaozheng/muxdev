@@ -14,6 +14,7 @@ from pathlib import Path
 import yaml
 
 from ..config.loader import load_config
+from ..config.runtime import WORKFLOW_ALIASES
 from ..models import WorkflowDefinition
 
 
@@ -23,9 +24,10 @@ SOFTWARE_DEV_WORKFLOW = yaml.safe_dump(load_config().get("workflows", {}).get("s
 def load_workflow(name_or_path: str) -> WorkflowDefinition:
     """Load a workflow by filesystem path or configured workflow name."""
     path = Path(name_or_path)
-    if path.exists():
+    if path.is_file():
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
     else:
+        name_or_path = WORKFLOW_ALIASES.get(name_or_path, name_or_path)
         workflows = load_config().get("workflows", {})
         if name_or_path not in workflows:
             raise ValueError(f"unknown workflow: {name_or_path}")
@@ -101,6 +103,12 @@ def should_run_when(expression: str | None, context: dict[str, object]) -> bool:
     if not expression:
         return True
     normalized = expression.replace("&&", "and")
+    if "||" in normalized:
+        return any(should_run_when(part.strip(), context) for part in normalized.split("||"))
+    bool_match = re.fullmatch(r"([A-Za-z_][\w]*)\.([A-Za-z_][\w]*)", normalized.strip())
+    if bool_match:
+        item = context.get(bool_match.group(1), {})
+        return bool(item.get(bool_match.group(2))) if isinstance(item, dict) else False
     if normalized == "review.has_blockers and loop < 2":
         review = context.get("review", {})
         has_blockers = bool(review.get("has_blockers")) if isinstance(review, dict) else False

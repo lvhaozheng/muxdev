@@ -409,13 +409,19 @@ def _submit_tui_task(client: DaemonClient, submit: dict[str, Any]) -> tuple[dict
             skill_specs=list(submit.get("skill") or []),
             require_approval=set(submit.get("require_approval") or set()),
         )
-        active_skills = resolve_active_skills(
-            Path.cwd(),
-            task=str(request["task"]),
-            roles=list(request.get("runtime_roles", {}).keys()),
-            provider=str(request["provider"]),
-            explicit=list(request.get("skill_specs", [])),
-            include_content=True,
+        explicit_skills = list(request.get("skill_specs", []))
+        active_skills = (
+            resolve_active_skills(
+                Path.cwd(),
+                task=str(request["task"]),
+                roles=[],
+                provider=str(request["provider"]),
+                explicit=explicit_skills,
+                include_content=True,
+                auto=False,
+            )
+            if explicit_skills
+            else []
         )
     except ValueError as exc:
         raise DaemonConnectionError(str(exc)) from exc
@@ -425,10 +431,8 @@ def _submit_tui_task(client: DaemonClient, submit: dict[str, Any]) -> tuple[dict
             "workspace": request["workspace"],
             "provider": request["provider"],
             "workflow": request["workflow"],
-            "profile": request["profile"],
             "gate": request["gate"],
             "depth": request["depth"],
-            "topology": request["topology"],
             "require_approval": request["require_approval"],
             "max_cost_usd": float(submit.get("max_cost_usd", 0.5)),
             "role_providers": request["role_providers"],
@@ -438,7 +442,7 @@ def _submit_tui_task(client: DaemonClient, submit: dict[str, Any]) -> tuple[dict
         }
     )
     description = (
-        f"workflow={request['workflow']} profile={request['profile']} gate={request['gate']} "
+        f"workflow={request['workflow']} intent={request['automation'].get('intent', '-')} gate={request['gate']} "
         f"depth={request['depth']} provider={request['provider']} skills={', '.join(str(skill.get('name')) for skill in active_skills) or '-'}"
     )
     return payload, description

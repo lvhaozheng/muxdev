@@ -2,6 +2,7 @@ version = 1
 
 [activation]
 roles = ["test", "tester"]
+stages = ["test", "targeted_test", "smoke_check", "run_smoke"]
 auto = true
 
 [permissions]
