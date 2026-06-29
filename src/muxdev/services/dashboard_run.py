@@ -11,6 +11,7 @@ from ..api.web import write_dashboard
 from ..config.runtime import load_runtime_config, provider_cache_path
 from ..models import ApprovalStatus, ProviderActionStatus
 from ..storage import Blackboard, compact_trace, read_recent_trace
+from .deliverables import workflow_deliverable_status
 from .progress import enrich_provider_attempts, enrich_stages, progress_summary
 from .ux import build_task_ux_summary
 
@@ -66,6 +67,7 @@ def startup_dashboard_payload(workspace: Path) -> dict[str, Any]:
             "stage_done": 0,
             "pending_approvals": 0,
             "pending_provider_actions": 0,
+            "pending_feedback_requests": 0,
             "errors": 0,
             "blockers": 0,
             "tokens": 0,
@@ -90,6 +92,13 @@ def build_run_dashboard_payload(workspace: Path, run_dir: Path, run_id: str, bla
     manifests = blackboard.table_rows("evidence_manifests", run_id=run_id)
     evaluations = blackboard.table_rows("evidence_evaluations", run_id=run_id)
     artifacts = _artifact_rows(blackboard.table_rows("artifacts", run_id=run_id), workspace=workspace)
+    deliverable_status = workflow_deliverable_status(
+        blackboard,
+        run_dir=run_dir,
+        run_id=run_id,
+        workflow=str(run.get("workflow") or ""),
+        require_report=str(run.get("status") or "") == "completed",
+    )
     payload = {
         "app": _app_payload(workspace),
         "run": run,
@@ -124,8 +133,9 @@ def build_run_dashboard_payload(workspace: Path, run_dir: Path, run_id: str, bla
         "snapshots": blackboard.table_rows("snapshots", run_id=run_id),
         "validator_panels": blackboard.table_rows("validator_panels", run_id=run_id),
         "trace": compact_trace(read_recent_trace(run_dir, limit=50)),
+        "deliverable_status": deliverable_status,
         "summary": {
-            **_summary(stages, approvals, provider_actions, usage, blockers, errors, run),
+            **_summary(stages, approvals, provider_actions, blackboard.table_rows("feedback_events", run_id=run_id), usage, blockers, errors, run),
             **progress_summary(
                 run=run,
                 stages=enrich_stages(stages),
@@ -243,6 +253,7 @@ def _summary(
     stages: list[dict[str, Any]],
     approvals: list[dict[str, Any]],
     provider_actions: list[dict[str, Any]],
+    feedback_events: list[dict[str, Any]],
     usage: list[dict[str, Any]],
     blockers: list[dict[str, Any]],
     errors: list[dict[str, Any]],
@@ -252,14 +263,16 @@ def _summary(
     done = sum(1 for row in stages if row.get("status") in {"completed", "skipped"})
     pending = sum(1 for row in approvals if row.get("status") == str(ApprovalStatus.PENDING))
     pending_actions = sum(1 for row in provider_actions if row.get("status") == str(ProviderActionStatus.PENDING))
+    pending_feedback = sum(1 for row in feedback_events if row.get("kind") == "design_feedback_request" and row.get("status") == "pending")
     status = str(run.get("status", "ready"))
     return {
-        "dashboard_status": "awaiting_provider_action" if pending_actions else ("needs_approval" if pending else status),
+        "dashboard_status": "awaiting_provider_action" if pending_actions else ("awaiting_feedback" if pending_feedback else ("needs_approval" if pending else status)),
         "progress": int((done / total) * 100) if total else 0,
         "stage_total": total,
         "stage_done": done,
         "pending_approvals": pending,
         "pending_provider_actions": pending_actions,
+        "pending_feedback_requests": pending_feedback,
         "errors": len(errors),
         "blockers": len(blockers),
         "tokens": sum(int(row.get("tokens") or 0) for row in usage),

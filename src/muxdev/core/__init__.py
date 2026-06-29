@@ -12,6 +12,7 @@ from .platforms import (
     split_command_line,
     system_name,
 )
+from .projects import resolve_project_root
 
 __all__ = [
     "follow_file_command",
@@ -20,6 +21,7 @@ __all__ = [
     "is_windows",
     "powershell_executable",
     "redact",
+    "resolve_project_root",
     "script_invocation",
     "shell_join",
     "split_command_line",

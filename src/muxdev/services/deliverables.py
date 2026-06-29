@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..storage import Blackboard
-from .design import DESIGN_PACK_FILES, write_design_pack, write_user_design_document
+from .design import DESIGN_PACK_FILES, USER_DESIGN_DIR, USER_DESIGN_FILENAME, write_design_pack, write_user_design_document
 
 
 DESIGN_WORKFLOWS = {"design", "design-lite"}
@@ -41,7 +41,7 @@ def publish_workflow_deliverables(
 ) -> dict[str, object]:
     """Write idempotent user-facing deliverables and return validation status."""
     workflow = _normalized_workflow(workflow)
-    stage_sections = _stage_sections(blackboard, run_id)
+    stage_sections = _stage_sections(blackboard, run_id, run_dir=run_dir)
     if workflow in DESIGN_WORKFLOWS:
         _publish_design_deliverables(
             blackboard,
@@ -267,6 +267,9 @@ def _deliverable_ready(blackboard: Blackboard, *, run_dir: Path, run_id: str, it
     if item == "design_pack":
         design_dir = run_dir / "design"
         return all(_design_pack_file_ready(design_dir / filename) for filename in DESIGN_PACK_FILES)
+    if item == "project_design_doc":
+        path = _artifact_path(blackboard, run_id, item) or _project_design_doc_path(blackboard, run_id)
+        return bool(path and path.exists() and path.is_file() and path.stat().st_size > 0)
     path = _artifact_path(blackboard, run_id, item)
     return bool(path and path.exists() and path.is_file() and path.stat().st_size > 0)
 
@@ -288,17 +291,50 @@ def _artifact_path(blackboard: Blackboard, run_id: str, kind: str) -> Path | Non
     return None
 
 
-def _stage_sections(blackboard: Blackboard, run_id: str) -> list[tuple[str, str]]:
+def _stage_sections(blackboard: Blackboard, run_id: str, *, run_dir: Path | None = None) -> list[tuple[str, str]]:
     sections: list[tuple[str, str]] = []
+    seen_paths: set[str] = set()
+
+    def add_section(title: str, path: Path) -> None:
+        if not path.exists() or not path.is_file():
+            return
+        key = str(path.resolve())
+        if key in seen_paths:
+            return
+        seen_paths.add(key)
+        sections.append((title, path.read_text(encoding="utf-8", errors="replace")))
+
     for row in blackboard.table_rows("artifacts", run_id=run_id):
         if row.get("kind") != "stage_output":
             continue
         path = Path(str(row.get("path") or ""))
-        if not path.exists() or not path.is_file():
-            continue
         title = str(row.get("stage_id") or path.stem)
-        sections.append((title, path.read_text(encoding="utf-8", errors="replace")))
+        add_section(title, path)
+    if run_dir is not None:
+        for path in _design_section_files(run_dir):
+            add_section(path.stem, path)
     return sections
+
+
+def _design_section_files(run_dir: Path) -> list[Path]:
+    design_dir = run_dir / "design"
+    if not design_dir.exists() or not design_dir.is_dir():
+        return []
+    ordered = [design_dir / filename for filename in DESIGN_PACK_FILES if (design_dir / filename).is_file()]
+    known = {path.name for path in ordered}
+    extras = sorted(path for path in design_dir.glob("*.md") if path.is_file() and path.name not in known)
+    return ordered + extras
+
+
+def _project_design_doc_path(blackboard: Blackboard, run_id: str) -> Path | None:
+    try:
+        run = blackboard.get_run(run_id)
+    except Exception:
+        return None
+    workspace = str(run.get("workspace") or "").strip()
+    if not workspace:
+        return None
+    return Path(workspace) / USER_DESIGN_DIR / USER_DESIGN_FILENAME
 
 
 def _add_artifact_once(

@@ -860,6 +860,13 @@ class Blackboard:
                 row["payload"] = {}
         return rows
 
+    def update_feedback_event_status(self, feedback_id: str, status: str) -> None:
+        self.conn.execute(
+            "UPDATE feedback_events SET status = ?, updated_at = ? WHERE feedback_id = ?",
+            (status, utc_now(), feedback_id),
+        )
+        self.conn.commit()
+
     def add_ci_rescue(
         self,
         *,

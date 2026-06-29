@@ -12,6 +12,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from .minimal_dashboard import render_minimal_dashboard_html as render_workbench_dashboard_html
+from ..core.projects import resolve_project_root
 from ..models import ApprovalStatus, ProviderActionStatus
 from ..providers import detect_providers
 from ..presentation.dashboard import (
@@ -97,7 +98,7 @@ def render_dashboard_html(payload: dict[str, Any]) -> str:
     .status {{ display: inline-flex; align-items: center; border-radius: 999px; padding: 2px 8px; border: 1px solid var(--line); font-weight: 700; }}
     .status.completed {{ color: var(--good); border-color: #bbf7d0; background: #f0fdf4; }}
     .status.running {{ color: var(--accent); border-color: #99f6e4; background: #f0fdfa; }}
-    .status.awaiting_approval, .status.awaiting_provider_action, .status.needs_approval, .status.paused_budget {{ color: var(--warn); border-color: #fde68a; background: #fffbeb; }}
+    .status.awaiting_approval, .status.awaiting_provider_action, .status.awaiting_feedback, .status.needs_approval, .status.paused_budget {{ color: var(--warn); border-color: #fde68a; background: #fffbeb; }}
     .status.blocked, .status.failed, .status.aborted {{ color: var(--bad); border-color: #fecaca; background: #fef2f2; }}
     .progress {{ width: 100%; height: 8px; background: #e5e7eb; border-radius: 999px; overflow: hidden; }}
     .progress > div {{ height: 100%; width: {_number(summary.get("progress", 0))}%; background: var(--accent); }}
@@ -884,7 +885,7 @@ def create_app(*, task_manager: object | None = None, paths: object | None = Non
 
     @app.post("/api/tasks")
     def create_task(request: TaskCreateRequest) -> dict[str, object]:
-        workspace = Path(request.workspace or Path.cwd()).resolve()
+        workspace = resolve_project_root(Path(request.workspace or Path.cwd()))
         return manager.submit_task(
             task=request.task,
             workspace=workspace,

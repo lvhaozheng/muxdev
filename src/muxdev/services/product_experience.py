@@ -258,7 +258,7 @@ def _task_management(tasks: list[dict[str, Any]]) -> dict[str, Any]:
             columns["done"] += 1
         elif status in {"blocked", "aborted", "failed"}:
             columns["failed"] += 1
-        elif status in {"awaiting_approval", "awaiting_provider_action", "paused_budget"}:
+        elif status in {"awaiting_approval", "awaiting_provider_action", "awaiting_feedback", "paused_budget"}:
             columns["waiting"] += 1
         elif status in {"needs_review", "review"} or str(task.get("current_stage") or "") == "review":
             columns["needs_review"] += 1

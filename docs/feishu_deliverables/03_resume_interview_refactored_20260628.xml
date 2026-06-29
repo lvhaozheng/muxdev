@@ -1,0 +1,220 @@
+<title>muxdev 项目复盘与面试准备：简历亮点、问答与延伸方向</title>
+
+<callout emoji="✅" background-color="light-green" border-color="green">
+  <p><b>更新基准：</b>2026-06-28 本地最新代码。推荐主线是：muxdev 不是“多 Agent 调度 demo”，而是一个 local-first Agentic SDLC control plane，把多个 AI Coding CLI 纳入可验证、可审批、可恢复、可治理的软件交付系统。</p>
+</callout>
+
+<h1>1. 项目复盘：muxdev 到底解决什么问题</h1>
+<table>
+  <colgroup><col width="180"/><col width="620"/></colgroup>
+  <thead><tr><th background-color="light-gray">维度</th><th background-color="light-gray">复盘结论</th></tr></thead>
+  <tbody>
+    <tr><td><b>一句话定位</b></td><td>本地优先的多 AI Coding Agent 软件交付控制内核，让 Codex、Claude Code、Qwen、Kimi、mock 等 provider CLI 进入统一 workflow、证据、审批、回滚和 Dashboard/TUI/API 可见性体系。</td></tr>
+    <tr><td><b>核心矛盾</b></td><td>单个 AI CLI 能写代码，但真实工程交付还需要生命周期管理、角色分工、验证证据、审批完整性、失败恢复、记忆治理和跨 provider 比较。</td></tr>
+    <tr><td><b>系统边界</b></td><td>provider 负责执行，muxdev 负责调度、策略、上下文、黑板状态、证据链、交付物、人工介入和产品化入口。</td></tr>
+    <tr><td><b>当前落地范围</b></td><td>automation、design-first workflow、trusted delivery、runtime safety、Evidence v2、delivery gate、provider action handoff、validation experiment、Mission Control Dashboard、TUI/API 与 LangGraph 兼容控制面。</td></tr>
+    <tr><td><b>技术栈</b></td><td>Python 3.11、Typer、FastAPI、Pydantic v2、SQLite blackboard、LangGraph、Rich/prompt_toolkit、Git worktree、provider adapter、JSON artifact contracts。</td></tr>
+  </tbody>
+</table>
+
+<whiteboard type="mermaid">flowchart LR
+  A[CLI / TUI / Dashboard / API] --> B[FastAPI daemon + TaskManager]
+  B --> C[SupervisorRuntime]
+  C --> D[Workflow DAG + LangGraph spec]
+  D --> E[Role stages: plan code test review docs]
+  E --> F[Provider adapters: mock / Codex / Claude / Qwen]
+  C --> G[Isolated worktree]
+  C --> H[SQLite blackboard + trace + ledger]
+  H --> I[Stage contracts + Evidence v2]
+  I --> J[Delivery gate + validator + semantic merge]
+  J --> K[Report / diff / rollback / deliverables]
+  H --> L[Approvals / provider actions / memory learning]</whiteboard>
+
+<h2>1.1 本地代码中的关键落点</h2>
+<table>
+  <colgroup><col width="230"/><col width="490"/><col width="360"/></colgroup>
+  <thead><tr><th background-color="light-gray">能力</th><th background-color="light-gray">最新实现怎么讲</th><th background-color="light-gray">代码证据</th></tr></thead>
+  <tbody>
+    <tr><td><b>自动决策</b></td><td>根据命令、任务文本、仓库标记、测试目录、敏感词和 memory context，选择 intent、depth、workflow 与 role topology。</td><td><code>services/automation.py</code></td></tr>
+    <tr><td><b>工作流编排</b></td><td>YAML workflow 支持 human gate、delivery gate、read-only stage、checkpoint、loop repair、design/dev/dev-lite/dev-new/fix/refactor/test/docs 等模板。</td><td><code>config/defaults/workflows.yaml</code><br/><code>workflows/engine.py</code></td></tr>
+    <tr><td><b>LangGraph 迁移</b></td><td><code>workflow_to_langgraph</code> 将 WorkflowDefinition 编译成 graph spec；可构建 StateGraph，但执行仍委托 muxdev native audited path，保证证据和审批稳定。</td><td><code>services/orchestration.py</code><br/><code>runtime/langgraph_engine.py</code></td></tr>
+    <tr><td><b>Provider Adapter</b></td><td>统一 mock 与 headless CLI provider，归一化 stdout/stderr、stream events、transcript、chunks、returncode、provider actions，并注入 Evidence v2 contract prompt。</td><td><code>providers/adapters.py</code><br/><code>clients/sessions/</code></td></tr>
+    <tr><td><b>可信交付</b></td><td>每个 stage 写 StageContract、RoleResultContract、snapshot、ledger event；最终写 diff、semantic merge review、blind validator、Evidence v2 和 final report。</td><td><code>runtime/supervisor.py</code><br/><code>storage/contracts.py</code><br/><code>services/evidence.py</code></td></tr>
+    <tr><td><b>Delivery Gate</b></td><td>确定性检查交付物非空、测试失败、review blocker、runtime error、pending provider action、secret-like 输出和设计文档完整性。</td><td><code>services/delivery_gate.py</code></td></tr>
+    <tr><td><b>交付物发布</b></td><td>按 workflow 发布 design pack、project design doc、plan summary、test report、review report、handoff summary、docs report，并能标记 ready/missing。</td><td><code>services/deliverables.py</code><br/><code>services/design.py</code></td></tr>
+    <tr><td><b>产品体验</b></td><td>Dashboard/TUI/API 把任务状态压缩成 headline、why、next actions、deliverables、risk，并区分 muxdev approval 与 provider action。</td><td><code>services/ux.py</code><br/><code>api/web.py</code><br/><code>api/minimal_dashboard.py</code></td></tr>
+    <tr><td><b>验证实验</b></td><td>对比 direct_cli、muxdev_single_cli、muxdev_multi_cli，记录质量、可靠性、证据、成本、人力介入、loop/RAG 信号，可选 LLM-as-a-Judge 与 local/langfuse/langsmith export。</td><td><code>services/validation.py</code></td></tr>
+  </tbody>
+</table>
+
+<hr/>
+
+<h1>2. 如何把 muxdev 讲成简历亮点</h1>
+<grid>
+  <column width-ratio="0.5">
+    <h3>不要只讲</h3>
+    <ul>
+      <li>我做了一个多 Agent 工具。</li>
+      <li>我接入了几个 AI CLI。</li>
+      <li>我让不同模型负责 plan/code/test/review。</li>
+    </ul>
+  </column>
+  <column width-ratio="0.5">
+    <h3>应该讲成</h3>
+    <ul>
+      <li>我设计了一个本地软件交付控制面。</li>
+      <li>我把外部 AI CLI 纳入统一 workflow、证据、审批和恢复体系。</li>
+      <li>我解决的是 AI 代码交付的可信性、可治理性和可产品化问题。</li>
+    </ul>
+  </column>
+</grid>
+
+<h2>2.1 三条面试主线</h2>
+<table>
+  <thead><tr><th background-color="light-gray">主线</th><th background-color="light-gray">一句话</th><th background-color="light-gray">展开关键词</th></tr></thead>
+  <tbody>
+    <tr><td><b>系统架构</b></td><td>从 CLI/TUI/API 到 daemon、runtime、provider adapter、blackboard 的本地控制面架构。</td><td>FastAPI daemon、TaskManager、SupervisorRuntime、SQLite blackboard、workflow DAG、isolated worktree</td></tr>
+    <tr><td><b>可信交付</b></td><td>把 AI 的“我完成了”转成证据、校验、审批对象和可回滚产物。</td><td>Evidence v2、hash ledger、contracts、delivery gate、blind validator、semantic merge、rollback snapshot</td></tr>
+    <tr><td><b>产品化治理</b></td><td>让用户知道当前卡在哪里、为什么卡、下一步怎么继续。</td><td>Provider Action、muxdev Approval、UX summary、Mission Control、deliverables ready/missing、validation experiment</td></tr>
+  </tbody>
+</table>
+
+<h2>2.2 适配岗位的表达角度</h2>
+<table>
+  <thead><tr><th background-color="light-gray">目标岗位</th><th background-color="light-gray">重点强调</th><th background-color="light-gray">关键词</th></tr></thead>
+  <tbody>
+    <tr><td>AI Infra / Agent Platform</td><td>多 provider 接入、Agent workflow、LangGraph 迁移、Evidence v2、validation harness。</td><td>Agentic SDLC、Provider Adapter、LangGraph、Workflow DAG、Evaluation</td></tr>
+    <tr><td>后端平台工程</td><td>daemon、任务状态机、SQLite blackboard、FastAPI endpoints、artifact contracts。</td><td>FastAPI、Pydantic、SQLite、State Machine、REST API、Worker</td></tr>
+    <tr><td>工程效率 / DevTools</td><td>一行启动、provider setup、mock demo、Dashboard/TUI、报告、回滚和交付物状态。</td><td>Developer Tools、Mission Control、TUI、Rollback、Report、DX</td></tr>
+    <tr><td>Tech Lead / 架构方向</td><td>本地优先、审批完整性、证据链、风险门禁、记忆治理和可恢复交付。</td><td>Local-first、Governance、Auditability、Approval Integrity、Recovery</td></tr>
+  </tbody>
+</table>
+
+<hr/>
+
+<h1>3. 简历写法模板</h1>
+<h2>3.1 项目标题模板</h2>
+<table>
+  <thead><tr><th background-color="light-gray">版本</th><th background-color="light-gray">标题</th><th background-color="light-gray">适用场景</th></tr></thead>
+  <tbody>
+    <tr><td>标准版</td><td>muxdev：本地优先的多 AI Coding Agent SDLC 控制平台</td><td>后端、平台、工程效率岗位</td></tr>
+    <tr><td>AI Infra 版</td><td>面向 AI 编码交付的 Agentic Workflow、Evidence 与 Provider Handoff 系统</td><td>Agent Platform、LLM 应用工程岗位</td></tr>
+    <tr><td>可信交付版</td><td>AI Coding CLI 的可验证工作流、审批完整性与回滚恢复系统</td><td>DevOps、研发效能、技术架构岗位</td></tr>
+  </tbody>
+</table>
+
+<h2>3.2 项目描述模板</h2>
+<blockquote><b>muxdev 是一个 local-first Agentic SDLC Kernel。</b>我独立设计并实现了从 CLI/TUI/Dashboard/API 到 FastAPI daemon、TaskManager、SupervisorRuntime、workflow DAG、provider adapter、SQLite blackboard、Evidence v2、Delivery Gate、Approval Subject Hash、rollback snapshot 和 validation experiment 的完整链路，将多个 AI Coding CLI 编排成可验证、可审批、可恢复、可审计的软件交付系统。</blockquote>
+
+<h2>3.3 技术栈模板</h2>
+<table>
+  <thead><tr><th background-color="light-gray">层次</th><th background-color="light-gray">技术栈</th><th background-color="light-gray">面试解释</th></tr></thead>
+  <tbody>
+    <tr><td>语言与框架</td><td>Python 3.11、Typer、FastAPI、Pydantic v2</td><td>CLI、API、配置模型和运行时 contract 的基础。</td></tr>
+    <tr><td>运行时</td><td>SupervisorRuntime、LangGraph StateGraph、workflow YAML、Git worktree</td><td>用 DAG 和隔离工作区管理 Agent stage 执行。</td></tr>
+    <tr><td>存储与审计</td><td>SQLite blackboard、trace.jsonl、hash ledger、JSON artifacts</td><td>所有 run、stage、approval、provider action、evidence 都可追踪。</td></tr>
+    <tr><td>AI Provider</td><td>mock provider、headless CLI adapter、Codex/Claude/Qwen 风格配置</td><td>provider 可替换，muxdev 保留统一治理边界。</td></tr>
+    <tr><td>产品入口</td><td>Rich/prompt_toolkit TUI、Dashboard HTML、REST/WebSocket API</td><td>面向用户展示任务进度、等待项、交付物和下一步动作。</td></tr>
+  </tbody>
+</table>
+
+<h2>3.4 个人贡献 Bullet 模板</h2>
+<ul>
+  <li>设计 local-first Agentic SDLC 控制面，将多种 AI Coding CLI 统一接入 provider adapter，并通过 role-aware workflow 编排 plan/code/test/review/docs 等阶段。</li>
+  <li>实现 FastAPI daemon 与 SQLite blackboard，统一管理 run、stage、agent、approval、provider action、artifact、test result、review blocker、evidence 和 ledger 状态。</li>
+  <li>实现 SupervisorRuntime 执行闭环，支持 workflow DAG、human gate、delivery gate、loop repair、checkpoint、read-only write guard、rollback snapshot 与 resume/retry。</li>
+  <li>构建可信交付体系：StageContract、RoleResultContract、Evidence v2 events/manifest/evaluation、hash ledger、Blind Validator Panel、Semantic Merge Review、final report 和 diff.patch。</li>
+  <li>重构设计与交付物发布层，按 workflow 生成 design pack、project design doc、plan summary、test report、review report、handoff summary，并在 Dashboard/API 展示 ready/missing。</li>
+  <li>区分 muxdev Approval 与外部 Provider Action，避免把 provider CLI 登录、确认、限流或 idle timeout 误当成系统审批，提升审计边界清晰度。</li>
+  <li>实现 validation experiment harness，对比 direct_cli、muxdev_single_cli、muxdev_multi_cli，并记录质量、可靠性、证据、成本、人力介入、loop/RAG 和可选 judge 信号。</li>
+  <li>提供 Mission Control Dashboard、TUI 和 UX summary API，将复杂运行状态压缩为 headline、why、next actions、deliverables 和 risk。</li>
+</ul>
+
+<callout emoji="❗" background-color="light-yellow" border-color="yellow">
+  <p><b>数据化表达原则：</b>没有真实 benchmark 前，不要写“提升 X%”。可以写“建立了可复现实验、结构化指标和 baseline delta 记录能力”，再在有实验数据后补充数字。</p>
+</callout>
+
+<hr/>
+
+<h1>4. 高频面试问答框架</h1>
+<table>
+  <colgroup><col width="330"/><col width="760"/></colgroup>
+  <thead><tr><th background-color="light-gray">问题</th><th background-color="light-gray">回答框架</th></tr></thead>
+  <tbody>
+    <tr><td><b>为什么不直接用 Codex 或 Claude Code？</b></td><td>直接 CLI 解决“谁来写代码”，muxdev 解决“AI 代码如何进入可控交付流程”。重点讲生命周期、证据、审批、回滚、记忆和多 provider 比较。</td></tr>
+    <tr><td><b>muxdev 的核心抽象是什么？</b></td><td>WorkflowDefinition 定义 stage DAG，role 决定职责，provider adapter 连接外部执行器，blackboard 记录事实，policy/approval/provider action 管理人工介入。</td></tr>
+    <tr><td><b>Daemon 和 SupervisorRuntime 怎么分工？</b></td><td>Daemon/TaskManager 是生命周期和全局状态边界；SupervisorRuntime 是执行器，负责 worktree、stage、provider、contract、evidence、validator、report 和 rollback。</td></tr>
+    <tr><td><b>LangGraph 在项目里做什么？</b></td><td>当前是 workflow control-plane target。代码能编译 graph spec 并在包可用时构建 StateGraph；执行仍走 muxdev native audited path，保证审批、provider action 和 Evidence v2 不被迁移打断。</td></tr>
+    <tr><td><b>Evidence v2 解决什么问题？</b></td><td>把“AI 说完成了”变成事件流、manifest、gate-first evaluation、artifact refs 和 hash chain。最终可以回答证据是否完整、测试是否通过、review 是否阻塞、approval 是否完整。</td></tr>
+    <tr><td><b>Delivery Gate 为什么是确定性的？</b></td><td>交付门禁不依赖主观 LLM 判断，而检查本地事实：artifact、test、review blocker、runtime error、pending action、secret-like 输出和设计完整性；复杂质量判断放到 review 或 validator。</td></tr>
+    <tr><td><b>Provider Action 和 muxdev Approval 为什么分开？</b></td><td>Provider Action 是外部 CLI 卡住，如登录、确认、限流；muxdev Approval 是系统策略门禁，如 plan/write/shell/merge。分开后 UI 和审计不会混淆责任边界。</td></tr>
+    <tr><td><b>审批漂移怎么防？</b></td><td>Approval 绑定 canonical subject hash，subject 可包含 policy hash、plan hash、patch hash、validator hash、semantic review hash。对象变化后旧审批不会静默复用。</td></tr>
+    <tr><td><b>如何防止只读 stage 偷偷改文件？</b></td><td>在 stage 前记录 snapshot 和 patch hash，stage 后比较 worktree patch hash；read-only stage 出现写入会记录 violation、session capsule、error，并阻塞运行。</td></tr>
+    <tr><td><b>多 Agent 一定比单 Agent 好吗？</b></td><td>不一定。muxdev 通过 automation 选择 simple/safe/deep/parallel，并用 validation experiment 比较 direct_cli、single_cli、multi_cli 的质量、证据、成本、耗时和人力介入。</td></tr>
+    <tr><td><b>设计工作流为什么值得单独讲？</b></td><td>因为代码里已经把 design/design-lite 做成一等 workflow：read-only 设计阶段、Design Pack、docs/design/design.md、设计完整性 gate 和后续 from-design 接续开发。</td></tr>
+    <tr><td><b>你做过哪些工程取舍？</b></td><td>默认 mock provider 保证离线回归；LangGraph 先做兼容控制面再迁移执行；delivery gate 做确定性本地检查；LLM judge 可选；多 provider 不预设优于单 provider。</td></tr>
+  </tbody>
+</table>
+
+<h2>4.1 30 秒讲法</h2>
+<blockquote>muxdev 是我做的本地 AI 软件交付控制内核。它不是替代 Codex 或 Claude Code，而是把这些 provider CLI 接入统一的 workflow、daemon、blackboard、evidence、approval 和 rollback 体系。用户可以从 CLI/TUI/Dashboard/API 提交任务，系统自动选择流程和角色，执行后产出 diff、report、Evidence v2、validator 结果和可恢复快照，让 AI 编码从一次性命令变成可治理的软件交付流程。</blockquote>
+
+<h2>4.2 2 分钟讲法</h2>
+<ol>
+  <li seq="auto">背景：AI Coding CLI 很多，但它们的权限、日志、上下文、确认弹窗和失败模式都不统一。</li>
+  <li seq="auto">定位：muxdev 做控制面，provider 做执行器，重点是可信交付和人工介入边界。</li>
+  <li seq="auto">架构：入口层进入 FastAPI daemon 和 TaskManager，SupervisorRuntime 执行 workflow DAG，并把 stage 状态写入 SQLite blackboard。</li>
+  <li seq="auto">执行：provider adapter 把外部 CLI 输出、transcript、chunks、provider action 统一成 ProviderStageOutput。</li>
+  <li seq="auto">可信：每个 stage 有 contract、snapshot、ledger；最终有 Evidence v2、delivery gate、semantic merge、blind validator、report、diff 和 rollback。</li>
+  <li seq="auto">产品化：Dashboard/TUI/API 把复杂状态翻译成当前在做什么、为什么卡住、下一步怎么处理。</li>
+</ol>
+
+<h2>4.3 STAR 案例</h2>
+<table>
+  <colgroup><col width="120"/><col width="720"/></colgroup>
+  <tbody>
+    <tr><td background-color="light-gray"><b>S 情境</b></td><td>多种 AI Coding CLI 能提高个人效率，但工程交付缺少统一验证、审批、恢复、记忆治理和可见性。</td></tr>
+    <tr><td background-color="light-gray"><b>T 任务</b></td><td>设计一个本地控制内核，把 provider CLI 纳入软件交付流程，并让每次 AI 修改都可追踪、可验证、可回滚。</td></tr>
+    <tr><td background-color="light-gray"><b>A 行动</b></td><td>实现 daemon、workflow DAG、SupervisorRuntime、provider adapter、blackboard、contracts、Evidence v2、Delivery Gate、Approval Subject Hash、Provider Action、Design Pack、Dashboard/TUI/API 和 validation harness。</td></tr>
+    <tr><td background-color="light-gray"><b>R 结果</b></td><td>形成一套 local-first Agentic SDLC 控制面：任务可以自动选流程，stage 可审计，交付物可校验，等待项可处理，失败可恢复，后续能通过验证实验比较不同策略。</td></tr>
+  </tbody>
+</table>
+
+<hr/>
+
+<h1>5. 项目延伸方向</h1>
+<table>
+  <thead><tr><th background-color="light-gray">方向</th><th background-color="light-gray">为什么有价值</th><th background-color="light-gray">可以怎么做</th></tr></thead>
+  <tbody>
+    <tr><td><b>Provider conformance suite</b></td><td>外部 CLI 的交互、权限、输出格式会变化，是平台稳定性的最大外部变量。</td><td>建立 provider adapter contract 测试，覆盖 auth、confirmation、rate limit、timeout、JSON/fenced output、transcript/chunks。</td></tr>
+    <tr><td><b>更完整的 benchmark</b></td><td>多 Agent 是否优于单 Agent 需要数据，而不是故事。</td><td>扩展 validation suite，按任务类型记录 score、成本、耗时、human intervention、evidence confidence 和 baseline delta。</td></tr>
+    <tr><td><b>LangGraph native execution</b></td><td>当前已经有 graph spec 与 StateGraph 构建，下一步可以逐步把执行语义迁过去。</td><td>先迁移无副作用 stage，再迁移 loop/human gate/checkpoint，保持 blackboard/evidence/approval contract 不变。</td></tr>
+    <tr><td><b>团队级治理</b></td><td>个人本地工具走向团队需要权限、策略、审计和共享视图。</td><td>增加 policy pack、role-based approval、shareable review page、组织级 Dashboard、敏感路径策略和审计导出。</td></tr>
+    <tr><td><b>更强 Memory/RAG</b></td><td>长期记忆和代码检索决定 provider context 质量。</td><td>把 citation coverage、retrieval hit rate、contradiction quarantine 接入 provider routing 和 evidence evaluation。</td></tr>
+    <tr><td><b>Skill/Plugin 生态</b></td><td>不同项目需要不同交付标准，技能治理可以成为平台扩展点。</td><td>完善 Skill Catalog、Trust、Lock、Verify、Eval、Delivery Standard 和 MCP guardrail 的闭环。</td></tr>
+    <tr><td><b>产品体验深水区</b></td><td>复杂系统要被用户长期使用，关键是降低认知负担。</td><td>在 Mission Control 中增加成本趋势、风险雷达、证据时间线、deliverable diff、provider health trend 和下一步推荐。</td></tr>
+  </tbody>
+</table>
+
+<h2>5.1 面试中主动承认的不足</h2>
+<ul>
+  <li>真实 provider 行为会持续变化，需要长期维护 conformance suite 和回归样例。</li>
+  <li>多 Agent 并不天然优于单 Agent，必须通过 validation experiment 和真实任务基准验证。</li>
+  <li>目前 LangGraph 仍处在兼容控制面阶段，native execution 迁移需要保护既有 evidence、approval 和 recovery 语义。</li>
+  <li>团队级权限、组织审计和云端协作还没有完全产品化，当前重点仍是 local-first 控制内核。</li>
+</ul>
+
+<hr/>
+
+<h1>6. 面试前复习清单</h1>
+<checkbox done="false">能用 30 秒说清楚：muxdev 不是 AI CLI，而是 AI Coding CLI 的本地交付控制面。</checkbox>
+<checkbox done="false">能画出入口、daemon、runtime、workflow、provider adapter、blackboard、evidence、deliverables 的链路。</checkbox>
+<checkbox done="false">能解释 Provider Action 与 muxdev Approval 的区别，并说明为什么这能避免审计边界混乱。</checkbox>
+<checkbox done="false">能结合 <code>workflow_to_langgraph</code> 说明 LangGraph 当前是 control-plane target，执行仍走 native audited path。</checkbox>
+<checkbox done="false">能讲清 Evidence v2 的 events、manifest、evaluation、head_hash 和 missing evidence。</checkbox>
+<checkbox done="false">能说出 Delivery Gate 的 deterministic checks，以及为什么不直接用 LLM 判断通过。</checkbox>
+<checkbox done="false">能坦诚讲不足：provider conformance、benchmark、团队治理、LangGraph native execution 仍是后续方向。</checkbox>
+
+<callout emoji="💡" background-color="light-yellow" border-color="yellow">
+  <p><b>收尾表达：</b>这个项目最大的价值不是“让 Agent 更多”，而是把 AI 编码放回软件工程交付系统：角色可控、证据可查、审批可绑定、失败可恢复、结果可比较、经验可沉淀。</p>
+</callout>

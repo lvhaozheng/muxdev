@@ -36,6 +36,7 @@ def task_with_context_packet(task: str, packet_path: Path, packet_hash: str) -> 
         f"- path: {packet_path}",
         f"- hash: {packet_hash}",
         "- Read this packet before acting when you need prior attempts, memory, review blockers, or human responses.",
+        "- For design, review, or revise stages, inspect run.feedback_events and run.upstream_artifacts before judging that a deliverable is missing from the worktree.",
     ]
     handled_responses = _handled_provider_response_lines(packet_path)
     if handled_responses:
@@ -88,6 +89,16 @@ def write_context_packet(
             for row in blackboard.list_provider_actions(run_id=run_id)
             if row.get("status") == "handled" and row.get("response") is not None
         ],
+        feedback_events=blackboard.table_rows("feedback_events", run_id=run_id),
+        artifacts=_context_artifacts(
+            blackboard.table_rows("artifacts", run_id=run_id),
+            completed_stage_ids={
+                str(row.get("stage_id") or "")
+                for row in blackboard.table_rows("stages", run_id=run_id)
+                if str(row.get("status") or "") == "completed"
+            },
+            current_stage_id=stage_id,
+        ),
         review_blockers=blackboard.table_rows("review_blockers", run_id=run_id),
         context_sources=context_sources or [],
         rag_query=rag_query,
@@ -128,6 +139,8 @@ def build_context_packet(
     automation: dict[str, object],
     provider_attempts: list[dict[str, object]],
     provider_action_responses: list[dict[str, object]] | None = None,
+    feedback_events: list[dict[str, object]] | None = None,
+    artifacts: list[dict[str, object]] | None = None,
     review_blockers: list[dict[str, object]] | None = None,
     context_sources: list[str] | None = None,
     rag_query: str | None = None,
@@ -164,6 +177,9 @@ def build_context_packet(
         "run": {
             "task_memory": grouped.get("run", []),
             "review_blockers": review_blockers or [],
+            "feedback_events": [_feedback_event(row) for row in (feedback_events or [])],
+            "artifacts": artifacts or [],
+            "upstream_artifacts": artifacts or [],
         },
         "loop_state": loop_state or {},
         "rag_decision": rag_decision.to_dict(),
@@ -189,6 +205,70 @@ def build_context_packet(
             "temporary_layers": ["session", "run", "branch"],
             "memory_refs": memory_refs(automation),
         },
+    }
+
+
+def _context_artifacts(
+    rows: list[dict[str, object]],
+    *,
+    completed_stage_ids: set[str],
+    current_stage_id: str,
+) -> list[dict[str, object]]:
+    allowed_kinds = {
+        "stage_output",
+        "delivery_gate",
+        "role_result_contract",
+        "design_pack",
+        "design_contract",
+        "project_design_doc",
+        "review_report",
+        "plan_summary",
+    }
+    refs: list[dict[str, object]] = []
+    for row in rows:
+        kind = str(row.get("kind") or "")
+        stage_id = str(row.get("stage_id") or "")
+        if kind not in allowed_kinds:
+            continue
+        if stage_id == current_stage_id:
+            continue
+        if stage_id and completed_stage_ids and stage_id not in completed_stage_ids:
+            continue
+        refs.append(_artifact_ref(row))
+    return refs[-20:]
+
+
+def _artifact_ref(row: dict[str, object]) -> dict[str, object]:
+    path = Path(str(row.get("path") or ""))
+    exists = path.exists()
+    return {
+        "stage_id": row.get("stage_id"),
+        "kind": row.get("kind"),
+        "name": row.get("name"),
+        "path": str(path),
+        "exists": exists,
+        "size_bytes": path.stat().st_size if exists and path.is_file() else 0,
+        "created_at": row.get("created_at"),
+    }
+
+
+def _feedback_event(row: dict[str, object]) -> dict[str, object]:
+    payload = row.get("payload")
+    if not isinstance(payload, dict):
+        try:
+            payload = json.loads(str(row.get("payload_json") or "{}"))
+        except json.JSONDecodeError:
+            payload = {}
+    return {
+        "feedback_id": row.get("feedback_id"),
+        "kind": row.get("kind"),
+        "status": row.get("status"),
+        "route_to": row.get("route_to"),
+        "severity": row.get("severity"),
+        "content": row.get("content"),
+        "payload": payload,
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
     }
 
 

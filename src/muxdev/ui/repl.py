@@ -168,6 +168,31 @@ def _plan_feedback(workspace: Path, approval_id: str, feedback: str) -> str:
             continue
         blackboard = Blackboard(run_dir)
         try:
+            pending_feedback = [
+                row
+                for row in blackboard.table_rows("feedback_events", run_id=run_dir.name)
+                if str(row.get("kind") or "") == "design_feedback_request"
+                and str(row.get("status") or "") == "pending"
+                and (run_dir.name == approval_id or str(row.get("feedback_id") or "") == approval_id)
+            ]
+            if pending_feedback:
+                feedback_id = blackboard.add_feedback_event(
+                    run_id=run_dir.name,
+                    source="user",
+                    kind="plan_feedback",
+                    severity="medium",
+                    status="pending",
+                    route_to="plan",
+                    content=feedback,
+                    payload={"source_feedback_requests": [row.get("feedback_id") for row in pending_feedback]},
+                )
+                for row in pending_feedback:
+                    blackboard.update_feedback_event_status(str(row.get("feedback_id")), "handled")
+                for stage_id in _plan_feedback_reset_stages(blackboard, run_dir.name):
+                    blackboard.reset_stage(run_dir.name, stage_id)
+                blackboard.set_run_status(run_dir.name, "running")
+                result = SupervisorRuntime(workspace).resume(run_dir.name)
+                return f"{feedback_id}: design feedback recorded; resume {result.status}"
             rows = blackboard.list_approvals(run_id=run_dir.name)
             try:
                 resolved = _resolve_local_approval_id(rows, approval_id)
@@ -203,12 +228,12 @@ def _plan_feedback_reset_stages(blackboard: Blackboard, run_id: str) -> list[str
     stage_ids = {str(row.get("stage_id") or "") for row in blackboard.table_rows("stages", run_id=run_id)}
     reset: list[str] = []
     if "plan_revise" in stage_ids:
-        reset.extend(["plan_revise", "approve_plan"])
+        reset.extend(["plan_revise", "plan_review", "plan_verify", "approve_plan"])
     elif "design_revise" in stage_ids:
-        reset.extend(["design_revise", "approve_plan", "human_design_approval"])
+        reset.extend(["design_revise", "design_review", "design_verify", "approve_plan", "human_design_approval", "design_pack"])
     else:
         reset.extend(stage_id for stage_id in ("quick_plan", "scaffold_plan", "design_brief", "design_plan", "plan", "design") if stage_id in stage_ids)
-        reset.extend(stage_id for stage_id in ("plan_review", "design_review", "approve_plan", "human_design_approval") if stage_id in stage_ids)
+        reset.extend(stage_id for stage_id in ("plan_review", "plan_verify", "design_review", "design_verify", "approve_plan", "human_design_approval", "design_pack") if stage_id in stage_ids)
     return [stage_id for index, stage_id in enumerate(reset) if stage_id in stage_ids and stage_id not in reset[:index]]
 
 

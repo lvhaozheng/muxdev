@@ -1,0 +1,295 @@
+<title>muxdev 技术理念与模块设计：从为什么到怎么做</title>
+
+<callout emoji="✅" background-color="light-green" border-color="green">
+  <p><b>核心结论：</b>muxdev 的技术主线不是“再做一个编码 Agent”，而是把多个本地 Provider CLI 编排成一个可恢复、可审计、可治理的软件交付控制面。三大理念分别落到三个关键模块：多智能体编排落到 <b>Role-aware Router</b>，本地优先架构落到 <b>Session Capsule</b>，治理即代码落到 <b>Evidence v2</b> 与 Delivery Gate / Skill Policy / Safety Policy 的组合。</p>
+</callout>
+
+<h1>0. 设计输入与边界</h1>
+<table>
+  <thead><tr><th background-color="light-gray">输入</th><th background-color="light-gray">本次使用方式</th><th background-color="light-gray">代表证据</th></tr></thead>
+  <tbody>
+    <tr><td>本地最新代码</td><td>以当前工作区实现为准，不复用旧的拓扑口径</td><td><code>README.md</code>、<code>src/muxdev/runtime/supervisor.py</code>、<code>src/muxdev/config/defaults/workflows.yaml</code></td></tr>
+    <tr><td>开源竞品</td><td>用公开仓库与官方文档校准能力边界和差异化定位</td><td>LangGraph、AutoGen、CrewAI、OpenHands、Aider</td></tr>
+    <tr><td>交付目标</td><td>用表格沉淀可审查事实，用飞书画板表达推导链路和架构关系</td><td>本文内嵌 Mermaid 画板与结构化表格</td></tr>
+    <tr><td>设计边界</td><td>聚焦“为什么到怎么做”，不是 API 手册，也不是逐行源码解析</td><td>技术理念 → 模块设计 → 系统架构</td></tr>
+  </tbody>
+</table>
+
+<h1>1. 三大技术理念：为什么</h1>
+<whiteboard type="mermaid">flowchart LR
+  P0[AI 编码工具碎片化] --> I1[多智能体编排]
+  P1[上下文与状态容易丢失] --> I2[本地优先架构]
+  P2[自然语言结论难审计] --> I3[治理即代码]
+
+  I1 --> M1[Role-aware Router]
+  I2 --> M2[Session Capsule]
+  I3 --> M3[Evidence v2]
+
+  M1 --> A1[按角色选择 Provider 与 Skill]
+  M2 --> A2[把交接状态落成本地胶囊]
+  M3 --> A3[把交付事实转成事件 Manifest Evaluation]
+
+  A1 --> S[可恢复可信交付控制面]
+  A2 --> S
+  A3 --> S
+</whiteboard>
+<table>
+  <thead><tr><th background-color="light-gray">技术理念</th><th background-color="light-gray">要解决的真实问题</th><th background-color="light-gray">设计推论</th><th background-color="light-gray">本地实现证据</th></tr></thead>
+  <tbody>
+    <tr><td>多智能体编排</td><td>不同 Provider 擅长不同角色，但单个 CLI 很难稳定覆盖需求、计划、实现、测试、评审、文档全链路</td><td>系统必须把“角色、阶段、依赖、权限、Provider、Skill”显式化，而不是让一个 Agent 自己临场决定</td><td><code>WorkflowStage.role</code>、<code>ProviderPlanner.select</code>、<code>workflow_to_langgraph</code></td></tr>
+    <tr><td>本地优先架构</td><td>AI 运行过程会产生大量任务状态、日志、补丁、审批、证据和上下文，云端黑盒会削弱可恢复性</td><td>运行状态先写本地 SQLite、run artifacts、ledger、context packet、session capsule，再由 CLI/TUI/API/Dashboard 读取</td><td><code>Blackboard</code>、<code>MemoryStore</code>、<code>LocalRagIndex</code>、<code>write_session_capsule</code></td></tr>
+    <tr><td>治理即代码</td><td>“模型说已完成”不能直接等于可交付，需要测试、评审、审批、风险和证据形成机器可检查的规则</td><td>治理规则应以 policy、skill、delivery gate、hash contract、Evidence v2 形式落地，并能被重复验证</td><td><code>SafetyPolicyEngine</code>、<code>delivery_rule_for_skill_payload</code>、<code>write_evidence_run</code>、<code>verify_run_evidence</code></td></tr>
+  </tbody>
+</table>
+
+<h1>2. 理念到模块的映射</h1>
+<table>
+  <thead><tr><th background-color="light-gray">理念</th><th background-color="light-gray">模块</th><th background-color="light-gray">模块职责</th><th background-color="light-gray">关键输入</th><th background-color="light-gray">关键输出</th></tr></thead>
+  <tbody>
+    <tr><td>多智能体编排</td><td><b>Role-aware Router</b></td><td>把任务拆成可路由的 stage，并按 role、显式覆盖、历史学习推荐、fallback 选择 provider；同时按 role/stage 激活 skill</td><td>workflow YAML、automation decision、role_providers、skill catalog、provider learning</td><td>provider_route_decision、stage contract、active skills、provider attempt</td></tr>
+    <tr><td>本地优先架构</td><td><b>Session Capsule</b></td><td>把一次 stage 的可交接状态压缩为本地 JSON 胶囊，保留补丁、摘要、工作树、证据、memory、provider action 引用</td><td>run_dir、stage output、patch hash、worktree HEAD、memory refs、evidence refs、provider action ids</td><td><code>capsules/*.session_capsule.json</code> 与 <code>*.handoff.patch</code></td></tr>
+    <tr><td>治理即代码</td><td><b>Evidence v2</b></td><td>把运行事实统一为 hash-chained events，再派生 manifest 和 gate-first evaluation，让交付状态可复核</td><td>blackboard rows、trace events、artifacts、tests、review blockers、approvals、provider actions</td><td><code>evidence/events.jsonl</code>、<code>manifest.json</code>、<code>evaluation.json</code></td></tr>
+  </tbody>
+</table>
+
+<whiteboard type="mermaid">flowchart TB
+  subgraph L1[技术理念层]
+    A[多智能体编排]
+    B[本地优先架构]
+    C[治理即代码]
+  end
+
+  subgraph L2[模块设计层]
+    R[Role-aware Router]
+    SC[Session Capsule]
+    E[Evidence v2]
+  end
+
+  subgraph L3[系统架构层]
+    UI[CLI / TUI / API / Dashboard]
+    D[Daemon TaskManager]
+    S[SupervisorRuntime]
+    LG[LangGraphWorkflowEngine]
+    PA[Provider Adapter]
+    BB[Blackboard SQLite]
+    MEM[Memory / RAG / Ledger]
+    G[Safety / Delivery / Skill Policy]
+  end
+
+  A --> R
+  B --> SC
+  C --> E
+  R --> S
+  SC --> MEM
+  E --> BB
+  UI --> D
+  D --> S
+  S --> LG
+  S --> PA
+  S --> BB
+  S --> G
+  BB --> UI
+  MEM --> S
+</whiteboard>
+
+<h1>3. Role-aware Router：从“模型调用”到“角色路由”</h1>
+<table>
+  <thead><tr><th background-color="light-gray">设计问题</th><th background-color="light-gray">模块做法</th><th background-color="light-gray">实现位置</th><th background-color="light-gray">结果</th></tr></thead>
+  <tbody>
+    <tr><td>任务应该走哪个工作流</td><td>自动决策 intent、depth、workflow、roles，并保留 deterministic fallback</td><td><code>services/automation.py::resolve_automation</code></td><td>任务进入 dev、fix、review、test、docs、design 等 workflow</td></tr>
+    <tr><td>工作流如何表达多角色</td><td>YAML stage 声明 role、deps、type、read_only、allow_write、allow_shell、delivery_targets、loop policy</td><td><code>config/defaults/workflows.yaml</code>、<code>models.WorkflowStage</code></td><td>同一流程可包含 requirements、plan、code、test、review、docs 等角色</td></tr>
+    <tr><td>某个角色交给哪个 Provider</td><td>优先使用显式 role override，其次 provider learning recommendation，最后 fallback provider</td><td><code>providers/planner.py::ProviderPlanner.select</code></td><td>每个 stage 产生可追踪的 <code>provider_route_decision</code></td></tr>
+    <tr><td>角色如何拿到正确技能</td><td>Skill 按 role、stage、file pattern、description、keyword 打分，受 trust policy 与 quarantine 控制</td><td><code>services/skills/selector.py</code>、<code>services/skills/trust.py</code></td><td>Provider prompt 只注入当前阶段需要的技能上下文</td></tr>
+    <tr><td>图式编排如何对接</td><td><code>workflow_to_langgraph</code> 将本地 workflow 编译成 LangGraph-compatible graph spec</td><td><code>services/orchestration.py</code>、<code>runtime/langgraph_engine.py</code></td><td>外部编排系统可读取 nodes、edges、role、loop metadata</td></tr>
+  </tbody>
+</table>
+
+<whiteboard type="mermaid">sequenceDiagram
+  participant U as User
+  participant C as CLI/API
+  participant A as Automation
+  participant W as Workflow YAML
+  participant R as Role-aware Router
+  participant P as Provider Adapter
+  participant B as Blackboard
+
+  U->>C: muxdev dev or design task
+  C->>A: resolve_task_request
+  A-->>C: intent depth workflow roles
+  C->>W: load workflow definition
+  W-->>R: stage role deps gates loop
+  R->>R: explicit override then learning then fallback
+  R->>P: run selected provider for stage
+  P-->>R: ProviderStageOutput
+  R->>B: route decision attempt contract artifact
+</whiteboard>
+
+<h1>4. Session Capsule：本地优先的交接单元</h1>
+<table>
+  <thead><tr><th background-color="light-gray">胶囊字段</th><th background-color="light-gray">为什么需要</th><th background-color="light-gray">设计含义</th></tr></thead>
+  <tbody>
+    <tr><td><code>run_id / stage_id / role / provider</code></td><td>回答“谁在什么时候做了哪一段”</td><td>胶囊绑定到角色化 stage，而不是只绑定到一段自然语言摘要</td></tr>
+    <tr><td><code>summary</code></td><td>让人和后续 agent 快速理解当前状态</td><td>使用 redaction 处理，避免把敏感输出原样扩散</td></tr>
+    <tr><td><code>worktree_head / latest_diff_path / patch_hash</code></td><td>回答“当前代码基于什么版本，改了什么，是否漂移”</td><td>补丁成为交接和回滚的最小事实单元</td></tr>
+    <tr><td><code>memory_refs / evidence_refs</code></td><td>让上下文可追溯，而不是把所有记忆直接塞进 prompt</td><td>长期记忆、证据和阶段状态彼此分离，但通过引用关联</td></tr>
+    <tr><td><code>open_findings / provider_actions</code></td><td>保留未解决风险与外部 provider 等待事项</td><td>resume 时能知道先处理审批、provider action 还是继续 stage</td></tr>
+    <tr><td><code>capsule_hash</code></td><td>保证胶囊本身可校验</td><td>本地优先不是散落文件，而是可验证 artifact</td></tr>
+  </tbody>
+</table>
+
+<whiteboard type="mermaid">flowchart LR
+  Stage[Stage Output] --> Diff[Patch and Patch Hash]
+  Stage --> Summary[Redacted Summary]
+  Stage --> Findings[Open Findings]
+  Stage --> Actions[Provider Actions]
+  Memory[Memory Refs] --> Capsule[Session Capsule JSON]
+  Evidence[Evidence Refs] --> Capsule
+  Diff --> Capsule
+  Summary --> Capsule
+  Findings --> Capsule
+  Actions --> Capsule
+  Capsule --> Resume[Resume / Attach / Handoff]
+  Capsule --> Audit[Audit / Report / Dashboard]
+</whiteboard>
+
+<h1>5. Evidence v2：把交付事实变成可验证事件</h1>
+<table>
+  <thead><tr><th background-color="light-gray">层次</th><th background-color="light-gray">内容</th><th background-color="light-gray">治理价值</th><th background-color="light-gray">实现位置</th></tr></thead>
+  <tbody>
+    <tr><td>Event</td><td>task、stage、change、test、review、runtime、approval、artifact、policy 等事实事件</td><td>所有交付判断先回到事实事件，而不是回到模型口头结论</td><td><code>models/evidence.py::EvidenceEvent</code></td></tr>
+    <tr><td>Hash Chain</td><td>每个事件记录 <code>prev_hash</code> 和 <code>event_hash</code></td><td>支持检测事件顺序、内容和 head hash 漂移</td><td><code>services/evidence.py::_hash_events</code></td></tr>
+    <tr><td>Manifest</td><td>事件数量、artifact 数量、required matrix、missing required、head hash</td><td>回答“证据是否完整”</td><td><code>EvidenceManifest</code></td></tr>
+    <tr><td>Evaluation</td><td>label、confidence、gates、components、standard scores、missing evidence、next actions</td><td>回答“现在是否可交付、风险在哪里、下一步做什么”</td><td><code>EvidenceEvaluation</code></td></tr>
+    <tr><td>Verification</td><td>重新校验 manifest、event chain、artifact refs、persisted hashes</td><td>让 evidence 可以被复跑验证</td><td><code>verify_run_evidence</code></td></tr>
+  </tbody>
+</table>
+
+<whiteboard type="mermaid">flowchart TB
+  BB[Blackboard Rows] --> EV[Collect Evidence Events]
+  TR[trace.jsonl] --> EV
+  ART[Artifacts and Tests] --> EV
+  POL[Policy and Approvals] --> EV
+  EV --> HC[Hash Event Chain]
+  HC --> MAN[Manifest]
+  MAN --> EVAL[Gate-first Evaluation]
+  EVAL --> UI[CLI / TUI / Dashboard]
+  HC --> VERIFY[muxdev evidence verify]
+  VERIFY --> UI
+</whiteboard>
+
+<h1>6. 治理即代码：不靠口头承诺，靠规则与证据闭环</h1>
+<table>
+  <thead><tr><th background-color="light-gray">治理对象</th><th background-color="light-gray">代码化载体</th><th background-color="light-gray">执行点</th><th background-color="light-gray">生成证据</th></tr></thead>
+  <tbody>
+    <tr><td>Provider 权限与命令风险</td><td><code>SafetyPolicy</code> 的 shell allow/deny、approval types、budget</td><td><code>SafetyPolicyEngine.evaluate_shell</code> 与 <code>evaluate_approval</code></td><td><code>policy_decision</code> trace event 与 Evidence policy event</td></tr>
+    <tr><td>交付是否达标</td><td>Skill Delivery Standard 派生出的 checks 和 required evidence</td><td><code>evaluate_delivery_gate</code></td><td><code>delivery_gates/*.json</code>、review blockers、Evidence evaluation</td></tr>
+    <tr><td>Skill 是否可信</td><td>trust state、auto flag、role binding、skill lock tree hash</td><td><code>select_skills</code>、<code>write_skill_lock</code>、<code>verify_skill_lock</code></td><td><code>.muxdev/skill-lock.json</code> 与 activation record</td></tr>
+    <tr><td>人工审批是否被复用</td><td>approval subject hash、policy hash、subject JSON</td><td><code>SupervisorRuntime._approval_gate</code></td><td>approval rows、subject hash、approval evidence event</td></tr>
+    <tr><td>交付结果是否可回放</td><td>stage contract、role result contract、ledger、Evidence v2</td><td>SupervisorRuntime stage lifecycle</td><td>contracts、ledger.jsonl、evidence artifacts</td></tr>
+  </tbody>
+</table>
+
+<h1>7. 系统架构：从理念到运行时的完整路径</h1>
+<whiteboard type="mermaid">flowchart TB
+  U[User] --> UI[CLI / TUI / Dashboard / API]
+  UI --> TS[Task Submit and Continue]
+  TS --> DAEMON[Daemon TaskManager]
+  DAEMON --> SUP[SupervisorRuntime]
+  SUP --> LG[LangGraph-compatible Control Plane]
+  SUP --> ROUTER[Role-aware Router]
+  ROUTER --> SKILL[Skill Selector and Policy]
+  ROUTER --> PROV[Provider Adapter]
+  PROV --> CLI[Codex Claude Qwen Mock and other CLIs]
+  SUP --> CP[Context Packet]
+  SUP --> CAPS[Session Capsule]
+  SUP --> DG[Delivery Gate]
+  SUP --> EV[Evidence v2]
+  SUP --> LEDGER[Hash Ledger]
+  CP --> LOCAL[Local RAG Memory Blackboard]
+  CAPS --> LOCAL
+  EV --> LOCAL
+  DG --> LOCAL
+  LEDGER --> LOCAL
+  LOCAL --> DASH[Mission Control and Reports]
+</whiteboard>
+
+<table>
+  <thead><tr><th background-color="light-gray">架构层</th><th background-color="light-gray">核心职责</th><th background-color="light-gray">为什么这样分层</th></tr></thead>
+  <tbody>
+    <tr><td>入口层</td><td>CLI、TUI、Dashboard、HTTP API 提交任务、展示状态、处理 approvals/actions</td><td>入口可以变化，但状态源必须统一</td></tr>
+    <tr><td>Daemon 层</td><td>TaskManager 管理 run 生命周期、worker、广播和全局状态</td><td>避免每个 CLI 进程各自拥有不一致状态</td></tr>
+    <tr><td>Runtime 层</td><td>SupervisorRuntime 执行 workflow、gate、provider、evidence、finalize、resume</td><td>把 agent 执行变成可恢复流程，而不是一次性脚本</td></tr>
+    <tr><td>编排层</td><td>LangGraphWorkflowEngine 暴露 nodes、edges、loop metadata，并在可用时构建 StateGraph</td><td>对齐开源图式编排生态，同时保留 muxdev 已审计执行路径</td></tr>
+    <tr><td>Provider 层</td><td>Headless CLI / mock provider 统一成 ProviderStageOutput、transcript、chunks、provider actions</td><td>让不同 AI CLI 可插拔，但不把治理交给 provider 自己</td></tr>
+    <tr><td>本地事实层</td><td>Blackboard、run artifacts、MemoryStore、LocalRagIndex、ledger、Evidence v2</td><td>所有关键事实在本地可查、可重放、可校验</td></tr>
+  </tbody>
+</table>
+
+<h1>8. 开源竞品对照：muxdev 的位置</h1>
+<table>
+  <thead><tr><th background-color="light-gray">开源仓库</th><th background-color="light-gray">强项</th><th background-color="light-gray">对 muxdev 的启发</th><th background-color="light-gray">muxdev 差异化</th></tr></thead>
+  <tbody>
+    <tr><td>LangGraph</td><td>面向长运行、有状态 agent 的底层编排框架，强调 persistence、human-in-the-loop、memory、streaming</td><td>图式控制面是多阶段 agent 系统的合理方向</td><td>muxdev 不是只提供图框架，而是把图式 stage 落到本地 SDLC 证据、审批、Provider CLI 和回滚闭环</td></tr>
+    <tr><td>AutoGen</td><td>多智能体框架先驱，强调 agentic AI 编程框架；当前官方仓库 master 标注 maintenance mode</td><td>多 Agent 协作需要明确协议，而不是只靠聊天回合</td><td>muxdev 把协作协议落成 workflow、role contract、session capsule 和 evidence artifact</td></tr>
+    <tr><td>CrewAI</td><td>强调独立的多 Agent 自动化框架，支持 Crews、Flows、training、replay、testing</td><td>角色与任务是用户最容易理解的协作抽象</td><td>muxdev 的角色不仅用于协作语义，还用于 provider routing、skill governance、delivery gate 与本地证据</td></tr>
+    <tr><td>OpenHands</td><td>开源软件工程 agent 平台，支持自托管、本地/云端运行、agent 连接与工作流入口</td><td>coding-agent 平台需要可视化和可运维入口</td><td>muxdev 更偏“本地可信交付控制面”，重点是把多个 provider CLI 纳入证据、审批、回滚和治理</td></tr>
+    <tr><td>Aider</td><td>终端 pair-programming 工具，擅长本地仓库、Git、代码地图、编辑与测试循环</td><td>本地开发者体验要足够轻，才能进入真实日常工作流</td><td>muxdev 不是单 Agent pair programmer，而是围绕多角色、多 provider、可审计交付和本地治理组织</td></tr>
+  </tbody>
+</table>
+
+<h2>8.1 官方来源校验</h2>
+<table>
+  <thead><tr><th background-color="light-gray">对象</th><th background-color="light-gray">2026-06-28 核对到的官方描述</th><th background-color="light-gray">在本文中的用法</th></tr></thead>
+  <tbody>
+    <tr><td>LangGraph</td><td>官方 GitHub README 将其定位为构建、管理和部署长运行、有状态 agent 的 low-level orchestration framework，并列出 durable execution、human-in-the-loop、memory 等能力。</td><td>用于对照 muxdev 的 LangGraph-compatible 控制面与 native audited executor 的取舍。</td></tr>
+    <tr><td>AutoGen</td><td>官方 GitHub README 标注 Maintenance Mode，并提示新用户从 Microsoft Agent Framework 开始。</td><td>用于说明多智能体框架会演化，muxdev 需要把协作协议沉淀为本地 contract，而不是绑定单一框架生命周期。</td></tr>
+    <tr><td>CrewAI</td><td>官方 GitHub README 将 CrewAI 描述为通过 Crews 与 event-driven Flows 提供多智能体自动化，并强调 role-based collaboration、state management、conditional branching。</td><td>用于对照 Role-aware Router：角色不是只用于提示词，而是进一步控制 provider、skill、gate 和 evidence。</td></tr>
+    <tr><td>OpenHands</td><td>官方 GitHub README 将其描述为 self-hosted developer control center，可运行 OpenHands、Claude Code、Codex、Gemini 或 ACP-compatible agent，并支持 local、remote、cloud backends。</td><td>用于对照 muxdev 的本地控制面；muxdev 更强调 SDLC 证据、审批、回滚与治理。</td></tr>
+    <tr><td>Aider</td><td>官方 GitHub README 定位为 terminal 中的 AI pair programming，强调现有代码库、codebase map、Git integration、linting 与 testing。</td><td>用于对照本地开发体验；muxdev 追求同样轻量入口，但覆盖多角色可信交付闭环。</td></tr>
+  </tbody>
+</table>
+
+<h1>9. 模块设计取舍</h1>
+<table>
+  <thead><tr><th background-color="light-gray">取舍</th><th background-color="light-gray">选择</th><th background-color="light-gray">原因</th><th background-color="light-gray">代价</th></tr></thead>
+  <tbody>
+    <tr><td>编排框架</td><td>LangGraph-compatible，但执行先保留 muxdev native audited path</td><td>能对齐生态，又不破坏现有 blackboard、approval、provider action、evidence 语义</td><td>短期内存在双层心智：图式 spec 与 native executor 并存</td></tr>
+    <tr><td>Provider 抽象</td><td>把 provider 当本地 CLI 后端，而不是把 muxdev 绑定到某个模型 API</td><td>兼容 Codex、Claude Code、Qwen、Kimi、mock 等不同开发工具</td><td>需要处理 CLI prompt、auth、confirmation、rate limit、transcript 等不稳定行为</td></tr>
+    <tr><td>上下文</td><td>Context Packet 与 Session Capsule 都落本地，并用 hash 引用</td><td>恢复、交接、审计和 Dashboard 都需要同一份事实</td><td>本地 artifact 体量会增长，需要清理策略</td></tr>
+    <tr><td>证据</td><td>采用轻量 Event Stream + Manifest + Evaluation，而不是重型报告先行</td><td>事件可增量、可复算、可验证，报告可以从证据派生</td><td>需要保持事件分类和 required matrix 的持续演进</td></tr>
+    <tr><td>治理</td><td>Policy、Skill trust、Delivery Standard、Evidence gate 共同决策</td><td>单一规则无法覆盖模型输出、权限、测试、评审、记忆和交付风险</td><td>规则链路较长，需要 UX 把下一步动作解释清楚</td></tr>
+  </tbody>
+</table>
+
+<h1>10. 建议路线图</h1>
+<table>
+  <thead><tr><th background-color="light-gray">优先级</th><th background-color="light-gray">方向</th><th background-color="light-gray">建议动作</th><th background-color="light-gray">预期收益</th></tr></thead>
+  <tbody>
+    <tr><td>P0</td><td>Role-aware Router 可解释性</td><td>在 Dashboard 中展示 role、provider、skill、route reason、learning decision 的完整链路</td><td>让用户知道“为什么这个阶段交给这个 provider”</td></tr>
+    <tr><td>P0</td><td>Evidence v2 可读性</td><td>把 evaluation gates、missing evidence、next actions 做成可点击证据中心</td><td>让治理结果从 JSON 变成操作路径</td></tr>
+    <tr><td>P1</td><td>Session Capsule 复用</td><td>支持从 capsule 直接 attach、resume、fork 或导出 handoff pack</td><td>提升长任务中断恢复和多人协作能力</td></tr>
+    <tr><td>P1</td><td>Provider conformance</td><td>为每类 provider 建立 transcript 解析、action 捕获、evidence prompt、timeout 行为的合规测试</td><td>降低接入新 CLI 的不可控成本</td></tr>
+    <tr><td>P2</td><td>竞品兼容</td><td>继续增强 LangGraph graph spec 的导出和导入能力</td><td>让 muxdev 更容易融入现有 agent orchestration 生态</td></tr>
+  </tbody>
+</table>
+
+<h1>11. 来源索引</h1>
+<table>
+  <thead><tr><th background-color="light-gray">类型</th><th background-color="light-gray">来源</th><th background-color="light-gray">用途</th></tr></thead>
+  <tbody>
+    <tr><td>本地代码</td><td><code>src/muxdev/services/orchestration.py</code></td><td><code>workflow_to_langgraph</code> 与 deep agent task pack</td></tr>
+    <tr><td>本地代码</td><td><code>src/muxdev/runtime/langgraph_engine.py</code></td><td>LangGraph-compatible graph spec、StateGraph 构建、native executor 保留</td></tr>
+    <tr><td>本地代码</td><td><code>src/muxdev/runtime/supervisor.py</code></td><td>stage 生命周期、provider route、approval、provider action、evidence、capsule</td></tr>
+    <tr><td>本地代码</td><td><code>src/muxdev/providers/planner.py</code></td><td>Role-aware Provider route decision</td></tr>
+    <tr><td>本地代码</td><td><code>src/muxdev/services/session_capsules.py</code></td><td>Session Capsule schema 与本地写入</td></tr>
+    <tr><td>本地代码</td><td><code>src/muxdev/services/evidence.py</code>、<code>src/muxdev/models/evidence.py</code></td><td>Evidence v2 事件、manifest、evaluation、verify</td></tr>
+    <tr><td>本地代码</td><td><code>src/muxdev/services/skills</code>、<code>src/muxdev/core/safety.py</code>、<code>src/muxdev/services/delivery_gate.py</code></td><td>治理即代码：skill trust、safety policy、delivery gate</td></tr>
+    <tr><td>竞品</td><td><a href="https://github.com/langchain-ai/langgraph">LangGraph GitHub</a></td><td>长运行、有状态 agent 编排、human-in-the-loop、memory、persistence 参考</td></tr>
+    <tr><td>竞品</td><td><a href="https://github.com/microsoft/autogen">AutoGen GitHub</a></td><td>多智能体框架与维护状态参考</td></tr>
+    <tr><td>竞品</td><td><a href="https://github.com/crewAIInc/crewAI">CrewAI GitHub</a></td><td>Crews、Flows、role-based automation 参考</td></tr>
+    <tr><td>竞品</td><td><a href="https://github.com/OpenHands/OpenHands">OpenHands GitHub</a></td><td>开源 coding-agent 平台与自托管参考</td></tr>
+    <tr><td>竞品</td><td><a href="https://github.com/Aider-AI/aider">Aider GitHub</a></td><td>本地终端 pair programming 与 repo map 参考</td></tr>
+  </tbody>
+</table>
+
+<blockquote>一句话版本：muxdev 的设计目标，是把“多个 AI 编码工具”从一组不稳定的 CLI 调用，提升为本地可审计的软件交付系统；Role-aware Router 负责正确分工，Session Capsule 负责状态可恢复，Evidence v2 负责交付可信。</blockquote>

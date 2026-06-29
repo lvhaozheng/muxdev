@@ -8,6 +8,7 @@ providers, and opening reports.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -208,13 +209,14 @@ def daemon_tasks_text(rows: list[dict[str, Any]]) -> str:
     for row in rows[:12]:
         reason = _task_error_reason(row)
         lines.append(
-            "  {task_id:<20} {status:<18} stage={stage:<10} time={elapsed:<7} approvals={approvals:<2} actions={actions:<2} tokens={tokens:<6} {task}".format(
+            "  {task_id:<20} {status:<18} stage={stage:<10} time={elapsed:<7} approvals={approvals:<2} actions={actions:<2} feedback={feedback:<2} tokens={tokens:<6} {task}".format(
                 task_id=_clip(row.get("task_id") or row.get("run_id") or "-", 20),
                 status=_clip(row.get("status") or "-", 18),
                 stage=_clip(row.get("current_stage") or "-", 10),
                 elapsed=_clip(_format_duration(row.get("elapsed_seconds")), 7),
                 approvals=row.get("pending_approvals", 0),
                 actions=row.get("pending_provider_actions", 0),
+                feedback=row.get("pending_feedback_requests", 0),
                 tokens=row.get("tokens", 0),
                 task=_clip(row.get("task") or "", 28),
             )
@@ -288,7 +290,7 @@ def daemon_task_detail_text(payload: dict[str, Any]) -> str:
         f"{run.get('run_id') or payload.get('task_id')}: {run.get('status', '-')}",
         _clip(run.get("task") or "", 110),
         f"workflow={run.get('workflow', '-')} provider={run.get('provider', '-')} profile={context.get('profile') or '-'} gate={context.get('gate') or '-'}",
-        f"stage={_current_stage(payload)} approvals={summary.get('pending_approvals', 0)} provider_actions={summary.get('pending_provider_actions', 0)} usage={summary.get('tokens', 0)} tokens ${float(summary.get('cost_usd') or 0):.4f}",
+        f"stage={_current_stage(payload)} approvals={summary.get('pending_approvals', 0)} provider_actions={summary.get('pending_provider_actions', 0)} feedback={summary.get('pending_feedback_requests', 0)} usage={summary.get('tokens', 0)} tokens ${float(summary.get('cost_usd') or 0):.4f}",
         f"skills={', '.join(skills) if skills else '-'}",
     ]
     if ux:
@@ -318,6 +320,13 @@ def daemon_task_detail_text(payload: dict[str, Any]) -> str:
         for row in actions[:3]:
             lines.append(f"  {row.get('action_id')}: {_clip(row.get('prompt_text') or '', 96)}")
             lines.append(f"    attach: {_clip(row.get('attach_command') or row.get('transcript_path') or '-', 96)}")
+    feedback_requests = _pending_design_feedback_rows(payload)
+    if feedback_requests:
+        lines.append("")
+        lines.append("Design feedback:")
+        for row in feedback_requests[:3]:
+            lines.append(f"  {row.get('feedback_id')}: {_clip(row.get('content') or '', 120)}")
+            lines.append(f"    reply: /feedback {run.get('run_id') or payload.get('task_id') or 'latest'} <answer>")
     events = _recent_event_lines(payload.get("trace", []), limit=5)
     if events:
         lines.append("")
@@ -426,6 +435,8 @@ def _daemon_focus_panel(
     grid.add_row("usage", f"{summary.get('tokens', 0)} tokens  ${float(summary.get('cost_usd') or 0):.4f}")
     grid.add_row("approvals", str(summary.get("pending_approvals", len(approvals))))
     grid.add_row("provider actions", str(summary.get("pending_provider_actions", len(pending_actions))))
+    feedback_requests = _pending_design_feedback_rows(task_payload)
+    grid.add_row("design feedback", str(summary.get("pending_feedback_requests", len(feedback_requests))))
     conflicts = [row for row in task_payload.get("parallel_conflicts", []) if isinstance(row, dict) and row.get("status") == "open"]
     semantic_reviews = [row for row in task_payload.get("semantic_merge_reviews", []) if isinstance(row, dict)]
     provider_learning = [row for row in task_payload.get("provider_learning", []) if isinstance(row, dict)]
@@ -441,6 +452,10 @@ def _daemon_focus_panel(
         grid.add_row("options", _option_labels(first) or "-")
         grid.add_row("attach", _clip(first.get("attach_command") or first.get("transcript_path") or "-", 500))
         grid.add_row("after attach", f"/action handled {first.get('action_id')}  then  /continue {run_id or 'latest'}")
+    elif feedback_requests:
+        first = feedback_requests[0]
+        grid.add_row("feedback prompt", _clip(first.get("content") or "", 1000))
+        grid.add_row("after feedback", f"/feedback {run_id or 'latest'} <answer>")
     elif ux:
         first_action = next((row for row in ux.get("next_actions", []) if isinstance(row, dict)), None)
         if first_action:
@@ -481,6 +496,28 @@ def _recent_event_lines(rows: object, *, limit: int) -> list[str]:
     return result
 
 
+def _pending_design_feedback_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = payload.get("feedback_events", []) if isinstance(payload.get("feedback_events"), list) else []
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("kind") or "") != "design_feedback_request" or str(row.get("status") or "") != "pending":
+            continue
+        item = dict(row)
+        payload_data = item.get("payload")
+        if not isinstance(payload_data, dict):
+            try:
+                parsed = json.loads(str(item.get("payload_json") or "{}"))
+            except json.JSONDecodeError:
+                parsed = {}
+            payload_data = parsed if isinstance(parsed, dict) else {}
+        if payload_data.get("stage_id") and not item.get("stage_id"):
+            item["stage_id"] = payload_data.get("stage_id")
+        result.append(item)
+    return result
+
+
 def _skill_names(rows: object) -> list[str]:
     if not isinstance(rows, list):
         return []
@@ -510,7 +547,7 @@ def _status_border(status: str) -> str:
         return "green"
     if status in {"running", "created"}:
         return "cyan"
-    if status in {"awaiting_approval", "awaiting_provider_action", "paused_budget", "needs_action", "needs_approval"}:
+    if status in {"awaiting_approval", "awaiting_provider_action", "awaiting_feedback", "paused_budget", "needs_action", "needs_approval"}:
         return "yellow"
     if status in {"blocked", "aborted", "failed"}:
         return "red"
@@ -780,6 +817,30 @@ def _plan_feedback(workspace: Path, approval_id: str, feedback: str) -> str:
             continue
         blackboard = Blackboard(run_dir)
         try:
+            feedback_requests = _pending_design_feedback_rows({"feedback_events": blackboard.table_rows("feedback_events", run_id=run_dir.name)})
+            matched_requests = [
+                row
+                for row in feedback_requests
+                if str(row.get("run_id") or "") == approval_id or str(row.get("feedback_id") or "") == approval_id or run_dir.name == approval_id
+            ]
+            if matched_requests:
+                feedback_id = blackboard.add_feedback_event(
+                    run_id=run_dir.name,
+                    source="user",
+                    kind="plan_feedback",
+                    severity="medium",
+                    status="pending",
+                    route_to="plan",
+                    content=feedback,
+                    payload={"source_feedback_requests": [row.get("feedback_id") for row in matched_requests]},
+                )
+                for row in matched_requests:
+                    blackboard.update_feedback_event_status(str(row.get("feedback_id")), "handled")
+                for stage_id in _plan_feedback_reset_stages(blackboard, run_dir.name):
+                    blackboard.reset_stage(run_dir.name, stage_id)
+                blackboard.set_run_status(run_dir.name, "running")
+                result = SupervisorRuntime(workspace).resume(run_dir.name)
+                return f"{feedback_id}: design feedback recorded; resume {result.status}"
             rows = blackboard.list_approvals(run_id=run_dir.name)
             try:
                 resolved = _resolve_local_approval_id(rows, approval_id)
@@ -815,12 +876,12 @@ def _plan_feedback_reset_stages(blackboard: Blackboard, run_id: str) -> list[str
     stage_ids = {str(row.get("stage_id") or "") for row in blackboard.table_rows("stages", run_id=run_id)}
     reset: list[str] = []
     if "plan_revise" in stage_ids:
-        reset.extend(["plan_revise", "approve_plan"])
+        reset.extend(["plan_revise", "plan_review", "plan_verify", "approve_plan"])
     elif "design_revise" in stage_ids:
-        reset.extend(["design_revise", "approve_plan", "human_design_approval"])
+        reset.extend(["design_revise", "design_review", "design_verify", "approve_plan", "human_design_approval", "design_pack"])
     else:
         reset.extend(stage_id for stage_id in ("quick_plan", "scaffold_plan", "design_brief", "design_plan", "plan", "design") if stage_id in stage_ids)
-        reset.extend(stage_id for stage_id in ("plan_review", "design_review", "approve_plan", "human_design_approval") if stage_id in stage_ids)
+        reset.extend(stage_id for stage_id in ("plan_review", "plan_verify", "design_review", "design_verify", "approve_plan", "human_design_approval", "design_pack") if stage_id in stage_ids)
     return [stage_id for index, stage_id in enumerate(reset) if stage_id in stage_ids and stage_id not in reset[:index]]
 
 
@@ -1109,6 +1170,7 @@ def _status_text(status: str) -> Text:
         "running": "bold cyan",
         "awaiting_approval": "bold yellow",
         "awaiting_provider_action": "bold yellow",
+        "awaiting_feedback": "bold yellow",
         "needs_action": "bold yellow",
         "needs_approval": "bold yellow",
         "paused_budget": "bold yellow",
@@ -1162,8 +1224,8 @@ def _display_value(value: object) -> str:
 def _task_error_reason(payload: dict[str, Any]) -> str:
     summary = payload.get("error_summary") if isinstance(payload.get("error_summary"), dict) else None
     if summary is None:
-        errors = payload.get("errors", []) if isinstance(payload.get("errors"), list) else []
-        summary = errors[0] if errors and isinstance(errors[0], dict) else None
+        errors = [row for row in payload.get("errors", []) if isinstance(row, dict)] if isinstance(payload.get("errors"), list) else []
+        summary = max(errors, key=lambda item: str(item.get("created_at") or "")) if errors else None
     if not summary:
         return ""
     stage = str(summary.get("stage_id") or "run")

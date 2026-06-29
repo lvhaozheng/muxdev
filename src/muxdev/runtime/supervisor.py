@@ -242,6 +242,12 @@ class SupervisorRuntime:
                 trace.write("resume_waiting_provider_action", actions=[row["action_id"] for row in pending_actions])
                 self._write_run_dashboard(run_dir, run_id, blackboard=blackboard)
                 return RunResult(run_id, RunStatus.AWAITING_PROVIDER_ACTION, run_dir, None)
+            pending_feedback = _pending_design_feedback_requests(blackboard, run_id)
+            if pending_feedback:
+                blackboard.set_run_status(run_id, RunStatus.AWAITING_FEEDBACK)
+                trace.write("resume_waiting_design_feedback", feedback_ids=[row["feedback_id"] for row in pending_feedback])
+                self._write_run_dashboard(run_dir, run_id, blackboard=blackboard)
+                return RunResult(run_id, RunStatus.AWAITING_FEEDBACK, run_dir, None)
             worktree = Path(run["worktree"])
             if not worktree.exists():
                 message = f"worktree missing: {worktree}"
@@ -264,7 +270,20 @@ class SupervisorRuntime:
             skills = task_context.get("skills", []) if isinstance(task_context.get("skills"), list) else []
             automation = task_context.get("automation", {}) if isinstance(task_context.get("automation"), dict) else {}
             workflow_for_resume = str(task_context.get("workflow_name") or run["workflow"])
-            if str(run.get("status") or "") == str(RunStatus.COMPLETED) and not _run_has_incomplete_stages(blackboard, run_id):
+            stages_complete = not _run_has_incomplete_stages(blackboard, run_id)
+            has_missing_deliverable_error = _run_has_missing_deliverable_error(blackboard, run_id)
+            has_missing_required_deliverables = _run_has_missing_required_deliverables(
+                blackboard,
+                run_dir=run_dir,
+                run_id=run_id,
+                workflow=workflow_for_resume,
+            )
+            should_repair_deliverables = (
+                str(run.get("status") or "") == str(RunStatus.COMPLETED)
+                or _latest_error_is_missing_deliverable(blackboard, run_id)
+                or (has_missing_deliverable_error and has_missing_required_deliverables)
+            )
+            if stages_complete and should_repair_deliverables:
                 result = _repair_completed_run_deliverables(
                     blackboard,
                     trace,
@@ -718,8 +737,7 @@ class SupervisorRuntime:
                 )
                 artifact_path = run_dir / output.artifact_name
                 artifact_path.parent.mkdir(parents=True, exist_ok=True)
-                if not artifact_path.exists():
-                    artifact_path.write_text(redact(output.content), encoding="utf-8")
+                artifact_path.write_text(redact(output.content), encoding="utf-8")
                 blackboard.add_usage(run_id, stage_provider, output.tokens, output.cost_usd)
                 blackboard.add_artifact(run_id, stage.id, output.artifact_name, artifact_path, "stage_output")
                 trace.write(
@@ -740,6 +758,40 @@ class SupervisorRuntime:
                     summary=output.summary,
                     artifact_path=str(artifact_path),
                 )
+                design_feedback = _design_feedback_request_from_output(stage, output)
+                if design_feedback:
+                    feedback_id = _record_design_feedback_request(
+                        blackboard,
+                        run_id=run_id,
+                        stage_id=stage.id,
+                        role=stage.role,
+                        workflow=workflow.name,
+                        prompt=str(design_feedback["prompt"]),
+                        prompt_source=str(design_feedback["source"]),
+                        artifact_path=artifact_path,
+                    )
+                    blackboard.complete_provider_attempt(
+                        run_id,
+                        stage.id,
+                        provider=stage_provider,
+                        attempt=attempt,
+                        status="feedback_requested",
+                        failure_kind="design_feedback_request",
+                        returncode=output.returncode,
+                        summary=output.summary,
+                        artifact_path=str(artifact_path),
+                    )
+                    blackboard.set_run_status(run_id, RunStatus.AWAITING_FEEDBACK)
+                    blackboard.upsert_stage(
+                        run_id,
+                        stage.id,
+                        role=stage.role,
+                        status=StageStatus.RUNNING,
+                        output_path=str(artifact_path),
+                        summary=f"waiting for design feedback: {feedback_id}",
+                    )
+                    trace.write("design_feedback_requested", stage=stage.id, feedback_id=feedback_id, source=design_feedback["source"])
+                    return RunResult(run_id, RunStatus.AWAITING_FEEDBACK, run_dir, None)
                 action_ids = _record_provider_actions(
                     blackboard,
                     run_id=run_id,
@@ -1171,6 +1223,41 @@ class SupervisorRuntime:
                         summary=output.summary,
                         artifact_path=str(artifact_path),
                     )
+                    design_feedback = _design_feedback_request_from_output(stage, output)
+                    if design_feedback:
+                        feedback_id = _record_design_feedback_request(
+                            blackboard,
+                            run_id=run_id,
+                            stage_id=stage.id,
+                            role=stage.role,
+                            workflow=workflow.name,
+                            prompt=str(design_feedback["prompt"]),
+                            prompt_source=str(design_feedback["source"]),
+                            artifact_path=artifact_path,
+                        )
+                        blackboard.complete_provider_attempt(
+                            run_id,
+                            stage.id,
+                            provider=stage_provider,
+                            attempt=attempt,
+                            status="feedback_requested",
+                            failure_kind="design_feedback_request",
+                            returncode=output.returncode,
+                            summary=output.summary,
+                            artifact_path=str(artifact_path),
+                        )
+                        blackboard.set_run_status(run_id, RunStatus.AWAITING_FEEDBACK)
+                        blackboard.upsert_stage(
+                            run_id,
+                            stage.id,
+                            role=stage.role,
+                            status=StageStatus.RUNNING,
+                            output_path=str(artifact_path),
+                            summary=f"waiting for design feedback: {feedback_id}",
+                        )
+                        trace.write("design_feedback_requested", stage=stage.id, feedback_id=feedback_id, source=design_feedback["source"])
+                        _refresh_provider_learning(blackboard, run_id)
+                        return RunResult(run_id, RunStatus.AWAITING_FEEDBACK, run_dir, None)
                     action_ids = _record_provider_actions(
                         blackboard,
                         run_id=run_id,
@@ -1984,6 +2071,35 @@ def _run_has_incomplete_stages(blackboard: Blackboard, run_id: str) -> bool:
     return any(str(row.get("status") or "") not in terminal for row in blackboard.table_rows("stages", run_id=run_id))
 
 
+def _latest_error_is_missing_deliverable(blackboard: Blackboard, run_id: str) -> bool:
+    errors = blackboard.table_rows("error_details", run_id=run_id)
+    if not errors:
+        return False
+    latest = max(errors, key=lambda row: str(row.get("created_at") or ""))
+    return _is_missing_deliverable_error(latest)
+
+
+def _run_has_missing_deliverable_error(blackboard: Blackboard, run_id: str) -> bool:
+    return any(_is_missing_deliverable_error(row) for row in blackboard.table_rows("error_details", run_id=run_id))
+
+
+def _run_has_missing_required_deliverables(blackboard: Blackboard, *, run_dir: Path, run_id: str, workflow: str) -> bool:
+    try:
+        status = workflow_deliverable_status(blackboard, run_dir=run_dir, run_id=run_id, workflow=workflow, require_report=False)
+    except Exception:
+        return False
+    return bool(status.get("missing"))
+
+
+def _is_missing_deliverable_error(error: dict[str, object]) -> bool:
+    if not error:
+        return False
+    latest = error
+    kind = str(latest.get("type") or latest.get("error") or "").lower()
+    message = str(latest.get("message") or "").lower()
+    return kind == "missing_deliverable" or "missing required deliverables" in message or "publish_error" in message
+
+
 def _block_missing_deliverables(
     blackboard: Blackboard,
     trace: TraceWriter,
@@ -2351,7 +2467,101 @@ def _latest_stage_output_hash(blackboard: Blackboard, run_id: str, stage_id: str
 
 
 def _stage_attempt_count(blackboard: Blackboard, run_id: str, stage_id: str) -> int:
-    return sum(1 for row in blackboard.table_rows("provider_attempts", run_id=run_id) if row.get("stage_id") == stage_id and row.get("status") not in {"retried", "provider_action"})
+    return sum(
+        1
+        for row in blackboard.table_rows("provider_attempts", run_id=run_id)
+        if row.get("stage_id") == stage_id and row.get("status") not in {"retried", "provider_action", "feedback_requested"}
+    )
+
+
+def _pending_design_feedback_requests(blackboard: Blackboard, run_id: str) -> list[dict[str, object]]:
+    return [
+        row
+        for row in blackboard.table_rows("feedback_events", run_id=run_id)
+        if str(row.get("kind") or "") == "design_feedback_request" and str(row.get("status") or "") == "pending"
+    ]
+
+
+def _design_feedback_request_from_output(stage, output: ProviderStageOutput) -> dict[str, str] | None:
+    if not _is_design_feedback_stage(stage):
+        return None
+    parsed = extract_json_object(output.content) or {}
+    if not parsed:
+        return None
+    prompt = ""
+    source = ""
+    decision = str(parsed.get("delivery_decision") or parsed.get("status") or "").lower().strip()
+    if decision in {"needs_feedback", "waiting_external_confirmation", "awaiting_feedback"}:
+        prompt = _feedback_prompt(parsed.get("feedback_request")) or _feedback_prompt(parsed.get("provider_action"))
+        source = "delivery_decision"
+    if not prompt and decision in {"needs_feedback", "waiting_external_confirmation", "awaiting_feedback"}:
+        prompt = _feedback_prompt(parsed.get("feedback_request"))
+        source = "feedback_request" if prompt else source
+    if not prompt and decision in {"needs_feedback", "waiting_external_confirmation", "awaiting_feedback"}:
+        prompt = _feedback_prompt(parsed.get("provider_action"))
+        source = "provider_action" if prompt else source
+    if not prompt:
+        return None
+    return {"prompt": prompt, "source": source or "design_feedback"}
+
+
+def _is_design_feedback_stage(stage) -> bool:
+    stage_id = str(getattr(stage, "id", "") or "")
+    role = str(getattr(stage, "role", "") or "")
+    return stage_id in {"design", "design_plan", "design_brief", "design_revise", "problem_statement"} or (
+        "design" in stage_id and role in {"architect", "plan"}
+    )
+
+
+def _feedback_prompt(value: object) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("prompt", "question", "text", "content", "message", "summary"):
+            text = str(value.get(key) or "").strip()
+            if text:
+                return text
+    if isinstance(value, list):
+        items = [str(item).strip() for item in value if str(item).strip()]
+        return "\n".join(items)
+    return ""
+
+
+def _record_design_feedback_request(
+    blackboard: Blackboard,
+    *,
+    run_id: str,
+    stage_id: str,
+    role: str | None,
+    workflow: str,
+    prompt: str,
+    prompt_source: str,
+    artifact_path: Path,
+) -> str:
+    for row in _pending_design_feedback_requests(blackboard, run_id):
+        payload = row.get("payload")
+        if not isinstance(payload, dict):
+            try:
+                payload = json.loads(str(row.get("payload_json") or "{}"))
+            except json.JSONDecodeError:
+                payload = {}
+        if str(payload.get("stage_id") or row.get("stage_id") or "") == stage_id and str(row.get("content") or "") == prompt:
+            return str(row.get("feedback_id"))
+    return blackboard.add_feedback_event(
+        run_id=run_id,
+        source="provider",
+        kind="design_feedback_request",
+        severity="medium",
+        status="pending",
+        route_to=role or "architect",
+        content=prompt,
+        payload={
+            "stage_id": stage_id,
+            "workflow": workflow,
+            "prompt_source": prompt_source,
+            "artifact_path": str(artifact_path),
+        },
+    )
 
 
 def _provider_action_input_kind(kind: str, choices: list[object] | None = None) -> str:

@@ -15,6 +15,7 @@ from typing import Any
 from ..application import TaskRuntimeService
 from ..clients.sessions import TmuxBackend
 from ..config.loader import path_config
+from ..core.projects import resolve_project_root
 from ..core.platforms import follow_file_command, hidden_subprocess_kwargs
 from ..core.text_cleaning import is_false_positive_provider_action
 from ..domain import RunSpec
@@ -169,6 +170,7 @@ class TaskManager:
         topology: str | None = None,
         automation: dict[str, object] | None = None,
     ) -> dict[str, Any]:
+        workspace = resolve_project_root(workspace)
         spec = RunSpec.from_submit_payload(
             task=task,
             workspace=workspace,
@@ -230,6 +232,16 @@ class TaskManager:
                     "provider_actions": pending_actions,
                     "dismissed_provider_actions": dismissed_actions,
                 }
+            pending_feedback = _pending_design_feedback_requests(board, resolved)
+            if pending_feedback:
+                board.set_run_status(resolved, RunStatus.AWAITING_FEEDBACK)
+                return {
+                    "task_id": resolved,
+                    "run_id": resolved,
+                    "status": str(RunStatus.AWAITING_FEEDBACK),
+                    "feedback_requests": pending_feedback,
+                    "dismissed_provider_actions": dismissed_actions,
+                }
         thread = threading.Thread(
             target=self._resume_task,
             args=(resolved, workspace),
@@ -237,7 +249,14 @@ class TaskManager:
             name=f"muxdev-continue-{resolved}",
             daemon=True,
         )
-        if not self.queue.start_if_idle(resolved, thread):
+
+        def mark_running() -> None:
+            if str(run.get("status") or "") == str(RunStatus.COMPLETED):
+                return
+            with self.board() as board:
+                board.set_run_status(resolved, RunStatus.RUNNING)
+
+        if not self.queue.start_if_idle(resolved, thread, before_start=mark_running):
             return {"task_id": resolved, "run_id": resolved, "status": "already_running"}
         self.broadcast({"type": "task_continue_requested", "task_id": resolved})
         return {"task_id": resolved, "run_id": resolved, "status": "continue_requested", "dismissed_provider_actions": dismissed_actions}
@@ -263,6 +282,7 @@ class TaskManager:
                 "evidence_evaluations": _rows_by_run(board.table_rows("evidence_evaluations")),
                 "snapshots": _rows_by_run(board.table_rows("snapshots")),
                 "artifacts": _rows_by_run(board.table_rows("artifacts")),
+                "feedback_events": _rows_by_run(board.table_rows("feedback_events")),
             }
             return [self._task_summary(board, row, rows_by_table=rows_by_table) for row in board.list_runs()]
 
@@ -326,6 +346,15 @@ class TaskManager:
         payload: dict[str, Any] | None = None,
         auto_submit: bool = True,
     ) -> dict[str, Any]:
+        if kind == "plan_feedback" and run_id:
+            return self.run_plan_feedback(
+                run_id,
+                content,
+                source=source,
+                payload=payload or {},
+                auto_submit=auto_submit,
+                max_cost_usd=0.5,
+            )
         with self.board() as board:
             routed = route_feedback(
                 workspace,
@@ -358,6 +387,55 @@ class TaskManager:
                 with self.board() as board:
                     board.update_ci_rescue(routed.rescue_id, rescue_run_id=str(submitted["run_id"]), status="submitted")
         self.broadcast({"type": "feedback_routed", "feedback_id": routed.feedback_id, "route_to": routed.route_to, "auto": routed.auto})
+        return result
+
+    def run_plan_feedback(
+        self,
+        run_id: str,
+        feedback: str,
+        *,
+        source: str = "user",
+        payload: dict[str, Any] | None = None,
+        auto_submit: bool = True,
+        max_cost_usd: float = 0.5,
+    ) -> dict[str, Any]:
+        content = feedback.strip()
+        if not content:
+            raise ValueError("feedback is required")
+        resolved = self.resolve_task_id(run_id)
+        with self.board() as board:
+            pending_requests = _pending_design_feedback_requests(board, resolved)
+            feedback_id = board.add_feedback_event(
+                run_id=resolved,
+                source=source,
+                kind="plan_feedback",
+                severity="medium",
+                status="pending",
+                route_to="plan",
+                content=content,
+                payload={
+                    **(payload or {}),
+                    "source_feedback_requests": [row.get("feedback_id") for row in pending_requests],
+                },
+            )
+            for row in pending_requests:
+                board.update_feedback_event_status(str(row.get("feedback_id")), "handled")
+            reset_stages = _plan_feedback_reset_stages(board, resolved)
+            for stage_id in reset_stages:
+                board.reset_stage(resolved, stage_id)
+            board.set_run_status(resolved, RunStatus.RUNNING)
+        result: dict[str, Any] = {
+            "task_id": resolved,
+            "run_id": resolved,
+            "feedback_id": feedback_id,
+            "status": "pending",
+            "kind": "plan_feedback",
+            "handled_feedback_requests": [row.get("feedback_id") for row in pending_requests],
+            "reset_stages": reset_stages,
+        }
+        self.broadcast({"type": "plan_feedback_submitted", "run_id": resolved, "feedback_id": feedback_id})
+        if auto_submit:
+            result["continue"] = self.continue_task(resolved, max_cost_usd=max_cost_usd)
         return result
 
     def ecosystem_state(self) -> dict[str, Any]:
@@ -656,6 +734,7 @@ class TaskManager:
             evaluations = board.table_rows("evidence_evaluations", run_id=run_id)
             snapshots = board.table_rows("snapshots", run_id=run_id)
             artifacts = board.table_rows("artifacts", run_id=run_id)
+            feedback_events = board.table_rows("feedback_events", run_id=run_id)
         else:
             stages = rows_by_table["stages"].get(run_id, [])
             approvals = rows_by_table["approvals"].get(run_id, [])
@@ -668,8 +747,14 @@ class TaskManager:
             evaluations = rows_by_table["evidence_evaluations"].get(run_id, [])
             snapshots = rows_by_table["snapshots"].get(run_id, [])
             artifacts = rows_by_table["artifacts"].get(run_id, [])
+            feedback_events = rows_by_table.get("feedback_events", {}).get(run_id, [])
         enriched_stages = enrich_stages(stages)
         enriched_attempts = enrich_provider_attempts(provider_attempts)
+        pending_feedback_requests = [
+            row
+            for row in feedback_events
+            if str(row.get("kind") or "") == "design_feedback_request" and str(row.get("status") or "") == "pending"
+        ]
         progress = progress_summary(
             run=run,
             stages=enriched_stages,
@@ -677,23 +762,29 @@ class TaskManager:
             approvals=approvals,
             provider_actions=provider_actions,
         )
-        latest_error = _latest_error(errors)
-        delivery_confidence = _delivery_confidence(
-            run,
-            test_results=test_results,
-            review_blockers=review_blockers,
-            evaluations=evaluations,
-            snapshots=snapshots,
-            artifacts=artifacts,
-            usage=usage,
-            errors=errors,
-        )
         deliverable_status = workflow_deliverable_status(
             board,
             run_dir=self._run_dir(run_id, run=run),
             run_id=run_id,
             workflow=str(run.get("workflow") or ""),
             require_report=str(run.get("status") or "") == str(RunStatus.COMPLETED),
+        )
+        completed_deliverables_ok = bool(
+            str(run.get("status") or "") == str(RunStatus.COMPLETED) and deliverable_status.get("complete") is True
+        )
+        current_errors = [] if completed_deliverables_ok else errors
+        current_review_blockers = [] if completed_deliverables_ok else review_blockers
+        latest_error = _latest_error(current_errors)
+        delivery_confidence = _delivery_confidence(
+            run,
+            test_results=test_results,
+            review_blockers=current_review_blockers,
+            evaluations=evaluations,
+            snapshots=snapshots,
+            artifacts=artifacts,
+            usage=usage,
+            errors=current_errors,
+            completed_deliverables_ok=completed_deliverables_ok,
         )
         return {
             **run,
@@ -707,9 +798,14 @@ class TaskManager:
             "stage_timeline": progress.get("stage_timeline", []),
             "pending_approvals": sum(1 for row in approvals if row.get("status") == str(ApprovalStatus.PENDING)),
             "pending_provider_actions": sum(1 for row in provider_actions if row.get("status") == str(ProviderActionStatus.PENDING)),
+            "pending_feedback_requests": len(pending_feedback_requests),
+            "feedback_request": pending_feedback_requests[-1] if pending_feedback_requests else None,
+            "feedback_events": feedback_events,
             "tokens": sum(int(row.get("tokens") or 0) for row in usage),
             "cost_usd": round(sum(float(row.get("cost_usd") or 0) for row in usage), 6),
-            "errors": len(errors),
+            "errors": len(current_errors),
+            "historical_errors": len(errors) if completed_deliverables_ok else 0,
+            "historical_error_summary": _latest_error(errors) if completed_deliverables_ok else None,
             "error_summary": latest_error,
             "delivery_confidence": delivery_confidence,
             "deliverable_status": deliverable_status,
@@ -787,17 +883,25 @@ def _plan_feedback_reset_stages(board: Blackboard, run_id: str) -> list[str]:
     stage_ids = {str(row.get("stage_id") or "") for row in board.table_rows("stages", run_id=run_id)}
     reset: list[str] = []
     if "plan_revise" in stage_ids:
-        reset.extend(["plan_revise", "approve_plan"])
+        reset.extend(["plan_revise", "plan_review", "plan_verify", "approve_plan"])
     elif "design_revise" in stage_ids:
-        reset.extend(["design_revise", "approve_plan", "human_design_approval"])
+        reset.extend(["design_revise", "design_review", "design_verify", "approve_plan", "human_design_approval", "design_pack"])
     else:
         for stage_id in ("quick_plan", "scaffold_plan", "design_brief", "design_plan", "plan", "design"):
             if stage_id in stage_ids:
                 reset.append(stage_id)
-        for stage_id in ("plan_review", "design_review", "approve_plan", "human_design_approval"):
+        for stage_id in ("plan_review", "plan_verify", "design_review", "design_verify", "approve_plan", "human_design_approval", "design_pack"):
             if stage_id in stage_ids:
                 reset.append(stage_id)
     return [stage_id for index, stage_id in enumerate(reset) if stage_id in stage_ids and stage_id not in reset[:index]]
+
+
+def _pending_design_feedback_requests(board: Blackboard, run_id: str) -> list[dict[str, Any]]:
+    return [
+        row
+        for row in board.table_rows("feedback_events", run_id=run_id)
+        if str(row.get("kind") or "") == "design_feedback_request" and str(row.get("status") or "") == "pending"
+    ]
 
 
 def _latest_error(errors: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -822,8 +926,9 @@ def _delivery_confidence(
     artifacts: list[dict[str, Any]],
     usage: list[dict[str, Any]],
     errors: list[dict[str, Any]],
+    completed_deliverables_ok: bool = False,
 ) -> dict[str, Any]:
-    evaluation = _latest_evaluation(evaluations)
+    evaluation = None if completed_deliverables_ok else _latest_evaluation(evaluations)
     status = str(run.get("status") or "")
     test_total = len(test_results)
     test_failed = sum(1 for row in test_results if not bool(row.get("passed")))

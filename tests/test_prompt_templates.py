@@ -56,5 +56,13 @@ def test_design_lite_prompt_requires_complete_design_md() -> None:
 
     assert "docs/design/design.md" in prompt.text
     assert "complete single-file design document" in lowered
+    assert "reasonable defaults" in lowered
+    assert "same language as the user's task" in lowered
+    assert "needs_feedback" in lowered
+    assert "assumptions and open_questions" in lowered
     assert "test strategy" in lowered
+    assert "claims" in lowered
+    assert "missing_evidence" in lowered
+    assert "internal only" in lowered
+    assert "do not place them inside design_doc or design_pack" in lowered
     assert "no implementation files" in lowered

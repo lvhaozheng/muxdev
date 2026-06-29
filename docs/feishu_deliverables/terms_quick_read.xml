@@ -1,0 +1,10 @@
+<callout emoji="💡" background-color="light-blue" border-color="blue">
+  <h3>阅读前先看：5 个高频术语</h3>
+  <ul>
+    <li><b>Provider CLI：</b>Codex、Claude Code、Qwen 等外部 AI 编码命令行工具，muxdev 把它们当作可替换的执行后端。</li>
+    <li><b>Agentic SDLC Kernel：</b>面向软件研发全流程的软件内核，负责把计划、编码、测试、审查、审批、证据、回滚串成闭环。</li>
+    <li><b>Evidence v2：</b>muxdev 的轻量证据链，用事件流、manifest 和 evaluation 记录“做了什么、如何验证、可信度如何”。</li>
+    <li><b>Provider Action：</b>外部 provider CLI 需要人工处理的等待项，例如登录、确认、限流或卡住，不等同于 muxdev 自己的审批。</li>
+    <li><b>Delivery Gate：</b>本地确定性验收关卡，检查产物、测试、review blocker、runtime error 和待处理 action，而不是再调用模型主观判断。</li>
+  </ul>
+</callout>

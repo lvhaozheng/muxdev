@@ -1,0 +1,196 @@
+<h1>9. 实现术语解释</h1>
+<callout emoji="ℹ️" background-color="light-blue" border-color="blue">
+  <p><b>阅读建议：</b>本节按面试和项目评审视角解释 muxdev 内部术语。重点不是背 API，而是说明这些概念在“多 AI Coding Agent 可信交付”里分别解决什么问题。</p>
+</callout>
+<table>
+  <thead>
+    <tr>
+      <th background-color="light-gray">术语</th>
+      <th background-color="light-gray">一句话解释</th>
+      <th background-color="light-gray">在 muxdev 中的作用</th>
+      <th background-color="light-gray">代码/实现线索</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>Provider CLI</code></td>
+      <td>外部 AI 编码命令行工具。</td>
+      <td>真正执行计划、编码、测试或审查任务的后端，例如 Codex、Claude Code、Qwen。</td>
+      <td><code>config/defaults/providers.yaml</code></td>
+    </tr>
+    <tr>
+      <td><code>Provider Registry</code></td>
+      <td>Provider 的静态能力登记和探测层。</td>
+      <td>回答“机器上有哪些 provider、是否安装、支持哪些 headless/json/approval 能力”。</td>
+      <td><code>providers/registry.py</code></td>
+    </tr>
+    <tr>
+      <td><code>Provider Adapter</code></td>
+      <td>把不同 provider CLI 的输出统一成 muxdev 可理解的结果。</td>
+      <td>屏蔽不同 CLI 的命令参数、prompt transport、transcript 和 action 解析差异。</td>
+      <td><code>providers/adapters.py</code></td>
+    </tr>
+    <tr>
+      <td><code>Headless CLI</code></td>
+      <td>不打开交互界面、由 muxdev 传入 prompt 并收集输出的 CLI 模式。</td>
+      <td>让 provider 可以被 daemon 工作流自动调用，并保存 transcript/chunks 作为证据。</td>
+      <td><code>HeadlessCliProviderAdapter</code></td>
+    </tr>
+    <tr>
+      <td><code>Role-aware Routing</code></td>
+      <td>按角色选择 provider，而不是所有任务都交给同一个模型。</td>
+      <td>让 plan、code、test、review、secure、docs 等角色可以分别路由到更合适的 provider。</td>
+      <td><code>providers/planner.py</code></td>
+    </tr>
+    <tr>
+      <td><code>Provider Action</code></td>
+      <td>外部 provider CLI 等待人工处理的事件。</td>
+      <td>登录、确认、限流、阻塞时进入待处理队列，用户处理外部 session 后再 continue。</td>
+      <td><code>provider_actions</code> 表、<code>clients/stream.py</code></td>
+    </tr>
+    <tr>
+      <td><code>muxdev Approval</code></td>
+      <td>muxdev 自己的策略审批。</td>
+      <td>用于 plan、write、shell、merge 等风险点，和 provider CLI 的确认提示严格分开。</td>
+      <td><code>approvals</code> 表、<code>runtime/supervisor.py</code></td>
+    </tr>
+    <tr>
+      <td><code>Approval Subject Hash</code></td>
+      <td>审批对象的规范化哈希。</td>
+      <td>把审批绑定到当前 plan、patch、policy、validator、semantic review，防止内容变化后复用旧审批。</td>
+      <td><code>_approval_subject</code>、<code>canonical_hash</code></td>
+    </tr>
+    <tr>
+      <td><code>Agentic SDLC Kernel</code></td>
+      <td>面向 AI Agent 的软件研发生命周期控制内核。</td>
+      <td>把设计、开发、测试、审查、审批、证据、报告、回滚和记忆纳入一个本地控制面。</td>
+      <td><code>SupervisorRuntime</code>、daemon、blackboard</td>
+    </tr>
+    <tr>
+      <td><code>Workflow DAG</code></td>
+      <td>由阶段和依赖组成的有向无环工作流。</td>
+      <td>描述任务先做 plan、再 code/test/review、再 delivery gate 的执行顺序。</td>
+      <td><code>config/defaults/workflows.yaml</code></td>
+    </tr>
+    <tr>
+      <td><code>Stage</code></td>
+      <td>工作流中的一个执行节点。</td>
+      <td>可以是 agent stage、human gate、delivery gate 或系统步骤，并带有读写、shell、checkpoint 等权限。</td>
+      <td><code>WorkflowStage</code></td>
+    </tr>
+    <tr>
+      <td><code>SupervisorRuntime</code></td>
+      <td>muxdev 的核心执行器。</td>
+      <td>负责准备 worktree、加载 workflow、调度 provider、处理 gate、写证据、生成报告和回滚点。</td>
+      <td><code>runtime/supervisor.py</code></td>
+    </tr>
+    <tr>
+      <td><code>LangGraph 语义桥接</code></td>
+      <td>把 muxdev workflow 编译成 LangGraph 风格的图语义。</td>
+      <td>支持未来迁移到 LangGraph 控制面，同时当前执行仍走 muxdev 已审计路径，保留证据和审批能力。</td>
+      <td><code>runtime/langgraph_engine.py</code>、<code>services/orchestration.py</code></td>
+    </tr>
+    <tr>
+      <td><code>Delivery Gate</code></td>
+      <td>交付前的本地确定性验收关卡。</td>
+      <td>检查 stage output、测试失败、review blocker、runtime error、pending provider action 等硬信号。</td>
+      <td><code>services/delivery_gate.py</code></td>
+    </tr>
+    <tr>
+      <td><code>Evidence v2</code></td>
+      <td>轻量证据事件流和评价体系。</td>
+      <td>把运行过程转成 events、manifest、evaluation，回答交付是否有证据支撑。</td>
+      <td><code>services/evidence.py</code></td>
+    </tr>
+    <tr>
+      <td><code>StageContract</code></td>
+      <td>每个 stage 的输入、约束、输出和决策契约。</td>
+      <td>让阶段结果可追踪、可验证，而不是只有 provider 的自然语言回复。</td>
+      <td><code>storage/contracts.py</code></td>
+    </tr>
+    <tr>
+      <td><code>RoleResultContract</code></td>
+      <td>角色执行结果的结构化记录。</td>
+      <td>记录某个 role 的结论、发现、artifact、snapshot 和是否接受。</td>
+      <td><code>write_role_result_contract</code></td>
+    </tr>
+    <tr>
+      <td><code>Hash Ledger</code></td>
+      <td>带哈希链的运行账本。</td>
+      <td>记录关键事件和产物哈希，降低事后篡改或证据漂移风险。</td>
+      <td><code>storage/ledger.py</code></td>
+    </tr>
+    <tr>
+      <td><code>Blind Validator</code></td>
+      <td>最终交付前的独立验证面板。</td>
+      <td>在不完全依赖实现者自评的前提下，判断 patch 是否满足任务和证据要求。</td>
+      <td><code>write_blind_validator_panel</code></td>
+    </tr>
+    <tr>
+      <td><code>Semantic Merge Review</code></td>
+      <td>对最终 diff 做语义级合并审查。</td>
+      <td>拦截冲突标记、明显不相关修改和高风险合并问题。</td>
+      <td><code>services/semantic_merge.py</code></td>
+    </tr>
+    <tr>
+      <td><code>Diff/Report</code></td>
+      <td>代码差异和最终交付报告。</td>
+      <td>Diff 给人审实际改动，Report 汇总任务、证据、测试、风险和下一步。</td>
+      <td><code>diff.patch</code>、<code>final_report.md</code></td>
+    </tr>
+    <tr>
+      <td><code>Rollback Snapshot</code></td>
+      <td>可回退到某个阶段前后的状态记录。</td>
+      <td>当 AI 改动不可接受时，用阶段快照恢复，而不是只能手工排查。</td>
+      <td><code>snapshots/</code>、<code>rollback</code> API</td>
+    </tr>
+    <tr>
+      <td><code>Isolated Worktree</code></td>
+      <td>为一次 run 准备的隔离 Git 工作区。</td>
+      <td>让 provider 修改先发生在隔离环境中，经过验证和审批后再应用回主工作区。</td>
+      <td><code>runtime/worktree.py</code></td>
+    </tr>
+    <tr>
+      <td><code>Session Capsule</code></td>
+      <td>provider 失败或阻塞时的会话胶囊。</td>
+      <td>保存摘要、patch、证据引用、open findings、provider action，方便人工接管或续跑。</td>
+      <td><code>services/session_capsules.py</code></td>
+    </tr>
+    <tr>
+      <td><code>Handoff Patch</code></td>
+      <td>交接给人或后续 agent 的补丁包。</td>
+      <td>当 session 失败、卡住或只读违规时，把当前改动和上下文打包，降低恢复成本。</td>
+      <td><code>capsules/*.handoff.patch</code></td>
+    </tr>
+    <tr>
+      <td><code>Blackboard</code></td>
+      <td>daemon 统一读写的本地 SQLite 状态库。</td>
+      <td>集中保存 runs、stages、artifacts、approvals、provider actions、evidence、learning 等运行状态。</td>
+      <td><code>storage/blackboard.py</code></td>
+    </tr>
+    <tr>
+      <td><code>Memory Quarantine</code></td>
+      <td>把低置信或互相矛盾的长期记忆隔离。</td>
+      <td>防止过期架构、错误经验继续进入 provider context，减少长期上下文污染。</td>
+      <td><code>storage/memory.py</code></td>
+    </tr>
+    <tr>
+      <td><code>Mock Provider</code></td>
+      <td>内置的确定性离线 provider。</td>
+      <td>不用外部账号也能跑通 workflow、evidence、report、dashboard，适合测试和演示。</td>
+      <td><code>providers/mock.py</code></td>
+    </tr>
+    <tr>
+      <td><code>Mission Control</code></td>
+      <td>Dashboard 的项目级任务控制台。</td>
+      <td>展示项目、工作流、Activity、Artifacts、Config、Action Center 等用户可见状态。</td>
+      <td><code>api/web.py</code>、Dashboard API</td>
+    </tr>
+    <tr>
+      <td><code>MCP JSON-RPC</code></td>
+      <td>给外部工具调用 muxdev 能力的本地 JSON-RPC 接口。</td>
+      <td>让其他工具可以复用 provider detect、workspace search、RAG query、workflow templates 等本地能力。</td>
+      <td><code>api/mcp.py</code></td>
+    </tr>
+  </tbody>
+</table>

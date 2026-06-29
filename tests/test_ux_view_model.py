@@ -63,6 +63,38 @@ def test_design_provider_action_is_labeled_as_provider_native_question() -> None
     assert "Provider 在设计阶段通过自身 CLI/session 请求" in ux["why"]
 
 
+def test_task_ux_summary_surfaces_design_feedback_request() -> None:
+    payload = {
+        "run": {"run_id": "run_feedback", "task": "design payroll approval flow", "status": "awaiting_feedback"},
+        "stages": [{"stage_id": "design_brief", "role": "architect", "status": "running", "summary": "waiting"}],
+        "approvals": [],
+        "provider_actions": [],
+        "feedback_events": [
+            {
+                "feedback_id": "fb_1",
+                "run_id": "run_feedback",
+                "kind": "design_feedback_request",
+                "status": "pending",
+                "content": "Which compliance region should this flow satisfy?",
+                "payload_json": '{"stage_id":"design_brief"}',
+            }
+        ],
+        "errors": [],
+        "review_blockers": [],
+        "artifacts": [],
+        "trace": [],
+    }
+
+    ux = build_task_ux_summary(payload)
+
+    assert ux["user_state"] == "needs_attention"
+    assert ux["headline"] == "Design feedback needed"
+    assert ux["next_actions"][0]["kind"] == "plan_feedback"
+    assert ux["next_actions"][0]["endpoint"] == "/api/feedback"
+    assert "Which compliance region" in ux["why"]
+    assert ux["advanced"]["pending_feedback_requests"] == 1
+
+
 def test_ux_overview_collects_action_center_items() -> None:
     overview = build_ux_overview(
         daemon={"status": "running", "tasks": 1},
@@ -92,6 +124,40 @@ def test_ux_overview_collects_action_center_items() -> None:
     assert "test_report" in overview["artifact_center"]["kinds"]
 
 
+def test_ux_overview_surfaces_pending_design_feedback_as_action() -> None:
+    overview = build_ux_overview(
+        daemon={"status": "running", "tasks": 1},
+        tasks=[
+            {
+                "task_id": "run_feedback",
+                "task": "design payroll approval flow",
+                "status": "awaiting_feedback",
+                "current_stage": "design_brief",
+                "pending_approvals": 0,
+                "pending_provider_actions": 0,
+                "pending_feedback_requests": 1,
+                "feedback_request": {
+                    "feedback_id": "fb_1",
+                    "kind": "design_feedback_request",
+                    "status": "pending",
+                    "content": "Which compliance region should this flow satisfy?",
+                    "payload_json": '{"stage_id":"design_brief"}',
+                },
+            }
+        ],
+        approvals=[],
+        provider_actions=[],
+    )
+
+    assert overview["counts"]["needs_attention"] == 1
+    assert overview["counts"]["feedback_requests"] == 1
+    assert overview["action_center"][0]["kind"] == "plan_feedback"
+    assert overview["action_center"][0]["feedback_id"] == "fb_1"
+    assert overview["action_center"][0]["optional"] is False
+    assert overview["current_status"]["waiting_design_feedback"] == 1
+    assert overview["task_board"][2]["tasks"][0]["pending_feedback_requests"] == 1
+
+
 def test_ux_overview_surfaces_missing_completed_deliverables() -> None:
     overview = build_ux_overview(
         daemon={"status": "running", "tasks": 1},
@@ -110,6 +176,124 @@ def test_ux_overview_surfaces_missing_completed_deliverables() -> None:
     assert overview["counts"]["needs_attention"] == 1
     assert overview["action_center"][0]["kind"] == "missing_deliverable"
     assert "docs_report" in overview["action_center"][0]["why"]
+
+
+def test_ux_overview_surfaces_blocked_missing_deliverable_as_repair() -> None:
+    overview = build_ux_overview(
+        daemon={"status": "running", "tasks": 1},
+        tasks=[
+            {
+                "task_id": "run_design_missing",
+                "task": "design a game",
+                "status": "blocked",
+                "errors": 2,
+                "error_summary": {
+                    "stage_id": "run",
+                    "type": "missing_deliverable",
+                    "message": "missing required deliverables: publish_error: design document incomplete",
+                    "created_at": "2026-06-28T02:00:00Z",
+                },
+                "deliverable_status": {"missing": ["project_design_doc"], "required": ["project_design_doc"], "ready": []},
+            }
+        ],
+        approvals=[],
+        provider_actions=[],
+    )
+
+    assert len(overview["action_center"]) == 1
+    assert overview["action_center"][0]["kind"] == "missing_deliverable"
+    assert "publish_error" in overview["action_center"][0]["why"]
+    assert "blind validator" not in overview["action_center"][0]["why"]
+
+
+def test_ux_overview_prioritizes_current_missing_deliverables_over_latest_blind_validator() -> None:
+    overview = build_ux_overview(
+        daemon={"status": "running", "tasks": 1},
+        tasks=[
+            {
+                "task_id": "run_design_missing_after_retry",
+                "task": "design a game",
+                "status": "blocked",
+                "errors": 3,
+                "error_summary": {
+                    "stage_id": "run",
+                    "type": "blind_validator_reject",
+                    "message": "blind validator rejected the patch",
+                    "created_at": "2026-06-28T03:00:00Z",
+                },
+                "deliverable_status": {"missing": ["project_design_doc"], "required": ["project_design_doc"], "ready": []},
+            }
+        ],
+        approvals=[],
+        provider_actions=[],
+    )
+
+    assert len(overview["action_center"]) == 1
+    assert overview["action_center"][0]["kind"] == "missing_deliverable"
+    assert "project_design_doc" in overview["action_center"][0]["why"]
+    assert "blind validator" not in overview["action_center"][0]["why"]
+
+
+def test_ux_overview_hides_resolved_missing_deliverable_error() -> None:
+    overview = build_ux_overview(
+        daemon={"status": "running", "tasks": 1},
+        tasks=[
+            {
+                "task_id": "run_design_repaired",
+                "task": "design a game",
+                "status": "completed",
+                "errors": 1,
+                "error_summary": {
+                    "stage_id": "run",
+                    "type": "missing_deliverable",
+                    "message": "missing required deliverables: project_design_doc",
+                    "created_at": "2026-06-28T02:00:00Z",
+                },
+                "deliverable_status": {
+                    "complete": True,
+                    "missing": [],
+                    "required": ["project_design_doc"],
+                    "ready": ["project_design_doc"],
+                },
+            }
+        ],
+        approvals=[],
+        provider_actions=[],
+    )
+
+    assert overview["action_center"] == []
+    assert overview["counts"]["needs_attention"] == 0
+
+
+def test_ux_overview_hides_historical_errors_after_completed_deliverables() -> None:
+    overview = build_ux_overview(
+        daemon={"status": "running", "tasks": 1},
+        tasks=[
+            {
+                "task_id": "run_design_repaired",
+                "task": "design a game",
+                "status": "completed",
+                "errors": 7,
+                "error_summary": {
+                    "stage_id": "run",
+                    "type": "blind_validator_reject",
+                    "message": "blind validator rejected the patch",
+                    "created_at": "2026-06-28T03:00:00Z",
+                },
+                "deliverable_status": {
+                    "complete": True,
+                    "missing": [],
+                    "required": ["project_design_doc", "design_pack"],
+                    "ready": ["project_design_doc", "design_pack"],
+                },
+            }
+        ],
+        approvals=[],
+        provider_actions=[],
+    )
+
+    assert overview["action_center"] == []
+    assert overview["counts"]["needs_attention"] == 0
 
 
 def test_ux_overview_labels_design_provider_action() -> None:
@@ -268,6 +452,105 @@ def test_task_ux_summary_reconciles_awaiting_provider_action_without_pending_rec
     assert all(item["kind"] != "plan_feedback" for item in ux["next_actions"])
 
 
+def test_task_ux_summary_uses_latest_error_for_recovery() -> None:
+    payload = {
+        "run": {"run_id": "run_latest_error", "task": "design game", "status": "blocked"},
+        "stages": [],
+        "summary": {},
+        "approvals": [],
+        "provider_actions": [],
+        "errors": [
+            {
+                "stage_id": "run",
+                "type": "blind_validator_reject",
+                "message": "blind validator rejected the patch",
+                "created_at": "2026-06-28T01:00:00Z",
+            },
+            {
+                "stage_id": "run",
+                "type": "missing_deliverable",
+                "message": "missing required deliverables: publish_error: design document incomplete",
+                "created_at": "2026-06-28T02:00:00Z",
+            },
+        ],
+        "review_blockers": [],
+        "artifacts": [],
+        "trace": [],
+    }
+
+    ux = build_task_ux_summary(payload)
+
+    assert ux["headline"] == "Delivery artifacts need repair"
+    assert "publish_error" in ux["why"]
+    assert "blind validator" not in ux["why"]
+
+
+def test_task_ux_summary_prioritizes_missing_deliverables_over_latest_blind_validator() -> None:
+    payload = {
+        "run": {"run_id": "run_blind_after_missing", "task": "design game", "status": "blocked"},
+        "stages": [],
+        "summary": {},
+        "approvals": [],
+        "provider_actions": [],
+        "errors": [
+            {
+                "stage_id": "run",
+                "type": "missing_deliverable",
+                "message": "missing required deliverables: project_design_doc",
+                "created_at": "2026-06-28T01:00:00Z",
+            },
+            {
+                "stage_id": "run",
+                "type": "blind_validator_reject",
+                "message": "blind validator rejected the patch",
+                "created_at": "2026-06-28T02:00:00Z",
+            },
+        ],
+        "deliverable_status": {"complete": False, "missing": ["project_design_doc"], "required": ["project_design_doc"], "ready": []},
+        "review_blockers": [],
+        "artifacts": [],
+        "trace": [],
+    }
+
+    ux = build_task_ux_summary(payload)
+
+    assert ux["headline"] == "Delivery artifacts need repair"
+    assert "project_design_doc" in ux["why"]
+    assert "blind validator" not in ux["why"]
+
+
+def test_task_ux_summary_ignores_historical_errors_after_completed_deliverables() -> None:
+    payload = {
+        "run": {"run_id": "run_completed_after_repair", "task": "design game", "status": "completed"},
+        "stages": [],
+        "summary": {},
+        "approvals": [],
+        "provider_actions": [],
+        "errors": [
+            {
+                "stage_id": "run",
+                "type": "blind_validator_reject",
+                "message": "blind validator rejected the patch",
+                "created_at": "2026-06-28T02:00:00Z",
+            },
+        ],
+        "deliverable_status": {
+            "complete": True,
+            "missing": [],
+            "required": ["project_design_doc", "design_pack"],
+            "ready": ["project_design_doc", "design_pack"],
+        },
+        "review_blockers": [],
+        "artifacts": [],
+        "trace": [],
+    }
+
+    ux = build_task_ux_summary(payload)
+
+    assert ux["headline"] == "Delivery is ready for review"
+    assert ux["user_state"] == "deliverable"
+
+
 def test_task_ux_summary_surfaces_design_document_deliverable() -> None:
     payload = {
         "run": {"run_id": "run_design", "task": "design snake game", "status": "completed"},
@@ -320,6 +603,33 @@ def test_ux_overview_surfaces_planning_feedback_as_optional_action() -> None:
     assert overview["optional_actions"][0]["kind"] == "plan_feedback"
     assert overview["optional_actions"][0]["optional"] is True
     assert "--run-id run_plan" in overview["optional_actions"][0]["command"]
+
+
+def test_ux_overview_keeps_feedback_open_after_design_stage_completed() -> None:
+    overview = build_ux_overview(
+        daemon={"status": "running", "tasks": 1},
+        tasks=[
+            {
+                "task_id": "run_design_feedback",
+                "status": "running",
+                "current_stage": "design_review",
+                "current_activity": "provider codex attempt 1 on design_review",
+                "pending_approvals": 0,
+                "pending_provider_actions": 0,
+                "stage_timeline": [
+                    {"stage_id": "design_brief", "role": "architect", "status": "completed"},
+                    {"stage_id": "design_review", "role": "review", "status": "running"},
+                ],
+            }
+        ],
+        approvals=[],
+        provider_actions=[],
+    )
+
+    assert overview["action_center"] == []
+    assert overview["counts"]["needs_attention"] == 0
+    assert overview["optional_actions"][0]["kind"] == "plan_feedback"
+    assert overview["optional_actions"][0]["run_id"] == "run_design_feedback"
 
 
 def test_ux_overview_reconciles_awaiting_approval_without_pending_record() -> None:

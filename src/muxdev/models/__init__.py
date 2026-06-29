@@ -24,6 +24,7 @@ class RunStatus(StrEnum):
     RUNNING = "running"
     AWAITING_APPROVAL = "awaiting_approval"
     AWAITING_PROVIDER_ACTION = "awaiting_provider_action"
+    AWAITING_FEEDBACK = "awaiting_feedback"
     PAUSED_BUDGET = "paused_budget"
     BLOCKED = "blocked"
     COMPLETED = "completed"

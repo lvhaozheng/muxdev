@@ -67,13 +67,21 @@ prompt_templates:
       Revise the design plan from review blockers and any user plan feedback. Return a complete single-file design document with all required sections, keeping scope tight.
     design-lite:
       design_brief: |
-        This is a user-facing design task. If the task does not specify the desired style, target users, platform/device priorities, references, constraints, or non-goals, ask the user through your native CLI/session interaction before producing the final design. muxdev should only pass through your prompt; do not assume muxdev will ask these questions for you.
+        This is a user-facing design task. Prefer completing the design with reasonable defaults when the missing details are low risk or conventional for the task. For example, a simple "design a snake game" can assume classic browser gameplay, casual users, keyboard/WASD controls, mobile touch controls as a secondary path, and a clean readable visual style.
 
-        If you are running headless and cannot directly ask the user, emit a clear provider action / external confirmation prompt that muxdev can surface, for example: "waiting_external_confirmation: Please confirm target users, visual style, reference products, platform/device priorities, and anything to avoid."
+        Use assumptions and open_questions for non-blocking unknowns. Do not stop just because style, audience, platform/device priorities, references, constraints, or non-goals were not explicitly named, unless that missing information would materially change the core goal, target platform, safety/compliance posture, business constraint, or an irreversible design decision.
 
-        If the muxdev Context Packet or the "Previously Handled Provider Actions" section contains provider_action_responses, treat those responses as the user's answer to your previous confirmation request. Do not emit another waiting_external_confirmation for the same missing preferences; continue with the best design JSON using the provided answers and list only genuinely unresolved items in open_questions.
+        If the missing information is genuinely blocking, do not turn the question into a final design artifact. Return a structured JSON object with:
+        - delivery_decision: "needs_feedback"
+        - feedback_request: the exact concise question for the user
+        - summary: why the design cannot safely proceed without the answer
+        You may use delivery_decision: "waiting_external_confirmation" instead of "needs_feedback" only when the provider/session format requires it. Do not create an approval for this; muxdev will surface it as design feedback.
 
-        After the necessary preferences are available, return a clean final JSON object. The resulting docs/design/design.md must be a complete single-file design document, not a short summary. It must cover goal/scope, users/platform, gameplay or interaction, UI/screens/states, rules/data/scoring, acceptance criteria, test strategy, risks, implementation roadmap, and open questions.
+        If the muxdev Context Packet contains run.feedback_events or user plan_feedback, treat those entries as the user's answer to your previous design feedback request. Do not ask the same question again; continue with the best design JSON using the provided answer and list only genuinely unresolved items in open_questions.
+
+        After the necessary preferences are available, return a clean final JSON object. Write all natural-language values in the same language as the user's task; if the task is Chinese, write Chinese design content and Chinese open questions while keeping JSON schema keys in English. The resulting docs/design/design.md must be a complete single-file design document, not a short summary. It must cover goal/scope, users/platform, gameplay or interaction, UI/screens/states, rules/data/scoring, acceptance criteria, test strategy, implementation roadmap, and open questions. Include risks when they are relevant, but do not block on low-risk unknowns.
+
+        claims, evidence, missing_evidence, delivery_decision, and other muxdev validation fields are internal only. If you need them for validation, keep them top-level and do not place them inside design_doc or design_pack user-facing content.
 
         Return:
         - summary
@@ -94,5 +102,9 @@ prompt_templates:
         Do not use "no implementation files were created", "read-only stage", or "not run/verified" as acceptance criteria. Those are only scope notes or residual risks.
     design:
       problem_statement: |
-        Start the design workflow by checking whether the user has specified style, audience, reference products, platform/device priorities, constraints, and non-goals. If important preferences are missing, ask through the provider's native CLI/session interaction first. In headless mode, emit a clear provider action / external confirmation prompt that muxdev can surface.
-        If the muxdev Context Packet or the "Previously Handled Provider Actions" section contains provider_action_responses, use those as the user's answer and do not ask the same confirmation again.
+        Start the design workflow by identifying the goal, users, constraints, and unknowns. Prefer reasonable defaults for low-risk or conventional gaps, and record those defaults in assumptions/open_questions.
+        Write all natural-language values in the same language as the user's task; if the task is Chinese, write Chinese design content while keeping JSON schema keys in English.
+        claims, evidence, missing_evidence, delivery_decision, and other muxdev validation fields are internal only. If present, keep them top-level and do not place them inside design_doc or design_pack user-facing content.
+        Request user feedback only when the missing information would materially change the core goal, target platform, safety/compliance posture, business constraint, or an irreversible design decision.
+        If feedback is genuinely blocking, return structured JSON with delivery_decision: "needs_feedback", feedback_request, and summary. Do not produce a final design artifact for that response.
+        If the muxdev Context Packet contains run.feedback_events or user plan_feedback, use those as the user's answer and do not ask the same confirmation again.

@@ -17,7 +17,8 @@ from muxdev.cli import app
 from muxdev.daemon.paths import default_daemon_paths
 from muxdev.daemon.process import daemon_health, daemon_status, start_daemon
 from muxdev.daemon.tasks import TaskManager
-from muxdev.models import ApprovalStatus, ProviderActionStatus
+from muxdev.models import ApprovalStatus, ProviderActionStatus, RunStatus
+from muxdev.services.design import DESIGN_PACK_FILES
 from muxdev.storage import MemoryStore
 
 
@@ -41,6 +42,7 @@ def test_daemon_state_bootstrap_creates_global_store() -> None:
 def test_daemon_api_task_lifecycle_and_websocket() -> None:
     workspace = _workspace_temp("api")
     try:
+        (workspace / ".muxdev").mkdir()
         manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())
         client = TestClient(create_app(task_manager=manager))
 
@@ -148,6 +150,7 @@ def test_live_dashboard_renders_minimal_sections_and_i18n() -> None:
     assert "submitPlanFeedback" in html
     assert "submitProviderResponse" in html
     assert "optionalTaskActions" in html
+    assert "delivery_repair" in html
     assert 'data-feedback-optional="true"' in html
     assert "auto_submit:!optional" in html
     assert "data-draft-key" in html
@@ -162,6 +165,7 @@ def test_live_dashboard_renders_minimal_sections_and_i18n() -> None:
     assert "Ready CLI Tools" in english
     assert "Needs My Action" in english
     assert "Workflow Templates" in english
+    assert "Delivery Repair" in english
     assert "Model Role / CLI Routing" in english
     assert "data-fold" in english
 
@@ -296,6 +300,166 @@ def test_dashboard_overview_groups_projects_workflows_roles(monkeypatch) -> None
     assert mcp["prompts_count"] > 0
     assert mcp["write_policy"] == "guarded"
     assert len(mcp["recent_guardrails"]) <= 3
+
+
+def test_dashboard_overview_treats_repaired_completed_deliverables_as_done() -> None:
+    workspace = _workspace_temp("dashboard-repaired")
+    try:
+        project = workspace / "test_course"
+        project.mkdir(parents=True)
+        manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())
+        run_id = "run_repaired_design"
+        run_dir = project / ".muxdev" / "runs" / run_id
+        design_dir = run_dir / "design"
+        design_dir.mkdir(parents=True, exist_ok=True)
+        docs_dir = project / "docs" / "design"
+        docs_dir.mkdir(parents=True, exist_ok=True)
+        design_doc = docs_dir / "design.md"
+        design_doc.write_text("# 设计文档\n\n## 任务概览\n\n- 已修复并发布。\n", encoding="utf-8")
+        for filename in DESIGN_PACK_FILES:
+            (design_dir / filename).write_text(f"# {filename}\n\nready\n", encoding="utf-8")
+        report = run_dir / "final_report.md"
+        report.write_text("# Final Report\n\ncompleted\n", encoding="utf-8")
+        with manager.board() as board:
+            board.create_run(
+                run_id=run_id,
+                task="设计一个贪吃蛇游戏",
+                workflow="design-lite",
+                provider="codex",
+                workspace=project,
+                worktree=run_dir / "worktree",
+            )
+            board.set_run_status(run_id, RunStatus.COMPLETED)
+            board.upsert_stage(run_id, "design_pack", role="docs", status="completed", summary="published")
+            board.add_artifact(run_id, None, "Design Document", design_doc, "project_design_doc")
+            board.add_artifact(run_id, None, "final_report.md", report, "report")
+            board.add_error(run_id, None, "blind_validator_reject", "blind validator rejected the patch")
+            board.add_review_blocker(
+                run_id,
+                "blind_validator",
+                type="blind_validator_reject",
+                file=None,
+                line=None,
+                severity="high",
+                suggestion="historical blocker before deliverable repair",
+            )
+
+        client = TestClient(create_app(task_manager=manager))
+        payload = client.get("/api/dashboard/overview", params={"workspace": str(project), "include_global_config": "false"}).json()
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    assert not any(item.get("run_id") == run_id or item.get("task_id") == run_id for item in payload["action_center"])
+    project_payload = next(item for item in payload["projects"] if item["path"] == str(project.resolve()))
+    assert project_payload["summary"]["failed"] == 0
+    assert project_payload["health"]["status"] == "ready"
+    task = next(item for item in _dashboard_tasks(payload) if item["task_id"] == run_id)
+    assert task["status"] == "completed"
+    assert task["errors"] == 0
+    assert task["historical_errors"] == 1
+    assert task["deliverable_status"]["complete"] is True
+    assert task["risk"] == "low"
+    assert task["delivery_confidence"]["label"] == "reviewable"
+    assert task["delivery_confidence"]["review"]["status"] == "clear"
+
+
+def test_dashboard_overview_groups_nested_design_workspace_under_project_root() -> None:
+    workspace = _workspace_temp("dashboard-nested-project")
+    try:
+        project = workspace / "test_cource"
+        nested = project / "docs" / "design"
+        nested.mkdir(parents=True)
+        (project / ".muxdev").mkdir()
+        (nested / ".muxdev" / "runs").mkdir(parents=True)
+        manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())
+        with manager.board() as board:
+            board.create_run(
+                run_id="run_nested_design",
+                task="根据本地的设计文档完成开发",
+                workflow="dev",
+                provider="codex",
+                workspace=nested,
+                worktree=nested / ".muxdev" / "runs" / "run_nested_design" / "worktree",
+            )
+            board.set_run_status("run_nested_design", RunStatus.BLOCKED)
+            board.add_error("run_nested_design", "task_intake", "provider_exit", "temporary provider error")
+
+        client = TestClient(create_app(task_manager=manager))
+        payload = client.get("/api/dashboard/overview", params={"workspace": str(project), "include_global_config": "false"}).json()
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    project_names = {project["name"] for project in payload["projects"]}
+    assert "test_cource" in project_names
+    assert "design" not in project_names
+    project_payload = next(project for project in payload["projects"] if project["name"] == "test_cource")
+    task = next(task for task in _dashboard_tasks(payload) if task["task_id"] == "run_nested_design")
+    assert task["workspace"] == str(nested.resolve())
+    assert task["project_name"] == "test_cource"
+    assert task["project_path"] == str(project.resolve())
+    recovery = next(item for item in payload["action_center"] if item["task_id"] == "run_nested_design")
+    assert recovery["project_id"] == project_payload["id"]
+    assert recovery["project_name"] == "test_cource"
+
+
+def test_dashboard_overview_keeps_unmarked_nested_workspace_as_project(monkeypatch) -> None:
+    workspace = _workspace_temp("dashboard-unmarked-nested")
+    try:
+        import muxdev.core.projects as projects_module
+
+        monkeypatch.setattr(projects_module, "_has_project_marker", lambda path: False)
+        nested = workspace / "plain" / "docs" / "design"
+        nested.mkdir(parents=True)
+        manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())
+        with manager.board() as board:
+            board.create_run(
+                run_id="run_unmarked_design",
+                task="unmarked nested workspace",
+                workflow="dev",
+                provider="mock",
+                workspace=nested,
+                worktree=nested / ".muxdev" / "runs" / "run_unmarked_design" / "worktree",
+            )
+            board.set_run_status("run_unmarked_design", RunStatus.RUNNING)
+
+        client = TestClient(create_app(task_manager=manager))
+        payload = client.get("/api/dashboard/overview", params={"workspace": str(workspace), "include_global_config": "false"}).json()
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    project_payload = next(project for project in payload["projects"] if project["name"] == "design")
+    assert project_payload["path"] == str(nested.resolve())
+    task = next(task for task in _dashboard_tasks(payload) if task["task_id"] == "run_unmarked_design")
+    assert task["project_name"] == "design"
+    assert task["project_path"] == str(nested.resolve())
+
+
+def test_task_submission_normalizes_nested_workspace_to_project_root() -> None:
+    workspace = _workspace_temp("submit-nested-project")
+    try:
+        project = workspace / "test_cource"
+        nested = project / "docs" / "design"
+        nested.mkdir(parents=True)
+        (project / ".git").mkdir()
+        manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())
+        client = TestClient(create_app(task_manager=manager))
+
+        submitted = client.post(
+            "/api/tasks",
+            json={"task": "nested workspace smoke", "workspace": str(nested), "provider": "mock"},
+        ).json()
+        task_id = submitted["task_id"]
+        _wait_for_terminal(client, task_id)
+        detail = client.get(f"/api/tasks/{task_id}").json()
+        project_task_context_exists = (project / ".muxdev" / "runs" / task_id / "task_context.json").exists()
+        nested_run_exists = (nested / ".muxdev" / "runs" / task_id).exists()
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    assert detail["run"]["workspace"] == str(project.resolve())
+    assert detail["run"]["worktree"].startswith(str(project / ".muxdev"))
+    assert project_task_context_exists
+    assert not nested_run_exists
 
 
 def test_dashboard_project_hide_and_restore(monkeypatch) -> None:
@@ -456,6 +620,7 @@ def test_dashboard_provider_health_falls_back_to_config_without_probe(monkeypatc
 def test_daemon_approvals_and_continue() -> None:
     workspace = _workspace_temp("approval")
     try:
+        (workspace / ".muxdev").mkdir()
         manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())
         client = TestClient(create_app(task_manager=manager))
         submitted = client.post(
@@ -486,6 +651,7 @@ def test_daemon_approvals_and_continue() -> None:
 def test_daemon_plan_feedback_revises_and_requests_new_approval() -> None:
     workspace = _workspace_temp("approval-feedback")
     try:
+        (workspace / ".muxdev").mkdir()
         manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())
         client = TestClient(create_app(task_manager=manager))
         submitted = client.post(
@@ -517,6 +683,73 @@ def test_daemon_plan_feedback_revises_and_requests_new_approval() -> None:
     assert approvals[0]["approval_id"] != original["approval_id"]
     stages = {row["stage_id"]: row["status"] for row in detail["stages"]}
     assert stages["approve_plan"] == "running"
+
+
+def test_daemon_design_feedback_request_uses_plan_feedback_api() -> None:
+    workspace = _workspace_temp("design-feedback")
+    try:
+        manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())
+        run_dir = manager.paths.runs_dir / "run_design_feedback"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        with manager.board() as board:
+            board.create_run(
+                run_id="run_design_feedback",
+                task="design compliance approval flow",
+                workflow="design-lite",
+                provider="mock",
+                workspace=workspace,
+                worktree=workspace / "worktree",
+            )
+            board.set_run_status("run_design_feedback", RunStatus.AWAITING_FEEDBACK)
+            for stage_id, status in (
+                ("design_brief", "running"),
+                ("design_review", "completed"),
+                ("design_verify", "completed"),
+                ("approve_plan", "running"),
+                ("design_pack", "completed"),
+            ):
+                board.upsert_stage("run_design_feedback", stage_id, role="architect" if stage_id == "design_brief" else "review", status=status)
+            request_id = board.add_feedback_event(
+                run_id="run_design_feedback",
+                source="provider",
+                kind="design_feedback_request",
+                severity="medium",
+                status="pending",
+                route_to="architect",
+                content="Which compliance region should this flow satisfy?",
+                payload={"stage_id": "design_brief", "workflow": "design-lite", "prompt_source": "delivery_decision"},
+            )
+        client = TestClient(create_app(task_manager=manager))
+
+        overview = client.get("/api/ux/overview").json()
+        blocked_continue = client.post("/api/tasks/run_design_feedback/continue").json()
+        result = client.post(
+            "/api/feedback",
+            json={
+                "kind": "plan_feedback",
+                "source": "dashboard",
+                "content": "Use US SOC2 assumptions.",
+                "run_id": "run_design_feedback",
+                "auto_submit": False,
+            },
+        ).json()
+        detail = client.get("/api/tasks/run_design_feedback").json()
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    assert overview["action_center"][0]["kind"] == "plan_feedback"
+    assert overview["action_center"][0]["feedback_id"] == request_id
+    assert blocked_continue["status"] == str(RunStatus.AWAITING_FEEDBACK)
+    assert blocked_continue["feedback_requests"][0]["feedback_id"] == request_id
+    assert result["handled_feedback_requests"] == [request_id]
+    assert result["reset_stages"] == ["design_brief", "design_review", "design_verify", "approve_plan", "design_pack"]
+    assert detail["run"]["status"] == str(RunStatus.RUNNING)
+    events = {row["feedback_id"]: row for row in detail["feedback_events"]}
+    assert events[request_id]["status"] == "handled"
+    assert any(row["kind"] == "plan_feedback" and row["content"] == "Use US SOC2 assumptions." for row in detail["feedback_events"])
+    stages = {row["stage_id"]: row["status"] for row in detail["stages"]}
+    assert stages["design_brief"] == "pending"
+    assert stages["design_review"] == "pending"
 
 
 def test_daemon_provider_actions_api_and_continue_wait(monkeypatch) -> None:
@@ -677,6 +910,40 @@ def test_daemon_continue_skips_false_positive_provider_action(monkeypatch) -> No
     assert action_id in result["dismissed_provider_actions"]
     assert resume_calls == ["run_provider_action_false_positive"]
     assert actions[0]["status"] == str(ProviderActionStatus.DISMISSED)
+
+
+def test_daemon_continue_marks_recovering_task_running(monkeypatch) -> None:
+    workspace = _workspace_temp("continue-running-status")
+    try:
+        manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())
+        with manager.board() as board:
+            board.create_run(
+                run_id="run_blocked_continue",
+                task="blocked continue smoke",
+                workflow="design-lite",
+                provider="mock",
+                workspace=workspace,
+                worktree=workspace / "worktree",
+            )
+            board.set_run_status("run_blocked_continue", RunStatus.BLOCKED)
+        resume_calls: list[str] = []
+
+        def record_resume(task_id: str, _workspace: Path, *, max_cost_usd: float) -> None:
+            resume_calls.append(task_id)
+
+        monkeypatch.setattr(manager, "_resume_task", record_resume)
+
+        result = manager.continue_task("run_blocked_continue")
+        run = manager.get_run("run_blocked_continue")
+        deadline = time.time() + 1
+        while not resume_calls and time.time() < deadline:
+            time.sleep(0.01)
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    assert result["status"] == "continue_requested"
+    assert run["status"] == str(RunStatus.RUNNING)
+    assert resume_calls == ["run_blocked_continue"]
 
 
 def test_daemon_attach_uses_real_provider_attach_command() -> None:

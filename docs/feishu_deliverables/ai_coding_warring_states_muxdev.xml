@@ -1,0 +1,662 @@
+<title>AI编码助手的“战国时代”：muxdev解决了什么问题？</title>
+
+<callout emoji="✅" background-color="light-green" border-color="green">
+  <p><b>核心结论：</b>AI 编码已经从“单个助手写代码”进入“多入口、多 provider、多 agent、多治理模型并存”的战国时代。Codex、Claude Code、Cursor、Qwen Code 等工具正在快速提高代码执行能力；AutoGen、CrewAI、STRIATUM-CTF 等框架/研究路线则推动多 Agent 编排和协议化工具调用。muxdev 的位置不是替代这些工具，而是在它们之上提供一个本地优先的 AI 软件交付控制面：统一入口、可信交付、本地治理。</p>
+</callout>
+
+<table>
+  <thead>
+    <tr>
+      <th background-color="light-gray">版本日期</th>
+      <th background-color="light-gray">依据范围</th>
+      <th background-color="light-gray">交付形式</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>2026-06-28</td>
+      <td>当前本地仓库最新代码、README/架构文档、公开官方文档与开源仓库资料</td>
+      <td>飞书文档，主体由表格和飞书画板承载</td>
+    </tr>
+  </tbody>
+</table>
+
+<whiteboard type="svg">
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720">
+  <rect x="0" y="0" width="1200" height="720" fill="#F8FAFC"/>
+  <text x="60" y="70" font-size="34" font-weight="700" fill="#111827">AI 编码助手的“战国地图”</text>
+  <text x="60" y="108" font-size="17" fill="#4B5563">竞争不再只是模型能力，而是入口、执行、协作、验证、治理五条战线同时开打。</text>
+
+  <g transform="translate(60,155)">
+    <rect x="0" y="0" width="250" height="390" rx="18" fill="#DBEAFE" stroke="#2563EB" stroke-width="2"/>
+    <circle cx="45" cy="50" r="24" fill="#2563EB"/>
+    <text x="35" y="59" font-size="24" font-weight="700" fill="#FFFFFF">1</text>
+    <text x="82" y="48" font-size="24" font-weight="700" fill="#1E3A8A">IDE 入口</text>
+    <text x="82" y="77" font-size="15" fill="#1E40AF">开发者低摩擦协作</text>
+    <line x1="26" y1="105" x2="224" y2="105" stroke="#93C5FD" stroke-width="2"/>
+    <text x="28" y="140" font-size="17" font-weight="700" fill="#111827">代表</text>
+    <text x="28" y="170" font-size="15" fill="#374151">Cursor、Copilot</text>
+    <text x="28" y="196" font-size="15" fill="#374151">Cline、Continue</text>
+    <text x="28" y="220" font-size="17" font-weight="700" fill="#111827">优势</text>
+    <text x="28" y="250" font-size="15" fill="#374151">上下文近、交互顺、用户心智强</text>
+    <text x="28" y="300" font-size="17" font-weight="700" fill="#111827">缺口</text>
+    <text x="28" y="330" font-size="15" fill="#374151">跨工具治理和交付证据较弱</text>
+  </g>
+
+  <g transform="translate(335,155)">
+    <rect x="0" y="0" width="250" height="390" rx="18" fill="#DCFCE7" stroke="#16A34A" stroke-width="2"/>
+    <circle cx="45" cy="50" r="24" fill="#16A34A"/>
+    <text x="35" y="59" font-size="24" font-weight="700" fill="#FFFFFF">2</text>
+    <text x="82" y="48" font-size="24" font-weight="700" fill="#14532D">CLI Agent</text>
+    <text x="82" y="77" font-size="15" fill="#166534">本地或云端任务执行</text>
+    <line x1="26" y1="105" x2="224" y2="105" stroke="#86EFAC" stroke-width="2"/>
+    <text x="28" y="140" font-size="17" font-weight="700" fill="#111827">代表</text>
+    <text x="28" y="170" font-size="15" fill="#374151">Codex、Claude Code</text>
+    <text x="28" y="196" font-size="15" fill="#374151">Qwen Code</text>
+    <text x="28" y="220" font-size="17" font-weight="700" fill="#111827">优势</text>
+    <text x="28" y="250" font-size="15" fill="#374151">能改文件、跑命令、调工具</text>
+    <text x="28" y="300" font-size="17" font-weight="700" fill="#111827">缺口</text>
+    <text x="28" y="330" font-size="15" fill="#374151">每家权限、日志、确认方式不同</text>
+  </g>
+
+  <g transform="translate(610,155)">
+    <rect x="0" y="0" width="250" height="390" rx="18" fill="#FEF3C7" stroke="#D97706" stroke-width="2"/>
+    <circle cx="45" cy="50" r="24" fill="#D97706"/>
+    <text x="35" y="59" font-size="24" font-weight="700" fill="#FFFFFF">3</text>
+    <text x="82" y="48" font-size="24" font-weight="700" fill="#78350F">Agent 框架</text>
+    <text x="82" y="77" font-size="15" fill="#92400E">构建多 Agent 应用</text>
+    <line x1="26" y1="105" x2="224" y2="105" stroke="#FCD34D" stroke-width="2"/>
+    <text x="28" y="140" font-size="17" font-weight="700" fill="#111827">代表</text>
+    <text x="28" y="170" font-size="15" fill="#374151">AutoGen、CrewAI</text>
+    <text x="28" y="196" font-size="15" fill="#374151">LangGraph</text>
+    <text x="28" y="220" font-size="17" font-weight="700" fill="#111827">优势</text>
+    <text x="28" y="250" font-size="15" fill="#374151">抽象强、流程灵活、扩展快</text>
+    <text x="28" y="300" font-size="17" font-weight="700" fill="#111827">缺口</text>
+    <text x="28" y="330" font-size="15" fill="#374151">不是开箱即用的代码交付控制面</text>
+  </g>
+
+  <g transform="translate(885,155)">
+    <rect x="0" y="0" width="250" height="390" rx="18" fill="#FEE2E2" stroke="#DC2626" stroke-width="2"/>
+    <circle cx="45" cy="50" r="24" fill="#DC2626"/>
+    <text x="35" y="59" font-size="24" font-weight="700" fill="#FFFFFF">4</text>
+    <text x="82" y="48" font-size="24" font-weight="700" fill="#7F1D1D">协议化 Agent</text>
+    <text x="82" y="77" font-size="15" fill="#991B1B">安全与工具协议</text>
+    <line x1="26" y1="105" x2="224" y2="105" stroke="#FCA5A5" stroke-width="2"/>
+    <text x="28" y="140" font-size="17" font-weight="700" fill="#111827">代表</text>
+    <text x="28" y="170" font-size="15" fill="#374151">STRIATUM-CTF、MCP 工具栈</text>
+    <text x="28" y="220" font-size="17" font-weight="700" fill="#111827">优势</text>
+    <text x="28" y="250" font-size="15" fill="#374151">工具接口标准化、长程任务可控</text>
+    <text x="28" y="300" font-size="17" font-weight="700" fill="#111827">缺口</text>
+    <text x="28" y="330" font-size="15" fill="#374151">通常是领域型研究系统</text>
+  </g>
+
+  <path d="M180 580 H1020" stroke="#64748B" stroke-width="3" stroke-dasharray="8 8"/>
+  <polygon points="1020,580 995,566 995,594" fill="#64748B"/>
+  <text x="245" y="620" font-size="18" fill="#111827">竞争焦点：代码生成</text>
+  <text x="465" y="620" font-size="18" fill="#111827">任务执行</text>
+  <text x="620" y="620" font-size="18" fill="#111827">多 Agent 协作</text>
+  <text x="815" y="620" font-size="18" fill="#111827">交付可信与治理</text>
+  <rect x="460" y="645" width="280" height="44" rx="22" fill="#111827"/>
+  <text x="500" y="674" font-size="20" font-weight="700" fill="#FFFFFF">muxdev 位于治理层</text>
+</svg>
+</whiteboard>
+
+<h1>1. 全景扫描：AI 编码工具进入多入口并存阶段</h1>
+<p>公开资料显示，AI 编码 agent 的使用已经不只是实验室概念。2026 年 AIDev 研究聚合了 932,791 个 agent-authored PR，覆盖 OpenAI Codex、Devin、GitHub Copilot、Cursor、Claude Code 五类 agent，说明 AI 编码正在进入真实开源协作现场。</p>
+
+<table>
+  <thead>
+    <tr>
+      <th background-color="light-gray">赛道</th>
+      <th background-color="light-gray">代表工具</th>
+      <th background-color="light-gray">主战场</th>
+      <th background-color="light-gray">核心优势</th>
+      <th background-color="light-gray">典型缺口</th>
+      <th background-color="light-gray">muxdev 的角色</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>终端 coding agent</td>
+      <td>OpenAI Codex CLI、Claude Code、Qwen Code、Gemini CLI</td>
+      <td>本地仓库、shell、文件编辑、测试执行</td>
+      <td>执行力强，适合把自然语言任务落到代码变更</td>
+      <td>每个 provider 的权限、日志、确认、限流、失败模式不同</td>
+      <td>统一 provider adapter、role routing、provider action、evidence</td>
+    </tr>
+    <tr>
+      <td>IDE agent</td>
+      <td>Cursor、GitHub Copilot、Cline、Continue</td>
+      <td>编辑器内补全、局部修改、代码问答、任务交接</td>
+      <td>上下文近，用户交互自然，低学习成本</td>
+      <td>跨工具流程、交付证据、审计与回滚通常不是核心</td>
+      <td>向 IDE 提供任务状态、证据、报告、审批和回滚 API</td>
+    </tr>
+    <tr>
+      <td>云端 PR/Issue agent</td>
+      <td>Codex Web、Copilot coding agent、Devin 等</td>
+      <td>云环境执行任务、开 PR、处理 issue</td>
+      <td>异步执行和团队协作入口强</td>
+      <td>本地约束、私有上下文、细粒度治理依赖平台能力</td>
+      <td>提供 local-first 控制面和可审计本地产物</td>
+    </tr>
+    <tr>
+      <td>开源多协议 agent</td>
+      <td>Qwen Code、OpenHands、Aider、OpenCode 类工具</td>
+      <td>可定制 agent、provider 选择、开源生态扩展</td>
+      <td>透明、可 fork、可接本地模型或多 API</td>
+      <td>工具能力强但交付治理仍需另建系统</td>
+      <td>把它们变成可替换执行后端，而不是让用户重新选边站</td>
+    </tr>
+    <tr>
+      <td>通用多 Agent 框架</td>
+      <td>AutoGen、CrewAI、LangGraph、MetaGPT</td>
+      <td>应用编排、角色协作、事件流、状态机</td>
+      <td>抽象能力强，适合构建 agent 产品</td>
+      <td>默认不等于“面向代码仓库的可信交付系统”</td>
+      <td>吸收 graph/flow 能力，但保留本地黑板、审批、证据、回滚</td>
+    </tr>
+    <tr>
+      <td>安全和协议驱动 agent</td>
+      <td>STRIATUM-CTF、MCP 工具链、安全扫描 agent</td>
+      <td>长程推理、工具协议、安全任务、动态环境</td>
+      <td>强调工具接口标准化和可持续上下文</td>
+      <td>常是领域型系统，不覆盖日常 SDLC 全流程</td>
+      <td>将 MCP/guardrail 纳入本地治理边界</td>
+    </tr>
+  </tbody>
+</table>
+
+<h1>2. “战国时代”的三大痛点</h1>
+<table>
+  <thead>
+    <tr>
+      <th background-color="light-gray">痛点</th>
+      <th background-color="light-gray">表面现象</th>
+      <th background-color="light-gray">深层问题</th>
+      <th background-color="light-gray">真实后果</th>
+      <th background-color="light-gray">muxdev 对应解法</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><b>碎片化</b></td>
+      <td>Codex、Claude Code、Qwen、Cursor 各有命令、权限、配置、日志、会话</td>
+      <td>AI 编码能力被拆散在不同入口里，团队难以形成统一流程</td>
+      <td>任务不可复盘，provider 迁移成本高，工程规范靠人记</td>
+      <td>统一 CLI/TUI/Dashboard/API 入口，provider adapter + role-aware routing</td>
+    </tr>
+    <tr>
+      <td><b>信任缺失</b></td>
+      <td>agent 说“完成了”，但测试、review、diff、风险、回滚点不清楚</td>
+      <td>自然语言结论替代了工程证据</td>
+      <td>高风险变更难合并，团队必须人工二次验证</td>
+      <td>StageContract、RoleResult、Evidence v2、ledger、Blind Validator、Semantic Merge</td>
+    </tr>
+    <tr>
+      <td><b>治理空白</b></td>
+      <td>审批只是点同意，memory 随意注入，外部 CLI 确认和系统审批混在一起</td>
+      <td>AI 研发缺少策略边界、审计对象和长期知识生命周期</td>
+      <td>审批漂移、记忆污染、权限误用、失败不可恢复</td>
+      <td>Approval Subject Hash、Provider Action 分离、local memory lifecycle、skill lock、guardrail</td>
+    </tr>
+  </tbody>
+</table>
+
+<whiteboard type="svg">
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="760" viewBox="0 0 1200 760">
+  <rect width="1200" height="760" fill="#FFFFFF"/>
+  <text x="58" y="68" font-size="34" font-weight="700" fill="#111827">三大痛点如何汇入 muxdev 控制面</text>
+  <text x="58" y="104" font-size="17" fill="#4B5563">muxdev 的产品逻辑是把“工具能力”升级成“工程交付能力”。</text>
+
+  <g transform="translate(70,170)">
+    <path d="M0 0 C90 -45 190 -45 280 0 C190 45 90 45 0 0" fill="#DBEAFE" stroke="#2563EB" stroke-width="2"/>
+    <text x="74" y="-8" font-size="24" font-weight="700" fill="#1D4ED8">碎片化</text>
+    <text x="46" y="26" font-size="15" fill="#374151">多入口、多 CLI、多日志</text>
+  </g>
+  <g transform="translate(70,330)">
+    <path d="M0 0 C90 -45 190 -45 280 0 C190 45 90 45 0 0" fill="#FEE2E2" stroke="#DC2626" stroke-width="2"/>
+    <text x="74" y="-8" font-size="24" font-weight="700" fill="#B91C1C">信任缺失</text>
+    <text x="42" y="26" font-size="15" fill="#374151">缺少测试、证据、可回滚性</text>
+  </g>
+  <g transform="translate(70,490)">
+    <path d="M0 0 C90 -45 190 -45 280 0 C190 45 90 45 0 0" fill="#FEF3C7" stroke="#D97706" stroke-width="2"/>
+    <text x="74" y="-8" font-size="24" font-weight="700" fill="#92400E">治理空白</text>
+    <text x="38" y="26" font-size="15" fill="#374151">审批漂移、记忆污染、权限不清</text>
+  </g>
+
+  <path d="M355 170 H480" stroke="#64748B" stroke-width="3"/>
+  <path d="M355 330 H480" stroke="#64748B" stroke-width="3"/>
+  <path d="M355 490 H480" stroke="#64748B" stroke-width="3"/>
+  <polygon points="480,170 458,158 458,182" fill="#64748B"/>
+  <polygon points="480,330 458,318 458,342" fill="#64748B"/>
+  <polygon points="480,490 458,478 458,502" fill="#64748B"/>
+
+  <g transform="translate(500,165)">
+    <rect x="0" y="0" width="280" height="380" rx="24" fill="#111827"/>
+    <text x="48" y="58" font-size="28" font-weight="700" fill="#FFFFFF">muxdev</text>
+    <text x="48" y="92" font-size="18" fill="#CBD5E1">Local-first SDLC Kernel</text>
+    <rect x="42" y="130" width="196" height="46" rx="23" fill="#2563EB"/>
+    <text x="74" y="160" font-size="17" font-weight="700" fill="#FFFFFF">统一入口</text>
+    <rect x="42" y="205" width="196" height="46" rx="23" fill="#16A34A"/>
+    <text x="74" y="235" font-size="17" font-weight="700" fill="#FFFFFF">可信交付</text>
+    <rect x="42" y="280" width="196" height="46" rx="23" fill="#D97706"/>
+    <text x="74" y="310" font-size="17" font-weight="700" fill="#FFFFFF">本地治理</text>
+  </g>
+
+  <path d="M785 250 H910" stroke="#64748B" stroke-width="3"/>
+  <path d="M785 360 H910" stroke="#64748B" stroke-width="3"/>
+  <path d="M785 470 H910" stroke="#64748B" stroke-width="3"/>
+  <polygon points="910,250 888,238 888,262" fill="#64748B"/>
+  <polygon points="910,360 888,348 888,372" fill="#64748B"/>
+  <polygon points="910,470 888,458 888,482" fill="#64748B"/>
+
+  <g transform="translate(930,210)">
+    <rect x="0" y="0" width="220" height="85" rx="16" fill="#EFF6FF" stroke="#93C5FD"/>
+    <text x="22" y="34" font-size="18" font-weight="700" fill="#1D4ED8">一个入口</text>
+    <text x="22" y="62" font-size="14" fill="#374151">CLI / TUI / Dashboard / API</text>
+  </g>
+  <g transform="translate(930,320)">
+    <rect x="0" y="0" width="220" height="85" rx="16" fill="#ECFDF5" stroke="#86EFAC"/>
+    <text x="22" y="34" font-size="18" font-weight="700" fill="#047857">一条证据链</text>
+    <text x="22" y="62" font-size="14" fill="#374151">Diff / Tests / Review / Evidence</text>
+  </g>
+  <g transform="translate(930,430)">
+    <rect x="0" y="0" width="220" height="85" rx="16" fill="#FFFBEB" stroke="#FCD34D"/>
+    <text x="22" y="34" font-size="18" font-weight="700" fill="#92400E">一套治理规则</text>
+    <text x="22" y="62" font-size="14" fill="#374151">Approval / Memory / Skills</text>
+  </g>
+
+  <rect x="300" y="640" width="600" height="56" rx="28" fill="#F1F5F9" stroke="#CBD5E1"/>
+  <text x="344" y="676" font-size="19" font-weight="700" fill="#111827">结果：让 AI 编码从“可生成”走向“可交付、可审计、可恢复”。</text>
+</svg>
+</whiteboard>
+
+<h1>3. muxdev 当前代码实现：不是愿景，而是本地控制面雏形</h1>
+<table>
+  <thead>
+    <tr>
+      <th background-color="light-gray">能力域</th>
+      <th background-color="light-gray">本地代码证据</th>
+      <th background-color="light-gray">实现要点</th>
+      <th background-color="light-gray">对应痛点</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>统一入口</td>
+      <td><code>src/muxdev/cli/main.py</code>、<code>src/muxdev/api/</code>、<code>src/muxdev/ui/</code></td>
+      <td>CLI、daemon TUI、FastAPI、Dashboard 统一提交与观察任务</td>
+      <td>碎片化</td>
+    </tr>
+    <tr>
+      <td>工作流编排</td>
+      <td><code>src/muxdev/runtime/supervisor.py</code>、<code>src/muxdev/workflows/engine.py</code></td>
+      <td>创建 run、隔离 worktree、按 DAG 执行 stage、记录 trace 和 artifacts</td>
+      <td>碎片化、信任缺失</td>
+    </tr>
+    <tr>
+      <td>LangGraph 语义桥接</td>
+      <td><code>src/muxdev/runtime/langgraph_engine.py</code>、<code>src/muxdev/services/orchestration.py</code></td>
+      <td><code>workflow_to_langgraph</code> 可导出 graph spec；执行仍回到 muxdev 审计路径</td>
+      <td>碎片化</td>
+    </tr>
+    <tr>
+      <td>Provider 路由</td>
+      <td><code>src/muxdev/providers/adapters.py</code>、<code>src/muxdev/providers/planner.py</code></td>
+      <td>Codex、Claude、Qwen、mock 等作为可替换 role backend</td>
+      <td>碎片化</td>
+    </tr>
+    <tr>
+      <td>Provider Action</td>
+      <td><code>src/muxdev/storage/blackboard.py</code>、<code>src/muxdev/runtime/stage_attempt.py</code></td>
+      <td>把外部 CLI 登录、确认、限流、卡住状态独立记录，不伪装成审批</td>
+      <td>治理空白</td>
+    </tr>
+    <tr>
+      <td>可信交付</td>
+      <td><code>src/muxdev/services/evidence.py</code>、<code>src/muxdev/storage/ledger.py</code></td>
+      <td>Evidence v2 事件流、manifest、evaluation、hash chain、artifact hash</td>
+      <td>信任缺失</td>
+    </tr>
+    <tr>
+      <td>交付门禁</td>
+      <td><code>src/muxdev/services/delivery_gate.py</code></td>
+      <td>本地确定性检查 artifact、测试失败、review blocker、runtime error、pending action</td>
+      <td>信任缺失、治理空白</td>
+    </tr>
+    <tr>
+      <td>本地记忆治理</td>
+      <td><code>src/muxdev/storage/memory.py</code></td>
+      <td>session/run/branch/project/workspace/user 分层，支持证据、审批、矛盾检测和 quarantine</td>
+      <td>治理空白</td>
+    </tr>
+    <tr>
+      <td>恢复与回滚</td>
+      <td><code>src/muxdev/runtime/worktree.py</code>、<code>src/muxdev/services/session_capsules.py</code></td>
+      <td>隔离 worktree、stage snapshot、handoff patch、session capsule</td>
+      <td>信任缺失、治理空白</td>
+    </tr>
+  </tbody>
+</table>
+
+<h1>4. muxdev 的解决思路：统一入口 + 可信交付 + 本地治理</h1>
+<whiteboard type="svg">
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="760" viewBox="0 0 1200 760">
+  <rect width="1200" height="760" fill="#F8FAFC"/>
+  <text x="60" y="70" font-size="34" font-weight="700" fill="#111827">muxdev 解决路径：统一入口 + 可信交付 + 本地治理</text>
+  <text x="60" y="108" font-size="17" fill="#4B5563">把多个 coding agent 的执行能力，收束到一条可审计、可恢复、可沉淀的软件交付链。</text>
+
+  <g transform="translate(55,170)">
+    <rect x="0" y="0" width="160" height="92" rx="18" fill="#E0F2FE" stroke="#0284C7" stroke-width="2"/>
+    <text x="34" y="37" font-size="20" font-weight="700" fill="#075985">User / Team</text>
+    <text x="30" y="66" font-size="14" fill="#334155">自然语言任务</text>
+  </g>
+  <g transform="translate(260,160)">
+    <rect x="0" y="0" width="190" height="112" rx="18" fill="#DBEAFE" stroke="#2563EB" stroke-width="2"/>
+    <text x="44" y="35" font-size="20" font-weight="700" fill="#1D4ED8">统一入口</text>
+    <text x="28" y="66" font-size="14" fill="#334155">CLI / TUI</text>
+    <text x="28" y="89" font-size="14" fill="#334155">Dashboard / API</text>
+  </g>
+  <g transform="translate(500,160)">
+    <rect x="0" y="0" width="220" height="112" rx="18" fill="#DCFCE7" stroke="#16A34A" stroke-width="2"/>
+    <text x="40" y="35" font-size="20" font-weight="700" fill="#166534">自动工作流</text>
+    <text x="25" y="66" font-size="14" fill="#334155">simple / safe / deep</text>
+    <text x="25" y="89" font-size="14" fill="#334155">parallel / ci</text>
+  </g>
+  <g transform="translate(770,160)">
+    <rect x="0" y="0" width="220" height="112" rx="18" fill="#FEF3C7" stroke="#D97706" stroke-width="2"/>
+    <text x="35" y="35" font-size="20" font-weight="700" fill="#92400E">角色化路由</text>
+    <text x="24" y="66" font-size="14" fill="#334155">plan / code / test</text>
+    <text x="24" y="89" font-size="14" fill="#334155">review / secure / docs</text>
+  </g>
+
+  <path d="M215 216 H260" stroke="#64748B" stroke-width="3"/>
+  <polygon points="260,216 240,204 240,228" fill="#64748B"/>
+  <path d="M450 216 H500" stroke="#64748B" stroke-width="3"/>
+  <polygon points="500,216 480,204 480,228" fill="#64748B"/>
+  <path d="M720 216 H770" stroke="#64748B" stroke-width="3"/>
+  <polygon points="770,216 750,204 750,228" fill="#64748B"/>
+
+  <g transform="translate(760,335)">
+    <rect x="0" y="0" width="250" height="118" rx="18" fill="#FEE2E2" stroke="#DC2626" stroke-width="2"/>
+    <text x="43" y="36" font-size="20" font-weight="700" fill="#991B1B">Provider CLI</text>
+    <text x="30" y="68" font-size="14" fill="#334155">Codex / Claude Code</text>
+    <text x="30" y="91" font-size="14" fill="#334155">Qwen / mock / others</text>
+  </g>
+  <g transform="translate(445,335)">
+    <rect x="0" y="0" width="250" height="118" rx="18" fill="#F1F5F9" stroke="#64748B" stroke-width="2"/>
+    <text x="57" y="36" font-size="20" font-weight="700" fill="#334155">Artifacts</text>
+    <text x="30" y="68" font-size="14" fill="#334155">diff / report / tests</text>
+    <text x="30" y="91" font-size="14" fill="#334155">transcripts / snapshots</text>
+  </g>
+  <g transform="translate(130,335)">
+    <rect x="0" y="0" width="250" height="118" rx="18" fill="#ECFDF5" stroke="#059669" stroke-width="2"/>
+    <text x="35" y="36" font-size="20" font-weight="700" fill="#047857">Evidence v2 + Ledger</text>
+    <text x="30" y="68" font-size="14" fill="#334155">event stream / manifest</text>
+    <text x="30" y="91" font-size="14" fill="#334155">hash chain / evaluation</text>
+  </g>
+
+  <path d="M880 272 V335" stroke="#64748B" stroke-width="3"/>
+  <polygon points="880,335 868,315 892,315" fill="#64748B"/>
+  <path d="M760 394 H695" stroke="#64748B" stroke-width="3"/>
+  <polygon points="695,394 715,382 715,406" fill="#64748B"/>
+  <path d="M445 394 H380" stroke="#64748B" stroke-width="3"/>
+  <polygon points="380,394 400,382 400,406" fill="#64748B"/>
+
+  <g transform="translate(130,535)">
+    <rect x="0" y="0" width="230" height="112" rx="18" fill="#FFF7ED" stroke="#EA580C" stroke-width="2"/>
+    <text x="44" y="36" font-size="20" font-weight="700" fill="#C2410C">Delivery Gate</text>
+    <text x="28" y="68" font-size="14" fill="#334155">deterministic local checks</text>
+    <text x="28" y="91" font-size="14" fill="#334155">block missing evidence</text>
+  </g>
+  <g transform="translate(455,535)">
+    <rect x="0" y="0" width="230" height="112" rx="18" fill="#EEF2FF" stroke="#4F46E5" stroke-width="2"/>
+    <text x="33" y="36" font-size="20" font-weight="700" fill="#4338CA">Approval Hash</text>
+    <text x="28" y="68" font-size="14" fill="#334155">plan / patch / policy</text>
+    <text x="28" y="91" font-size="14" fill="#334155">validator / semantic review</text>
+  </g>
+  <g transform="translate(780,535)">
+    <rect x="0" y="0" width="250" height="112" rx="18" fill="#F0FDFA" stroke="#0D9488" stroke-width="2"/>
+    <text x="37" y="36" font-size="20" font-weight="700" fill="#0F766E">交付与沉淀</text>
+    <text x="30" y="68" font-size="14" fill="#334155">merge / rollback</text>
+    <text x="30" y="91" font-size="14" fill="#334155">memory promotion</text>
+  </g>
+
+  <path d="M255 453 V535" stroke="#64748B" stroke-width="3"/>
+  <polygon points="255,535 243,515 267,515" fill="#64748B"/>
+  <path d="M360 591 H455" stroke="#64748B" stroke-width="3"/>
+  <polygon points="455,591 435,579 435,603" fill="#64748B"/>
+  <path d="M685 591 H780" stroke="#64748B" stroke-width="3"/>
+  <polygon points="780,591 760,579 760,603" fill="#64748B"/>
+
+  <path d="M770 250 C640 300 545 300 450 250" fill="none" stroke="#94A3B8" stroke-width="2" stroke-dasharray="7 7"/>
+  <text x="520" y="308" font-size="15" fill="#475569">Provider Action Handoff 回到统一入口处理</text>
+</svg>
+</whiteboard>
+
+<table>
+  <thead>
+    <tr>
+      <th background-color="light-gray">解决思路</th>
+      <th background-color="light-gray">产品语言</th>
+      <th background-color="light-gray">技术抓手</th>
+      <th background-color="light-gray">用户得到什么</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><b>统一入口</b></td>
+      <td>不再让用户在每个 AI 工具之间切换心智</td>
+      <td>daemon、TaskManager、WorkflowDefinition、ProviderAdapter、Dashboard/API</td>
+      <td>用一个任务入口调度多个 coding agent，并看到统一状态</td>
+    </tr>
+    <tr>
+      <td><b>可信交付</b></td>
+      <td>不相信“我已经完成”，只相信证据链</td>
+      <td>StageContract、RoleResult、Evidence v2、ledger、validator、semantic merge、delivery gate</td>
+      <td>知道改了什么、谁验证了、证据在哪、风险还剩什么</td>
+    </tr>
+    <tr>
+      <td><b>本地治理</b></td>
+      <td>AI 研发流程必须有边界、有审批、有记忆生命周期</td>
+      <td>Approval Subject Hash、Provider Action、MemoryStore、Skill Lock、MCP Guardrail、rollback snapshot</td>
+      <td>审批不漂移，外部确认不混淆，项目知识不乱入，失败可恢复</td>
+    </tr>
+  </tbody>
+</table>
+
+<h1>5. 竞品分析：muxdev vs AutoGen vs CrewAI vs STRIATUM-CTF</h1>
+<callout emoji="ℹ️" background-color="light-blue" border-color="blue">
+  <p><b>边界说明：</b>AutoGen 与 CrewAI 是通用多 Agent 框架；公开可查的 STRIATUM-CTF 是面向 CTF/安全推理的研究型 agentic framework，不是通用 AI 编码助手。把它们与 muxdev 对比，是为了看“编排、工具协议、交付治理”三个方向的不同答案。</p>
+</callout>
+
+<table>
+  <thead>
+    <tr>
+      <th background-color="light-gray">维度</th>
+      <th background-color="light-gray">muxdev</th>
+      <th background-color="light-gray">AutoGen</th>
+      <th background-color="light-gray">CrewAI</th>
+      <th background-color="light-gray">STRIATUM-CTF</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>核心定位</td>
+      <td>本地优先 AI 软件交付控制面</td>
+      <td>构建单/多 Agent 应用的编程框架</td>
+      <td>面向 autonomous agents 和 production workflows 的 Python 框架</td>
+      <td>基于 MCP 的安全/CTF 长程推理框架</td>
+    </tr>
+    <tr>
+      <td>第一用户</td>
+      <td>使用多个 coding agent 的开发者和团队</td>
+      <td>Agent 应用开发者、研究者</td>
+      <td>自动化应用开发者、业务流程团队</td>
+      <td>安全研究、CTF、工具协议研究者</td>
+    </tr>
+    <tr>
+      <td>抽象中心</td>
+      <td>SDLC run、stage、role、evidence、approval、rollback</td>
+      <td>AgentChat、Core、Extensions、Studio</td>
+      <td>Agents、Crews、Flows、Tasks、Processes</td>
+      <td>MCP tool interface、test-time reasoning、exploit trajectory</td>
+    </tr>
+    <tr>
+      <td>对代码仓库的默认态度</td>
+      <td>代码仓库就是主战场，默认围绕 diff/test/review/report</td>
+      <td>可用于代码，但不是专为 SDLC 交付闭环设计</td>
+      <td>可编排代码任务，但更偏通用自动化</td>
+      <td>面向动态漏洞环境，不覆盖常规软件交付</td>
+    </tr>
+    <tr>
+      <td>可信交付</td>
+      <td>Evidence v2、ledger、delivery gate、validator、semantic merge 是一等对象</td>
+      <td>需要应用开发者自行实现交付证据和治理</td>
+      <td>提供 guardrails、observability、human-in-the-loop，但交付证据需要业务建模</td>
+      <td>强调协议化工具和日志分析，领域目标是攻防验证</td>
+    </tr>
+    <tr>
+      <td>治理模型</td>
+      <td>Approval 和 Provider Action 分离；memory 可审批、可隔离、可追踪</td>
+      <td>有 MCP/code execution 扩展，安全治理由集成者承担</td>
+      <td>有 guardrails、memory、observability、RBAC 等企业化方向</td>
+      <td>通过 MCP 标准化工具接口，减少长程任务幻觉</td>
+    </tr>
+    <tr>
+      <td>与 muxdev 的关系</td>
+      <td>控制面本体</td>
+      <td>可作为某些 stage 的后端或实验编排层</td>
+      <td>可作为 role crew / flow backend</td>
+      <td>启发 muxdev 的 MCP guardrail 和安全任务协议化</td>
+    </tr>
+  </tbody>
+</table>
+
+<h1>6. AI 编码工具关键对比：Codex、Claude Code、Cursor、Qwen Code</h1>
+<table>
+  <thead>
+    <tr>
+      <th background-color="light-gray">工具</th>
+      <th background-color="light-gray">公开定位</th>
+      <th background-color="light-gray">强项</th>
+      <th background-color="light-gray">在 muxdev 中的理想角色</th>
+      <th background-color="light-gray">治理注意点</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Codex</td>
+      <td>OpenAI 的 Codex docs 覆盖 App、IDE Extension、CLI、Web、GitHub/Slack/Linear 等入口；开源 Codex CLI 是本地终端 coding agent</td>
+      <td>OpenAI 生态、CLI/IDE/Web 多入口、sandboxing、workflows、subagents、security 方向</td>
+      <td>code、review、docs、security scan 或高可靠执行 role</td>
+      <td>需要把云端/本地任务、权限、审批和输出证据纳入统一 run</td>
+    </tr>
+    <tr>
+      <td>Claude Code</td>
+      <td>Anthropic 文档称其可读代码库、编辑文件、运行命令，并在 terminal、IDE、desktop、browser 使用</td>
+      <td>长上下文、工具执行、权限模式、session 管理、MCP/skills/hooks/subagents 生态</td>
+      <td>plan、architect、review、secure、complex reasoning role</td>
+      <td>强 agent 能力必须绑定只读/写入 gate、provider action 和 audit trail</td>
+    </tr>
+    <tr>
+      <td>Cursor</td>
+      <td>Cursor 官网把自身定位为 coding agent，覆盖 desktop、CLI、agent、autocomplete、cloud agent、review 等入口</td>
+      <td>IDE 内上下文和交互体验强，Tab、Cmd+K、Agent 构成 autonomy slider</td>
+      <td>IDE 前端入口、开发者交互层、handoff surface</td>
+      <td>若要成为团队交付层，需要补齐跨任务 evidence、approval、rollback 与 provider 中立性</td>
+    </tr>
+    <tr>
+      <td>Qwen Code</td>
+      <td>开源终端 AI coding agent，强调 Auto-Memory、Auto-Skills、SubAgents、Agent Teams、MCP、多协议、多平台</td>
+      <td>开源、multi-protocol、支持本地模型/多 API、headless/daemon/SDK/IM bot</td>
+      <td>code、test、batch、低成本本地/开源 provider role</td>
+      <td>多协议能力强，但仍需要外层交付门禁和团队治理规范</td>
+    </tr>
+  </tbody>
+</table>
+
+<h1>7. 结论：muxdev 解决的是“AI 编码交付系统”问题</h1>
+<grid>
+  <column width-ratio="0.5">
+    <h3>如果只看单个工具</h3>
+    <ul>
+      <li>问题是“哪个模型/agent 更会写代码”。</li>
+      <li>评价标准是生成质量、速度、上下文、IDE/CLI 体验。</li>
+      <li>用户主要依赖工具自己的日志、权限和会话。</li>
+    </ul>
+  </column>
+  <column width-ratio="0.5">
+    <h3>如果看真实工程交付</h3>
+    <ul>
+      <li>问题变成“多个 agent 如何被调度、验证和治理”。</li>
+      <li>评价标准是证据、审批、回滚、复盘、记忆沉淀。</li>
+      <li>团队需要 provider 中立、本地可审计的控制面。</li>
+    </ul>
+  </column>
+</grid>
+
+<callout emoji="📌" background-color="light-yellow" border-color="yellow">
+  <p><b>一句话：</b>Codex、Claude Code、Cursor、Qwen Code 代表 AI 编码工具能力的爆发；muxdev 解决的是这些能力进入真实软件工程后，如何统一入口、可信交付和本地治理的问题。</p>
+</callout>
+
+<h1>8. 建议路线图：让 muxdev 从“可运行内核”走向“团队级控制面”</h1>
+<table>
+  <thead>
+    <tr>
+      <th background-color="light-gray">阶段</th>
+      <th background-color="light-gray">目标</th>
+      <th background-color="light-gray">关键动作</th>
+      <th background-color="light-gray">验收信号</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>P0 Demo 可信化</td>
+      <td>把 mock/真实 provider 的完整 run 做成可演示样板</td>
+      <td>固定同一任务，用 mock、Codex/Qwen 分别跑，保存 report/evidence/diff/rollback 截图</td>
+      <td>任何人能在 10 分钟内看懂 muxdev 的交付闭环</td>
+    </tr>
+    <tr>
+      <td>P1 Provider Conformance</td>
+      <td>减少真实 CLI 差异造成的不稳定</td>
+      <td>为 Codex、Claude、Qwen 建立 doctor、stream parser、action parser、retry cases</td>
+      <td>provider action 可复现，失败可 handoff，学习分数可解释</td>
+    </tr>
+    <tr>
+      <td>P2 Team Governance</td>
+      <td>让团队能把 AI 研发规范固化进仓库</td>
+      <td>强化 profiles、roles、gates、skills、memory approval、dashboard policy view</td>
+      <td>审批对象可追踪，memory promotion 可审查，skills 可锁定</td>
+    </tr>
+    <tr>
+      <td>P3 Ecosystem Surface</td>
+      <td>从 CLI 工具升级为可嵌入控制面</td>
+      <td>完善 API、MCP、IDE/web extension hints、artifact center、task board</td>
+      <td>外部 IDE 或平台可复用 muxdev 的任务、证据、审批和回滚能力</td>
+    </tr>
+  </tbody>
+</table>
+
+<h1>9. 资料来源</h1>
+<table>
+  <thead>
+    <tr>
+      <th background-color="light-gray">类别</th>
+      <th background-color="light-gray">来源</th>
+      <th background-color="light-gray">用途</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td>本地代码</td><td><code>README.md</code>、<code>docs/architecture.md</code>、<code>docs/product_guide.md</code>、<code>src/muxdev/runtime/supervisor.py</code>、<code>src/muxdev/services/evidence.py</code>、<code>src/muxdev/storage/memory.py</code></td><td>确认 muxdev 当前实现与产品边界</td></tr>
+    <tr><td>OpenAI Codex</td><td><a href="https://developers.openai.com/codex/">https://developers.openai.com/codex/</a>；<a href="https://github.com/openai/codex">https://github.com/openai/codex</a></td><td>Codex 入口、CLI 和生态定位</td></tr>
+    <tr><td>Claude Code</td><td><a href="https://code.claude.com/docs/en/overview">https://code.claude.com/docs/en/overview</a></td><td>Claude Code 官方定位和可用入口</td></tr>
+    <tr><td>Cursor</td><td><a href="https://cursor.com/en-US">https://cursor.com/en-US</a></td><td>Cursor agent、CLI、autocomplete、cloud agent 等产品形态</td></tr>
+    <tr><td>Qwen Code</td><td><a href="https://github.com/QwenLM/qwen-code">https://github.com/QwenLM/qwen-code</a></td><td>开源 terminal agent、多协议和多平台能力</td></tr>
+    <tr><td>AutoGen</td><td><a href="https://microsoft.github.io/autogen/stable/">https://microsoft.github.io/autogen/stable/</a>；<a href="https://github.com/microsoft/autogen">https://github.com/microsoft/autogen</a></td><td>多 Agent 框架定位与维护状态</td></tr>
+    <tr><td>CrewAI</td><td><a href="https://docs.crewai.com/">https://docs.crewai.com/</a>；<a href="https://github.com/crewAIInc/crewAI">https://github.com/crewAIInc/crewAI</a></td><td>Crews、Flows、生产级 agentic workflows</td></tr>
+    <tr><td>STRIATUM-CTF</td><td><a href="https://arxiv.org/abs/2603.22577">https://arxiv.org/abs/2603.22577</a></td><td>协议驱动安全 agent 与 MCP 思路</td></tr>
+    <tr><td>行业研究</td><td><a href="https://arxiv.org/abs/2602.09185">AIDev</a>；<a href="https://arxiv.org/abs/2602.14690">Configuring Agentic AI Coding Tools</a>；<a href="https://arxiv.org/abs/2604.14228">Dive into Claude Code</a></td><td>佐证 AI 编码 agent 使用、配置碎片化和系统设计趋势</td></tr>
+  </tbody>
+</table>

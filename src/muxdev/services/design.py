@@ -36,7 +36,6 @@ DESIGN_DOCUMENT_QUALITY_GROUPS = {
     "ui and states": ("界面", "状态", "屏幕", "ui", "state", "screen"),
     "rules and data": ("规则", "数据", "计分", "rules", "data", "scoring", "entities", "api"),
     "acceptance and tests": ("验收", "测试", "验证", "acceptance", "test", "verify"),
-    "risks": ("风险", "缓解", "risk", "mitigation"),
     "roadmap": ("实施", "路线", "步骤", "implementation", "roadmap", "sequence"),
     "open questions": ("待确认", "未确认", "open question", "assumption", "假设"),
 }
@@ -73,16 +72,60 @@ DESIGN_STAGE_TITLES = {
 }
 
 DESIGN_FIELD_TITLES = {
+    "name": "方案名称",
+    "summary": "摘要",
     "problem_statement": "目标与范围",
+    "goal": "目标",
+    "goals": "目标",
     "scope": "目标与范围",
     "assumptions": "假设",
+    "assumed_defaults": "默认假设",
     "acceptance_criteria": "验收标准",
     "requirements": "需求与约束",
+    "constraints": "约束",
+    "non_goals": "非目标",
     "user_preferences": "用户偏好",
     "design_preferences": "用户偏好",
     "style_preferences": "用户偏好",
+    "audience": "目标用户",
+    "users": "目标用户",
+    "target_users": "目标用户",
+    "platform": "目标平台",
+    "target_platform": "目标平台",
+    "style": "视觉风格",
+    "visual_direction": "视觉方向",
     "proposed_design": "设计方案",
     "architecture": "设计方案",
+    "architecture_options": "架构选项",
+    "decision_record": "方案决策",
+    "system_design": "系统设计",
+    "core_loop": "核心流程",
+    "controls": "控制方式",
+    "desktop": "桌面端",
+    "keyboard": "键盘",
+    "mobile": "移动端",
+    "touch": "触控",
+    "input_rules": "输入规则",
+    "interactions": "交互",
+    "feedback": "反馈",
+    "ui": "界面",
+    "ui_states": "界面与状态",
+    "screens": "页面",
+    "states": "状态",
+    "rules": "规则",
+    "rules_and_data": "规则与数据",
+    "scoring": "计分",
+    "entities": "实体",
+    "data_model": "数据模型",
+    "game": "游戏状态",
+    "snake": "蛇",
+    "snake_segment": "蛇身格",
+    "food": "食物",
+    "board": "棋盘",
+    "score": "分数",
+    "modules": "模块",
+    "technical_approach": "技术方案",
+    "technology": "技术方案",
     "state_model": "状态模型",
     "data_flow": "数据流",
     "api_and_data_model": "API 与数据模型",
@@ -90,14 +133,39 @@ DESIGN_FIELD_TITLES = {
     "tests": "测试策略",
     "implementation_sequence": "实施步骤",
     "implementation_roadmap": "实施步骤",
+    "roadmap": "实施路线",
     "important_alternatives": "备选方案",
     "risks_and_mitigations": "风险与缓解",
     "risks": "风险与缓解",
     "open_questions": "待确认问题",
     "unconfirmed_items": "未确认项",
+    "final_design_review": "最终设计评审",
 }
 
 PREFERENCE_KEYS = {"user_preferences", "design_preferences", "style_preferences"}
+INTERNAL_USER_DOC_KEYS = {
+    "artifacts",
+    "blockers",
+    "claims",
+    "contract_version",
+    "created_at",
+    "delivery_decision",
+    "depth",
+    "evidence",
+    "feedback_request",
+    "has_blockers",
+    "intent",
+    "memory_proposals",
+    "missing_evidence",
+    "ordered_steps",
+    "provider",
+    "roles",
+    "run_id",
+    "source_evidence",
+    "status",
+    "verification_approach",
+    "workflow",
+}
 NOISE_PREFIXES = (
     "Reading prompt from stdin",
     "output:",
@@ -264,23 +332,20 @@ def _acceptance_section_mentions_non_delivery(text: str) -> bool:
 
 def _markdown_for(filename: str, task: str, run_id: str, automation: dict[str, Any]) -> str:
     title = filename[3:-3].replace("_", " ").title()
-    roles = ", ".join(str(role) for role in automation.get("roles", []) or []) or "design roles"
     return "\n".join(
         [
             f"# {title}",
             "",
-            f"- Run: {run_id}",
-            f"- Task: {task}",
-            f"- Roles: {roles}",
+            f"- 任务: {task}",
             "",
-            "本节未在 provider 输出中明确提供；请在实现前复核并补充。",
+            "本节尚未在设计输出中明确提供；请在实现前复核并补充。",
             "",
         ]
     )
 
 
 def _user_design_markdown(*, run_id: str, task: str, workflow: str, sections: list[tuple[str, str]]) -> str:
-    structured = _extract_structured_design_payload(sections)
+    structured = _extract_structured_design_payload(sections, purpose="user_doc")
     if structured:
         return _structured_design_markdown(run_id=run_id, task=task, workflow=workflow, payload=structured)
     return _fallback_design_markdown(run_id=run_id, task=task, workflow=workflow, sections=sections)
@@ -290,10 +355,6 @@ def _fallback_design_markdown(*, run_id: str, task: str, workflow: str, sections
     lines = [
         "# 设计文档",
         "",
-        f"- Run: {run_id}",
-        f"- Workflow: {workflow}",
-        f"- 任务: {task}",
-        "",
     ]
     if workflow in DESIGN_WORKFLOWS:
         lines.extend(
@@ -301,17 +362,17 @@ def _fallback_design_markdown(*, run_id: str, task: str, workflow: str, sections
                 "## 任务概览",
                 "",
                 f"- 任务: {task}",
-                "- 说明: 以下内容来自 provider 的最终设计输出，已过滤会话日志和调试事件。",
+                "- 说明: 以下内容来自设计阶段的最终输出，已过滤会话日志和调试事件。",
                 "",
                 "## 未确认项",
                 "",
-                "- Provider 最终输出未明确记录目标用户、视觉风格或参考产品偏好；后续实现前需要确认。",
+                "- 当前设计未明确记录目标用户、视觉风格或参考产品偏好；后续实现前需要确认。",
                 "",
             ]
         )
     for title, content in sections:
         clean_title = _localized_title(str(title).strip() or "Design")
-        clean_content = _clean_stage_content(str(content)).strip()
+        clean_content = _clean_user_visible_content(str(content)).strip()
         if not clean_content:
             continue
         lines.extend([f"## {clean_title}", "", clean_content, ""])
@@ -324,16 +385,17 @@ def _structured_design_markdown(*, run_id: str, task: str, workflow: str, payloa
     if isinstance(payload.get("design_pack"), dict):
         return _structured_design_pack_markdown(run_id=run_id, task=task, workflow=workflow, payload=payload)
 
-    design_doc = payload.get("design_doc") if isinstance(payload.get("design_doc"), dict) else payload
+    if isinstance(payload.get("design_doc"), dict):
+        design_doc = payload.get("design_doc")
+    elif isinstance(payload.get("design_document"), dict):
+        design_doc = payload.get("design_document")
+    else:
+        design_doc = payload
     if not isinstance(design_doc, dict):
         raise ValueError("structured design payload is not a mapping")
 
     lines = [
         "# 设计文档",
-        "",
-        f"- Run: {run_id}",
-        f"- Workflow: {workflow}",
-        f"- 任务: {task}",
         "",
         "## 任务概览",
         "",
@@ -345,7 +407,7 @@ def _structured_design_markdown(*, run_id: str, task: str, workflow: str, payloa
     preference_value = _first_present(design_doc, PREFERENCE_KEYS)
     lines.extend(["## 用户偏好", ""])
     if preference_value is None:
-        lines.append("- Provider 最终输出未明确记录目标用户、视觉风格或参考产品偏好；后续实现前需要确认。")
+        lines.append("- 当前设计未明确记录目标用户、视觉风格或参考产品偏好；后续实现前需要确认。")
     else:
         _append_value(lines, preference_value)
     lines.append("")
@@ -382,8 +444,8 @@ def _structured_design_markdown(*, run_id: str, task: str, workflow: str, payloa
     risk_values = []
     if _has_content(payload.get("risks")):
         risk_values.append(payload.get("risks"))
-    if _has_content(payload.get("missing_evidence")):
-        risk_values.append({"missing_evidence": payload.get("missing_evidence")})
+    if _has_content(payload.get("risks_and_mitigations")):
+        risk_values.append(payload.get("risks_and_mitigations"))
     if risk_values:
         lines.extend(["## 风险与缓解", ""])
         for value in risk_values:
@@ -404,7 +466,7 @@ def _structured_design_markdown(*, run_id: str, task: str, workflow: str, payloa
         lines.append("")
 
     for key, value in design_doc.items():
-        if key in emitted or key in PREFERENCE_KEYS or key in {"summary", "claims", "evidence", "tests"}:
+        if key in emitted or key in PREFERENCE_KEYS or key in {"summary", "tests"} or _is_internal_user_key(key):
             continue
         if not _has_content(value):
             continue
@@ -418,20 +480,110 @@ def _structured_design_markdown(*, run_id: str, task: str, workflow: str, payloa
     return body
 
 
-def _extract_structured_design_payload(sections: list[tuple[str, str]]) -> dict[str, Any] | None:
-    payloads: list[dict[str, Any]] = []
+def _extract_structured_design_payload(
+    sections: list[tuple[str, str]],
+    *,
+    purpose: str = "user_doc",
+) -> dict[str, Any] | None:
+    candidates: list[tuple[int, int, int, dict[str, Any]]] = []
+    order = 0
     for _title, content in sections:
-        payloads.extend(_payloads_from_text(str(content)))
-    for payload in reversed(payloads):
-        if isinstance(payload.get("design_pack"), dict):
-            return payload
-        if isinstance(payload.get("design_doc"), dict):
-            return payload
-        if _looks_like_design_pack(payload):
-            return {"design_pack": payload}
-        if _looks_like_design_doc(payload):
-            return {"design_doc": payload}
+        for payload in _payloads_from_text(str(content)):
+            for kind, normalized in _structured_payload_candidates(payload):
+                priority = _payload_priority(kind, purpose=purpose)
+                if priority <= 0:
+                    continue
+                candidates.append((priority, _payload_content_score(normalized), order, normalized))
+            order += 1
+    if candidates:
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        return candidates[0][3]
     return None
+
+
+def _structured_payload_candidates(payload: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    summary = payload.get("summary")
+    for key in ("design_doc", "design_document"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            normalized: dict[str, Any] = {"design_doc": value}
+            if _has_content(summary):
+                normalized["summary"] = summary
+            for optional_key in ("risks", "risks_and_mitigations"):
+                if _has_content(payload.get(optional_key)):
+                    normalized[optional_key] = payload[optional_key]
+            candidates.append(("explicit_design_doc", normalized))
+    if isinstance(payload.get("design_pack"), dict):
+        candidates.append(("explicit_design_pack", payload))
+    if _looks_like_design_doc(payload):
+        candidates.append(("loose_design_doc", {"design_doc": payload}))
+    if _looks_like_design_pack(payload):
+        candidates.append(("loose_design_pack", {"design_pack": payload}))
+    return candidates
+
+
+def _payload_priority(kind: str, *, purpose: str) -> int:
+    if purpose == "design_pack":
+        return {
+            "explicit_design_pack": 40,
+            "explicit_design_doc": 30,
+            "loose_design_pack": 20,
+            "loose_design_doc": 10,
+        }.get(kind, 0)
+    return {
+        "explicit_design_doc": 40,
+        "explicit_design_pack": 30,
+        "loose_design_doc": 20,
+        "loose_design_pack": 10,
+    }.get(kind, 0)
+
+
+def _payload_content_score(payload: dict[str, Any]) -> int:
+    body = payload.get("design_doc") if isinstance(payload.get("design_doc"), dict) else payload.get("design_pack")
+    if not isinstance(body, dict):
+        body = payload
+    score_keys = {
+        "problem_statement",
+        "summary",
+        "scope",
+        "requirements",
+        "goals",
+        "constraints",
+        "non_goals",
+        "audience",
+        "platform",
+        "target_users",
+        "target_platform",
+        "core_loop",
+        "controls",
+        "interactions",
+        "ui",
+        "screens",
+        "states",
+        "state_model",
+        "rules",
+        "scoring",
+        "entities",
+        "data_model",
+        "api_and_data_model",
+        "acceptance_criteria",
+        "test_strategy",
+        "tests",
+        "implementation_sequence",
+        "implementation_roadmap",
+        "roadmap",
+        "open_questions",
+        "unconfirmed_items",
+        "risks",
+        "risks_and_mitigations",
+    }
+    score = sum(10 for key in score_keys if _has_content(body.get(key)))
+    try:
+        score += min(len(json.dumps(body, ensure_ascii=False)), 5000) // 250
+    except (TypeError, ValueError):
+        score += 0
+    return score
 
 
 def _payloads_from_text(text: str) -> list[dict[str, Any]]:
@@ -496,6 +648,11 @@ def _looks_like_design_doc(payload: dict[str, Any]) -> bool:
         "rules",
         "test_strategy",
         "tests",
+        "constraints",
+        "non_goals",
+        "open_questions",
+        "implementation_roadmap",
+        "roadmap",
     }
     return bool(design_keys.intersection(payload))
 
@@ -522,10 +679,6 @@ def _structured_design_pack_markdown(*, run_id: str, task: str, workflow: str, p
     lines = [
         "# 设计文档",
         "",
-        f"- Run: {run_id}",
-        f"- Workflow: {workflow}",
-        f"- 任务: {task}",
-        "",
         "## 任务概览",
         "",
     ]
@@ -543,9 +696,8 @@ def _structured_design_pack_markdown(*, run_id: str, task: str, workflow: str, p
         ("规则与数据", ["rules", "scoring", "entities", "data_model", "api_and_data_model"]),
         ("验收标准", ["acceptance_criteria", "tests", "test_strategy"]),
         ("实施路线", ["implementation_sequence", "implementation_roadmap", "roadmap"]),
-        ("证据与依据", ["claims", "evidence"]),
         ("风险与缓解", ["risks", "risks_and_mitigations"]),
-        ("待确认问题 / 未确认项", ["open_questions", "unconfirmed_items", "missing_evidence"]),
+        ("待确认问题 / 未确认项", ["open_questions", "unconfirmed_items"]),
     ]
     emitted = {"summary", "name", "platform", "audience", "style"}
     for title, keys in groups:
@@ -561,7 +713,7 @@ def _structured_design_pack_markdown(*, run_id: str, task: str, workflow: str, p
             lines.append("")
 
     for key, value in pack.items():
-        if key in emitted or not _has_content(value):
+        if key in emitted or _is_internal_user_key(key) or not _has_content(value):
             continue
         lines.extend([f"## {_field_title(key)}", ""])
         _append_value(lines, value)
@@ -581,7 +733,7 @@ def _design_pack_markdown_sections(
     sections: list[tuple[str, str]],
     automation: dict[str, Any],
 ) -> dict[str, str]:
-    payload = _extract_structured_design_payload(sections)
+    payload = _extract_structured_design_payload(sections, purpose="design_pack")
     pack: dict[str, Any] = {}
     if payload:
         if isinstance(payload.get("design_pack"), dict):
@@ -589,8 +741,7 @@ def _design_pack_markdown_sections(
         elif isinstance(payload.get("design_doc"), dict):
             pack = dict(payload["design_doc"])
     fallback = _combined_stage_text(sections)
-    roles = ", ".join(str(role) for role in automation.get("roles", []) or []) or "design roles"
-    common = [f"- Run: {run_id}", f"- Workflow: {workflow}", f"- Task: {task}", f"- Roles: {roles}", ""]
+    common = [f"- 任务: {task}", ""]
 
     mapping = {
         "00_problem_statement.md": ("问题陈述", ["problem_statement", "summary", "name", "goals", "scope"]),
@@ -599,11 +750,11 @@ def _design_pack_markdown_sections(
         "03_decision_record.md": ("方案决策", ["decision_record", "proposed_design", "core_loop", "rules"]),
         "04_system_design.md": ("系统设计", ["system_design", "architecture", "states", "state_model", "entities"]),
         "05_api_and_data_model.md": ("API 与数据模型", ["api_and_data_model", "data_model", "data_flow", "scoring"]),
-        "06_risk_and_threat_model.md": ("风险与威胁模型", ["risks", "risks_and_mitigations", "missing_evidence"]),
+        "06_risk_and_threat_model.md": ("风险与威胁模型", ["risks", "risks_and_mitigations"]),
         "07_test_strategy.md": ("测试策略", ["test_strategy", "tests", "acceptance_criteria"]),
         "08_implementation_roadmap.md": ("实施路线图", ["implementation_sequence", "implementation_roadmap", "roadmap"]),
-        "09_open_questions.md": ("待确认问题", ["open_questions", "unconfirmed_items", "missing_evidence"]),
-        "10_final_design_review.md": ("最终设计评审", ["final_design_review", "claims", "evidence", "acceptance_criteria"]),
+        "09_open_questions.md": ("待确认问题", ["open_questions", "unconfirmed_items"]),
+        "10_final_design_review.md": ("最终设计评审", ["final_design_review", "acceptance_criteria"]),
     }
     rendered: dict[str, str] = {}
     for filename, (title, keys) in mapping.items():
@@ -616,10 +767,10 @@ def _design_pack_markdown_sections(
             lines.extend([f"## {_field_title(key)}", ""])
             _append_value(lines, pack.get(key))
             lines.append("")
-        if not used and fallback:
-            lines.extend(["## Provider 输出摘录", "", fallback, ""])
+        if not used and fallback and not pack:
+            lines.extend(["## 设计输出摘录", "", fallback, ""])
         elif not used:
-            lines.extend(["## 待补充", "", "- Provider 未明确给出本节内容，请在实现前复核。", ""])
+            lines.extend(["## 待补充", "", "- 本节尚未在设计输出中明确给出，请在实现前复核。", ""])
         rendered[filename] = "\n".join(lines).rstrip() + "\n"
     return rendered
 
@@ -627,7 +778,7 @@ def _design_pack_markdown_sections(
 def _combined_stage_text(sections: list[tuple[str, str]]) -> str:
     chunks: list[str] = []
     for title, content in sections:
-        clean = _clean_stage_content(str(content)).strip()
+        clean = _clean_user_visible_content(str(content)).strip()
         if not clean:
             continue
         clean_title = _localized_title(str(title).strip() or "Design")
@@ -636,6 +787,40 @@ def _combined_stage_text(sections: list[tuple[str, str]]) -> str:
     if len(text) > 4000:
         return text[:4000].rstrip() + "\n\n..."
     return text
+
+
+def _clean_user_visible_content(content: str) -> str:
+    clean = _clean_stage_content(content)
+    visible: list[str] = []
+    skip_section = False
+    internal_terms = (
+        "claims",
+        "evidence",
+        "missing evidence",
+        "missing_evidence",
+        "delivery_decision",
+        "verification_approach",
+        "run:",
+        "workflow:",
+        "roles:",
+        "provider",
+        "muxdev",
+    )
+    for line in clean.splitlines():
+        stripped = line.strip()
+        lowered = stripped.lower()
+        if stripped.startswith("#"):
+            skip_section = any(term in lowered for term in internal_terms)
+            if skip_section:
+                continue
+        elif skip_section:
+            continue
+        if any(lowered.startswith(prefix) for prefix in ("- run:", "- workflow:", "- roles:", "run:", "workflow:", "roles:")):
+            continue
+        if re.match(r'[-*]?\s*"?(?:claims|evidence|missing_evidence|delivery_decision|verification_approach)"?\s*[:：]', lowered):
+            continue
+        visible.append(line)
+    return "\n".join(visible).strip()
 
 
 def _clean_stage_content(content: str) -> str:
@@ -677,6 +862,11 @@ def _field_title(key: str) -> str:
     return DESIGN_FIELD_TITLES.get(key, key.replace("_", " ").title())
 
 
+def _is_internal_user_key(key: str) -> bool:
+    normalized = str(key).strip().lower().replace("-", "_")
+    return normalized in INTERNAL_USER_DOC_KEYS
+
+
 def _first_present(data: dict[str, Any], keys: set[str]) -> Any:
     for key in keys:
         if _has_content(data.get(key)):
@@ -687,6 +877,8 @@ def _first_present(data: dict[str, Any], keys: set[str]) -> Any:
 def _append_value(lines: list[str], value: Any) -> None:
     if isinstance(value, dict):
         for key, item in value.items():
+            if _is_internal_user_key(str(key)):
+                continue
             if not _has_content(item):
                 continue
             title = _field_title(str(key))
@@ -719,6 +911,8 @@ def _append_value(lines: list[str], value: Any) -> None:
 def _dict_inline_summary(value: dict[str, Any]) -> str:
     parts: list[str] = []
     for key, item in value.items():
+        if _is_internal_user_key(str(key)):
+            continue
         if _is_scalar(item) and _has_content(item):
             parts.append(f"{_field_title(str(key))}: {_scalar_text(item)}")
     return "; ".join(parts)

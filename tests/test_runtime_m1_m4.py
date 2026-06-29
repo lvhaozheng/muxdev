@@ -13,7 +13,7 @@ from muxdev.models import ApprovalStatus, ProviderActionStatus, RunStatus
 from muxdev.runtime import SupervisorRuntime, WorktreeManager
 from muxdev.providers.adapters import ProviderStageOutput
 from muxdev.services.deliverables import workflow_deliverable_status
-from muxdev.services.design import DESIGN_PACK_FILES
+from muxdev.services.design import DESIGN_PACK_FILES, design_document_quality_issues, write_user_design_document
 from muxdev.storage import Blackboard
 
 
@@ -286,12 +286,107 @@ def test_design_doc_extracts_structured_payload_from_provider_stream(monkeypatch
     assert '{"type":' not in content
 
 
+def test_design_doc_prefers_chinese_design_doc_over_later_intake_payload(workspace: Path) -> None:
+    chinese_design = {
+        "summary": "已完成中文贪吃蛇游戏设计方案。",
+        "claims": ["muxdev internal claim should not be user-facing"],
+        "evidence": [{"source": "muxdev trace"}],
+        "missing_evidence": ["Missing Evidence internal note"],
+        "design_doc": {
+            "problem_statement": "目标是设计一个简单、可直接实现的中文贪吃蛇小游戏，范围限定为浏览器单页游戏。",
+            "scope": ["提供完整设计文档", "覆盖桌面键盘和移动端触控", "不包含账号系统或在线排行榜"],
+            "requirements": [
+                "首屏必须直接呈现游戏棋盘、分数区和主要操作入口。",
+                "设计需要说明游戏开始、暂停、失败和重新开始之间的状态转换。",
+                "移动端方向按钮需要足够大，避免误触并保持棋盘可见。",
+            ],
+            "constraints": ["棋盘需要响应式布局", "移动端控制区不能遮挡游戏区域", "分数只保存在本地状态"],
+            "non_goals": ["不做多人模式", "不做复杂关卡编辑器"],
+            "user_preferences": {
+                "assumed_defaults": ["目标平台为 Web 浏览器", "默认规则为撞墙失败"],
+                "visual_direction": "清晰的像素风",
+            },
+            "audience": "喜欢短局休闲游戏的中文用户。",
+            "platform": "桌面和移动端浏览器。",
+            "core_loop": ["开始游戏", "控制蛇移动", "吃到食物", "增长身体并得分", "碰撞后结束", "重新开始"],
+            "controls": {"desktop": "方向键或 WASD", "mobile": "底部方向按钮", "input_rules": ["禁止 180 度立即反向"]},
+            "ui": [
+                "棋盘使用等比例网格呈现蛇身、蛇头和食物。",
+                "当前分数和最高分固定在棋盘上方，游戏过程中实时更新。",
+                "暂停、继续和重新开始按钮放在主操作区，移动端方向控制放在棋盘下方。",
+            ],
+            "states": ["待开始", "运行中", "暂停", "游戏结束"],
+            "rules": [
+                "不能直接反向移动，避免玩家一键让蛇头撞到蛇身。",
+                "食物只出现在空白格，蛇吃到食物后身体增长一格。",
+                "撞墙或撞到自己即失败，失败后保留本局分数并允许立即重开。",
+            ],
+            "scoring": "每吃到一个食物增加 10 分，并随分数逐步提升速度。",
+            "acceptance_criteria": ["用户可以开始、暂停和重新开始游戏", "蛇能移动、吃食物、增长并计分", "碰撞后进入明确的游戏结束状态"],
+            "test_strategy": ["检查设计文档覆盖目标、用户、交互、状态、规则和验收", "实现后冒烟测试键盘、触控、暂停、计分、碰撞和重开"],
+            "proposed_design": {"技术方案": "HTML/CSS/JavaScript Canvas", "模块": ["游戏引擎", "渲染器", "输入控制器"]},
+            "state_model": {"game": ["待开始", "运行中", "暂停", "游戏结束"], "snake_segment": ["x 坐标", "y 坐标"]},
+            "data_flow": ["用户输入进入输入控制器", "游戏引擎更新蛇和食物状态", "渲染器绘制棋盘和分数"],
+            "implementation_sequence": [
+                "搭建页面骨架、棋盘容器、分数区和基础视觉样式。",
+                "实现输入控制、固定节奏 tick、蛇移动、食物生成和碰撞判断。",
+                "补充分数、最高分、速度提升、暂停和重新开始流程。",
+                "验证桌面键盘、移动端触控、不同屏幕宽度和失败恢复体验。",
+            ],
+            "open_questions": ["最终棋盘尺寸和速度曲线仍可在实现前微调。"],
+            "claims": ["muxdev nested claim should not render"],
+            "evidence": [{"file": "muxdev evidence should not render"}],
+            "missing_evidence": ["Missing Evidence nested note"],
+        },
+    }
+    later_intake_like_payload = {
+        "summary": "Intake classification: actionable design-lite feature request.",
+        "problem_statement": "Design a simple Snake game with classic rules.",
+        "users": ["Casual browser players"],
+        "acceptance_criteria": ["English intake acceptance should not be selected."],
+        "constraints": ["English shallow payload generated later by repair."],
+        "non_goals": ["No account system."],
+        "open_questions": ["English question should not win."],
+    }
+
+    path = write_user_design_document(
+        workspace=workspace,
+        run_id="run_lang",
+        task="设计一个简单的贪吃蛇小游戏",
+        workflow="design-lite",
+        sections=[
+            ("design_brief", json.dumps(chinese_design, ensure_ascii=False)),
+            ("00_problem_statement", "```json\n" + json.dumps(later_intake_like_payload, ensure_ascii=False) + "\n```"),
+        ],
+    )
+
+    content = path.read_text(encoding="utf-8")
+    assert "目标是设计一个简单、可直接实现的中文贪吃蛇小游戏" in content
+    assert "Design a simple Snake game" not in content
+    assert "Intake classification" not in content
+    assert "Run:" not in content
+    assert "Workflow:" not in content
+    assert "Assumed Defaults" not in content
+    assert "Input Rules" not in content
+    assert "Snake Segment" not in content
+    assert "默认假设" in content
+    assert "输入规则" in content
+    assert "蛇身格" in content
+    assert "Claims" not in content
+    assert "Evidence" not in content
+    assert "Missing Evidence" not in content
+    assert "muxdev" not in content.lower()
+
+
 def test_design_doc_extracts_top_level_design_pack(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
     class DesignPackProvider:
         def run_stage(self, *, stage_id: str, task: str, worktree: Path) -> ProviderStageOutput:
             if stage_id == "design_brief":
                 payload = {
                     "summary": "完成贪吃蛇小游戏设计。",
+                    "claims": ["muxdev internal top-level claim"],
+                    "evidence": [{"source": "muxdev provider trace"}],
+                    "missing_evidence": ["Missing Evidence internal top-level note"],
                     "design_pack": {
                         "name": "贪吃蛇小游戏",
                         "platform": "Web",
@@ -317,6 +412,9 @@ def test_design_doc_extracts_top_level_design_pack(monkeypatch: pytest.MonkeyPat
                         "risks": ["移动端手感需要后续验证"],
                         "risks_and_mitigations": ["Small mobile screens can crowd controls; reserve a fixed control area below the board."],
                         "open_questions": ["Confirm exact board size and speed curve."],
+                        "claims": ["muxdev internal nested claim"],
+                        "evidence": [{"source": "muxdev nested trace"}],
+                        "missing_evidence": ["Missing Evidence nested note"],
                     },
                 }
                 return ProviderStageOutput("design/design_brief.md", json.dumps(payload, ensure_ascii=False), "done")
@@ -333,11 +431,67 @@ def test_design_doc_extracts_top_level_design_pack(monkeypatch: pytest.MonkeyPat
     assert "贪吃蛇小游戏" in content
     assert "## 玩法与交互" in content
     assert "## 验收标准" in content
+    assert "Claims" not in content
+    assert "Evidence" not in content
+    assert "Missing Evidence" not in content
+    assert "muxdev" not in content.lower()
     design_dir = result.run_dir / "design"
     for filename in DESIGN_PACK_FILES:
         section = (design_dir / filename).read_text(encoding="utf-8")
         assert "This design pack section is generated by muxdev P0" not in section
-        assert "Provider 输出摘录" in section or "## " in section
+        assert "Provider 输出摘录" not in section
+        assert "Claims" not in section
+        assert "Evidence" not in section
+        assert "Missing Evidence" not in section
+        assert "muxdev" not in section.lower()
+        assert "设计输出摘录" in section or "## " in section
+
+
+def test_design_pack_without_risks_still_publishes(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
+    class DesignPackWithoutRisksProvider:
+        def run_stage(self, *, stage_id: str, task: str, worktree: Path) -> ProviderStageOutput:
+            if stage_id == "design_brief":
+                payload = {
+                    "summary": "完成贪吃蛇小游戏设计。",
+                    "design_pack": {
+                        "name": "贪吃蛇小游戏",
+                        "platform": "Web",
+                        "audience": "休闲玩家",
+                        "style": "现代清晰网格",
+                        "goals": ["Create a clear browser snake-game design", "Support keyboard play"],
+                        "scope": ["Design-only handoff", "Single-page browser game", "No backend"],
+                        "constraints": ["Readable controls", "Simple local game state"],
+                        "core_loop": ["开始游戏", "移动蛇", "吃食物", "获得分数", "避免碰撞", "重新开始"],
+                        "controls": {"keyboard": "方向键 / WASD"},
+                        "interactions": ["Start from idle", "Pause and resume", "Restart from game over"],
+                        "feedback": ["Score updates immediately", "Collision shows game over"],
+                        "ui": ["分数", "开始", "暂停", "重新开始"],
+                        "screens": ["Start screen", "Running board", "Paused overlay", "Game-over summary"],
+                        "states": ["idle", "running", "paused", "gameOver"],
+                        "rules": ["撞墙或撞到自己即失败", "食物只出现在空白格"],
+                        "scoring": "Each food adds 10 points.",
+                        "entities": ["Snake", "Food", "Board", "Score"],
+                        "data_model": {"snake": "ordered grid cells", "food": "one empty grid cell", "score": "integer points"},
+                        "acceptance_criteria": ["可以开始游戏", "蛇能移动和吃食物", "失败后可以重新开始"],
+                        "test_strategy": ["Inspect complete design sections.", "Future smoke tests cover start, movement, scoring, collision, and restart."],
+                        "implementation_sequence": ["Build board UI", "Implement movement and food rules", "Add score", "Verify controls"],
+                        "open_questions": ["Confirm exact board size and speed curve."],
+                    },
+                }
+                return ProviderStageOutput("design/design_brief.md", json.dumps(payload, ensure_ascii=False), "done")
+            if stage_id == "design_review":
+                return ProviderStageOutput("design/design_review.md", '{"has_blockers": false, "blockers": []}', "ok")
+            return ProviderStageOutput(f"design/{stage_id}.md", "# stage\n\nok", "ok")
+
+    monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: DesignPackWithoutRisksProvider())
+
+    result = SupervisorRuntime(workspace).run("设计一个贪吃蛇游戏", provider="mock", workflow_name="design-lite")
+
+    assert result.status == RunStatus.COMPLETED
+    content = (workspace / "docs" / "design" / "design.md").read_text(encoding="utf-8")
+    assert "贪吃蛇小游戏" in content
+    issues = design_document_quality_issues(markdown=content)
+    assert not any("risks" in issue for issue in issues)
 
 
 def test_design_verify_blocks_shallow_design_document(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
@@ -430,6 +584,96 @@ def test_completed_continue_repairs_missing_design_deliverables_without_provider
     assert "This design pack section is generated by muxdev P0" not in (result.run_dir / "design" / "00_problem_statement.md").read_text(encoding="utf-8")
 
 
+def test_missing_deliverable_continue_repairs_running_run_after_blind_validator_without_provider(
+    monkeypatch: pytest.MonkeyPatch, workspace: Path
+) -> None:
+    runtime = SupervisorRuntime(workspace)
+    result = runtime.run("retry missing design deliverables from run artifacts", provider="mock", workflow_name="design-lite")
+    assert result.status == RunStatus.COMPLETED
+    user_doc = workspace / "docs" / "design" / "design.md"
+    user_doc.write_text("", encoding="utf-8")
+    for filename in DESIGN_PACK_FILES:
+        (result.run_dir / "design" / filename).write_text("This design pack section is generated by muxdev P0\n", encoding="utf-8")
+
+    blackboard = Blackboard(result.run_dir)
+    try:
+        blackboard.conn.execute(
+            "DELETE FROM artifacts WHERE run_id = ? AND kind IN (?, ?, ?, ?)",
+            (result.run_id, "project_design_doc", "design_pack", "design_contract", "memory_proposals"),
+        )
+        blackboard.conn.commit()
+        blackboard.add_error(result.run_id, None, "missing_deliverable", "missing required deliverables: project_design_doc, design_pack")
+        blackboard.add_error(result.run_id, None, "blind_validator_reject", "blind validator rejected the patch")
+        blackboard.conn.execute(
+            """
+            UPDATE error_details
+            SET created_at = ?
+            WHERE run_id = ? AND type = ?
+            """,
+            ("2099-01-01T00:00:00Z", result.run_id, "blind_validator_reject"),
+        )
+        blackboard.conn.commit()
+        blackboard.set_run_status(result.run_id, RunStatus.RUNNING)
+    finally:
+        blackboard.close()
+
+    def fail_provider(_name: str):
+        raise AssertionError("missing deliverable repair should not call provider")
+
+    monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", fail_provider)
+
+    repaired = runtime.resume(result.run_id)
+
+    assert repaired.status == RunStatus.COMPLETED
+    assert user_doc.exists()
+    assert (result.run_dir / "design" / "00_problem_statement.md").exists()
+    blackboard = Blackboard(result.run_dir)
+    try:
+        artifacts = blackboard.table_rows("artifacts", run_id=result.run_id)
+        kinds = {row["kind"] for row in artifacts}
+        run = blackboard.get_run(result.run_id)
+    finally:
+        blackboard.close()
+    assert run["status"] == str(RunStatus.COMPLETED)
+    assert {"project_design_doc", "design_pack"} <= kinds
+
+
+def test_completed_continue_recovers_design_doc_from_run_design_files(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
+    runtime = SupervisorRuntime(workspace)
+    result = runtime.run("recover design doc from run files", provider="mock", workflow_name="design-lite")
+    assert result.status == RunStatus.COMPLETED
+    user_doc = workspace / "docs" / "design" / "design.md"
+    user_doc.write_text("", encoding="utf-8")
+
+    blackboard = Blackboard(result.run_dir)
+    try:
+        blackboard.conn.execute(
+            "DELETE FROM artifacts WHERE run_id = ? AND kind IN (?, ?)",
+            (result.run_id, "stage_output", "project_design_doc"),
+        )
+        blackboard.conn.commit()
+    finally:
+        blackboard.close()
+
+    def fail_provider(_name: str):
+        raise AssertionError("completed deliverable repair should recover from run design files")
+
+    monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", fail_provider)
+
+    repaired = runtime.resume(result.run_id)
+
+    assert repaired.status == RunStatus.COMPLETED
+    assert user_doc.exists()
+    content = user_doc.read_text(encoding="utf-8")
+    assert "Mock design output" in content
+    blackboard = Blackboard(result.run_dir)
+    try:
+        design_artifacts = [row for row in blackboard.table_rows("artifacts", run_id=result.run_id) if row["kind"] == "project_design_doc"]
+    finally:
+        blackboard.close()
+    assert [Path(row["path"]) for row in design_artifacts] == [user_doc]
+
+
 def test_design_provider_question_pauses_and_response_reaches_next_context(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
     class DesignQuestionProvider:
         def __init__(self) -> None:
@@ -503,6 +747,98 @@ def test_design_provider_question_pauses_and_response_reaches_next_context(monke
     assert provider.seen_preference is True
     assert "面向儿童，像素风，浏览器优先" in content
     assert "## 用户偏好" in content
+
+
+def test_structured_design_feedback_pauses_and_reruns_with_feedback(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
+    class FeedbackProvider:
+        def __init__(self) -> None:
+            self.design_brief_calls = 0
+            self.saw_feedback = False
+            self.saw_upstream_artifact = False
+
+        def run_stage(self, *, stage_id: str, task: str, worktree: Path) -> ProviderStageOutput:
+            if stage_id == "design_brief":
+                self.design_brief_calls += 1
+                if self.design_brief_calls == 1:
+                    return ProviderStageOutput(
+                        "design/design_brief.md",
+                        json.dumps(
+                            {
+                                "delivery_decision": "needs_feedback",
+                                "feedback_request": "Which compliance region should this flow satisfy?",
+                                "summary": "Compliance region changes the core design.",
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "needs design feedback",
+                    )
+                match = re.search(r"- path: (.+)", task)
+                assert match is not None
+                packet = json.loads(Path(match.group(1).strip()).read_text(encoding="utf-8"))
+                events = packet["run"]["feedback_events"]
+                self.saw_feedback = any(
+                    row.get("kind") == "plan_feedback" and "US SOC2" in str(row.get("content") or "")
+                    for row in events
+                )
+                return _complete_design_stage_output(stage_id, "Design uses US SOC2 assumptions")
+            if stage_id == "design_review":
+                match = re.search(r"- path: (.+)", task)
+                assert match is not None
+                packet = json.loads(Path(match.group(1).strip()).read_text(encoding="utf-8"))
+                upstream = packet["run"]["upstream_artifacts"]
+                self.saw_upstream_artifact = any(
+                    row.get("stage_id") == "design_brief"
+                    and row.get("kind") == "stage_output"
+                    and Path(str(row.get("path") or "")).exists()
+                    for row in upstream
+                )
+                return ProviderStageOutput(
+                    "design/design_review.md",
+                    json.dumps({"blockers": [], "delivery_decision": "complete", "missing_evidence": []}),
+                    "review complete",
+                )
+            return ProviderStageOutput(f"{stage_id}.md", json.dumps({"summary": "ok"}), "ok")
+
+    provider = FeedbackProvider()
+    monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: provider)
+    runtime = SupervisorRuntime(workspace)
+
+    paused = runtime.run("design compliance approval flow", provider="mock", workflow_name="design-lite")
+    blackboard = Blackboard(paused.run_dir)
+    try:
+        feedback_requests = [
+            row
+            for row in blackboard.table_rows("feedback_events", run_id=paused.run_id)
+            if row["kind"] == "design_feedback_request" and row["status"] == "pending"
+        ]
+        provider_actions = blackboard.list_provider_actions(status=str(ProviderActionStatus.PENDING), run_id=paused.run_id)
+        assert len(feedback_requests) == 1
+        assert provider_actions == []
+        request_id = feedback_requests[0]["feedback_id"]
+        blackboard.add_feedback_event(
+            run_id=paused.run_id,
+            source="user",
+            kind="plan_feedback",
+            severity="medium",
+            status="pending",
+            route_to="plan",
+            content="Use US SOC2 assumptions.",
+            payload={"source_feedback_requests": [request_id]},
+        )
+        blackboard.update_feedback_event_status(request_id, "handled")
+        for stage_id in ("design_brief", "design_review", "design_verify", "design_revise", "approve_plan", "design_pack"):
+            blackboard.reset_stage(paused.run_id, stage_id)
+        blackboard.set_run_status(paused.run_id, RunStatus.RUNNING)
+    finally:
+        blackboard.close()
+
+    resumed = runtime.resume(paused.run_id)
+
+    assert paused.status == RunStatus.AWAITING_FEEDBACK
+    assert resumed.status == RunStatus.COMPLETED
+    assert provider.design_brief_calls == 2
+    assert provider.saw_feedback is True
+    assert provider.saw_upstream_artifact is True
 
 
 def test_legacy_design_v2_alias_completes_review_gate_and_design_pack(workspace: Path) -> None:

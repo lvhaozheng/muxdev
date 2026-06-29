@@ -10,6 +10,7 @@ from typing import Any
 
 from ...config.loader import load_config
 from ...config.runtime import GATES, PUBLIC_WORKFLOWS, load_runtime_config
+from ...core.projects import resolve_project_root
 from ...services.product_experience import budget_panel, git_safety_panel, project_context_status, rules_skills_panel
 from ...services.skills import build_skill_catalog, verify_skill_lock
 from ...services.standards import EVIDENCE_LEVELS, RISK_LEVELS, SEVERITY_LEVELS, catalog_payload
@@ -56,7 +57,7 @@ def build_dashboard_overview(
     memory_governance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the aggregated project/global view used by the live dashboard."""
-    workspace = workspace.resolve()
+    workspace = resolve_project_root(workspace)
     ecosystem = ecosystem or {}
     hidden_projects = hidden_projects or {}
     hidden_tasks = hidden_tasks or {}
@@ -289,7 +290,7 @@ def _empty_project(path: Path) -> dict[str, Any]:
 def _project_summary(tasks: list[dict[str, Any]]) -> dict[str, Any]:
     active = [task for task in tasks if str(task.get("status")) not in {"completed", "blocked", "aborted"}]
     waiting = [task for task in tasks if int(task.get("pending_approvals") or 0) or int(task.get("pending_provider_actions") or 0)]
-    failed = [task for task in tasks if str(task.get("status")) in {"blocked", "aborted", "failed"} or int(task.get("errors") or 0)]
+    failed = [task for task in tasks if _task_currently_failed(task)]
     return {
         "tasks": len(tasks),
         "active": len(active),
@@ -302,7 +303,7 @@ def _project_summary(tasks: list[dict[str, Any]]) -> dict[str, Any]:
 
 def _project_health(tasks: list[dict[str, Any]]) -> dict[str, Any]:
     waiting = [task for task in tasks if int(task.get("pending_approvals") or 0) or int(task.get("pending_provider_actions") or 0)]
-    failed = [task for task in tasks if str(task.get("status")) in {"blocked", "aborted", "failed"} or int(task.get("errors") or 0)]
+    failed = [task for task in tasks if _task_currently_failed(task)]
     high_cost = [task for task in tasks if float(task.get("cost_usd") or 0) > 0.5]
     if failed:
         status = "blocked"
@@ -499,11 +500,13 @@ def _task_card(task: dict[str, Any], role: str) -> dict[str, Any]:
         "risk": task.get("risk") or _task_risk(task),
         "delivery_confidence": task.get("delivery_confidence", {}),
         "evidence_summary": task.get("evidence_summary", {}),
+        "deliverable_status": task.get("deliverable_status", {}),
         "cost_usd": task.get("cost_usd", 0),
         "tokens": task.get("tokens", 0),
         "pending_approvals": task.get("pending_approvals", 0),
         "pending_provider_actions": task.get("pending_provider_actions", 0),
         "errors": task.get("errors", 0),
+        "historical_errors": task.get("historical_errors", 0),
         "error_summary": task.get("error_summary"),
         "gate": task.get("gate") or "",
         "skills": task.get("skills") or [],
@@ -1362,7 +1365,7 @@ def _workflow_best_for(name: str) -> list[str]:
 def _task_workspace(task: dict[str, Any], fallback: Path) -> Path:
     value = task.get("workspace") or ""
     try:
-        return Path(str(value or fallback)).expanduser().resolve()
+        return resolve_project_root(Path(str(value or fallback)))
     except OSError:
         return fallback
 
@@ -1395,7 +1398,7 @@ def _hidden_project_ids(hidden_projects: dict[str, dict[str, Any]]) -> set[str]:
 
 def _resolve_path(value: str) -> Path:
     try:
-        return Path(value).expanduser().resolve()
+        return resolve_project_root(Path(value))
     except OSError:
         return Path(value)
 
@@ -1407,13 +1410,24 @@ def _project_id(path: Path) -> str:
 
 
 def _task_risk(task: dict[str, Any]) -> str:
-    if str(task.get("status") or "") in {"blocked", "aborted", "failed"} or int(task.get("errors") or 0):
+    if _task_currently_failed(task):
         return "high"
     if int(task.get("pending_approvals") or 0) or int(task.get("pending_provider_actions") or 0):
         return "medium"
     if float(task.get("cost_usd") or 0) > 0.5:
         return "medium"
     return "low"
+
+
+def _task_deliverables_completed(task: dict[str, Any]) -> bool:
+    deliverable_status = task.get("deliverable_status") if isinstance(task.get("deliverable_status"), dict) else {}
+    return str(task.get("status") or "") == "completed" and deliverable_status.get("complete") is True
+
+
+def _task_currently_failed(task: dict[str, Any]) -> bool:
+    if _task_deliverables_completed(task):
+        return False
+    return str(task.get("status") or "") in {"blocked", "aborted", "failed"} or int(task.get("errors") or 0) > 0
 
 
 def _rows(value: object) -> list[dict[str, Any]]:

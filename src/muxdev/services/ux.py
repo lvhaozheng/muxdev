@@ -15,7 +15,7 @@ from ..core.text_cleaning import clean_provider_text
 
 
 TERMINAL_STATUSES = {"completed", "blocked", "aborted"}
-WAITING_STATUSES = {"awaiting_approval", "awaiting_provider_action", "paused_budget"}
+WAITING_STATUSES = {"awaiting_approval", "awaiting_provider_action", "awaiting_feedback", "paused_budget"}
 FAILED_STATUSES = {"blocked", "aborted", "failed"}
 DONE_STATUSES = {"completed"}
 BOARD_COLUMNS = {
@@ -93,13 +93,19 @@ def build_task_ux_summary(payload: dict[str, Any]) -> dict[str, Any]:
     stages = [row for row in payload.get("stages", []) if isinstance(row, dict)]
     approvals = [row for row in payload.get("approvals", []) if isinstance(row, dict)]
     provider_actions = [row for row in payload.get("provider_actions", []) if isinstance(row, dict)]
+    feedback_events = [row for row in payload.get("feedback_events", []) if isinstance(row, dict)]
     errors = [row for row in payload.get("errors", []) if isinstance(row, dict)]
     blockers = [row for row in payload.get("review_blockers", []) if isinstance(row, dict)]
     pending_approvals = [row for row in approvals if str(row.get("status")) == "pending"]
     pending_actions = [row for row in provider_actions if str(row.get("status")) == "pending"]
+    pending_feedback_requests = _pending_design_feedback_requests(feedback_events)
     current_stage = _current_stage(stages)
     progress = [_stage_progress(row) for row in stages]
     deliverables = _deliverables(payload, run_id)
+    deliverable_status = payload.get("deliverable_status") if isinstance(payload.get("deliverable_status"), dict) else {}
+    missing_deliverables = [str(item) for item in deliverable_status.get("missing", []) if item]
+    completed_deliverables_ok = bool(status in DONE_STATUSES and deliverable_status.get("complete") is True)
+    needs_deliverable_repair = bool(missing_deliverables and deliverable_status.get("complete") is not True)
     planning_feedback = _planning_feedback_action(run_id, stages)
 
     if pending_actions:
@@ -143,6 +149,28 @@ def build_task_ux_summary(payload: dict[str, Any]) -> dict[str, Any]:
             ]
         )
         user_state = "needs_action"
+        risk = "medium"
+    elif pending_feedback_requests:
+        first = pending_feedback_requests[0]
+        headline = "Design feedback needed"
+        why = str(first.get("content") or "The design stage needs your answer before it can safely continue.")
+        next_actions = [
+            NextAction(
+                kind="plan_feedback",
+                label="Submit design feedback",
+                description="Answer the design question and rerun the affected design stages.",
+                command=f'muxdev feedback add plan_feedback "<your feedback>" --run-id {run_id}',
+                endpoint="/api/feedback",
+            ),
+            NextAction(
+                kind="stop_task",
+                label="Stop task",
+                description="Abort this run if the design request is no longer valid.",
+                endpoint=f"/api/tasks/{run_id}/stop",
+                danger=True,
+            ),
+        ]
+        user_state = "needs_attention"
         risk = "medium"
     elif pending_approvals:
         first = pending_approvals[0]
@@ -193,6 +221,33 @@ def build_task_ux_summary(payload: dict[str, Any]) -> dict[str, Any]:
         ]
         user_state = "needs_attention"
         risk = "medium"
+    elif status == "awaiting_feedback":
+        headline = "Design feedback state needs reconciliation"
+        why = "The run is marked awaiting feedback, but no pending design feedback request exists. Continue the task to refresh the design state."
+        next_actions = [
+            NextAction(
+                kind="continue_task",
+                label="Continue",
+                description="Resume the run and let muxdev reconcile the design feedback gate.",
+                endpoint=f"/api/tasks/{run_id}/continue",
+            ),
+            NextAction(
+                kind="view_report",
+                label="View report",
+                description="Inspect the partial report for context.",
+                endpoint=f"/api/tasks/{run_id}/report",
+                method="GET",
+            ),
+            NextAction(
+                kind="stop_task",
+                label="Stop task",
+                description="Abort this run if it is no longer valid.",
+                endpoint=f"/api/tasks/{run_id}/stop",
+                danger=True,
+            ),
+        ]
+        user_state = "needs_attention"
+        risk = "medium"
     elif status == "awaiting_provider_action":
         headline = "Provider action state needs reconciliation"
         why = "The run is marked awaiting provider action, but no pending provider action record exists. Continue the task to refresh the provider gate state."
@@ -220,9 +275,17 @@ def build_task_ux_summary(payload: dict[str, Any]) -> dict[str, Any]:
         ]
         user_state = "needs_attention"
         risk = "medium"
-    elif status in {"blocked", "aborted"} or errors:
-        headline = "Task needs recovery"
-        why = _first_error(errors) or "The task stopped before normal delivery."
+    elif status in {"blocked", "aborted"} or needs_deliverable_repair or (errors and not completed_deliverables_ok):
+        latest_error = _latest_error_row(errors)
+        if _is_missing_deliverable_error(latest_error):
+            headline = "Delivery artifacts need repair"
+            why = _error_reason(latest_error or {}) or "Missing required deliverables."
+        elif needs_deliverable_repair:
+            headline = "Delivery artifacts need repair"
+            why = "Missing required deliverables: " + ", ".join(missing_deliverables)
+        else:
+            headline = "Task needs recovery"
+            why = _error_reason(latest_error or {}) or "The task stopped before normal delivery."
         next_actions = [
             NextAction(
                 kind="retry_continue",
@@ -316,6 +379,8 @@ def build_task_ux_summary(payload: dict[str, Any]) -> dict[str, Any]:
             "pending_approvals": len(pending_approvals),
             "provider_actions": len(provider_actions),
             "pending_provider_actions": len(pending_actions),
+            "feedback_events": len(feedback_events),
+            "pending_feedback_requests": len(pending_feedback_requests),
             "errors": len(errors),
             "review_blockers": len(blockers),
             "trace_events": len(payload.get("trace", []) if isinstance(payload.get("trace"), list) else []),
@@ -379,9 +444,48 @@ def build_ux_overview(
         if not isinstance(task, dict):
             continue
         run_id = str(task.get("task_id") or task.get("run_id") or "")
+        status = str(task.get("status") or "")
+        error = task.get("error_summary") if isinstance(task.get("error_summary"), dict) else {}
         deliverable_status = task.get("deliverable_status") if isinstance(task.get("deliverable_status"), dict) else {}
+        feedback_request = _task_feedback_request(task)
         missing_deliverables = [str(item) for item in deliverable_status.get("missing", []) if item]
-        if _task_needs_approval_reconcile(task):
+        missing_deliverable_reason = (
+            _missing_deliverable_reason(task, missing_deliverables)
+            if status in FAILED_STATUSES or status in DONE_STATUSES or _is_missing_deliverable_error(error)
+            else ""
+        )
+        resolved_missing_deliverable = bool(deliverable_status.get("complete") is True and _is_missing_deliverable_error(error))
+        resolved_completed_errors = bool(status in DONE_STATUSES and deliverable_status.get("complete") is True)
+        if feedback_request:
+            action_items.append(
+                {
+                    "kind": "plan_feedback",
+                    "run_id": run_id,
+                    "task_id": run_id,
+                    "feedback_id": feedback_request.get("feedback_id") or "",
+                    "headline": "Design feedback needed",
+                    "why": feedback_request.get("content") or "The design stage needs your answer before it can safely continue.",
+                    "command": f'muxdev feedback add plan_feedback "<your feedback>" --run-id {run_id}',
+                    "endpoint": "/api/feedback",
+                    "optional": False,
+                    **_action_context(task, run_id=run_id, stage_id=str(feedback_request.get("stage_id") or task.get("current_stage") or "")),
+                }
+            )
+            continue
+        if _task_needs_feedback_reconcile(task):
+            action_items.append(
+                {
+                    "kind": "feedback_reconcile",
+                    "run_id": run_id,
+                    "task_id": run_id,
+                    "headline": "Design feedback state needs reconciliation",
+                    "why": "The run is marked awaiting feedback, but no pending design feedback request exists.",
+                    "endpoint": task.get("recover_endpoint") or f"/api/tasks/{run_id}/continue",
+                    "secondary_endpoint": task.get("report_endpoint") or f"/api/tasks/{run_id}/report",
+                    **_action_context(task, run_id=run_id, stage_id=str(task.get("current_stage") or "")),
+                }
+            )
+        elif _task_needs_approval_reconcile(task):
             action_items.append(
                 {
                     "kind": "approval_reconcile",
@@ -407,20 +511,25 @@ def build_ux_overview(
                     **_action_context(task, run_id=run_id, stage_id=str(task.get("current_stage") or "")),
                 }
             )
-        elif str(task.get("status") or "") == "completed" and missing_deliverables:
+        elif missing_deliverable_reason:
             action_items.append(
                 {
                     "kind": "missing_deliverable",
                     "run_id": run_id,
                     "task_id": run_id,
                     "headline": "Delivery artifacts need repair",
-                    "why": "Missing required deliverables: " + ", ".join(missing_deliverables),
+                    "why": missing_deliverable_reason,
                     "endpoint": task.get("recover_endpoint") or f"/api/tasks/{run_id}/continue",
                     "secondary_endpoint": task.get("report_endpoint") or f"/api/tasks/{run_id}/report",
                     **_action_context(task, run_id=run_id, stage_id=str(task.get("current_stage") or "")),
                 }
             )
-        elif _task_is_planning(task):
+            continue
+        elif resolved_missing_deliverable:
+            continue
+        elif resolved_completed_errors:
+            continue
+        elif _task_accepts_plan_feedback(task):
             optional_actions.append(
                 {
                     "kind": "plan_feedback",
@@ -428,16 +537,14 @@ def build_ux_overview(
                     "task_id": run_id,
                     "headline": "Plan is open for feedback",
                     "why": task.get("current_activity") or f"muxdev is working on {task.get('current_stage') or 'planning'}.",
-                    "command": f'muxdev feedback add manual_feedback "<your feedback>" --run-id {run_id}',
+                    "command": f'muxdev feedback add plan_feedback "<your feedback>" --run-id {run_id}',
                     "endpoint": "/api/feedback",
                     "optional": True,
                     **_action_context(task, run_id=run_id, stage_id=str(task.get("current_stage") or "")),
                 }
             )
-        status = str(task.get("status") or "")
         if status not in FAILED_STATUSES and not int(task.get("errors") or 0):
             continue
-        error = task.get("error_summary") if isinstance(task.get("error_summary"), dict) else {}
         reason = _error_reason(error) or "The task stopped before normal delivery."
         action_items.append(
             {
@@ -458,8 +565,10 @@ def build_ux_overview(
         for task in tasks
         if int(task.get("pending_approvals") or 0)
         or int(task.get("pending_provider_actions") or 0)
-        or int(task.get("errors") or 0)
+        or _task_pending_feedback_count(task)
+        or _task_has_unresolved_errors(task)
         or bool((task.get("deliverable_status") if isinstance(task.get("deliverable_status"), dict) else {}).get("missing"))
+        or _task_needs_feedback_reconcile(task)
         or _task_needs_approval_reconcile(task)
         or _task_needs_provider_action_reconcile(task)
     ]
@@ -476,6 +585,7 @@ def build_ux_overview(
             "needs_attention": len(needs_attention),
             "approvals": len(approvals),
             "provider_actions": len(provider_actions),
+            "feedback_requests": sum(_task_pending_feedback_count(task) for task in tasks if isinstance(task, dict)),
         },
         "action_center": action_items,
         "optional_actions": optional_actions,
@@ -630,6 +740,62 @@ def _is_design_provider_action(row: dict[str, Any]) -> bool:
     )
 
 
+def _pending_design_feedback_requests(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    requests = [
+        _feedback_event_with_payload(row)
+        for row in rows
+        if str(row.get("kind") or "") == "design_feedback_request" and str(row.get("status") or "") == "pending"
+    ]
+    return sorted(requests, key=lambda row: str(row.get("created_at") or ""))
+
+
+def _feedback_event_with_payload(row: dict[str, Any]) -> dict[str, Any]:
+    result = dict(row)
+    payload = result.get("payload")
+    if not isinstance(payload, dict):
+        try:
+            parsed = json.loads(str(result.get("payload_json") or "{}"))
+        except json.JSONDecodeError:
+            parsed = {}
+        payload = parsed if isinstance(parsed, dict) else {}
+    result["payload"] = payload
+    if not result.get("stage_id") and payload.get("stage_id"):
+        result["stage_id"] = payload.get("stage_id")
+    return result
+
+
+def _task_feedback_request(task: dict[str, Any]) -> dict[str, Any] | None:
+    direct = task.get("feedback_request")
+    if isinstance(direct, dict) and str(direct.get("status") or "") == "pending":
+        return _feedback_event_with_payload(direct)
+    events = task.get("feedback_events", []) if isinstance(task.get("feedback_events"), list) else []
+    pending = _pending_design_feedback_requests([row for row in events if isinstance(row, dict)])
+    if pending:
+        return pending[-1]
+    return None
+
+
+def _task_pending_feedback_count(task: dict[str, Any]) -> int:
+    try:
+        count = int(task.get("pending_feedback_requests") or 0)
+    except (TypeError, ValueError):
+        count = 0
+    if count:
+        return count
+    return 1 if _task_feedback_request(task) else 0
+
+
+def _task_has_unresolved_errors(task: dict[str, Any]) -> bool:
+    if not int(task.get("errors") or 0):
+        return False
+    error = task.get("error_summary") if isinstance(task.get("error_summary"), dict) else {}
+    deliverable_status = task.get("deliverable_status") if isinstance(task.get("deliverable_status"), dict) else {}
+    status = str(task.get("status") or "")
+    if status in DONE_STATUSES and deliverable_status.get("complete") is True:
+        return False
+    return not (deliverable_status.get("complete") is True and _is_missing_deliverable_error(error))
+
+
 def _planning_feedback_action(run_id: str, stages: list[dict[str, Any]]) -> NextAction | None:
     planning = [row for row in stages if _is_planning_stage(str(row.get("stage_id") or ""), str(row.get("role") or ""))]
     if not planning or not any(str(row.get("status")) in {"running", "completed"} for row in planning):
@@ -638,7 +804,7 @@ def _planning_feedback_action(run_id: str, stages: list[dict[str, Any]]) -> Next
         kind="plan_feedback",
         label="Give plan feedback",
         description="Add constraints, corrections, or preferences for the planning/design stages.",
-        command=f'muxdev feedback add manual_feedback "<your feedback>" --run-id {run_id}',
+        command=f'muxdev feedback add plan_feedback "<your feedback>" --run-id {run_id}',
         endpoint="/api/feedback",
         optional=True,
     )
@@ -649,11 +815,15 @@ def _is_planning_stage(stage_id: str, role: str) -> bool:
     return any(token in text for token in ("plan", "design", "requirement", "architecture", "roadmap", "problem_statement"))
 
 
-def _task_is_planning(task: dict[str, Any]) -> bool:
+def _task_accepts_plan_feedback(task: dict[str, Any]) -> bool:
     status = str(task.get("status") or "")
     if status in TERMINAL_STATUSES:
         return False
+    if status == "awaiting_feedback" or _task_pending_feedback_count(task):
+        return False
     if _task_needs_approval_reconcile(task):
+        return False
+    if _task_needs_feedback_reconcile(task):
         return False
     if _task_needs_provider_action_reconcile(task):
         return False
@@ -663,7 +833,12 @@ def _task_is_planning(task: dict[str, Any]) -> bool:
     if _is_planning_stage(current, str(task.get("role") or "")):
         return True
     timeline = task.get("stage_timeline", []) if isinstance(task.get("stage_timeline"), list) else []
-    return any(isinstance(row, dict) and str(row.get("status")) == "running" and _is_planning_stage(str(row.get("stage_id") or ""), str(row.get("role") or "")) for row in timeline)
+    return any(
+        isinstance(row, dict)
+        and str(row.get("status")) in {"running", "completed"}
+        and _is_planning_stage(str(row.get("stage_id") or ""), str(row.get("role") or ""))
+        for row in timeline
+    )
 
 
 def _task_needs_approval_reconcile(task: dict[str, Any]) -> bool:
@@ -671,6 +846,16 @@ def _task_needs_approval_reconcile(task: dict[str, Any]) -> bool:
         str(task.get("status") or "") == "awaiting_approval"
         and int(task.get("pending_approvals") or 0) == 0
         and int(task.get("pending_provider_actions") or 0) == 0
+        and int(task.get("errors") or 0) == 0
+    )
+
+
+def _task_needs_feedback_reconcile(task: dict[str, Any]) -> bool:
+    return (
+        str(task.get("status") or "") == "awaiting_feedback"
+        and _task_pending_feedback_count(task) == 0
+        and int(task.get("pending_provider_actions") or 0) == 0
+        and int(task.get("pending_approvals") or 0) == 0
         and int(task.get("errors") or 0) == 0
     )
 
@@ -738,10 +923,31 @@ def _deliverables(payload: dict[str, Any], run_id: str) -> list[dict[str, Any]]:
     return deliverables
 
 
-def _first_error(errors: list[dict[str, Any]]) -> str:
-    if not errors:
+def _latest_error_row(errors: list[dict[str, Any]]) -> dict[str, Any] | None:
+    rows = [row for row in errors if isinstance(row, dict)]
+    if not rows:
+        return None
+    return max(rows, key=lambda item: str(item.get("created_at") or ""))
+
+
+def _is_missing_deliverable_error(error: dict[str, Any] | None) -> bool:
+    if not error:
+        return False
+    kind = str(error.get("type") or error.get("error") or "").lower()
+    message = str(error.get("message") or "").lower()
+    return kind == "missing_deliverable" or "missing required deliverables" in message or "publish_error" in message
+
+
+def _missing_deliverable_reason(task: dict[str, Any], missing_deliverables: list[str]) -> str:
+    error = task.get("error_summary") if isinstance(task.get("error_summary"), dict) else None
+    deliverable_status = task.get("deliverable_status") if isinstance(task.get("deliverable_status"), dict) else {}
+    if deliverable_status.get("complete") is True:
         return ""
-    return _error_reason(errors[0])
+    if _is_missing_deliverable_error(error):
+        return _error_reason(error or {}) or "Missing required deliverables."
+    if missing_deliverables:
+        return "Missing required deliverables: " + ", ".join(missing_deliverables)
+    return ""
 
 
 def _error_reason(error: dict[str, Any]) -> str:
@@ -782,6 +988,7 @@ def _current_status(
     running = [task for task in tasks if str(task.get("status")) == "running"]
     waiting_provider = [task for task in tasks if int(task.get("pending_provider_actions") or 0) > 0 or str(task.get("status")) == "awaiting_provider_action"]
     waiting_approval = [task for task in tasks if int(task.get("pending_approvals") or 0) > 0 or str(task.get("status")) == "awaiting_approval"]
+    waiting_feedback = [task for task in tasks if _task_pending_feedback_count(task) > 0 or str(task.get("status")) == "awaiting_feedback"]
     stuck = [task for task in tasks if str(task.get("status")) in FAILED_STATUSES or int(task.get("errors") or 0) > 0]
     completed = [task for task in tasks if str(task.get("status")) in DONE_STATUSES]
     latest_completed = completed[:5]
@@ -791,6 +998,7 @@ def _current_status(
         "stuck": len(stuck),
         "waiting_provider_action": len(waiting_provider),
         "waiting_muxdev_approval": len(waiting_approval),
+        "waiting_design_feedback": len(waiting_feedback),
         "pending_provider_actions": len(provider_actions),
         "pending_approvals": len(approvals),
         "recent_completed": [
@@ -820,7 +1028,12 @@ def _board_column(task: dict[str, Any]) -> str:
         return "done"
     if status in FAILED_STATUSES or int(task.get("errors") or 0) > 0:
         return "failed"
-    if status in WAITING_STATUSES or int(task.get("pending_approvals") or 0) or int(task.get("pending_provider_actions") or 0):
+    if (
+        status in WAITING_STATUSES
+        or int(task.get("pending_approvals") or 0)
+        or int(task.get("pending_provider_actions") or 0)
+        or _task_pending_feedback_count(task)
+    ):
         return "waiting"
     if status in {"needs_review", "review"} or str(task.get("current_stage") or "") == "review":
         return "needs_review"
@@ -842,6 +1055,7 @@ def _board_task(task: dict[str, Any]) -> dict[str, Any]:
         "tokens": task.get("tokens", 0),
         "pending_approvals": task.get("pending_approvals", 0),
         "pending_provider_actions": task.get("pending_provider_actions", 0),
+        "pending_feedback_requests": task.get("pending_feedback_requests", 0),
         "current_stage": task.get("current_stage"),
         "delivery_confidence": task.get("delivery_confidence", {}),
         "evidence_summary": task.get("evidence_summary", {}),
@@ -900,7 +1114,7 @@ def _task_risk(task: dict[str, Any]) -> str:
         return "high" if status in DONE_STATUSES else "medium"
     if status in FAILED_STATUSES or int(task.get("errors") or 0) > 0:
         return "high"
-    if int(task.get("pending_approvals") or 0) or int(task.get("pending_provider_actions") or 0):
+    if int(task.get("pending_approvals") or 0) or int(task.get("pending_provider_actions") or 0) or _task_pending_feedback_count(task):
         return "medium"
     if float(task.get("cost_usd") or 0) > 0.5:
         return "medium"
