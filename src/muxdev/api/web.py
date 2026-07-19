@@ -13,9 +13,23 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
-from pydantic import BaseModel, ConfigDict, Field
-
 from .. import __version__
+from .models import (
+    ApprovalFeedbackRequest,
+    BenchmarkReplayRequest,
+    CancelRequest,
+    ContinueRequest,
+    ControlledAttestationRequest,
+    DemoRunRequest,
+    FeedbackRequest,
+    MultiRepoPlanRequest,
+    ProviderActionResponseRequest,
+    ReconcileRequest,
+    RoutingBenchmarkRequest,
+    RoutingReplayRequest,
+    StorageBackupRequest,
+    TaskCreateRequest,
+)
 from .minimal_dashboard import render_minimal_dashboard_html as render_workbench_dashboard_html
 from ..core.projects import resolve_project_root
 from ..core.canonical import canonical_sha256
@@ -32,7 +46,6 @@ from ..presentation.dashboard import (
     restore_dashboard_project,
     restore_dashboard_task,
 )
-from ..services.multirepo import plan_multi_repo_orchestration
 from ..services.product_experience import build_product_experience
 from ..services.skills import activate_skill, build_skill_catalog, scan_skills, score_skill, set_skill_policy, skill_show
 from ..services.skills.events import read_skill_events
@@ -45,7 +58,7 @@ from ..services.storage_admin import (
     storage_status as build_storage_status,
     verify_controlled_backup,
 )
-from ..services.attestation_bundle import export_attestation_bundle, verify_attestation_bundle
+from ..services.attestation_bundle import verify_attestation_bundle
 from ..services.trust import ProjectSigningKeyStore
 from ..services.local_auth import COOKIE_NAME, request_is_authenticated
 from ..services.routing_benchmark import TRUSTED_ROUTING_SUITE_ID, load_registered_routing_suite
@@ -642,108 +655,6 @@ def _terminal_class(summary: dict[str, Any]) -> str:
     return "terminal" if summary.get("terminal") else ""
 
 
-class TaskCreateRequest(BaseModel):
-    task: str
-    workspace: str | None = None
-    provider: str = "auto"
-    workflow: str = "software-dev"
-    gate: str | None = None
-    require_approval: list[str] = Field(default_factory=list)
-    max_cost_usd: float = 0.5
-    role_providers: dict[str, str] = Field(default_factory=dict)
-    skills: list[dict[str, Any]] = Field(default_factory=list)
-    ci_block_on_approval: bool = False
-    depth: str | None = None
-    automation: dict[str, Any] = Field(default_factory=dict)
-    routing_policy: dict[str, Any] = Field(default_factory=dict)
-
-
-class ContinueRequest(BaseModel):
-    max_cost_usd: float = 0.5
-
-
-class CancelRequest(BaseModel):
-    reason: str = ""
-    wait: bool = False
-    timeout: float = 30.0
-
-
-class ReconcileRequest(BaseModel):
-    decision: str
-    reason: str
-    acknowledge_duplicate_risk: bool = False
-
-
-class ApprovalFeedbackRequest(BaseModel):
-    feedback: str
-    max_cost_usd: float = 0.5
-
-
-class ProviderActionResponseRequest(BaseModel):
-    response: Any | None = None
-    choice: str | None = None
-    text: str | None = None
-    max_cost_usd: float = 0.5
-
-    def response_payload(self) -> Any:
-        if self.response is not None:
-            return self.response
-        if self.choice is not None:
-            return {"choice": self.choice}
-        if self.text is not None:
-            return {"text": self.text}
-        return {"handled": True}
-
-
-class MultiRepoPlanRequest(BaseModel):
-    task: str
-    repos: list[str] = Field(default_factory=list)
-    mode: str = "design"
-    workspace: str | None = None
-
-
-class FeedbackRequest(BaseModel):
-    kind: str
-    source: str = "manual"
-    content: str
-    workspace: str | None = None
-    run_id: str | None = None
-    severity: str = "medium"
-    provider: str = "mock"
-    payload: dict[str, Any] = Field(default_factory=dict)
-    auto_submit: bool = True
-
-
-class StorageBackupRequest(BaseModel):
-    scope: str = "all"
-
-
-class ControlledAttestationRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-
-class RoutingReplayRequest(BaseModel):
-    run_id: str
-    benchmark_snapshot_id: str | None = None
-
-
-class RoutingBenchmarkRequest(BaseModel):
-    suite_id: str = "trusted-routing-v1"
-    live: bool = False
-    acknowledged: bool = False
-    max_cost_usd: float | None = None
-
-
-class BenchmarkReplayRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    suite_id: str = TRUSTED_ROUTING_SUITE_ID
-
-
-class DemoRunRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    workspace: str | None = None
-
-
 def create_app(
     *,
     task_manager: object | None = None,
@@ -827,7 +738,7 @@ def create_app(
     @app.get("/tasks/{task_id}/terminal", response_class=HTMLResponse)
     def task_terminal_page(task_id: str, agent: str = "implementer") -> str:
         try:
-            detail = manager.task_detail(task_id)
+            detail = manager.queries.detail(task_id)
             handoff = manager.attach_command(task_id, agent=agent)
             return render_task_terminal_html(detail, handoff, agent=agent)
         except KeyError as exc:
@@ -838,7 +749,7 @@ def create_app(
     @app.get("/review/{task_id}", response_class=HTMLResponse)
     def task_review_page(task_id: str) -> str:
         try:
-            return render_run_review_html(manager.task_detail(task_id))
+            return render_run_review_html(manager.queries.detail(task_id))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except FileNotFoundError as exc:
@@ -876,8 +787,7 @@ def create_app(
     @app.get("/api/tasks/{run_id}/attestation")
     def task_attestation(run_id: str) -> dict[str, object]:
         try:
-            with manager.board() as board:
-                record = board.latest_delivery_attestation(run_id)
+            record = manager.queries.attestation(run_id)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="task not found") from exc
         if record is None:
@@ -908,12 +818,7 @@ def create_app(
         exports_root.mkdir(parents=True, exist_ok=True)
         output = exports_root / f"bundle_{uuid4().hex}.muxattest"
         try:
-            with manager.board() as board:
-                run = board.get_run(run_id)
-                run_dir = manager._run_dir(run_id, run=run)  # noqa: SLF001 - same application boundary
-                payload = export_attestation_bundle(
-                    board, run_id=run_id, run_dir=run_dir, output=output
-                )
+            payload = manager.commands.export_attestation(run_id, output)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="attestation not found") from exc
         except ValueError as exc:
@@ -937,8 +842,7 @@ def create_app(
         _require_local_origin(http_request)
         if not re.fullmatch(r"atex_[0-9a-f]{32}", export_id):
             raise HTTPException(status_code=400, detail="invalid export id")
-        with manager.board() as board:
-            record = board.get_attestation_export(export_id)
+        record = manager.queries.attestation_export(export_id)
         if record is None:
             raise HTTPException(status_code=404, detail="attestation export not found")
         exports_root = (manager.paths.data_dir / "attestation-exports").resolve()
@@ -993,8 +897,7 @@ def create_app(
     @app.get("/api/runs/{run_id}/replay")
     def state_replay(run_id: str) -> dict[str, object]:
         try:
-            with manager.board() as board:
-                return board.replay_run(run_id)
+            return manager.queries.replay(run_id)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -1007,9 +910,9 @@ def create_app(
         return dashboard_hidden_tasks_path(manager.paths.data_dir)
 
     def _dashboard_payload(root: Path, *, include_hidden: bool = False, include_global_config: bool = True) -> dict[str, object]:
-        tasks = manager.list_tasks()
-        approvals = manager.approvals(status=str(ApprovalStatus.PENDING))
-        actions = manager.provider_actions(status=str(ProviderActionStatus.PENDING))
+        tasks = manager.queries.list_tasks()
+        approvals = manager.queries.approvals(status=str(ApprovalStatus.PENDING))
+        actions = manager.queries.provider_actions(status=str(ProviderActionStatus.PENDING))
         provider_health = _provider_health_payload() if include_global_config else _deferred_provider_health_payload()
         ecosystem = manager.ecosystem_state() if include_global_config else {}
         memory_governance = _memory_governance_payload(root) if include_global_config else {}
@@ -1072,9 +975,9 @@ def create_app(
 
     @app.get("/api/ux/overview")
     def ux_overview() -> dict[str, object]:
-        tasks = manager.list_tasks()
-        approvals = manager.approvals(status=str(ApprovalStatus.PENDING))
-        actions = manager.provider_actions(status=str(ProviderActionStatus.PENDING))
+        tasks = manager.queries.list_tasks()
+        approvals = manager.queries.approvals(status=str(ApprovalStatus.PENDING))
+        actions = manager.queries.provider_actions(status=str(ProviderActionStatus.PENDING))
         return build_ux_overview(
             daemon=manager.daemon_status(),
             tasks=tasks,
@@ -1090,7 +993,7 @@ def create_app(
             daemon={**manager.daemon_status(), "status": "ok"},
             provider_health=_provider_health_payload(),
         )
-        payload["product_experience"] = build_product_experience(Path.cwd(), tasks=manager.list_tasks(), provider_health=payload["provider_health"])
+        payload["product_experience"] = build_product_experience(Path.cwd(), tasks=manager.queries.list_tasks(), provider_health=payload["provider_health"])
         return payload
 
     @app.get("/api/providers/health")
@@ -1109,7 +1012,7 @@ def create_app(
     @app.get("/api/product/experience")
     def product_experience(workspace: str | None = None) -> dict[str, object]:
         root = Path(workspace or Path.cwd()).resolve()
-        return build_product_experience(root, tasks=manager.list_tasks(), provider_health=_provider_health_payload())
+        return build_product_experience(root, tasks=manager.queries.list_tasks(), provider_health=_provider_health_payload())
 
     @app.get("/api/validation/experiments")
     def validation_experiments(workspace: str | None = None) -> list[dict[str, object]]:
@@ -1182,7 +1085,7 @@ def create_app(
             workspace = resolve_project_root(Path(request.workspace or Path.cwd()))
         except (FileNotFoundError, NotADirectoryError, OSError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return manager.submit_task(
+        return manager.commands.submit(
             task=request.task,
             workspace=workspace,
             provider=request.provider,
@@ -1200,12 +1103,12 @@ def create_app(
 
     @app.get("/api/tasks")
     def list_tasks() -> list[dict[str, object]]:
-        return manager.list_tasks()
+        return manager.queries.list_tasks()
 
     @app.get("/api/tasks/{task_id}")
     def task_detail(task_id: str) -> dict[str, object]:
         try:
-            return manager.task_detail(task_id)
+            return manager.queries.detail(task_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except FileNotFoundError as exc:
@@ -1214,7 +1117,7 @@ def create_app(
     @app.get("/api/tasks/{task_id}/ux")
     def task_ux(task_id: str) -> dict[str, object]:
         try:
-            return build_task_ux_summary(manager.task_detail(task_id))
+            return build_task_ux_summary(manager.queries.detail(task_id))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except FileNotFoundError as exc:
@@ -1223,7 +1126,7 @@ def create_app(
     @app.post("/api/tasks/{task_id}/continue")
     def continue_task(task_id: str, request: ContinueRequest | None = None) -> dict[str, object]:
         try:
-            return manager.continue_task(task_id, max_cost_usd=(request.max_cost_usd if request else 0.5))
+            return manager.commands.continue_task(task_id, max_cost_usd=(request.max_cost_usd if request else 0.5))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -1231,14 +1134,14 @@ def create_app(
     def stop_task(task_id: str, request: Request) -> dict[str, object]:
         _require_local_origin(request)
         try:
-            return manager.stop_task(task_id)
+            return manager.commands.stop(task_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/tasks/{task_id}/story")
     def task_story(task_id: str, cursor: str | None = None, limit: int = 200) -> dict[str, object]:
         try:
-            return manager.task_story(task_id, cursor=cursor, limit=limit)
+            return manager.queries.story(task_id, cursor=cursor, limit=limit)
         except (KeyError, FileNotFoundError) as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -1268,7 +1171,7 @@ def create_app(
         _require_local_origin(http_request)
         try:
             payload = request or CancelRequest()
-            return manager.cancel_task(task_id, reason=payload.reason, wait=payload.wait, timeout=payload.timeout)
+            return manager.coordinator.cancel(task_id, reason=payload.reason, wait=payload.wait, timeout=payload.timeout)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -1277,7 +1180,7 @@ def create_app(
     @app.get("/api/tasks/{task_id}/executions")
     def task_executions(task_id: str) -> dict[str, object]:
         try:
-            return manager.task_executions(task_id)
+            return manager.coordinator.executions(task_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -1405,21 +1308,21 @@ def create_app(
     @app.get("/api/tasks/{task_id}/diff")
     def task_diff(task_id: str) -> dict[str, object]:
         try:
-            return manager.diff(task_id)
+            return manager.queries.diff(task_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/tasks/{task_id}/report")
     def task_report(task_id: str) -> dict[str, object]:
         try:
-            return manager.report(task_id)
+            return manager.queries.report(task_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/tasks/{task_id}/rollback")
     def rollback_task(task_id: str, to_stage: str | None = None) -> dict[str, object]:
         try:
-            return manager.rollback(task_id, to_stage=to_stage)
+            return manager.commands.rollback(task_id, to_stage=to_stage)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -1432,7 +1335,7 @@ def create_app(
 
     @app.get("/api/provider-actions")
     def provider_actions(status: str | None = None) -> list[dict[str, object]]:
-        return manager.provider_actions(status=status)
+        return manager.queries.provider_actions(status=status)
 
     @app.get("/api/provider-scores")
     def provider_scores(role: str | None = None) -> list[dict[str, object]]:
@@ -1457,14 +1360,12 @@ def create_app(
     @app.post("/api/multi-repo/plan")
     def multi_repo_plan(request: MultiRepoPlanRequest) -> dict[str, object]:
         workspace = Path(request.workspace or Path.cwd()).resolve()
-        with manager.board() as board:
-            return plan_multi_repo_orchestration(
-                workspace,
-                repos=[Path(repo) for repo in request.repos],
-                task=request.task,
-                mode=request.mode,
-                blackboard=board,
-            )
+        return manager.commands.plan_multi_repo(
+            workspace=workspace,
+            repos=[Path(repo) for repo in request.repos],
+            task=request.task,
+            mode=request.mode,
+        )
 
     @app.post("/api/feedback")
     def feedback(request: FeedbackRequest) -> dict[str, object]:
@@ -1499,7 +1400,7 @@ def create_app(
     @app.get("/api/tasks/{task_id}/provider-actions")
     def task_provider_actions(task_id: str, status: str | None = None) -> list[dict[str, object]]:
         try:
-            return manager.provider_actions(status=status, task_id=task_id)
+            return manager.queries.provider_actions(status=status, task_id=task_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -1547,15 +1448,15 @@ def create_app(
     def provider_action_handled(action_id: str, request: ProviderActionResponseRequest | None = None) -> dict[str, object]:
         try:
             if request is not None:
-                return manager.respond_provider_action(action_id, request.response_payload())
-            return manager.update_provider_action(action_id, ProviderActionStatus.HANDLED)
+                return manager.commands.provider_response(action_id, request.response_payload())
+            return manager.commands.provider_action(action_id, ProviderActionStatus.HANDLED)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/provider-actions/{action_id}/response")
     def provider_action_response(action_id: str, request: ProviderActionResponseRequest) -> dict[str, object]:
         try:
-            return manager.respond_provider_action(action_id, request.response_payload())
+            return manager.commands.provider_response(action_id, request.response_payload())
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -1563,11 +1464,11 @@ def create_app(
     def provider_action_handled_and_continue(task_id: str, action_id: str, request: ProviderActionResponseRequest | None = None) -> dict[str, object]:
         try:
             handled = (
-                manager.respond_provider_action(action_id, request.response_payload())
+                manager.commands.provider_response(action_id, request.response_payload())
                 if request is not None and (request.response is not None or request.choice is not None or request.text is not None)
-                else manager.update_provider_action(action_id, ProviderActionStatus.HANDLED)
+                else manager.commands.provider_action(action_id, ProviderActionStatus.HANDLED)
             )
-            continued = manager.continue_task(task_id, max_cost_usd=(request.max_cost_usd if request else 0.5))
+            continued = manager.commands.continue_task(task_id, max_cost_usd=(request.max_cost_usd if request else 0.5))
             return {
                 "task_id": task_id,
                 "run_id": task_id,
@@ -1581,8 +1482,8 @@ def create_app(
     @app.post("/api/tasks/{task_id}/actions/{action_id}/respond-and-continue")
     def provider_action_respond_and_continue(task_id: str, action_id: str, request: ProviderActionResponseRequest) -> dict[str, object]:
         try:
-            handled = manager.respond_provider_action(action_id, request.response_payload())
-            continued = manager.continue_task(task_id, max_cost_usd=request.max_cost_usd)
+            handled = manager.commands.provider_response(action_id, request.response_payload())
+            continued = manager.commands.continue_task(task_id, max_cost_usd=request.max_cost_usd)
             return {
                 "task_id": task_id,
                 "run_id": task_id,
@@ -1596,32 +1497,32 @@ def create_app(
     @app.post("/api/provider-actions/{action_id}/dismiss")
     def provider_action_dismiss(action_id: str) -> dict[str, object]:
         try:
-            return manager.update_provider_action(action_id, ProviderActionStatus.DISMISSED)
+            return manager.commands.provider_action(action_id, ProviderActionStatus.DISMISSED)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/approvals")
     def approvals(status: str | None = None) -> list[dict[str, object]]:
-        return manager.approvals(status=status)
+        return manager.queries.approvals(status=status)
 
     @app.post("/api/approvals/{approval_id}/approve")
     def approve(approval_id: str) -> dict[str, object]:
         try:
-            return manager.decide_approval(approval_id, ApprovalStatus.APPROVED)
+            return manager.commands.approve(approval_id, ApprovalStatus.APPROVED)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/approvals/{approval_id}/deny")
     def deny(approval_id: str) -> dict[str, object]:
         try:
-            return manager.decide_approval(approval_id, ApprovalStatus.DENIED)
+            return manager.commands.approve(approval_id, ApprovalStatus.DENIED)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/approvals/{approval_id}/feedback")
     def approval_feedback(approval_id: str, request: ApprovalFeedbackRequest) -> dict[str, object]:
         try:
-            return manager.plan_feedback(approval_id, request.feedback)
+            return manager.commands.planning_feedback(approval_id, request.feedback)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -1630,8 +1531,8 @@ def create_app(
     @app.post("/api/approvals/{approval_id}/feedback-and-continue")
     def approval_feedback_and_continue(approval_id: str, request: ApprovalFeedbackRequest) -> dict[str, object]:
         try:
-            feedback = manager.plan_feedback(approval_id, request.feedback)
-            continued = manager.continue_task(str(feedback.get("run_id")), max_cost_usd=request.max_cost_usd)
+            feedback = manager.commands.planning_feedback(approval_id, request.feedback)
+            continued = manager.commands.continue_task(str(feedback.get("run_id")), max_cost_usd=request.max_cost_usd)
             return {
                 "approval": feedback,
                 "continue": continued,

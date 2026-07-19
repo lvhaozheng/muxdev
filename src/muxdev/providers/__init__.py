@@ -1,6 +1,6 @@
 """Provider discovery and runtime-adapter public API."""
 
-from .adapters import HeadlessCliProviderAdapter, MockProviderAdapter, ProviderAdapter, ProviderStageOutput, get_runtime_provider
+from .adapters import HeadlessCliProviderAdapter, MockProviderAdapter, ProviderAdapter, get_runtime_provider
 from .certified import CodexHarnessAdapter, QwenHarnessAdapter, ReplayAdapter, decode_codex_jsonl, decode_qwen_stream_json
 from .contracts import (
     ProviderActionDecision,
@@ -70,7 +70,6 @@ __all__ = [
     "ProviderRuntime",
     "ProviderRuntimeKind",
     "ProviderSession",
-    "ProviderStageOutput",
     "ProviderStatus",
     "ProviderStreamEvent",
     "QwenHarnessAdapter",

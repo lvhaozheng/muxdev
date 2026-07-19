@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Iterator, Mapping, Sequence
 
 from ..core.platforms import hidden_subprocess_kwargs, script_invocation
-from .adapters import HeadlessCliProviderAdapter, ProviderAdapter, ProviderStageOutput, _build_harness_events, _static_probe_env
+from ..domain import StageExecutionInput, StageExecutionResult
+from .adapters import HeadlessCliProviderAdapter, ProviderAdapter, _build_harness_events, _static_probe_env
 from .certification import make_certification_report, require_live_acknowledgement, sha256_text
 from .harness import (
     ADAPTER_CONTRACT_VERSION,
@@ -92,7 +93,7 @@ class CodexHarnessAdapter(HeadlessCliProviderAdapter):
         self.timeout = min(self.timeout, 60)
         try:
             with tempfile.TemporaryDirectory(prefix="muxdev-codex-cert-") as temp:
-                output = self.run_stage(stage_id="certify", task="Reply exactly MUXDEV_CERT_OK without tools.", worktree=Path(temp))
+                output = self.execute(_certification_input(self.id, Path(temp)))
                 return output.returncode == 0, f"live smoke exit={output.returncode}"
         finally:
             self.timeout = original_timeout
@@ -143,7 +144,7 @@ class QwenHarnessAdapter(HeadlessCliProviderAdapter):
         self.timeout = min(self.timeout, 60)
         try:
             with tempfile.TemporaryDirectory(prefix="muxdev-qwen-cert-") as temp:
-                output = self.run_stage(stage_id="certify", task="Reply exactly MUXDEV_CERT_OK without tools.", worktree=Path(temp))
+                output = self.execute(_certification_input(self.id, Path(temp)))
                 return output.returncode == 0, f"live smoke exit={output.returncode}"
         finally:
             self.timeout = original_timeout
@@ -224,7 +225,7 @@ class ReplayAdapter(ProviderAdapter):
         review_result = ""
         if "review" in handle.stage_id.lower():
             review_result = '\n{"has_blockers": false, "blockers": []}\n'
-        handle.metadata["output"] = ProviderStageOutput(
+        handle.metadata["output"] = StageExecutionResult(
             artifact_name=f"replay/{handle.stage_id}.json",
             content="# SIMULATED REPLAY\nThis output came from a verified fixture and is not production delivery evidence.\n" + review_result,
             summary="verified fixture replay (simulated)", tokens=0, cost_usd=0, returncode=0,
@@ -232,14 +233,10 @@ class ReplayAdapter(ProviderAdapter):
         )
         yield from events
 
-    def run_stage(
-        self, *, stage_id: str, task: str, worktree: Path,
-        skills: list[dict[str, object]] | None = None, session_dir: Path | None = None,
-        run_id: str | None = None, attempt: int = 1,
-    ) -> ProviderStageOutput:
+    def execute(self, input: StageExecutionInput) -> StageExecutionResult:
         handle = self.start(
-            stage_id=stage_id, task=task, worktree=worktree, skills=skills or [],
-            session_dir=session_dir, run_id=run_id, attempt=attempt,
+            stage_id=input.stage_id, task=input.task, worktree=input.worktree, skills=list(input.skills),
+            session_dir=input.session_dir, run_id=input.run_id, attempt=input.attempt,
         )
         tuple(self.events(handle))
         return handle.metadata["output"]  # type: ignore[return-value]
@@ -249,6 +246,20 @@ class ReplayAdapter(ProviderAdapter):
 
     def resume(self, handle: AttemptHandle) -> AttemptHandle | Unsupported:
         return self.start(**handle.metadata)
+
+
+def _certification_input(provider: str, worktree: Path) -> StageExecutionInput:
+    return StageExecutionInput(
+        run_id="certification",
+        stage_id="certify",
+        role="review",
+        task="Reply exactly MUXDEV_CERT_OK without tools.",
+        worktree=worktree,
+        context={},
+        capabilities={},
+        provider=provider,
+        policy={"read_only": True},
+    )
 
 
 def decode_codex_jsonl(output: str, *, returncode: int) -> list[tuple[str, HarnessEventSource, dict[str, object]]]:

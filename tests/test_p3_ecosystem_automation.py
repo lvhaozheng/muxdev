@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import shutil
 import uuid
 from pathlib import Path
@@ -24,29 +23,32 @@ pytestmark = pytest.mark.integration
 
 def test_feedback_router_submits_ci_rescue_and_records_cache() -> None:
     workspace = _workspace_temp("p3-feedback")
+    manager: TaskManager | None = None
     try:
         manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())
-        client = TestClient(create_app(task_manager=manager))
+        with TestClient(create_app(task_manager=manager)) as client:
+            routed = client.post(
+                "/api/feedback",
+                json={
+                    "kind": "ci_failed",
+                    "source": "github-actions",
+                    "content": "pytest failed in tests/test_login.py",
+                    "workspace": str(workspace),
+                    "provider": "mock",
+                },
+            ).json()
+            ecosystem = client.get("/api/ecosystem").json()
 
-        routed = client.post(
-            "/api/feedback",
-            json={
-                "kind": "ci_failed",
-                "source": "github-actions",
-                "content": "pytest failed in tests/test_login.py",
-                "workspace": str(workspace),
-                "provider": "mock",
-            },
-        ).json()
-        ecosystem = client.get("/api/ecosystem").json()
-
-        assert routed["auto"] is True
-        assert routed["route_to"] == "test"
-        assert routed["submitted"]["run_id"].startswith("run_")
-        assert ecosystem["feedback_events"][0]["kind"] == "ci_failed"
-        assert ecosystem["ci_rescues"][0]["rescue_run_id"] == routed["submitted"]["run_id"]
-        assert ecosystem["cache_entries"][0]["kind"] == "feedback_event"
+            assert routed["auto"] is True
+            assert routed["route_to"] == "test"
+            assert routed["submitted"]["run_id"].startswith("run_")
+            assert ecosystem["feedback_events"][0]["kind"] == "ci_failed"
+            assert ecosystem["ci_rescues"][0]["rescue_run_id"] == routed["submitted"]["run_id"]
+            assert ecosystem["cache_entries"][0]["kind"] == "feedback_event"
+            assert manager.wait(routed["submitted"]["run_id"], timeout=30.0)
     finally:
+        if manager is not None:
+            assert manager.close(timeout=30.0) == []
         shutil.rmtree(workspace, ignore_errors=True)
 
 
@@ -118,7 +120,7 @@ def test_mcp_guardrail_tools_record_events() -> None:
         tool_names = {tool["name"] for tool in server_manifest()["tools"]}
         assert "muxdev.check_policy" in tool_names
         assert "workflow.templates" in tool_names
-        assert "workflow.plugins" in tool_names
+        assert "workflow.plugins" not in tool_names
         assert "muxdev.submit_task" in tool_names
         templates = handle_jsonrpc(
             {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "workflow.templates", "arguments": {}}},
@@ -226,7 +228,7 @@ def test_cli_skill_lock_and_removed_plugin_command() -> None:
 
         assert locked.exit_code == 0
         assert removed.exit_code != 0
-        assert json.loads(removed.stdout)["status"] == "removed"
+        assert removed.stdout == ""
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 

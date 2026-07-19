@@ -12,6 +12,7 @@ from typing import Iterator, Mapping, Protocol
 from uuid import uuid4
 
 from ..core.redaction import redact
+from ..domain import StageExecutionInput, StageExecutionResult
 
 ADAPTER_CONTRACT_VERSION = 1
 ADAPTER_POLICY_VERSION = "v0.2-week4"
@@ -221,6 +222,8 @@ class AgentHarnessAdapter(Protocol):
     id: str
     adapter_version: str
     trust_tier: TrustTier
+
+    def execute(self, input: StageExecutionInput) -> StageExecutionResult: ...
 
     def probe(self) -> AdapterProbe: ...
 

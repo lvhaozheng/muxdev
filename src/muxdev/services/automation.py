@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..domain import AutomationDecision
+
 
 KNOWN_DEPTHS = {"auto", "simple", "light", "safe", "deep", "parallel", "ci"}
 LIGHTWEIGHT_CONFIDENCE_THRESHOLD = 0.7
@@ -156,31 +158,6 @@ class RepoSignals:
 
 
 @dataclass(frozen=True)
-class AutomationDecision:
-    intent: str
-    depth: str
-    workflow: str
-    roles: list[str]
-    reasons: list[str]
-    repo: RepoSignals
-    memory_context: list[dict[str, object]] = field(default_factory=list)
-    intake: dict[str, object] = field(default_factory=dict)
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "intent": self.intent,
-            "depth": self.depth,
-            "workflow": self.workflow,
-            "roles": self.roles,
-            "reasons": self.reasons,
-            "repo": self.repo.to_dict(),
-            "memory_context": self.memory_context,
-            "memory_refs": [item.get("id") for item in self.memory_context if item.get("id")],
-            "intake": self.intake,
-        }
-
-
-@dataclass(frozen=True)
 class TaskIntakeDecision:
     clarity: str = "clear"
     reasonableness: str = "reasonable"
@@ -218,7 +195,6 @@ def resolve_automation(
     command_workflow: str,
     task: str,
     config: dict[str, Any],
-    profile: str | None = None,
     workflow: str | None = None,
     depth: str | None = None,
 ) -> AutomationDecision:
@@ -231,15 +207,15 @@ def resolve_automation(
     selected_workflow = _select_workflow(intent, command_workflow, selected_depth, requested=workflow, intake=intake)
     roles = _workflow_roles(workspace, selected_workflow, fallback=_fallback_roles(intent))
     memory_context = _load_memory_context(workspace, task, roles, limit=int(config.get("memory", {}).get("max_items_per_role", 8)) if isinstance(config.get("memory"), dict) else 8)
-    reasons = _reasons(intent, selected_depth, selected_workflow, roles, repo, bool(memory_context), requested_depth=depth, legacy_profile=profile)
+    reasons = _reasons(intent, selected_depth, selected_workflow, roles, repo, bool(memory_context), requested_depth=depth)
     return AutomationDecision(
         intent=intent,
         depth=selected_depth,
         workflow=selected_workflow,
-        roles=roles,
-        reasons=reasons,
-        repo=repo,
-        memory_context=memory_context,
+        roles=tuple(roles),
+        reasons=tuple(reasons),
+        repo=repo.to_dict(),
+        memory_context=tuple(memory_context),
         intake=intake.to_dict(),
     )
 
@@ -464,7 +440,6 @@ def _reasons(
     has_memory: bool,
     *,
     requested_depth: str | None,
-    legacy_profile: str | None,
 ) -> list[str]:
     reasons = [f"intent resolved to {intent} from command/task"]
     if requested_depth and requested_depth != "auto":
@@ -475,8 +450,6 @@ def _reasons(
         reasons.append(f"{depth} flow selected from intent and repository signals")
     reasons.append(f"workflow template selected as {workflow}")
     reasons.append(f"model roles derived from workflow template: {', '.join(roles) or '-'}")
-    if legacy_profile and legacy_profile != "auto":
-        reasons.append("legacy profile input was accepted for compatibility but no longer controls runtime topology")
     if repo.test_markers:
         reasons.append("test markers found, so test-capable roles remain available")
     if has_memory:

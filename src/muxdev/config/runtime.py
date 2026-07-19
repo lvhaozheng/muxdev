@@ -23,10 +23,6 @@ from .loader import deep_merge, load_config
 DEFAULT_GATE = "safe"
 DEFAULT_WORKFLOW = "dev"
 
-# Kept as an empty compatibility symbol for older imports. Runtime topology is
-# now selected from task intent/depth/workflow, not from profile presets.
-PROFILES: dict[str, dict[str, object]] = {}
-
 GATES = {
     "auto": {"require_approval": []},
     "safe": {"require_approval": []},
@@ -60,30 +56,6 @@ PUBLIC_WORKFLOWS = (
     "test",
     "docs",
 )
-
-ROLE_ALIASES = {
-    "supervisor": "lead",
-    "architect": "plan",
-    "implementer": "code",
-    "tester": "test",
-    "reviewer": "review",
-    "security": "secure",
-    "doc_writer": "docs",
-}
-
-RUNTIME_ROLE_TO_LEGACY_ROLE = {
-    "lead": "architect",
-    "plan": "architect",
-    "requirements": "architect",
-    "architect": "architect",
-    "code": "implementer",
-    "test": "tester",
-    "test_strategy": "tester",
-    "review": "reviewer",
-    "secure": "reviewer",
-    "docs": "implementer",
-    "memory_curator": "architect",
-}
 
 BUILTIN_RUNTIME_CONFIG: dict[str, Any] = {
     "version": 2,
@@ -185,7 +157,9 @@ def load_runtime_config(
 
 def normalize_runtime_config(config: dict[str, Any]) -> dict[str, Any]:
     result = deepcopy(config)
-    result.pop("profile", None)
+    retired = sorted({key for key in ("profile", "topology") if key in result})
+    if retired:
+        raise ValueError(f"retired runtime option(s): {', '.join(retired)}")
     result["gate"] = str(result.get("gate") or DEFAULT_GATE)
     if result["gate"] not in GATES:
         result["gate"] = DEFAULT_GATE
@@ -221,12 +195,7 @@ def load_task_file(path: Path) -> dict[str, Any]:
 
 
 def normalize_role(role: str) -> str:
-    key = str(role).strip().replace("-", "_")
-    return ROLE_ALIASES.get(key, key)
-
-
-def legacy_role(role: str) -> str:
-    return RUNTIME_ROLE_TO_LEGACY_ROLE.get(normalize_role(role), normalize_role(role))
+    return str(role).strip().replace("-", "_")
 
 
 def parse_role_overrides(values: list[str] | None) -> dict[str, str]:
@@ -250,7 +219,6 @@ def resolve_task_request(
     command_workflow: str,
     provider: str | None = None,
     workflow: str | None = None,
-    profile: str | None = None,
     gate: str | None = None,
     depth: str | None = None,
     role_overrides: list[str] | None = None,
@@ -276,14 +244,12 @@ def resolve_task_request(
     if not resolved_task:
         raise ValueError("task is required")
 
-    requested_profile = profile or (str(task_config.get("profile")) if task_config.get("profile") else None)
     requested_depth = depth or (str(task_config.get("depth")) if task_config.get("depth") else None)
     automation = resolve_automation(
         workspace=workspace,
         command_workflow=command_workflow,
         task=resolved_task,
         config=effective,
-        profile=requested_profile,
         workflow=workflow,
         depth=requested_depth,
     )
@@ -308,7 +274,6 @@ def resolve_task_request(
         if not value:
             continue
         role_providers[normalize_role(role)] = value
-        role_providers[legacy_role(role)] = value
     if roles and not provider:
         default_provider = next(iter(roles.values()))
     fixed_fallback = provider or (default_provider if default_provider != "auto" else configured_fallback)
@@ -672,11 +637,24 @@ def _worktree_check(workspace: Path) -> dict[str, object]:
 
 
 def _mock_provider_check() -> dict[str, object]:
+    from ..domain import StageExecutionInput
     from ..providers.mock import MockProvider
 
     try:
         with tempfile.TemporaryDirectory(prefix="muxdev-doctor-") as temp:
-            output = MockProvider().run_stage(stage_id="implement", task="doctor mock smoke", worktree=Path(temp))
+            output = MockProvider().execute(
+                StageExecutionInput(
+                    run_id="doctor",
+                    stage_id="implement",
+                    role="code",
+                    task="doctor mock smoke",
+                    worktree=Path(temp),
+                    context={},
+                    capabilities={},
+                    provider="mock",
+                    policy={},
+                )
+            )
         return _check("mock_provider", "Mock provider", "pass", f"mock provider completed: {output.summary}")
     except Exception as exc:
         return _check("mock_provider", "Mock provider", "fail", f"mock provider failed: {exc}", "Reinstall muxdev or run the test suite.", {"error": str(exc)})

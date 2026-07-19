@@ -123,6 +123,16 @@ def test_daemon_rollback_to_stage_snapshot() -> None:
         assert rollback["status"] == "rolled_back"
         assert rollback["to_stage"] == "implement"
         assert rollback["snapshot"].endswith("implement.patch")
+        assert rollback["recovery_id"].startswith("recovery_")
+        assert "implement" in rollback["invalidated_stages"]
+        assert rollback["invalidated_projection"]["evidence_events"] > 0
+        with manager.board() as board:
+            stage_rows = {row["stage_id"]: row for row in board.table_rows("stages", run_id=task_id)}
+            assert stage_rows["implement"]["status"] == "pending"
+            assert board.table_rows("evidence_evaluations", run_id=task_id) == []
+            assert board.latest_delivery_attestation(task_id) is None
+            recovery_events = [row for row in board.table_rows("state_events", run_id=task_id) if row["event_type"] == "recovery.forked"]
+            assert recovery_events
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 

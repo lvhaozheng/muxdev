@@ -51,7 +51,7 @@ def test_setup_check_does_not_write_and_yes_writes_toml(monkeypatch) -> None:
     assert cache_exists
 
 
-def test_resolve_task_request_maps_new_and_legacy_roles(monkeypatch) -> None:
+def test_resolve_task_request_uses_current_roles_only(monkeypatch) -> None:
     workspace = _workspace_temp("resolve")
     monkeypatch.setattr(runtime_config, "detect_providers", lambda: [_probe("mock", ProviderStatus.READY)])
     try:
@@ -60,7 +60,6 @@ def test_resolve_task_request_maps_new_and_legacy_roles(monkeypatch) -> None:
             task="ship feature",
             command_workflow="dev",
             provider="mock",
-            profile="squad",
             gate="strict",
             role_overrides=["code=mock"],
             skill_specs=["review=security-review"],
@@ -73,7 +72,7 @@ def test_resolve_task_request_maps_new_and_legacy_roles(monkeypatch) -> None:
     assert "topology" not in request
     assert request["gate"] == "strict"
     assert request["role_providers"]["code"] == "mock"
-    assert request["role_providers"]["implementer"] == "mock"
+    assert "implementer" not in request["role_providers"]
     assert "write" in request["require_approval"]
     assert request["skill_specs"] == ["review=security-review"]
 

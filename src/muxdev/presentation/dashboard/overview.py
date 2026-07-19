@@ -16,7 +16,7 @@ from ...services.skills import build_skill_catalog, verify_skill_lock
 from ...services.standards import EVIDENCE_LEVELS, RISK_LEVELS, SEVERITY_LEVELS, catalog_payload
 from ...services.ux import build_ux_overview
 from ...services.validation import list_validation_experiments
-from ...services.workflow_plugins import list_workflow_plugins
+from ...services.workflow_templates import list_workflow_templates
 
 _STANDARD_CATALOG = catalog_payload()
 _STANDARD_IDS = set(SEVERITY_LEVELS) | set(RISK_LEVELS) | set(EVIDENCE_LEVELS)
@@ -1294,10 +1294,10 @@ def _provider_names(value: object) -> set[str]:
 
 def _workflow_templates(workspace: Path) -> dict[str, Any]:
     return {
-        "templates": [plugin.to_dict() for plugin in list_workflow_plugins()],
+        "templates": [template.to_dict() for template in list_workflow_templates()],
         "definitions": _workflow_definitions(workspace),
-        "config_key": "workflow_plugins",
-        "sources": ["builtin workflow templates", "project workflow_plugins config", "configured workflow definitions"],
+        "config_key": "workflow_templates",
+        "sources": ["builtin workflow templates", "project workflow_templates config", "configured workflow definitions"],
     }
 
 

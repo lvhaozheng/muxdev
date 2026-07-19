@@ -207,8 +207,6 @@ def test_dev_submits_daemon_task_with_resolved_main_path_options(monkeypatch) ->
             "ship daemon task",
             "--provider",
             "mock",
-            "--profile",
-            "solo",
             "--gate",
             "strict",
             "--role",
@@ -225,7 +223,6 @@ def test_dev_submits_daemon_task_with_resolved_main_path_options(monkeypatch) ->
     assert submitted["task"] == "ship daemon task"
     assert submitted["workflow"] == "dev"
     assert "profile" not in submitted
-    assert "--profile is deprecated" in result.stderr
     assert submitted["gate"] == "strict"
     assert submitted["role_providers"]["code"] == "mock"
     assert "skills" in submitted
@@ -386,13 +383,13 @@ def test_session_start_list_stop_and_rag_query() -> None:
     assert json.loads(queried.stdout)[0]["path"] == "notes.md"
 
 
-def test_graph_mcp_workflow_and_flow_smoke() -> None:
+def test_graph_mcp_and_workflow_smoke_with_removed_flow_surface() -> None:
     graph = runner.invoke(app, ["graph", "export", "--json"])
     manifest = runner.invoke(app, ["mcp", "manifest", "--json"])
     doctor = runner.invoke(app, ["mcp", "doctor", "--json"])
     request = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "resources/list"})
     served = runner.invoke(app, ["mcp", "serve", "--request", request])
-    plugin = runner.invoke(app, ["workflow", "plugin", "spec-lite", "--json"])
+    template = runner.invoke(app, ["workflow", "template", "spec-lite", "--json"])
     command = runner.invoke(
         app,
         ["workflow", "render", "spec-lite", "--phase", "planning", "--provider", "codex", "--task", "ship it", "--json"],
@@ -418,12 +415,11 @@ def test_graph_mcp_workflow_and_flow_smoke() -> None:
     assert json.loads(doctor.stdout)["write_policy"] == "guarded"
     assert served.exit_code == 0
     assert json.loads(served.stdout)["result"]["resources"]
-    assert plugin.exit_code == 0
-    assert json.loads(plugin.stdout)["artifacts"]["planning"] == ".muxdev/spec/plan.md"
+    assert template.exit_code == 0
+    assert json.loads(template.stdout)["artifacts"]["planning"] == ".muxdev/spec/plan.md"
     assert command.exit_code == 0
     assert json.loads(command.stdout)["canonical"] == "/spec-lite:plan ship it"
-    assert flow.exit_code == 0
-    assert json.loads(flow.stdout)["schedule"] == "0 9 * * *"
+    assert flow.exit_code != 0
 
 
 def _create_mock_run(task: str) -> str:

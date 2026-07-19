@@ -1,21 +1,9 @@
 # Security Policy
 
-## Supported Version
+Security fixes target the current release-candidate line.
 
-Security fixes target the current `0.2.0rc1` line during the release-candidate
-period.
+Read the complete policy in [English](docs/en/security-and-trust.md) or [中文](docs/cn/security-and-trust.md).
 
-## Reporting
+Report issues through the repository's private security channel when available. Include the muxdev version, platform, redacted reproduction, affected Provider fingerprint, and relevant event or attestation hashes. Never disclose credentials, signing private keys, Provider state, prompts, transcripts, private repository contents, or uncontrolled archives.
 
-Do not include credentials, private keys, Provider state, prompts, transcripts
-or private repository contents in a public report. Provide the muxdev version,
-platform, redacted reproduction steps and relevant event or attestation hashes
-through the repository's private security-reporting channel when available.
-
-## Local Trust Boundary
-
-muxdev is single-machine and single-operator. The bearer token, signing keys and
-Provider state are private to the current OS user. A process already running as
-that user may still access local files; use a separate OS account for a stronger
-boundary. An unpinned `.muxattest` identity is self-asserted, not an organization
-identity.
+muxdev is local-first and assumes one OS user controls the machine. Loopback authentication does not defend against a malicious process already running as that user. An unpinned local attestation identity is self-asserted, not an organization identity.

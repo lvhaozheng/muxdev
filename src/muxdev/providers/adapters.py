@@ -14,7 +14,6 @@ import platform
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 from uuid import uuid4
@@ -25,6 +24,7 @@ from ..core.redaction import redact
 from ..core.platforms import hidden_subprocess_kwargs
 from ..core.text_cleaning import clean_provider_text
 from ..core.private_paths import muxdev_private_data_dir
+from ..domain import StageExecutionInput, StageExecutionResult
 from .certification import make_certification_report, require_live_acknowledgement, sha256_file, sha256_text
 from .contracts import ProviderCapabilities, ProviderDescriptor, ProviderRuntimeKind
 from .harness import (
@@ -41,6 +41,7 @@ from .harness import (
     capability_map,
 )
 from .mock import MockProvider
+from .event_parsers import parser_for
 
 
 EVIDENCE_PROMPT_BLOCK = """# muxdev Evidence v2 Contract
@@ -59,22 +60,8 @@ Use this JSON shape when possible:
 """
 
 
-@dataclass(frozen=True)
-class ProviderStageOutput:
-    """Normalized stage result returned by every provider adapter."""
-
-    artifact_name: str
-    content: str
-    summary: str
-    tokens: int = 100
-    cost_usd: float = 0.01
-    returncode: int = 0
-    provider_actions: list[dict[str, Any]] = field(default_factory=list)
-    harness_events: tuple[HarnessEvent, ...] = ()
-
-
 class ProviderAdapter:
-    """Versioned Agent Harness contract with a legacy ``run_stage`` facade."""
+    """Versioned Agent Harness adapter with one typed execution method."""
 
     id = "provider"
     adapter_version = f"generic/{ADAPTER_CONTRACT_VERSION}"
@@ -134,15 +121,7 @@ class ProviderAdapter:
     def resume(self, handle: AttemptHandle) -> AttemptHandle | Unsupported:
         return Unsupported("crash-safe provider resume is not verified")
 
-    def run_stage(
-        self,
-        *,
-        stage_id: str,
-        task: str,
-        worktree: Path,
-        skills: list[dict[str, object]] | None = None,
-        session_dir: Path | None = None,
-    ) -> ProviderStageOutput:
+    def execute(self, input: StageExecutionInput) -> StageExecutionResult:
         raise NotImplementedError
 
 
@@ -207,7 +186,7 @@ class MockProviderAdapter(ProviderAdapter):
         attempt = int(handle.metadata.get("attempt") or 1)
         task = str(handle.metadata.get("task") or "")
         skills = handle.metadata.get("skills")
-        output = self._legacy_run_stage(
+        output = self._mock_stage(
             stage_id=handle.stage_id,
             task=task,
             worktree=handle.worktree,
@@ -225,7 +204,7 @@ class MockProviderAdapter(ProviderAdapter):
                 ("harness.attempt_completed", HarnessEventSource.HARNESS, {"returncode": output.returncode}),
             ],
         )
-        output = ProviderStageOutput(**{**output.__dict__, "harness_events": tuple(events)})
+        output = StageExecutionResult(**{**output.__dict__, "harness_events": tuple(events)})
         handle.metadata["output"] = output
         yield from events
 
@@ -240,35 +219,45 @@ class MockProviderAdapter(ProviderAdapter):
         )
         return resumed
 
-    def run_stage(
-        self,
-        *,
-        stage_id: str,
-        task: str,
-        worktree: Path,
-        skills: list[dict[str, object]] | None = None,
-        session_dir: Path | None = None,
-        run_id: str | None = None,
-        attempt: int = 1,
-    ) -> ProviderStageOutput:
-        handle = self.start(stage_id=stage_id, task=task, worktree=worktree, skills=skills or [], run_id=run_id, attempt=attempt)
+    def execute(self, input: StageExecutionInput) -> StageExecutionResult:
+        handle = self.start(
+            stage_id=input.stage_id,
+            task=input.task,
+            worktree=input.worktree,
+            skills=list(input.skills),
+            session_dir=input.session_dir,
+            run_id=input.run_id,
+            attempt=input.attempt,
+        )
         tuple(self.events(handle))
         return handle.metadata["output"]  # type: ignore[return-value]
 
-    def _legacy_run_stage(
+    def _mock_stage(
         self,
         *,
         stage_id: str,
         task: str,
         worktree: Path,
         skills: list[dict[str, object]] | None = None,
-    ) -> ProviderStageOutput:
-        output = self._mock.run_stage(stage_id=stage_id, task=task, worktree=worktree)
+    ) -> StageExecutionResult:
+        output = self._mock.execute(
+            StageExecutionInput(
+                run_id="mock",
+                stage_id=stage_id,
+                role=None,
+                task=task,
+                worktree=worktree,
+                context={},
+                capabilities={},
+                provider=self.id,
+                policy={},
+            )
+        )
         skill_lines = _skill_context_lines(skills or [], include_content=False)
         content = output.content
         if skill_lines:
             content += "\n\n# Active Skills\n" + "\n".join(skill_lines) + "\n"
-        return ProviderStageOutput(
+        return StageExecutionResult(
             artifact_name=output.artifact_name,
             content=content,
             summary=output.summary + (f"; skills={len(skills or [])}" if skills else ""),
@@ -293,6 +282,7 @@ class HeadlessCliProviderAdapter(ProviderAdapter):
         timeout: float = 300,
         prompt_template: str = DEFAULT_PROMPT_TEMPLATE,
         prompt_transport: str = "argument",
+        resume_command: list[str] | None = None,
     ) -> None:
         self.id = provider_id
         self.adapter_version = f"generic-cli/{ADAPTER_CONTRACT_VERSION}"
@@ -301,6 +291,8 @@ class HeadlessCliProviderAdapter(ProviderAdapter):
         self.timeout = timeout
         self.prompt_template = prompt_template
         self.prompt_transport = prompt_transport
+        self.resume_command = list(resume_command or [])
+        self.event_parser = parser_for(provider_id)
         self.backend = HeadlessSubprocessBackend()
         self.cancellation_token: object | None = None
         self.cancel_grace_seconds = 10.0
@@ -375,6 +367,19 @@ class HeadlessCliProviderAdapter(ProviderAdapter):
         handle.session_id = str(kwargs.get("session_id") or f"session_{uuid4().hex}")
         return handle
 
+    def resume(self, handle: AttemptHandle) -> AttemptHandle | Unsupported:
+        if not self.resume_command or not handle.session_id:
+            return Unsupported("provider-specific resume command or native session id is unavailable")
+        command = [item.replace("{session_id}", handle.session_id) for item in self.resume_command]
+        return AttemptHandle(
+            attempt_id=f"attempt_{uuid4().hex}",
+            provider=self.id,
+            stage_id=handle.stage_id,
+            worktree=handle.worktree,
+            session_id=handle.session_id,
+            metadata={**handle.metadata, "resumed_from": handle.attempt_id, "command_override": command},
+        )
+
     def events(self, handle: AttemptHandle) -> Iterator[HarnessEvent]:
         output, decoded = self._execute_handle(handle)
         events = _build_harness_events(
@@ -384,7 +389,7 @@ class HeadlessCliProviderAdapter(ProviderAdapter):
             attempt=int(handle.metadata.get("attempt") or 1),
             decoded=decoded,
         )
-        output = ProviderStageOutput(**{**output.__dict__, "harness_events": tuple(events)})
+        output = StageExecutionResult(**{**output.__dict__, "harness_events": tuple(events)})
         handle.metadata["output"] = output
         yield from events
 
@@ -392,37 +397,28 @@ class HeadlessCliProviderAdapter(ProviderAdapter):
         self.cancellation_token = token
         self.cancel_grace_seconds = max(0.0, float(grace_seconds))
 
-    def run_stage(
-        self,
-        *,
-        stage_id: str,
-        task: str,
-        worktree: Path,
-        skills: list[dict[str, object]] | None = None,
-        session_dir: Path | None = None,
-        run_id: str | None = None,
-        attempt: int = 1,
-    ) -> ProviderStageOutput:
-        """Compatibility facade implemented through the lifecycle contract."""
+    def execute(self, input: StageExecutionInput) -> StageExecutionResult:
         handle = self.start(
-            stage_id=stage_id,
-            task=task,
-            worktree=worktree,
-            skills=skills or [],
-            session_dir=session_dir,
-            run_id=run_id,
-            attempt=attempt,
+            stage_id=input.stage_id,
+            task=input.task,
+            worktree=input.worktree,
+            skills=list(input.skills),
+            session_dir=input.session_dir,
+            run_id=input.run_id,
+            attempt=input.attempt,
         )
         tuple(self.events(handle))
         return handle.metadata["output"]  # type: ignore[return-value]
 
-    def _execute_handle(self, handle: AttemptHandle) -> tuple[ProviderStageOutput, list[tuple[str, HarnessEventSource, dict[str, object]]]]:
+    def _execute_handle(self, handle: AttemptHandle) -> tuple[StageExecutionResult, list[tuple[str, HarnessEventSource, dict[str, object]]]]:
         stage_id = handle.stage_id
         task = str(handle.metadata.get("task") or "")
         skills_value = handle.metadata.get("skills")
         skills = skills_value if isinstance(skills_value, list) else []
         prompt = self._prompt(stage_id, task, skills=skills)
-        command, input_text = _command_for_prompt(self.command, prompt, transport=self.prompt_transport)
+        configured_command = handle.metadata.get("command_override")
+        base_command = [str(item) for item in configured_command] if isinstance(configured_command, list) else self.command
+        command, input_text = _command_for_prompt(base_command, prompt, transport=self.prompt_transport)
         worktree = handle.worktree
         requested_session_dir = handle.metadata.get("session_dir")
         session_dir = Path(str(requested_session_dir)) if requested_session_dir else path_config(worktree, "runtime_root") / "provider_sessions"
@@ -454,6 +450,9 @@ class HeadlessCliProviderAdapter(ProviderAdapter):
             **cancellation_kwargs,
         )
         raw_content = (result.stdout or "") + (("\n" + result.stderr) if result.stderr else "")
+        native_session_id = self.event_parser.session_id(result.stdout or "")
+        if native_session_id:
+            handle.session_id = native_session_id
         content = redact(clean_provider_text(raw_content, fallback=raw_content))
         event_lines = "\n".join(f"{event.type}: {event.text}" for event in result.events)
         if event_lines:
@@ -477,7 +476,7 @@ class HeadlessCliProviderAdapter(ProviderAdapter):
         decoded = [("harness.attempt_started", HarnessEventSource.HARNESS, {"session_id": handle.session_id})]
         decoded.extend(self._decode_provider_events(result.stdout or "", returncode=result.returncode))
         decoded.append(("harness.attempt_completed", HarnessEventSource.HARNESS, {"returncode": result.returncode}))
-        return ProviderStageOutput(
+        return StageExecutionResult(
             artifact_name=f"session/{self.id}_{stage_id}.log",
             content=content,
             summary=summary,
@@ -485,22 +484,19 @@ class HeadlessCliProviderAdapter(ProviderAdapter):
             cost_usd=0,
             returncode=result.returncode,
             provider_actions=provider_actions,
+            transcript_path=str(transcript_path),
+            chunks_path=str(chunks_path),
+            stdout_hash=sha256_text([result.stdout or ""]),
+            stderr_hash=sha256_text([result.stderr or ""]),
+            stdout_bytes=len((result.stdout or "").encode("utf-8")),
+            stderr_bytes=len((result.stderr or "").encode("utf-8")),
         ), decoded
 
     def _decode_provider_events(self, output: str, *, returncode: int) -> list[tuple[str, HarnessEventSource, dict[str, object]]]:
-        decoded: list[tuple[str, HarnessEventSource, dict[str, object]]] = []
-        for line_number, line in enumerate(output.splitlines(), start=1):
-            if not line.strip():
-                continue
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                decoded.append(("provider.unknown", HarnessEventSource.PROVIDER, {"line": line_number, "reason": "invalid_json"}))
-                continue
-            decoded.append(("provider.unknown", HarnessEventSource.PROVIDER, {"line": line_number, "event": payload}))
-        if not decoded:
-            decoded.append(("provider.terminal", HarnessEventSource.DERIVED, {"returncode": returncode}))
-        return decoded
+        return [
+            (event.type, HarnessEventSource.PROVIDER if not event.type.endswith("classified") else HarnessEventSource.DERIVED, event.payload)
+            for event in self.event_parser.parse(output, returncode=returncode)
+        ]
 
     def _advertised_capabilities(self, help_text: str) -> set[str]:
         lowered = help_text.lower()
@@ -573,6 +569,7 @@ def get_runtime_provider(provider: str) -> ProviderAdapter:
         "timeout": float(runtime.get("timeout", 300)),
         "prompt_template": str(runtime.get("prompt_template", DEFAULT_PROMPT_TEMPLATE)),
         "prompt_transport": str(prompt_transport or "argument"),
+        "resume_command": [str(item) for item in runtime.get("resume_command", [])],
     }
     if adapter_type is HeadlessCliProviderAdapter:
         return adapter_type(provider, command, **common)

@@ -11,7 +11,7 @@ def test_stage_prompt_composes_role_and_schema_instructions() -> None:
         stage=WorkflowStage(id="plan", role="architect", read_only=True, output_schema="PlanArtifact"),
     )
 
-    assert prompt.role_key == "plan"
+    assert prompt.role_key == "architect"
     assert "Workflow: dev" in prompt.text
     assert "Role: architect" in prompt.text
     assert "Shape the solution boundaries" in prompt.text

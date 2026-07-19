@@ -4,6 +4,7 @@ import shutil
 import uuid
 from pathlib import Path
 
+from muxdev.domain import StageExecutionInput
 from muxdev.providers import HeadlessCliProviderAdapter, get_runtime_provider
 from muxdev.clients.sessions import SessionResult
 
@@ -46,7 +47,7 @@ def test_codex_adapter_sends_prompt_via_stdin(monkeypatch) -> None:
 
     worktree = _test_worktree("provider_adapter_stdin")
     monkeypatch.setenv("MUXDEV_HOME", str(worktree / "muxdev-home"))
-    output = adapter.run_stage(stage_id="problem_statement", task="ship it", worktree=worktree)
+    output = adapter.execute(StageExecutionInput.for_provider(stage_id="problem_statement", task="ship it", worktree=worktree, provider=adapter.id))
 
     assert output.returncode == 0
     assert captured["command"] == adapter.command
@@ -72,7 +73,7 @@ def test_codex_adapter_uses_muxdev_writable_codex_home(monkeypatch) -> None:
         return SessionResult(0, "ok", "", [])
 
     adapter.backend.run = fake_run
-    adapter.run_stage(stage_id="plan", task="ship it", worktree=worktree)
+    adapter.execute(StageExecutionInput.for_provider(stage_id="plan", task="ship it", worktree=worktree, provider=adapter.id))
 
     codex_home = Path(str(captured["env"]["CODEX_HOME"]))
     assert codex_home == muxdev_home / "data" / "provider_state" / "codex"
@@ -89,7 +90,7 @@ def test_headless_cli_failure_summary_includes_output_excerpt() -> None:
     adapter.backend.run = fake_run
 
     worktree = _test_worktree("provider_adapter_summary")
-    output = adapter.run_stage(stage_id="problem_statement", task="ship it", worktree=worktree)
+    output = adapter.execute(StageExecutionInput.for_provider(stage_id="problem_statement", task="ship it", worktree=worktree, provider=adapter.id))
 
     assert output.summary == "fake problem_statement exited with 1: first line\nfatal: command line too long"
 

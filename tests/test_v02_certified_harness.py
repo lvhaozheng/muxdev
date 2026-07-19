@@ -15,7 +15,7 @@ from muxdev.api.web import create_app
 from muxdev.clients.sessions.backends import DockerBackend, SessionResult, _provider_subprocess_env
 from muxdev.daemon.paths import default_daemon_paths
 from muxdev.daemon.tasks import TaskManager
-from muxdev.domain import CancellationToken, HarnessPolicySpec, RunSpec
+from muxdev.domain import CancellationToken, HarnessPolicySpec, RunSpec, StageExecutionInput
 from muxdev.models import ApprovalStatus, RunStatus
 from muxdev.providers import (
     CapabilityVerificationState,
@@ -227,7 +227,7 @@ def test_replay_hash_check_and_simulation_label(workspace: Path, monkeypatch: py
     with pytest.raises(ValueError, match="hash mismatch"):
         ReplayAdapter(fixture, fixture_hash="bad")
     monkeypatch.setattr("subprocess.Popen", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("shell called")))
-    output = adapter.run_stage(stage_id="demo", task="ignored", worktree=workspace, run_id="run-demo")
+    output = adapter.execute(StageExecutionInput.for_provider(stage_id="demo", task="ignored", worktree=workspace, provider=adapter.id, run_id="run-demo"))
     assert "SIMULATED REPLAY" in output.content
     assert "not production delivery evidence" in output.content
     assert [event.sequence for event in output.harness_events] == list(range(1, len(output.harness_events) + 1))

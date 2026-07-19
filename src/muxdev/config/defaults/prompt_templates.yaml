@@ -39,7 +39,7 @@ prompt_templates:
     PlanArtifact: |
       Return a concise plan with a summary, ordered steps, acceptance criteria, verification approach, risks, delivery decision, evidence, and gaps.
     TestResult: |
-      Return whether verification passed, the command or method used, acceptance criteria covered, relevant output summary, configured coverage result when available, skipped checks, delivery decision, evidence, and gaps. If tests were not run, say why.
+      Return whether verification passed, the exact command or method used, its integer exit_code, acceptance criteria covered, relevant stdout/stderr summary, configured coverage result when available, security artifact references, skipped checks, delivery decision, evidence, and gaps. If tests were not run, return passed=false and a non-zero exit_code and say why.
     ReviewResult: |
       Return whether blockers exist, missing evidence, delivery decision, and residual risk. Each blocker should include type, severity, evidence, file or line when known, and a concrete suggestion.
   stages:

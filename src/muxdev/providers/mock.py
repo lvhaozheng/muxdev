@@ -3,20 +3,9 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
-from pathlib import Path
-
+from ..domain import StageExecutionInput, StageExecutionResult
 from ..models import PlanArtifact, ReviewResult, TestResult
 from ..core.redaction import redact
-
-
-@dataclass(frozen=True)
-class MockStageOutput:
-    artifact_name: str
-    content: str
-    summary: str
-    tokens: int = 100
-    cost_usd: float = 0.01
 
 
 def _mock_design_payload(task: str, *, summary: str) -> dict[str, object]:
@@ -81,13 +70,14 @@ def _mock_design_payload(task: str, *, summary: str) -> dict[str, object]:
 class MockProvider:
     id = "mock"
 
-    def run_stage(self, *, stage_id: str, task: str, worktree: Path) -> MockStageOutput:
+    def execute(self, input: StageExecutionInput) -> StageExecutionResult:
+        stage_id, task, worktree = input.stage_id, input.task, input.worktree
         safe_task = redact(task)
         if stage_id == "direct":
             target = worktree / "muxdev_mock_direct.txt"
             target.write_text(f"Mock direct CLI result for task: {safe_task}\n", encoding="utf-8")
             content = "# Direct CLI Result\n\nmock direct CLI completed the task in one pass.\n"
-            return MockStageOutput("direct_output.md", content, "mock direct CLI completed", tokens=70, cost_usd=0.005)
+            return StageExecutionResult("direct_output.md", content, "mock direct CLI completed", stage_id, self.id, tokens=70, cost_usd=0.005)
         if stage_id == "judge":
             payload = {
                 "score": 0.82,
@@ -100,47 +90,47 @@ class MockProvider:
                 "reasons": ["mock judge accepted the run"],
                 "risks": [],
             }
-            return MockStageOutput("validation/judge_mock.json", json.dumps(payload, ensure_ascii=False, indent=2), "mock judge completed", tokens=40, cost_usd=0.002)
+            return StageExecutionResult("validation/judge_mock.json", json.dumps(payload, ensure_ascii=False, indent=2), "mock judge completed", stage_id, self.id, tokens=40, cost_usd=0.002)
         if stage_id in {"design", "plan", "quick_plan", "scaffold_plan"}:
             artifact = PlanArtifact(summary=f"Plan for: {safe_task}", steps=["inspect", "implement", "test", "review"])
             content = "# Plan\n\n" + artifact.summary + "\n\n```json\n" + artifact.model_dump_json(indent=2) + "\n```\n"
-            return MockStageOutput(f"{stage_id}.md", content, artifact.summary)
+            return StageExecutionResult(f"{stage_id}.md", content, artifact.summary, stage_id, self.id, tokens=100, cost_usd=0.01)
         if stage_id in {"design_brief", "design_plan"}:
             payload = _mock_design_payload(safe_task, summary="Mock design plan")
             content = "# Design Plan\n\nMock design plan\n\n```json\n" + json.dumps(payload, ensure_ascii=False, indent=2) + "\n```\n"
-            return MockStageOutput(f"design/{stage_id}.md", content, "Mock design plan")
+            return StageExecutionResult(f"design/{stage_id}.md", content, "Mock design plan", stage_id, self.id, tokens=100, cost_usd=0.01)
         if stage_id == "plan_revise":
             artifact = PlanArtifact(summary=f"Revised plan for: {safe_task}", steps=["adjust plan from feedback", "review", "implement", "verify"])
             content = "# Revised Plan\n\n" + artifact.summary + "\n\n```json\n" + artifact.model_dump_json(indent=2) + "\n```\n"
-            return MockStageOutput("plan_revise.md", content, artifact.summary)
+            return StageExecutionResult("plan_revise.md", content, artifact.summary, stage_id, self.id, tokens=100, cost_usd=0.01)
         if stage_id in {"implement", "code", "scaffold", "refactor"}:
             target = worktree / "muxdev_mock_change.txt"
             target.write_text(f"Mock implementation for task: {safe_task}\n", encoding="utf-8")
-            return MockStageOutput(f"session/{stage_id}.log", "mock implementer wrote muxdev_mock_change.txt\n", "mock implementation completed")
+            return StageExecutionResult(f"session/{stage_id}.log", "mock implementer wrote muxdev_mock_change.txt\n", "mock implementation completed", stage_id, self.id, tokens=100, cost_usd=0.01)
         if stage_id in {"docs_update", "docs_fix"}:
             target = worktree / "docs" / "muxdev_mock_docs.md"
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(f"# muxdev mock docs\n\nMock documentation update for task: {safe_task}\n", encoding="utf-8")
             content = f"# {stage_id.replace('_', ' ').title()}\n\nUpdated docs/muxdev_mock_docs.md for task: {safe_task}\n"
-            return MockStageOutput(f"docs/{stage_id}.md", content, f"mock {stage_id} completed")
+            return StageExecutionResult(f"docs/{stage_id}.md", content, f"mock {stage_id} completed", stage_id, self.id, tokens=100, cost_usd=0.01)
         if stage_id in {"test", "targeted_test", "smoke_check", "run_smoke"}:
-            result = TestResult(passed=True, command="pytest", summary=f"mock {stage_id} passed")
+            result = TestResult(passed=True, command="pytest", exit_code=0, summary=f"mock {stage_id} passed")
             content = "mock test log\n" + result.model_dump_json(indent=2) + "\n"
-            return MockStageOutput(f"{stage_id}.log", content, result.summary)
+            return StageExecutionResult(f"{stage_id}.log", content, result.summary, stage_id, self.id, tokens=100, cost_usd=0.01)
         if stage_id in {"review", "plan_review", "light_review", "review_test_result", "docs_review", "final_design_review"}:
             result = ReviewResult(has_blockers=False, blockers=[])
             content = "# Review\n\nNo blockers.\n\n```json\n" + result.model_dump_json(indent=2) + "\n```\n"
-            return MockStageOutput(f"{stage_id}.md", content, "no blockers")
+            return StageExecutionResult(f"{stage_id}.md", content, "no blockers", stage_id, self.id, tokens=100, cost_usd=0.01)
         if stage_id == "design_review":
             result = ReviewResult(has_blockers=False, blockers=[])
             content = "# Design Review\n\nNo blockers.\n\n```json\n" + result.model_dump_json(indent=2) + "\n```\n"
-            return MockStageOutput("design/design_review.md", content, "design review passed")
+            return StageExecutionResult("design/design_review.md", content, "design review passed", stage_id, self.id, tokens=100, cost_usd=0.01)
         if stage_id == "design_revise":
             payload = _mock_design_payload(safe_task, summary="Mock revised design output")
             content = "# Revised Design\n\nMock revised design output\n\n```json\n" + json.dumps(payload, ensure_ascii=False, indent=2) + "\n```\n"
-            return MockStageOutput("design/design_revise.md", content, "mock design revision completed")
+            return StageExecutionResult("design/design_revise.md", content, "mock design revision completed", stage_id, self.id, tokens=100, cost_usd=0.01)
         if stage_id == "fix":
-            return MockStageOutput("session/fix.log", "no fix needed\n", "fix skipped")
+            return StageExecutionResult("session/fix.log", "no fix needed\n", "fix skipped", stage_id, self.id, tokens=100, cost_usd=0.01)
         if stage_id in {
             "task_intake",
             "project_brief",
@@ -161,5 +151,5 @@ class MockProvider:
         }:
             title = stage_id.replace("_", " ").title()
             content = f"# {title}\n\nMock design output for task: {safe_task}\n"
-            return MockStageOutput(f"design/{stage_id}.md", content, f"mock {stage_id} completed")
-        return MockStageOutput(f"{stage_id}.md", json.dumps({"stage": stage_id}), f"mock {stage_id} completed")
+            return StageExecutionResult(f"design/{stage_id}.md", content, f"mock {stage_id} completed", stage_id, self.id, tokens=100, cost_usd=0.01)
+        return StageExecutionResult(f"{stage_id}.md", json.dumps({"stage": stage_id}), f"mock {stage_id} completed", stage_id, self.id, tokens=100, cost_usd=0.01)

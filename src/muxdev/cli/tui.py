@@ -17,7 +17,7 @@ from ..config.runtime import resolve_task_request
 from ..daemon.paths import DEFAULT_API_PORT, DEFAULT_HOST, DEFAULT_UI_PORT
 from ..daemon.process import start_daemon
 from ..services.skills import resolve_active_skills
-from ..ui.tui import (
+from ..presentation.daemon_tui import (
     daemon_approvals_text,
     daemon_chat_view,
     daemon_diff_text,
@@ -354,14 +354,12 @@ def _parse_submit_command(text: str) -> dict[str, Any] | None:
     index = 1
     while index < len(parts):
         token = parts[index]
-        if token in {"--provider", "--profile", "-p", "--gate", "-g", "--workflow", "--max-cost-usd", "--role", "--skill", "-s", "--require-approval"}:
+        if token in {"--provider", "--gate", "-g", "--workflow", "--max-cost-usd", "--role", "--skill", "-s", "--require-approval"}:
             if index + 1 >= len(parts):
                 return {"error": f"missing value for {token}"}
             value = parts[index + 1]
             if token == "--provider":
                 options["provider"] = value
-            elif token in {"--profile", "-p"}:
-                options["profile"] = value
             elif token in {"--gate", "-g"}:
                 options["gate"] = value
             elif token == "--workflow":
@@ -402,7 +400,6 @@ def _submit_tui_task(client: DaemonClient, submit: dict[str, Any]) -> tuple[dict
             command_workflow=str(submit["command_workflow"]),
             provider=submit.get("provider"),
             workflow=submit.get("workflow"),
-            profile=submit.get("profile"),
             gate=submit.get("gate"),
             depth=submit.get("depth"),
             role_overrides=list(submit.get("role") or []),

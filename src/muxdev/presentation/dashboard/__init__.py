@@ -11,10 +11,7 @@ from .overview import (
     restore_dashboard_project,
     restore_dashboard_task,
 )
-from .view_model import DashboardViewModel
-
 __all__ = [
-    "DashboardViewModel",
     "build_dashboard_overview",
     "dashboard_hidden_projects_path",
     "dashboard_hidden_tasks_path",

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 from uuid import uuid4
 
-from ..application import LifecycleService, TaskRuntimeService
+from ..application import LifecycleService, TaskCommandService, TaskQueryService, TaskQueueCoordinator, TaskRuntimeService
 from ..clients.sessions import TmuxBackend
 from ..config.loader import path_config
 from ..core.projects import resolve_project_root
@@ -27,9 +27,12 @@ from ..providers import get_runtime_provider
 from ..providers.certification import certification_is_current
 from ..providers.policy import isolation_summary
 from ..runtime import SupervisorRuntime, new_run_id
+from ..runtime.recovery import finalize_stage_recovery
 from ..services.dashboard_run import build_run_dashboard_payload, startup_dashboard_payload
 from ..services.deliverables import workflow_deliverable_status
 from ..services.feedback import route_feedback
+from ..services.attestation_bundle import export_attestation_bundle
+from ..services.multirepo import plan_multi_repo_orchestration
 from ..services.progress import enrich_provider_attempts, enrich_stages, progress_summary
 from ..services.provider_learning import refresh_provider_learning
 from ..services.provider_scores import build_provider_scores
@@ -46,6 +49,7 @@ from ..services.task_story import build_task_story, query_dashboard_task_summari
 from ..storage import ActiveExecutionError, Blackboard, DurableExecutionQueue
 from ..storage.repositories import ProviderActionsRepository
 from ..storage.read_models import DashboardReadModel
+from ..workflows import load_workflow
 from .event_bus import EventBus
 from .paths import DaemonPaths, daemon_runtime_settings, default_daemon_paths
 from .queue import DurableWorkerPool
@@ -167,11 +171,17 @@ class TaskManager:
     poll_ms: int = 250
     execution_guards: dict[str, ExecutionGuard] = field(init=False, default_factory=dict)
     auth: LocalApiAuth = field(init=False)
+    commands: TaskCommandService = field(init=False)
+    queries: TaskQueryService = field(init=False)
+    coordinator: TaskQueueCoordinator = field(init=False)
 
     def __post_init__(self) -> None:
         type(self)._instance_refs = [ref for ref in type(self)._instance_refs if ref() is not None]
         type(self)._instance_refs.append(weakref.ref(self))
         self.events = EventBus(subscribers=self.subscribers)
+        self.commands = TaskCommandService(self)
+        self.queries = TaskQueryService(self)
+        self.coordinator = TaskQueueCoordinator(self)
         self.paths.ensure()
         self.auth = LocalApiAuth(self.paths.data_dir)
         daemon_settings = daemon_runtime_settings(self.paths)
@@ -570,6 +580,28 @@ class TaskManager:
             "plan": plan,
         }
 
+    def task_attestation(self, run_id: str) -> dict[str, Any] | None:
+        with self.board() as board:
+            return board.latest_delivery_attestation(run_id)
+
+    def attestation_export_record(self, export_id: str) -> dict[str, Any] | None:
+        with self.board() as board:
+            return board.get_attestation_export(export_id)
+
+    def export_task_attestation(self, run_id: str, output: Path) -> dict[str, Any]:
+        with self.board() as board:
+            run = board.get_run(run_id)
+            run_dir = self._run_dir(run_id, run=run)
+            return export_attestation_bundle(board, run_id=run_id, run_dir=run_dir, output=output)
+
+    def replay_task_state(self, run_id: str) -> dict[str, Any]:
+        with self.board() as board:
+            return board.replay_run(run_id)
+
+    def plan_multi_repo(self, *, workspace: Path, repos: list[Path], task: str, mode: str) -> dict[str, Any]:
+        with self.board() as board:
+            return plan_multi_repo_orchestration(workspace, repos=repos, task=task, mode=mode, blackboard=board)
+
     def benchmark_replay(self, suite_id: str = "trusted-routing-v1") -> dict[str, Any]:
         with self.board() as board:
             return run_replay_benchmark(board, suite_id=suite_id)
@@ -930,7 +962,7 @@ class TaskManager:
         if apply_failed and fallback and "already exists in working directory" in (apply_result.stderr or ""):
             apply_failed = False
         failed = apply_failed or (git_failed and not fallback)
-        return {
+        payload: dict[str, Any] = {
             "task_id": task_id,
             "run_id": task_id,
             "worktree": str(worktree),
@@ -941,6 +973,33 @@ class TaskManager:
             "stderr": (checkout.stderr or "") + (clean.stderr or "") + ((apply_result.stderr or "") if apply_result else ""),
             "fallback": fallback,
         }
+        if not failed:
+            run_dir = self._run_dir(task_id)
+            with self.board() as board:
+                run = board.get_run(task_id)
+                archived = run_dir / "workflow.yaml"
+                workflow = load_workflow(str(archived)) if archived.is_file() else load_workflow(str(run["workflow"]))
+                payload.update(
+                    finalize_stage_recovery(
+                        board,
+                        run_dir=run_dir,
+                        run_id=task_id,
+                        workflow=workflow,
+                        from_stage=stage_id,
+                        snapshot_path=patch_path,
+                        snapshot_hash=str(rows[-1].get("patch_hash") or ""),
+                    )
+                )
+            self.broadcast(
+                {
+                    "type": "recovery_forked",
+                    "run_id": task_id,
+                    "recovery_id": payload.get("recovery_id"),
+                    "from_stage": stage_id,
+                    "invalidated_stages": payload.get("invalidated_stages"),
+                }
+            )
+        return payload
 
     def attach_command(self, task_id: str, *, agent: str = "implementer") -> dict[str, Any]:
         resolved = self.resolve_task_id(task_id)

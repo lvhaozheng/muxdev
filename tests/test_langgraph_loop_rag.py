@@ -8,20 +8,18 @@ from pathlib import Path
 import pytest
 
 from muxdev.context import build_context_packet, task_with_context_packet
-from muxdev.runtime import LangGraphWorkflowEngine, SupervisorRuntime
-from muxdev.workflows import load_workflow
+from muxdev.runtime import SupervisorRuntime
+from muxdev.services.orchestration import workflow_graph
 
 
 pytestmark = pytest.mark.integration
 
 
-def test_langgraph_graph_spec_preserves_loop_metadata() -> None:
-    workflow = load_workflow("design-v2")
+def test_native_graph_spec_preserves_loop_metadata() -> None:
+    spec = workflow_graph("design-v2")
 
-    spec = LangGraphWorkflowEngine(Path.cwd()).graph_spec(workflow)
-
-    assert spec["runtime"] == "langgraph"
-    assert workflow.name == "design"
+    assert spec["runtime"] == "native"
+    assert spec["name"] == "design"
     assert "design_revise" in spec["ordered_stage_ids"]
     loop_edges = [edge for edge in spec["edges"] if edge.get("kind") == "conditional_loop"]
     assert loop_edges
@@ -87,8 +85,8 @@ def test_task_with_context_packet_inlines_handled_provider_responses() -> None:
     assert "do not ask the same confirmation again" in prompt
 
 
-def test_supervisor_defaults_to_langgraph_wrapper_trace() -> None:
-    workspace = _workspace_temp("langgraph-runtime")
+def test_supervisor_uses_native_scheduler_trace() -> None:
+    workspace = _workspace_temp("native-runtime")
     try:
         result = SupervisorRuntime(workspace).run("review this tiny task", provider="mock", workflow_name="review")
         trace = (result.run_dir / "trace.jsonl").read_text(encoding="utf-8")
@@ -96,8 +94,8 @@ def test_supervisor_defaults_to_langgraph_wrapper_trace() -> None:
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 
-    assert any(event["type"] == "langgraph_runtime_selected" for event in events)
-    assert any(event["type"] == "langgraph_execution_completed" for event in events)
+    assert any(event["type"] == "native_runtime_selected" for event in events)
+    assert not any("langgraph" in event["type"] for event in events)
 
 
 def _workspace_temp(prefix: str) -> Path:

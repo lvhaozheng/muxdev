@@ -1,0 +1,1 @@
+{"components": {"evidence": 1.0}, "confidence": 0.9, "created_at": "2026-07-18T00:00:00Z", "gates": {"design": true}, "label": "trusted", "missing_evidence": [], "next_actions": [], "reasons": ["frozen compatibility fixture"]}

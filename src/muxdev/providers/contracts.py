@@ -1,8 +1,7 @@
 """Provider runtime contracts.
 
-Adapters can continue to expose the legacy ``run_stage`` shape while richer
-providers opt into descriptors, sessions, streaming events, and handoff-aware
-resume semantics.
+All adapters use the same typed execution input and result. Descriptors,
+sessions, streaming events, and handoff-aware resume remain optional facets.
 """
 
 from __future__ import annotations
@@ -97,7 +96,7 @@ class ProviderRuntime(Protocol):
     def prepare_session(self, ctx: StageExecutionInput) -> ProviderSession:
         ...
 
-    def run_stage(self, ctx: StageExecutionInput) -> StageExecutionResult:
+    def execute(self, ctx: StageExecutionInput) -> StageExecutionResult:
         ...
 
     def resume_action(self, action: ProviderActionDecision) -> ProviderResumeResult:

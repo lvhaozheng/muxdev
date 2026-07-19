@@ -13,7 +13,6 @@ from ..storage import Blackboard, canonical_hash, sha256_file
 from ..storage.contracts import write_json_artifact
 
 
-LEGACY_EVIDENCE_TABLES = ("evidence_bundles", "evidence_items", "evidence_scorecards")
 LEGACY_EVIDENCE_FILES = ("scorecard.json", "coverage_matrix.json", "human_summary.md")
 
 
@@ -165,38 +164,6 @@ def verify_run_evidence(run_dir: Path, run_id: str, blackboard: Blackboard | Non
             board.close()
 
 
-def cleanup_legacy_evidence(run_dir: Path, blackboard: Blackboard, *, yes: bool = False) -> dict[str, Any]:
-    """Remove v1 evidence tables and artifacts from a run directory."""
-    if not yes:
-        raise ValueError("cleanup requires --yes")
-    removed_files: list[str] = []
-    failed_files: list[str] = []
-    evidence_dir = run_dir / "evidence"
-    if evidence_dir.exists():
-        for name in LEGACY_EVIDENCE_FILES:
-            path = evidence_dir / name
-            if path.exists():
-                if _try_unlink(path):
-                    removed_files.append(str(path))
-                else:
-                    failed_files.append(str(path))
-        for path in evidence_dir.glob("*.evidence.json"):
-            if _try_unlink(path):
-                removed_files.append(str(path))
-            else:
-                failed_files.append(str(path))
-    dropped_tables: list[str] = []
-    for table in LEGACY_EVIDENCE_TABLES:
-        blackboard.conn.execute(f"DROP TABLE IF EXISTS {table}")
-        dropped_tables.append(table)
-    blackboard.conn.execute(
-        "DELETE FROM artifacts WHERE kind IN (?, ?, ?, ?)",
-        ("evidence_bundle", "evidence_scorecard", "evidence_coverage", "evidence_summary"),
-    )
-    blackboard.conn.commit()
-    return {"run_dir": str(run_dir), "removed_files": removed_files, "failed_files": failed_files, "dropped_tables": dropped_tables}
-
-
 def _collect_events(run_dir: Path, run_id: str, blackboard: Blackboard) -> list[EvidenceEvent]:
     run = blackboard.get_run(run_id)
     events: list[EvidenceEvent] = []
@@ -304,13 +271,32 @@ def _collect_events(run_dir: Path, run_id: str, blackboard: Blackboard) -> list[
 
     for row in blackboard.table_rows("test_results", run_id=run_id):
         passed = bool(row.get("passed"))
+        validation = _result_validation_for_stage(blackboard, run_id, str(row.get("stage_id") or "test"))
+        reported_test = validation.get("reported_test") if isinstance(validation.get("reported_test"), dict) else {}
+        validation_path = Path(str(validation.get("_path") or "")) if validation.get("_path") else None
+        verified_exit = (
+            bool(validation.get("valid"))
+            and isinstance(reported_test.get("exit_code"), int)
+            and bool(passed) == (int(reported_test["exit_code"]) == 0)
+        )
         add(
             kind="test",
             stage_id=str(row.get("stage_id") or "test"),
             claim=f"{row.get('command') or 'test command'} {'passed' if passed else 'failed'}",
             status="passed" if passed else "failed",
-            strength="A" if passed else "B",
-            metrics={"command": row.get("command"), "summary": row.get("summary")},
+            strength="A" if verified_exit else ("B" if not passed else "C"),
+            artifact_refs=[_artifact_ref(validation_path, producer="result_validation", run_dir=run_dir)] if validation_path else [],
+            metrics={
+                "command": row.get("command"),
+                "exit_code": reported_test.get("exit_code"),
+                "summary": row.get("summary"),
+                "result_contract_valid": bool(validation.get("valid")),
+                "provider_returncode": validation.get("provider_returncode"),
+                "stdout_sha256": (validation.get("provider_streams") or {}).get("stdout_sha256") if isinstance(validation.get("provider_streams"), dict) else None,
+                "stderr_sha256": (validation.get("provider_streams") or {}).get("stderr_sha256") if isinstance(validation.get("provider_streams"), dict) else None,
+                "coverage": reported_test.get("coverage") or {},
+                "security_artifacts": reported_test.get("security_artifacts") or [],
+            },
             tags=["verification"],
         )
 
@@ -651,6 +637,20 @@ def _verify_persisted_hashes(run_dir: Path, run_id: str, blackboard: Blackboard)
     return errors
 
 
+def _result_validation_for_stage(blackboard: Blackboard, run_id: str, stage_id: str) -> dict[str, Any]:
+    rows = [
+        row
+        for row in blackboard.table_rows("artifacts", run_id=run_id)
+        if str(row.get("stage_id") or "") == stage_id and str(row.get("kind") or "") == "result_validation"
+    ]
+    for row in reversed(rows):
+        path = Path(str(row.get("path") or ""))
+        payload = _read_json(path)
+        if payload is not None:
+            return {**payload, "_path": str(path)}
+    return {}
+
+
 def _artifact_ref(path: Path, *, producer: str, run_dir: Path | None = None) -> ArtifactRef:
     resolved = path.expanduser().resolve()
     relative: str | None = None
@@ -715,11 +715,3 @@ def _dedupe(values: list[str]) -> list[str]:
             result.append(value)
             seen.add(value)
     return result
-
-
-def _try_unlink(path: Path) -> bool:
-    try:
-        path.unlink()
-        return True
-    except PermissionError:
-        return False

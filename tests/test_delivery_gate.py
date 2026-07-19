@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from muxdev.models import RunStatus
-from muxdev.providers.adapters import ProviderStageOutput
+from muxdev.domain import StageExecutionInput, StageExecutionResult
 from muxdev.runtime.supervisor import SupervisorRuntime
 from muxdev.services.delivery_gate import delivery_rule_for_skill_payload, evaluate_delivery_gate, extract_delivery_standard
 from muxdev.storage import Blackboard
@@ -124,8 +124,9 @@ stages:
     )
 
     class InspectProvider:
-        def run_stage(self, *, stage_id: str, task: str, worktree: Path, **_kwargs) -> ProviderStageOutput:
-            return ProviderStageOutput("inspect.md", '{"has_blockers": false, "blockers": []}', "inspect ok")
+        def execute(self, input: StageExecutionInput) -> StageExecutionResult:
+            _stage_id, _task, _worktree = input.stage_id, input.task, input.worktree
+            return StageExecutionResult("inspect.md", '{"has_blockers": false, "blockers": []}', "inspect ok")
 
     monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: InspectProvider())
 
@@ -167,9 +168,10 @@ stages:
     )
 
     class FailingTestProvider:
-        def run_stage(self, *, stage_id: str, task: str, worktree: Path, **_kwargs) -> ProviderStageOutput:
-            payload = {"passed": False, "command": "pytest -q", "summary": "one test failed"}
-            return ProviderStageOutput("test.log", json.dumps(payload), "one test failed")
+        def execute(self, input: StageExecutionInput) -> StageExecutionResult:
+            _stage_id, _task, _worktree = input.stage_id, input.task, input.worktree
+            payload = {"passed": False, "command": "pytest -q", "exit_code": 1, "summary": "one test failed"}
+            return StageExecutionResult("test.log", json.dumps(payload), "one test failed")
 
     monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: FailingTestProvider())
 

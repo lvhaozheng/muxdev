@@ -10,6 +10,7 @@ from ..core.redaction import redact
 from ..services.rag import LocalRagIndex
 from ..services.rag_policy import RagDecision, decide_rag
 from ..storage import TraceWriter, append_ledger_event, sha256_text
+from .budget import apply_context_budget
 
 
 def task_with_memory_context(task: str, automation: dict[str, object]) -> str:
@@ -157,7 +158,7 @@ def build_context_packet(
         rag_query=rag_query,
         memory_items=memory_items,
     )
-    return {
+    packet: dict[str, object] = {
         "schema": "muxdev.context_packet.v1",
         "session": {
             "temporary_context": grouped.get("session", []),
@@ -206,6 +207,7 @@ def build_context_packet(
             "memory_refs": memory_refs(automation),
         },
     }
+    return apply_context_budget(packet, provider=provider, automation=automation)
 
 
 def _context_artifacts(

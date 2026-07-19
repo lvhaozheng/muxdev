@@ -12,7 +12,7 @@ from muxdev.api.web import create_app
 from muxdev.daemon.paths import default_daemon_paths
 from muxdev.daemon.tasks import TaskManager
 from muxdev.models import ProviderActionStatus, RunStatus
-from muxdev.providers.adapters import ProviderStageOutput
+from muxdev.domain import StageExecutionInput, StageExecutionResult
 from muxdev.runtime import SupervisorRuntime
 from muxdev.storage import Blackboard
 
@@ -37,9 +37,10 @@ stages:
     )
 
     class MutatingProvider:
-        def run_stage(self, *, stage_id: str, task: str, worktree: Path, skills=None) -> ProviderStageOutput:
+        def execute(self, input: StageExecutionInput) -> StageExecutionResult:
+            worktree = input.worktree
             (worktree / "unexpected.txt").write_text("read-only mutation\n", encoding="utf-8")
-            return ProviderStageOutput("inspect.md", "inspected", "inspected")
+            return StageExecutionResult("inspect.md", "inspected", "inspected")
 
     monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: MutatingProvider())
 
@@ -78,19 +79,12 @@ stages:
     )
 
     class SessionArchivingProvider:
-        def run_stage(
-            self,
-            *,
-            stage_id: str,
-            task: str,
-            worktree: Path,
-            skills=None,
-            session_dir: Path | None = None,
-        ) -> ProviderStageOutput:
+        def execute(self, input: StageExecutionInput) -> StageExecutionResult:
+            stage_id, session_dir = input.stage_id, input.session_dir
             assert session_dir is not None
             session_dir.mkdir(parents=True, exist_ok=True)
             (session_dir / f"{stage_id}.log").write_text("session archive only\n", encoding="utf-8")
-            return ProviderStageOutput("inspect.md", "inspected", "inspected")
+            return StageExecutionResult("inspect.md", "inspected", "inspected")
 
     monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: SessionArchivingProvider())
 
@@ -121,11 +115,12 @@ stages:
     )
 
     class LegacySessionArchivingProvider:
-        def run_stage(self, *, stage_id: str, task: str, worktree: Path, skills=None) -> ProviderStageOutput:
+        def execute(self, input: StageExecutionInput) -> StageExecutionResult:
+            stage_id, worktree = input.stage_id, input.worktree
             archive_dir = worktree / ".muxdev" / "provider_sessions"
             archive_dir.mkdir(parents=True, exist_ok=True)
             (archive_dir / f"{stage_id}.log").write_text("legacy session archive only\n", encoding="utf-8")
-            return ProviderStageOutput("inspect.md", "inspected", "inspected")
+            return StageExecutionResult("inspect.md", "inspected", "inspected")
 
     monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: LegacySessionArchivingProvider())
 
@@ -158,11 +153,11 @@ stages:
         def __init__(self) -> None:
             self.calls = 0
 
-        def run_stage(self, *, stage_id: str, task: str, worktree: Path, skills=None) -> ProviderStageOutput:
+        def execute(self, input: StageExecutionInput) -> StageExecutionResult:
             self.calls += 1
             if self.calls == 1:
-                return ProviderStageOutput("session/code.log", "temporary network error", "temporary network error", returncode=1)
-            return ProviderStageOutput("session/code.log", "ok", "ok")
+                return StageExecutionResult("session/code.log", "temporary network error", "temporary network error", returncode=1)
+            return StageExecutionResult("session/code.log", "ok", "ok")
 
     provider = FlakyProvider()
     monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: provider)
@@ -185,8 +180,8 @@ def test_provider_action_writes_session_capsule_and_attempt(monkeypatch) -> None
     workspace = _workspace_temp("p2-action-capsule")
 
     class AuthProvider:
-        def run_stage(self, *, stage_id: str, task: str, worktree: Path, skills=None) -> ProviderStageOutput:
-            return ProviderStageOutput("session/auth.log", "Please sign in to continue.", "auth required", returncode=1)
+        def execute(self, input: StageExecutionInput) -> StageExecutionResult:
+            return StageExecutionResult("session/auth.log", "Please sign in to continue.", "auth required", returncode=1)
 
     monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: AuthProvider())
 

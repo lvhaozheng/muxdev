@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-import inspect
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..clients.stream import StreamAdapter, looks_like_auth_error
+from ..core.redaction import redact
 from ..core.text_cleaning import provider_action_text
 from ..models import ProviderActionKind
-from ..providers.adapters import ProviderAdapter, ProviderStageOutput
+from ..domain import StageExecutionResult
+from ..providers.adapters import ProviderAdapter
+from .stage_executor import StageExecutor
 
 PROVIDER_MAX_ATTEMPTS = 2
 TRANSIENT_RETRY_FAILURES = {"transient_provider_exit"}
@@ -28,7 +30,7 @@ def run_provider_stage_with_attempts(
     worktree: Path,
     skills: list[dict[str, object]],
     session_dir: Path | None = None,
-) -> tuple[ProviderStageOutput, int]:
+) -> tuple[StageExecutionResult, int]:
     attempt = next_provider_attempt(blackboard, run_id, stage_id, provider)
     max_attempt = attempt + PROVIDER_MAX_ATTEMPTS - 1
     while attempt <= max_attempt:
@@ -48,7 +50,7 @@ def run_provider_stage_with_attempts(
         trace.write("provider_attempt_started", stage=stage_id, provider=provider, attempt=attempt)
         output = run_provider_stage(
             provider_impl, stage_id=stage_id, task=task, worktree=worktree,
-            skills=skills, session_dir=session_dir, run_id=run_id, attempt=attempt,
+            skills=skills, session_dir=session_dir, run_id=run_id, role=role, provider=provider, attempt=attempt,
         )
         failure_kind = provider_failure_kind(output)
         has_action = bool(provider_actions_from_output(output))
@@ -90,7 +92,7 @@ def next_provider_attempt(blackboard: Any, run_id: str, stage_id: str, provider:
     return (max(attempts) if attempts else 0) + 1
 
 
-def provider_attempt_status(output: ProviderStageOutput) -> str:
+def provider_attempt_status(output: StageExecutionResult) -> str:
     if provider_actions_from_output(output):
         return "provider_action"
     if output.returncode == 0:
@@ -98,7 +100,7 @@ def provider_attempt_status(output: ProviderStageOutput) -> str:
     return "failed"
 
 
-def provider_failure_kind(output: ProviderStageOutput) -> str | None:
+def provider_failure_kind(output: StageExecutionResult) -> str | None:
     actions = provider_actions_from_output(output)
     if actions:
         return str(actions[0].get("kind") or ProviderActionKind.PROVIDER_BLOCKED)
@@ -116,7 +118,7 @@ def provider_failure_kind(output: ProviderStageOutput) -> str | None:
     return None
 
 
-def provider_actions_from_output(output: ProviderStageOutput) -> list[dict[str, object]]:
+def provider_actions_from_output(output: StageExecutionResult) -> list[dict[str, object]]:
     if output.provider_actions:
         return output.provider_actions
     provider_text = output.content.split("\n\n# Stream Events\n", 1)[0]
@@ -162,52 +164,60 @@ def run_provider_stage(
     skills: list[dict[str, object]],
     session_dir: Path | None = None,
     run_id: str | None = None,
+    role: str | None = None,
+    provider: str | None = None,
     attempt: int = 1,
-) -> ProviderStageOutput:
-    kwargs = provider_stage_kwargs(
-        provider_impl,
+) -> StageExecutionResult:
+    return StageExecutor(provider_impl).execute(
+        run_id=run_id or "unbound",
         stage_id=stage_id,
+        role=role,
+        provider=provider or str(getattr(provider_impl, "id", "unknown")),
         task=task,
         worktree=worktree,
         skills=skills,
         session_dir=session_dir,
-        run_id=run_id,
         attempt=attempt,
     )
-    return provider_impl.run_stage(**kwargs)
 
 
-def provider_stage_kwargs(
-    provider_impl: ProviderAdapter,
+def persist_stage_execution_result(
+    blackboard: Any,
+    trace: Any,
     *,
+    run_dir: Path,
+    run_id: str,
     stage_id: str,
-    task: str,
-    worktree: Path,
-    skills: list[dict[str, object]],
-    session_dir: Path | None,
-    run_id: str | None = None,
-    attempt: int = 1,
-) -> dict[str, object]:
-    kwargs: dict[str, object] = {"stage_id": stage_id, "task": task, "worktree": worktree}
-    try:
-        signature = inspect.signature(provider_impl.run_stage)
-    except (TypeError, ValueError):
-        kwargs["skills"] = skills
-        if session_dir is not None:
-            kwargs["session_dir"] = session_dir
-        return kwargs
-
-    parameters = signature.parameters
-    accepts_extra = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
-    if accepts_extra or "skills" in parameters:
-        kwargs["skills"] = skills
-    if session_dir is not None and (accepts_extra or "session_dir" in parameters):
-        kwargs["session_dir"] = session_dir
-    if run_id is not None and (accepts_extra or "run_id" in parameters):
-        kwargs["run_id"] = run_id
-    if accepts_extra or "attempt" in parameters:
-        kwargs["attempt"] = attempt
-    return kwargs
+    provider: str,
+    attempt: int,
+    output: StageExecutionResult,
+    write_text: Callable[[Path, str], None],
+) -> Path:
+    """Persist the common Provider result envelope for all schedulers."""
+    artifact_path = run_dir / output.artifact_name
+    write_text(artifact_path, redact(output.content))
+    blackboard.add_usage(run_id, provider, output.tokens, output.cost_usd)
+    blackboard.add_artifact(run_id, stage_id, output.artifact_name, artifact_path, "stage_output")
+    trace.write(
+        "provider_event",
+        stage=stage_id,
+        provider=provider,
+        returncode=output.returncode,
+        artifact=str(artifact_path),
+    )
+    blackboard.complete_provider_attempt(
+        run_id,
+        stage_id,
+        provider=provider,
+        attempt=attempt,
+        status=provider_attempt_status(output),
+        failure_kind=provider_failure_kind(output),
+        returncode=output.returncode,
+        summary=output.summary,
+        artifact_path=str(artifact_path),
+        harness_events=output.harness_events,
+    )
+    return artifact_path
 
 
 def _default_choice(options: list[dict[str, object]]) -> str | None:

@@ -54,19 +54,47 @@ class SkillRef:
 class AutomationDecision:
     """Automation metadata chosen before a run is submitted."""
 
-    payload: Mapping[str, object] = field(default_factory=dict)
-
-    @property
-    def intent(self) -> str | None:
-        value = self.payload.get("intent")
-        return str(value) if value else None
+    intent: str = "dev"
+    depth: str = "safe"
+    workflow: str = "dev"
+    roles: tuple[str, ...] = ()
+    reasons: tuple[str, ...] = ()
+    repo: Mapping[str, object] = field(default_factory=dict)
+    memory_context: tuple[Mapping[str, object], ...] = ()
+    intake: Mapping[str, object] = field(default_factory=dict)
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object] | None) -> "AutomationDecision":
-        return cls(dict(payload or {}))
+        data = payload or {}
+        roles = data.get("roles") if isinstance(data.get("roles"), list) else []
+        reasons = data.get("reasons") if isinstance(data.get("reasons"), list) else []
+        memory = data.get("memory_context") if isinstance(data.get("memory_context"), list) else []
+        return cls(
+            intent=str(data.get("intent") or "dev"),
+            depth=str(data.get("depth") or "safe"),
+            workflow=str(data.get("workflow") or "dev"),
+            roles=tuple(str(item) for item in roles),
+            reasons=tuple(str(item) for item in reasons),
+            repo=dict(data.get("repo") or {}) if isinstance(data.get("repo"), Mapping) else {},
+            memory_context=tuple(dict(item) for item in memory if isinstance(item, Mapping)),
+            intake=dict(data.get("intake") or {}) if isinstance(data.get("intake"), Mapping) else {},
+        )
 
     def to_payload(self) -> dict[str, object]:
-        return dict(self.payload)
+        return {
+            "intent": self.intent,
+            "depth": self.depth,
+            "workflow": self.workflow,
+            "roles": list(self.roles),
+            "reasons": list(self.reasons),
+            "repo": dict(self.repo),
+            "memory_context": [dict(item) for item in self.memory_context],
+            "memory_refs": [item.get("id") for item in self.memory_context if item.get("id")],
+            "intake": dict(self.intake),
+        }
+
+    def to_dict(self) -> dict[str, object]:
+        return self.to_payload()
 
 
 @dataclass(frozen=True)

@@ -11,7 +11,7 @@ import pytest
 
 from muxdev.models import ApprovalStatus, ProviderActionStatus, RunStatus
 from muxdev.runtime import SupervisorRuntime, WorktreeManager
-from muxdev.providers.adapters import ProviderStageOutput
+from muxdev.domain import StageExecutionInput, StageExecutionResult
 from muxdev.services.deliverables import workflow_deliverable_status
 from muxdev.services.design import DESIGN_PACK_FILES, design_document_quality_issues, write_user_design_document
 from muxdev.storage import Blackboard
@@ -48,9 +48,9 @@ def _complete_design_payload(summary: str = "Complete design") -> dict[str, obje
     }
 
 
-def _complete_design_stage_output(stage_id: str, summary: str = "complete design") -> ProviderStageOutput:
+def _complete_design_stage_output(stage_id: str, summary: str = "complete design") -> StageExecutionResult:
     payload = _complete_design_payload(summary)
-    return ProviderStageOutput(f"design/{stage_id}.md", json.dumps(payload, ensure_ascii=False), summary)
+    return StageExecutionResult(f"design/{stage_id}.md", json.dumps(payload, ensure_ascii=False), summary)
 
 
 @pytest.fixture()
@@ -227,7 +227,10 @@ def test_design_workflow_publishes_user_visible_design_document(workspace: Path)
 
 def test_design_doc_extracts_structured_payload_from_provider_stream(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
     class StreamDesignProvider:
-        def run_stage(self, *, stage_id: str, task: str, worktree: Path) -> ProviderStageOutput:
+        def execute(self, input: StageExecutionInput) -> StageExecutionResult:
+            stage_id, _task, _worktree = input.stage_id, input.task, input.worktree
+            if stage_id == "design_review":
+                return StageExecutionResult("design/design_review.md", '{"has_blockers": false, "blockers": []}', "review complete")
             payload = {
                 "summary": "已完成贪吃蛇游戏设计。",
                 "design_doc": {
@@ -270,7 +273,7 @@ def test_design_doc_extracts_structured_payload_from_provider_stream(monkeypatch
                     "chunks: chunks.jsonl",
                 ]
             )
-            return ProviderStageOutput("design/design_brief.md", content, "done")
+            return StageExecutionResult("design/design_brief.md", content, "done")
 
     monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: StreamDesignProvider())
 
@@ -383,7 +386,8 @@ def test_design_doc_prefers_chinese_design_doc_over_later_intake_payload(workspa
 
 def test_design_doc_extracts_top_level_design_pack(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
     class DesignPackProvider:
-        def run_stage(self, *, stage_id: str, task: str, worktree: Path) -> ProviderStageOutput:
+        def execute(self, input: StageExecutionInput) -> StageExecutionResult:
+            stage_id, _task, _worktree = input.stage_id, input.task, input.worktree
             if stage_id == "design_brief":
                 payload = {
                     "summary": "完成贪吃蛇小游戏设计。",
@@ -420,10 +424,10 @@ def test_design_doc_extracts_top_level_design_pack(monkeypatch: pytest.MonkeyPat
                         "missing_evidence": ["Missing Evidence nested note"],
                     },
                 }
-                return ProviderStageOutput("design/design_brief.md", json.dumps(payload, ensure_ascii=False), "done")
+                return StageExecutionResult("design/design_brief.md", json.dumps(payload, ensure_ascii=False), "done")
             if stage_id == "design_review":
-                return ProviderStageOutput("design/design_review.md", '{"has_blockers": false, "blockers": []}', "ok")
-            return ProviderStageOutput(f"design/{stage_id}.md", "# stage\n\nok", "ok")
+                return StageExecutionResult("design/design_review.md", '{"has_blockers": false, "blockers": []}', "ok")
+            return StageExecutionResult(f"design/{stage_id}.md", "# stage\n\nok", "ok")
 
     monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: DesignPackProvider())
 
@@ -452,7 +456,8 @@ def test_design_doc_extracts_top_level_design_pack(monkeypatch: pytest.MonkeyPat
 
 def test_design_pack_without_risks_still_publishes(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
     class DesignPackWithoutRisksProvider:
-        def run_stage(self, *, stage_id: str, task: str, worktree: Path) -> ProviderStageOutput:
+        def execute(self, input: StageExecutionInput) -> StageExecutionResult:
+            stage_id, _task, _worktree = input.stage_id, input.task, input.worktree
             if stage_id == "design_brief":
                 payload = {
                     "summary": "完成贪吃蛇小游戏设计。",
@@ -481,10 +486,10 @@ def test_design_pack_without_risks_still_publishes(monkeypatch: pytest.MonkeyPat
                         "open_questions": ["Confirm exact board size and speed curve."],
                     },
                 }
-                return ProviderStageOutput("design/design_brief.md", json.dumps(payload, ensure_ascii=False), "done")
+                return StageExecutionResult("design/design_brief.md", json.dumps(payload, ensure_ascii=False), "done")
             if stage_id == "design_review":
-                return ProviderStageOutput("design/design_review.md", '{"has_blockers": false, "blockers": []}', "ok")
-            return ProviderStageOutput(f"design/{stage_id}.md", "# stage\n\nok", "ok")
+                return StageExecutionResult("design/design_review.md", '{"has_blockers": false, "blockers": []}', "ok")
+            return StageExecutionResult(f"design/{stage_id}.md", "# stage\n\nok", "ok")
 
     monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: DesignPackWithoutRisksProvider())
 
@@ -499,7 +504,8 @@ def test_design_pack_without_risks_still_publishes(monkeypatch: pytest.MonkeyPat
 
 def test_design_verify_blocks_shallow_design_document(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
     class ShallowDesignProvider:
-        def run_stage(self, *, stage_id: str, task: str, worktree: Path) -> ProviderStageOutput:
+        def execute(self, input: StageExecutionInput) -> StageExecutionResult:
+            stage_id, _task, _worktree = input.stage_id, input.task, input.worktree
             if stage_id in {"design_brief", "design_revise"}:
                 payload = {
                     "summary": "Completed a thin snake design.",
@@ -508,10 +514,10 @@ def test_design_verify_blocks_shallow_design_document(monkeypatch: pytest.Monkey
                         "acceptance_criteria": ["AC-1: no implementation files were created"],
                     },
                 }
-                return ProviderStageOutput(f"design/{stage_id}.md", json.dumps(payload, ensure_ascii=False), "thin design")
+                return StageExecutionResult(f"design/{stage_id}.md", json.dumps(payload, ensure_ascii=False), "thin design")
             if stage_id == "design_review":
-                return ProviderStageOutput("design/design_review.md", '{"has_blockers": false, "blockers": []}', "review passed")
-            return ProviderStageOutput(f"design/{stage_id}.md", "# stage\n\nok", "ok")
+                return StageExecutionResult("design/design_review.md", '{"has_blockers": false, "blockers": []}', "review passed")
+            return StageExecutionResult(f"design/{stage_id}.md", "# stage\n\nok", "ok")
 
     monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: ShallowDesignProvider())
 
@@ -683,10 +689,11 @@ def test_design_provider_question_pauses_and_response_reaches_next_context(monke
             self.calls = 0
             self.seen_preference = False
 
-        def run_stage(self, *, stage_id: str, task: str, worktree: Path) -> ProviderStageOutput:
+        def execute(self, input: StageExecutionInput) -> StageExecutionResult:
+            stage_id, task, _worktree = input.stage_id, input.task, input.worktree
             self.calls += 1
             if self.calls == 1:
-                return ProviderStageOutput(
+                return StageExecutionResult(
                     "session/design_brief.log",
                     "waiting_external_confirmation: 请确认目标用户和视觉风格",
                     "needs design preference",
@@ -700,6 +707,8 @@ def test_design_provider_question_pauses_and_response_reaches_next_context(monke
                         }
                     ],
                 )
+            if stage_id == "design_review":
+                return StageExecutionResult("design/design_review.md", '{"has_blockers": false, "blockers": []}', "review complete")
             match = re.search(r"- path: (.+)", task)
             assert match is not None
             packet = json.loads(Path(match.group(1).strip()).read_text(encoding="utf-8"))
@@ -745,7 +754,7 @@ def test_design_provider_question_pauses_and_response_reaches_next_context(monke
                     "open_questions": ["Confirm final visual theme and difficulty tuning."],
                 },
             }
-            return ProviderStageOutput("design/design_brief.md", json.dumps(payload, ensure_ascii=False), "done")
+            return StageExecutionResult("design/design_brief.md", json.dumps(payload, ensure_ascii=False), "done")
 
     provider = DesignQuestionProvider()
     monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: provider)
@@ -789,11 +798,12 @@ def test_structured_design_feedback_pauses_and_reruns_with_feedback(monkeypatch:
             self.saw_feedback = False
             self.saw_upstream_artifact = False
 
-        def run_stage(self, *, stage_id: str, task: str, worktree: Path) -> ProviderStageOutput:
+        def execute(self, input: StageExecutionInput) -> StageExecutionResult:
+            stage_id, task, _worktree = input.stage_id, input.task, input.worktree
             if stage_id == "design_brief":
                 self.design_brief_calls += 1
                 if self.design_brief_calls == 1:
-                    return ProviderStageOutput(
+                    return StageExecutionResult(
                         "design/design_brief.md",
                         json.dumps(
                             {
@@ -825,12 +835,12 @@ def test_structured_design_feedback_pauses_and_reruns_with_feedback(monkeypatch:
                     and Path(str(row.get("path") or "")).exists()
                     for row in upstream
                 )
-                return ProviderStageOutput(
+                return StageExecutionResult(
                     "design/design_review.md",
-                    json.dumps({"blockers": [], "delivery_decision": "complete", "missing_evidence": []}),
+                    json.dumps({"has_blockers": False, "blockers": [], "delivery_decision": "complete", "missing_evidence": []}),
                     "review complete",
                 )
-            return ProviderStageOutput(f"{stage_id}.md", json.dumps({"summary": "ok"}), "ok")
+            return StageExecutionResult(f"{stage_id}.md", json.dumps({"summary": "ok"}), "ok")
 
     provider = FeedbackProvider()
     monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: provider)
@@ -919,22 +929,23 @@ def test_design_review_blockers_drive_revision_loop(monkeypatch: pytest.MonkeyPa
             self.review_count = 0
             self.revise_count = 0
 
-        def run_stage(self, *, stage_id: str, task: str, worktree: Path) -> ProviderStageOutput:
+        def execute(self, input: StageExecutionInput) -> StageExecutionResult:
+            stage_id, _task, _worktree = input.stage_id, input.task, input.worktree
             if stage_id in {"design_plan", "design_brief"}:
                 return _complete_design_stage_output(stage_id, "design loop base")
             if stage_id == "design_review":
                 self.review_count += 1
                 if self.review_count == 1:
-                    return ProviderStageOutput(
+                    return StageExecutionResult(
                         "design/design_review.md",
                         '{"has_blockers": true, "blockers": [{"type": "gap", "severity": "high", "suggestion": "add API constraints"}]}',
                         "design blockers",
                     )
-                return ProviderStageOutput("design/design_review.md", '{"has_blockers": false, "blockers": []}', "design accepted")
+                return StageExecutionResult("design/design_review.md", '{"has_blockers": false, "blockers": []}', "design accepted")
             if stage_id == "design_revise":
                 self.revise_count += 1
-                return ProviderStageOutput("design/design_revise.md", "# Revised\n\nAdded API constraints.", "revised")
-            return ProviderStageOutput(f"{stage_id}.md", f"# {stage_id}", f"{stage_id} ok")
+                return StageExecutionResult("design/design_revise.md", "# Revised\n\nAdded API constraints.", "revised")
+            return StageExecutionResult(f"{stage_id}.md", f"# {stage_id}", f"{stage_id} ok")
 
     provider = DesignReviewProvider()
     monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: provider)
@@ -949,18 +960,19 @@ def test_design_review_blockers_drive_revision_loop(monkeypatch: pytest.MonkeyPa
 
 def test_design_blocks_after_max_review_fixes(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
     class BlockingDesignProvider:
-        def run_stage(self, *, stage_id: str, task: str, worktree: Path) -> ProviderStageOutput:
+        def execute(self, input: StageExecutionInput) -> StageExecutionResult:
+            stage_id, _task, _worktree = input.stage_id, input.task, input.worktree
             if stage_id in {"design_plan", "design_brief"}:
                 return _complete_design_stage_output(stage_id, "blocking design base")
             if stage_id == "design_review":
-                return ProviderStageOutput(
+                return StageExecutionResult(
                     "design/design_review.md",
                     '{"has_blockers": true, "blockers": [{"type": "gap", "severity": "high", "suggestion": "still missing"}]}',
                     "still blocked",
                 )
             if stage_id == "design_revise":
-                return ProviderStageOutput("design/design_revise.md", "# Revised\n\nTried once.", "revised")
-            return ProviderStageOutput(f"{stage_id}.md", f"# {stage_id}", f"{stage_id} ok")
+                return StageExecutionResult("design/design_revise.md", "# Revised\n\nTried once.", "revised")
+            return StageExecutionResult(f"{stage_id}.md", f"# {stage_id}", f"{stage_id} ok")
 
     monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: BlockingDesignProvider())
 
@@ -1147,14 +1159,15 @@ def test_review_blockers_drive_fix_loop(monkeypatch: pytest.MonkeyPatch, workspa
         def __init__(self) -> None:
             self.review_count = 0
 
-        def run_stage(self, *, stage_id: str, task: str, worktree: Path) -> ProviderStageOutput:
+        def execute(self, input: StageExecutionInput) -> StageExecutionResult:
+            stage_id, _task, worktree = input.stage_id, input.task, input.worktree
             if stage_id == "implement":
                 (worktree / "fix_loop.txt").write_text("initial implementation\n", encoding="utf-8")
-                return ProviderStageOutput("session/implement.log", "implemented", "implemented")
+                return StageExecutionResult("session/implement.log", "implemented", "implemented")
             if stage_id == "review":
                 self.review_count += 1
                 if self.review_count == 1:
-                    return ProviderStageOutput(
+                    return StageExecutionResult(
                         "review.md",
                         """
 ```json
@@ -1163,11 +1176,15 @@ def test_review_blockers_drive_fix_loop(monkeypatch: pytest.MonkeyPatch, workspa
 """,
                         "blockers found",
                     )
-                return ProviderStageOutput("review.md", '{"has_blockers": false, "blockers": []}', "no blockers")
+                return StageExecutionResult("review.md", '{"has_blockers": false, "blockers": []}', "no blockers")
             if stage_id == "fix":
                 (worktree / "fix_loop.txt").write_text("fixed blocker\n", encoding="utf-8")
-                return ProviderStageOutput("session/fix.log", "fixed blocker", "fixed blocker")
-            return ProviderStageOutput(f"{stage_id}.md", "{}", f"{stage_id} ok")
+                return StageExecutionResult("session/fix.log", "fixed blocker", "fixed blocker")
+            if stage_id == "test":
+                return StageExecutionResult("test.md", '{"passed": true, "command": "pytest -q", "exit_code": 0, "summary": "passed"}', "tests passed")
+            if "review" in stage_id:
+                return StageExecutionResult(f"{stage_id}.md", '{"has_blockers": false, "blockers": []}', f"{stage_id} ok")
+            return StageExecutionResult(f"{stage_id}.md", "{}", f"{stage_id} ok")
 
     provider = FlakyReviewProvider()
     monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: provider)
@@ -1189,8 +1206,9 @@ def test_review_blockers_drive_fix_loop(monkeypatch: pytest.MonkeyPatch, workspa
 
 def test_external_confirmation_output_creates_provider_action_not_approval(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
     class ExternalPromptProvider:
-        def run_stage(self, *, stage_id: str, task: str, worktree: Path) -> ProviderStageOutput:
-            return ProviderStageOutput("session/external.log", "waiting_external_confirmation: continue?", "needs confirmation")
+        def execute(self, input: StageExecutionInput) -> StageExecutionResult:
+            _stage_id, _task, _worktree = input.stage_id, input.task, input.worktree
+            return StageExecutionResult("session/external.log", "waiting_external_confirmation: continue?", "needs confirmation")
 
     monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: ExternalPromptProvider())
 
@@ -1214,14 +1232,19 @@ def test_provider_action_must_be_handled_before_resume(monkeypatch: pytest.Monke
         def __init__(self) -> None:
             self.calls = 0
 
-        def run_stage(self, *, stage_id: str, task: str, worktree: Path) -> ProviderStageOutput:
+        def execute(self, input: StageExecutionInput) -> StageExecutionResult:
+            stage_id, _task, worktree = input.stage_id, input.task, input.worktree
             self.calls += 1
             if self.calls == 1:
-                return ProviderStageOutput("session/external.log", "Apply this change? [y/N]", "needs confirmation")
+                return StageExecutionResult("session/external.log", "Apply this change? [y/N]", "needs confirmation")
             if stage_id == "implement":
                 (worktree / "provider_action_resume.txt").write_text("implemented after provider action\n", encoding="utf-8")
-                return ProviderStageOutput("session/implement.log", "implemented", "implemented")
-            return ProviderStageOutput(f"{stage_id}.md", "{}", "ok")
+                return StageExecutionResult("session/implement.log", "implemented", "implemented")
+            if stage_id == "test":
+                return StageExecutionResult("test.md", '{"passed": true, "command": "pytest -q", "exit_code": 0, "summary": "passed"}', "tests passed")
+            if "review" in stage_id:
+                return StageExecutionResult(f"{stage_id}.md", '{"has_blockers": false, "blockers": []}', "ok")
+            return StageExecutionResult(f"{stage_id}.md", "{}", "ok")
 
     provider = ExternalPromptProvider()
     monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: provider)
@@ -1260,10 +1283,11 @@ stages:
             self.calls = 0
             self.seen_response = False
 
-        def run_stage(self, *, stage_id: str, task: str, worktree: Path) -> ProviderStageOutput:
+        def execute(self, input: StageExecutionInput) -> StageExecutionResult:
+            _stage_id, task, _worktree = input.stage_id, input.task, input.worktree
             self.calls += 1
             if self.calls == 1:
-                return ProviderStageOutput(
+                return StageExecutionResult(
                     "session/ask.log",
                     "Choose mode",
                     "needs choice",
@@ -1282,7 +1306,7 @@ stages:
             packet = json.loads(Path(match.group(1).strip()).read_text(encoding="utf-8"))
             responses = packet["task"]["provider_action_responses"]
             self.seen_response = responses[0]["response"] == {"choice": "safe"}
-            return ProviderStageOutput("ask.md", "done", "done")
+            return StageExecutionResult("ask.md", "done", "done")
 
     provider = ChoiceProvider()
     monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: provider)

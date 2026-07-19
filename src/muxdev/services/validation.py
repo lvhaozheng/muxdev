@@ -12,7 +12,7 @@ from typing import Any
 
 import yaml
 
-from ..config.runtime import legacy_role, normalize_role
+from ..config.runtime import normalize_role
 from ..core.platforms import hidden_subprocess_kwargs
 from ..core.redaction import redact
 from ..models import RunStatus, StageStatus, utc_now
@@ -163,7 +163,9 @@ def collect_validation_metric(
     context_packets = _read_context_packets(run_dir)
     loop_iterations = sum(1 for event in trace_events if event.get("type") == "loop_iteration_completed")
     loop_blocked = any(event.get("type") == "loop_blocked" for event in trace_events)
-    workflow_engine = "langgraph" if any(event.get("type") == "langgraph_runtime_selected" for event in trace_events) else "native"
+    # Archived traces can contain ``langgraph_runtime_selected``.  New and
+    # restored runs are evaluated against the sole native scheduler.
+    workflow_engine = "native"
     rag_packets = [packet for packet in context_packets if isinstance(packet.get("rag_decision"), dict)]
     enabled_rag_packets = [packet for packet in rag_packets if bool(packet.get("rag_decision", {}).get("enabled"))]
     rag_hits = [hit for packet in enabled_rag_packets for hit in packet.get("rag_context", []) if isinstance(hit, dict)]
@@ -681,7 +683,6 @@ def _expand_role_providers(role_providers: dict[str, str]) -> dict[str, str]:
     for role, provider in role_providers.items():
         normalized = normalize_role(role)
         expanded[normalized] = provider
-        expanded[legacy_role(normalized)] = provider
     return expanded
 
 

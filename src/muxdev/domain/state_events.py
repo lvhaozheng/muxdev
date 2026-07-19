@@ -20,6 +20,7 @@ PROVIDER_ACTION_RESPONDED = "provider_action.responded"
 PROVIDER_ACTION_TRANSITIONED = "provider_action.transitioned"
 WORKER_FAILED = "worker.failed"
 LEGACY_RUN_IMPORTED = "legacy_run.imported"
+RECOVERY_FORKED = "recovery.forked"
 
 SUPPORTED_EVENT_VERSIONS = {
     RUN_CREATED: 1,
@@ -32,6 +33,7 @@ SUPPORTED_EVENT_VERSIONS = {
     PROVIDER_ACTION_TRANSITIONED: 1,
     WORKER_FAILED: 1,
     LEGACY_RUN_IMPORTED: 1,
+    RECOVERY_FORKED: 1,
 }
 
 
@@ -183,6 +185,10 @@ def reduce_run_state(state: Mapping[str, Any] | None, event: StateEventEnvelope)
         if str(current.get("status")) == "aborted":
             raise InvalidStateTransition("aborted run cannot be changed by worker failure")
         current["status"] = "blocked"
+    elif event.event_type == RECOVERY_FORKED:
+        recoveries = list(current.get("recoveries") or [])
+        recoveries.append(payload)
+        current["recoveries"] = recoveries
     current["last_sequence"] = event.sequence
     return current
 

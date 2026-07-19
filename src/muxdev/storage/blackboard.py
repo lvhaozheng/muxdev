@@ -21,6 +21,7 @@ from ..domain.state_events import (
     PROVIDER_ACTION_REQUESTED,
     PROVIDER_ACTION_RESPONDED,
     PROVIDER_ACTION_TRANSITIONED,
+    RECOVERY_FORKED,
     RUN_CREATED,
     RUN_TRANSITIONED,
     STAGE_TRANSITIONED,
@@ -35,7 +36,8 @@ from ..models import ApprovalStatus, ProviderActionKind, ProviderActionStatus, R
 from ..core.redaction import redact
 from ..providers.harness import CertificationReport, HarnessEvent, HarnessEventSource
 from .contracts import canonical_hash
-from .sqlite import Migration, SQLiteEngine, UnitOfWork, add_missing_columns, apply_migrations, execute_script
+from .schema import blackboard_migrations
+from .sqlite import SQLiteEngine, UnitOfWork, add_missing_columns, apply_migrations, execute_script
 
 
 class RunStore:
@@ -140,15 +142,7 @@ class Blackboard:
         try:
             apply_migrations(
                 self.engine,
-                (
-                    Migration(1, "blackboard_baseline", "blackboard-v1-20260718", self._create_v1_schema),
-                    Migration(2, "operational_state_events", "blackboard-v2-state-events-attempt-history", self._create_v2_schema),
-                    Migration(3, "durable_execution_queue", "blackboard-v3-durable-runtime-20260719", self._create_v3_schema),
-                    Migration(4, "certified_agent_harness", "blackboard-v4-certified-harness-20260719-r2", self._create_v4_schema),
-                    Migration(5, "quality_routing_and_review", "blackboard-v5-routing-review-20260719-r1", self._create_v5_schema),
-                    Migration(6, "signed_delivery_attestation", "blackboard-v6-signed-attestation-20260719-r1", self._create_v6_schema),
-                    Migration(7, "trusted_routing_benchmark", "blackboard-v7-trusted-benchmark-20260719-r1", self._create_v7_schema),
-                ),
+                blackboard_migrations(self),
                 backup_root=self.db_path.parent / "backups" / "migrations",
             )
         except BaseException:
@@ -156,6 +150,9 @@ class Blackboard:
             raise
         if execution_guard is not None:
             self.engine.commit_validator = self._validate_execution_guard
+        from .repositories import BlackboardRepositories
+
+        self.repositories = BlackboardRepositories.from_blackboard(self)
 
     def _validate_execution_guard(self) -> None:
         """Fence every Runtime commit against the currently owned execution lease."""
@@ -3095,6 +3092,83 @@ class Blackboard:
             status=StageStatus.PENDING,
             summary="retry requested",
         )
+
+    def record_recovery_fork(
+        self,
+        run_id: str,
+        *,
+        from_stage: str,
+        invalidated_stages: list[str],
+        snapshot_path: Path,
+        snapshot_hash: str,
+        recovery_id: str,
+    ) -> dict[str, int]:
+        """Invalidate current delivery projections while retaining immutable history."""
+        stage_ids = [str(item) for item in invalidated_stages if str(item)]
+        with self.unit_of_work():
+            self._ensure_legacy_run_imported(run_id)
+            self._append_state_event(
+                run_id=run_id,
+                event_type=RECOVERY_FORKED,
+                payload={
+                    "recovery_id": recovery_id,
+                    "from_stage": from_stage,
+                    "invalidated_stages": stage_ids,
+                    "snapshot_path": str(snapshot_path),
+                    "snapshot_hash": snapshot_hash,
+                },
+                idempotency_key=f"recovery:{recovery_id}",
+            )
+            for stage_id in stage_ids:
+                row = self.conn.execute(
+                    "SELECT role FROM stages WHERE run_id=? AND stage_id=?",
+                    (run_id, stage_id),
+                ).fetchone()
+                if row is not None:
+                    self.upsert_stage(
+                        run_id,
+                        stage_id,
+                        role=str(row["role"]) if row["role"] else None,
+                        status=StageStatus.PENDING,
+                        summary=f"invalidated by recovery {recovery_id}",
+                    )
+            placeholders = ",".join("?" for _ in stage_ids)
+            if stage_ids:
+                values: list[Any] = [run_id, *stage_ids]
+                self.conn.execute(
+                    f"DELETE FROM test_results WHERE run_id=? AND stage_id IN ({placeholders})",
+                    values,
+                )
+                self.conn.execute(
+                    f"DELETE FROM review_blockers WHERE run_id=? AND stage_id IN ({placeholders})",
+                    values,
+                )
+                self.conn.execute(
+                    f"""DELETE FROM artifacts
+                        WHERE run_id=? AND stage_id IN ({placeholders})
+                          AND kind IN ('stage_output','result_validation','delivery_gate','role_result_contract')""",
+                    values,
+                )
+            evidence_count = int(self.conn.execute("SELECT COUNT(*) FROM evidence_events WHERE run_id=?", (run_id,)).fetchone()[0])
+            evaluation_count = int(self.conn.execute("SELECT COUNT(*) FROM evidence_evaluations WHERE run_id=?", (run_id,)).fetchone()[0])
+            attestation_count = int(self.conn.execute("SELECT COUNT(*) FROM delivery_attestations WHERE run_id=? AND is_current=1", (run_id,)).fetchone()[0])
+            self.conn.execute("DELETE FROM evidence_events WHERE run_id=?", (run_id,))
+            self.conn.execute("DELETE FROM evidence_manifests WHERE run_id=?", (run_id,))
+            self.conn.execute("DELETE FROM evidence_evaluations WHERE run_id=?", (run_id,))
+            self.conn.execute("UPDATE delivery_attestations SET is_current=0 WHERE run_id=?", (run_id,))
+            current = self.conn.execute("SELECT status FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            if current is not None and str(current["status"]) != str(RunStatus.RUNNING):
+                self.set_run_status(
+                    run_id,
+                    RunStatus.RUNNING,
+                    recovery_reason=f"recover from {from_stage} snapshot",
+                    idempotency_key=f"recovery:{recovery_id}:run",
+                )
+        return {
+            "evidence_events": evidence_count,
+            "evidence_evaluations": evaluation_count,
+            "attestations": attestation_count,
+        }
 
     def skip_stage(self, run_id: str, stage_id: str, reason: str = "skip requested") -> None:
         row = self.conn.execute(

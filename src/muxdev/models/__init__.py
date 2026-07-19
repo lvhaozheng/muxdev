@@ -92,7 +92,12 @@ class ReviewResult(BaseModel):
 class TestResult(BaseModel):
     passed: bool
     command: str
+    exit_code: int
     summary: str
+    stdout: str | None = None
+    stderr: str | None = None
+    coverage: dict[str, Any] = Field(default_factory=dict)
+    security_artifacts: list[str] = Field(default_factory=list)
 
 
 class LoopPolicy(BaseModel):

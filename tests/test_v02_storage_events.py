@@ -31,6 +31,9 @@ from muxdev.services.storage_admin import (
 from muxdev.storage import Blackboard, MemoryStore, MigrationChecksumError, UnsupportedSchemaError
 
 
+PRE_REFACTOR_V7 = Path(__file__).parent / "fixtures" / "pre_refactor_v7"
+
+
 @pytest.fixture
 def workspace() -> Path:
     root = Path(".test_workspaces") / f"v02_storage_{uuid4().hex}"
@@ -202,6 +205,30 @@ def test_blackboard_and_memory_share_durable_sqlite_defaults(workspace: Path) ->
     with MemoryStore(workspace) as memory:
         assert memory.storage_health()["journal_mode"] == "wal"
         assert memory.storage_health()["synchronous"] == "full"
+
+
+def test_frozen_pre_refactor_v7_remains_queryable_and_recoverable(workspace: Path) -> None:
+    run_dir = workspace / ".muxdev" / "runs" / "run_pre_refactor_v7"
+    shutil.copytree(PRE_REFACTOR_V7, run_dir)
+    database = run_dir / "blackboard.sqlite"
+
+    with Blackboard(run_dir, db_path=database) as board:
+        assert board.storage_health()["schema_version"] == 7
+        run = board.repositories.lifecycle.get_run("run_pre_refactor_v7")
+        assert run["status"] == "blocked"
+        assert run["task"] == "resume a pre-refactor v7 task"
+        evidence = board.table_rows("evidence_events", run_id="run_pre_refactor_v7")
+        assert evidence[0]["event_hash"] == "sha256:legacy-event"
+        assert board.repositories.lifecycle.replay_run("run_pre_refactor_v7")["matches"] is True
+
+        board.repositories.lifecycle.set_run_status(
+            "run_pre_refactor_v7",
+            "running",
+            recovery_reason="operator continued frozen v7 task",
+            idempotency_key="fixture:continue",
+        )
+        assert board.repositories.lifecycle.get_run("run_pre_refactor_v7")["status"] == "running"
+        assert board.repositories.lifecycle.replay_run("run_pre_refactor_v7")["matches"] is True
 
 
 @pytest.mark.integration

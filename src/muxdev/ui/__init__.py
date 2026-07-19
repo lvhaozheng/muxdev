@@ -1,14 +1,12 @@
-"""Terminal UI, REPL, and Rich rendering package."""
+"""Interactive REPL package.
+
+The daemon-backed TUI lives in :mod:`muxdev.cli.tui`; the removed workspace
+TUI no longer has a second state-management path.
+"""
 
 from .repl import handle_repl_command, start_repl
-from .tui import load_payload, start_tui, status_panel, status_payload, startup_payload
 
 __all__ = [
     "handle_repl_command",
-    "load_payload",
     "start_repl",
-    "start_tui",
-    "startup_payload",
-    "status_panel",
-    "status_payload",
 ]

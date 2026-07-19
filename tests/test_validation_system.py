@@ -167,9 +167,9 @@ def test_validation_harness_applies_multi_cli_role_overrides_and_optional_judge(
 
         multi = next(run for run in experiment.runs if run.strategy == "muxdev_multi_cli")
         assert multi.role_providers["code"] == "mock"
-        assert multi.role_providers["implementer"] == "mock"
         assert multi.role_providers["test"] == "mock"
-        assert multi.role_providers["tester"] == "mock"
+        assert "implementer" not in multi.role_providers
+        assert "tester" not in multi.role_providers
         assert multi.judge_path and Path(multi.judge_path).exists()
         judged = [metric for metric in experiment.metrics if metric.judge_score is not None]
         assert len(judged) == 2

@@ -1,8 +1,8 @@
 """Minimal JSON-RPC/MCP-compatible control surface.
 
 The MCP server exposes read-oriented muxdev capabilities to external agents:
-    provider discovery, workspace search, local RAG, workflow templates, command
-rendering, and flow listing. Tool handlers reuse the same services as the CLI so
+    provider discovery, workspace search, local RAG, workflow templates, and
+command rendering. Tool handlers reuse the same services as the CLI so
 there is one behavior source for humans, scripts, and agent clients.
 """
 
@@ -19,10 +19,9 @@ from ..core.safety import SafetyPolicyEngine
 from ..providers import detect_providers
 from ..presentation.dashboard import build_dashboard_overview
 from ..services.evidence import verify_run_evidence
-from ..services.flows import FlowRegistry
 from ..services.rag import LocalRagIndex
 from ..services.ux import build_provider_health
-from ..services.workflow_plugins import list_workflow_plugins, render_plugin_command
+from ..services.workflow_templates import list_workflow_templates, render_template_command
 from ..storage import Blackboard, MemoryStore, RunStore, canonical_hash, sha256_text
 
 
@@ -72,29 +71,18 @@ def server_manifest(workspace: Path | None = None) -> dict[str, Any]:
                 "inputSchema": {"type": "object", "properties": {}},
             },
             {
-                "name": "workflow.plugins",
-                "description": "Deprecated alias for workflow.templates.",
-                "inputSchema": {"type": "object", "properties": {}},
-            },
-            {
                 "name": "workflow.render",
                 "description": "Render a workflow template phase command for a provider.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "template": {"type": "string"},
-                        "plugin": {"type": "string", "description": "Deprecated alias for template."},
                         "phase": {"type": "string"},
                         "provider": {"type": "string"},
                         "task": {"type": "string"},
                     },
                     "required": ["phase", "provider"],
                 },
-            },
-            {
-                "name": "flow.list",
-                "description": "List local muxdev scheduled flow definitions.",
-                "inputSchema": {"type": "object", "properties": {}},
             },
             {
                 "name": "muxdev.check_policy",
@@ -257,17 +245,17 @@ def _call_tool(name: str, arguments: dict[str, Any], workspace: Path) -> dict[st
         query = str(arguments["query"])
         limit = int(arguments.get("limit", 5))
         return {"content": [{"type": "json", "json": LocalRagIndex(workspace).query(query, limit=limit)}]}
-    if name in {"workflow.templates", "workflow.plugins"}:
-        return {"content": [{"type": "json", "json": [plugin.to_dict() for plugin in list_workflow_plugins()]}]}
+    if name == "workflow.templates":
+        return {"content": [{"type": "json", "json": [template.to_dict() for template in list_workflow_templates()]}]}
     if name == "workflow.render":
-        template = arguments.get("template", arguments.get("plugin"))
+        template = arguments.get("template")
         if template is None:
             raise ValueError("workflow.render requires template")
         return {
             "content": [
                 {
                     "type": "json",
-                    "json": render_plugin_command(
+                    "json": render_template_command(
                         str(template),
                         str(arguments["phase"]),
                         str(arguments["provider"]),
@@ -276,8 +264,6 @@ def _call_tool(name: str, arguments: dict[str, Any], workspace: Path) -> dict[st
                 }
             ]
         }
-    if name == "flow.list":
-        return {"content": [{"type": "json", "json": [flow.to_dict() for flow in FlowRegistry(workspace).list()]}]}
     if name == "muxdev.check_policy":
         result = SafetyPolicyEngine().evaluate_shell(str(arguments["command"]))
         payload = {"decision": str(result.decision), "reason": result.reason, "command": str(arguments["command"])}

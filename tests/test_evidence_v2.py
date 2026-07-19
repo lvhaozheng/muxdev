@@ -13,12 +13,13 @@ import pytest
 
 from muxdev.cli import app
 from muxdev.models import RunStatus
-from muxdev.providers.adapters import HeadlessCliProviderAdapter, ProviderStageOutput
+from muxdev.domain import StageExecutionInput, StageExecutionResult
+from muxdev.providers.adapters import HeadlessCliProviderAdapter
 from muxdev.runtime import SupervisorRuntime
 from muxdev.services.dashboard_run import build_run_dashboard_payload
 from muxdev.services.evidence import verify_run_evidence
 from muxdev.storage import Blackboard
-from muxdev.ui.tui import status_panel
+from muxdev.presentation import status_panel
 
 
 pytestmark = pytest.mark.integration
@@ -49,6 +50,10 @@ def test_completed_run_writes_evidence_v2_artifacts() -> None:
         assert evaluation["standard_scores"]["max_evidence"] in {"E2", "E3"}
         assert evaluation["standard_scores"]["meets_minimum"] is True
         assert any(event["evidence_level"] in {"E2", "E3"} for event in events)
+        test_events = [event for event in events if event["kind"] == "test" and event["status"] == "passed"]
+        assert test_events and test_events[-1]["metrics"]["exit_code"] == 0
+        assert test_events[-1]["metrics"]["result_contract_valid"] is True
+        assert any(ref.get("producer") == "result_validation" for ref in test_events[-1]["artifact_refs"])
         assert all({"standard_id", "severity", "risk_level", "evidence_level"} <= set(event) for event in events)
         assert "memory_safety" not in evaluation["components"]
         assert not (result.run_dir / "evidence" / "scorecard.json").exists()
@@ -88,8 +93,9 @@ stages:
     )
 
     class InspectProvider:
-        def run_stage(self, *, stage_id: str, task: str, worktree: Path, skills=None) -> ProviderStageOutput:
-            return ProviderStageOutput("inspect.md", "inspection only", "inspection only")
+        def execute(self, input: StageExecutionInput) -> StageExecutionResult:
+            _stage_id, _task, _worktree, _skills = input.stage_id, input.task, input.worktree, list(input.skills)
+            return StageExecutionResult("inspect.md", "inspection only", "inspection only")
 
     monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: InspectProvider())
     try:
@@ -119,8 +125,9 @@ stages:
     )
 
     class BlockingReviewProvider:
-        def run_stage(self, *, stage_id: str, task: str, worktree: Path, skills=None) -> ProviderStageOutput:
-            return ProviderStageOutput(
+        def execute(self, input: StageExecutionInput) -> StageExecutionResult:
+            _stage_id, _task, _worktree, _skills = input.stage_id, input.task, input.worktree, list(input.skills)
+            return StageExecutionResult(
                 "review.md",
                 '{"has_blockers": true, "blockers": [{"type": "bug", "file": "x.py", "line": 1, "severity": "high", "suggestion": "fix blocker"}]}',
                 "blocker found",
@@ -134,35 +141,6 @@ stages:
         assert result.status == RunStatus.BLOCKED
         assert evaluation["label"] == "blocked"
         assert "high review blocker must be resolved" in evaluation["missing_evidence"]
-    finally:
-        shutil.rmtree(workspace, ignore_errors=True)
-
-
-def test_cleanup_legacy_evidence_removes_v1_artifacts_and_tables() -> None:
-    workspace = _workspace_temp("evidence-v2-cleanup")
-    try:
-        with _chdir(workspace):
-            result = SupervisorRuntime(workspace).run("legacy evidence cleanup smoke", provider="mock")
-            legacy_path = result.run_dir / "evidence" / "scorecard.json"
-            legacy_bundle = result.run_dir / "evidence" / "implement.evidence.json"
-            legacy_path.write_text("{}", encoding="utf-8")
-            legacy_bundle.write_text("{}", encoding="utf-8")
-            with Blackboard(result.run_dir) as blackboard:
-                blackboard.conn.execute("CREATE TABLE IF NOT EXISTS evidence_bundles(run_id TEXT)")
-                blackboard.conn.execute("INSERT INTO evidence_bundles(run_id) VALUES (?)", (result.run_id,))
-                blackboard.conn.commit()
-            cleanup = runner.invoke(app, ["evidence", "cleanup-legacy", result.run_id, "--yes", "--json"])
-
-        assert cleanup.exit_code == 0
-        payload = json.loads(cleanup.stdout)
-        assert "evidence_bundles" in payload["dropped_tables"]
-        failed_files = set(payload.get("failed_files", []))
-        assert not legacy_path.exists() or str(legacy_path) in failed_files
-        assert not legacy_bundle.exists() or str(legacy_bundle) in failed_files
-        with Blackboard(result.run_dir) as blackboard:
-            tables = {row["name"] for row in blackboard.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            assert "evidence_bundles" not in tables
-            assert blackboard.table_rows("evidence_events", run_id=result.run_id)
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 

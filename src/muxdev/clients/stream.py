@@ -38,7 +38,9 @@ class StreamEvent:
 
 
 @dataclass(frozen=True)
-class ProviderActionRequest:
+class DetectedProviderAction:
+    """Provider prompt detected from untrusted subprocess output."""
+
     kind: str
     prompt_text: str
     options: list[dict[str, object]]
@@ -68,9 +70,9 @@ class StreamAdapter:
             events.append(StreamEvent(StreamEventType.APPROVAL_PROMPT_DETECTED, action_text))
         return events
 
-    def provider_actions(self, events: list[StreamEvent]) -> list[ProviderActionRequest]:
+    def provider_actions(self, events: list[StreamEvent]) -> list[DetectedProviderAction]:
         """Convert low-level stream events into user-visible provider actions."""
-        actions: list[ProviderActionRequest] = []
+        actions: list[DetectedProviderAction] = []
         seen: set[tuple[str, str]] = set()
         for event in events:
             kind = _action_kind(event.type)
@@ -81,7 +83,7 @@ class StreamAdapter:
             if key in seen:
                 continue
             seen.add(key)
-            actions.append(ProviderActionRequest(kind=kind, prompt_text=prompt, options=_options_for(kind, event.text)))
+            actions.append(DetectedProviderAction(kind=kind, prompt_text=prompt, options=_options_for(kind, event.text)))
         return actions
 
     def idle_timeout(self, seconds: float) -> StreamEvent:

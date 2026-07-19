@@ -12,16 +12,13 @@ import pytest
 from rich.console import Console
 
 from muxdev.ui.repl import handle_repl_command
-from muxdev.ui.tui import (
+from muxdev.presentation.daemon_tui import (
     daemon_chat_view,
     daemon_help_text,
     daemon_provider_actions_text,
     daemon_task_detail_text,
     daemon_tasks_text,
     _daemon_focus_panel,
-    _handle_tui_command,
-    _normalize_command,
-    _render_tui,
 )
 
 
@@ -45,43 +42,6 @@ def test_repl_exit_stops_loop() -> None:
 
     assert running is False
     assert message == "bye"
-
-
-def test_tui_slash_commands_normalize() -> None:
-    assert _normalize_command("/refresh") == "r"
-    assert _normalize_command("/quit") == "q"
-    assert _normalize_command("/run add tests") == "run add tests"
-    assert _normalize_command("/dev add tests") == "run add tests"
-    assert _normalize_command("/design plan it") == "workflow design plan it"
-    assert _normalize_command("/approve appr_1") == "approve appr_1"
-    assert _normalize_command("/action handled pact_1") == "action handled pact_1"
-    assert _normalize_command("/action choose pact_1 safe") == "action choose pact_1 safe"
-    assert _normalize_command("/action respond pact_1 clarify target") == "action respond pact_1 clarify target"
-    assert _normalize_command("/action continue pact_1") == "action continue pact_1"
-
-
-def test_tui_help_lists_slash_commands() -> None:
-    workspace = _workspace_temp()
-    try:
-        message = _handle_tui_command("help", workspace, "latest")
-    finally:
-        shutil.rmtree(workspace, ignore_errors=True)
-
-    assert "/run" in message
-    assert "/approve" in message
-
-
-def test_tui_render_only_clears_when_requested() -> None:
-    workspace = _workspace_temp()
-    console = _FakeConsole()
-    try:
-        _render_tui(console, workspace, "latest")
-        assert console.clears == 0
-
-        _render_tui(console, workspace, "latest", clear_screen=True)
-        assert console.clears == 1
-    finally:
-        shutil.rmtree(workspace, ignore_errors=True)
 
 
 def test_daemon_tui_only_clears_on_initial_render(monkeypatch) -> None:
@@ -285,11 +245,8 @@ def test_daemon_tui_tolerates_old_daemon_without_provider_actions(monkeypatch) -
     assert "muxdev serve --restart" in message
 
 
-def test_daemon_chat_view_renders_intro_and_empty_state(monkeypatch) -> None:
-    import muxdev.ui.tui as tui_module
-
+def test_daemon_chat_view_renders_intro_and_empty_state() -> None:
     workspace = _workspace_temp()
-    monkeypatch.setattr(tui_module, "detect_providers", lambda: (_ for _ in ()).throw(AssertionError("daemon TUI render must not probe providers")))
     try:
         text = _render_to_text(
             daemon_chat_view(
@@ -319,7 +276,6 @@ def test_daemon_task_summary_handles_core_statuses() -> None:
     for status in ["running", "awaiting_approval", "awaiting_provider_action", "completed"]:
         text = daemon_task_detail_text(_daemon_payload(status))
         assert f": {status}" in text
-        assert "profile=squad" in text
         assert "gate=safe" in text
         assert "Recent events" in text
         if status == "awaiting_provider_action":
@@ -363,18 +319,6 @@ def test_daemon_provider_actions_text_shows_prompt_and_attach() -> None:
     assert "Apply this change" in text
     assert "Yes, No" in text
     assert "muxdev attach run_1 --agent designer" in text
-
-
-class _FakeConsole:
-    def __init__(self) -> None:
-        self.clears = 0
-        self.prints = 0
-
-    def clear(self) -> None:
-        self.clears += 1
-
-    def print(self, *args: object, **kwargs: object) -> None:
-        self.prints += 1
 
 
 def _workspace_temp() -> Path:

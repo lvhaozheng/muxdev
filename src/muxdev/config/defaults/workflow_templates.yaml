@@ -1,0 +1,66 @@
+command_dialects:
+  codex: {prefix: "$", colon: "-"}
+  opencode: {prefix: "/", colon: "-"}
+  cursor: {prefix: "/", colon: "-"}
+
+workflow_templates:
+  void:
+    description: Plain provider session without phase command injection.
+    best_for: [Direct provider sessions, Low-ceremony exploration]
+    phases: [running]
+    supported_providers: [mock, codex, claude-code, qwen, kimi, trae, antigravity]
+    commands: {running: "{task}"}
+    prompts:
+      running: Run the task directly while respecting muxdev safety, evidence, and workspace boundaries.
+    artifacts: {}
+    notes: Full human control while retaining muxdev execution boundaries.
+  muxdev:
+    description: Default design, approve, implement, test, review workflow.
+    best_for: [Standard implementation work, Risk-aware trusted delivery]
+    phases: [design, implement, test, review, fix]
+    supported_providers: [mock, codex, claude-code, qwen, kimi]
+    commands:
+      design: "/muxdev:design {task}"
+      implement: "/muxdev:implement {task}"
+      test: "/muxdev:test {task}"
+      review: "/muxdev:review {task}"
+      fix: "/muxdev:fix {task}"
+    prompts:
+      design: "Produce acceptance criteria, risks, and an implementation plan for: {task}"
+      implement: "Implement the approved plan for: {task}"
+      test: "Verify the implementation and record evidence for: {task}"
+      review: "Review blockers, regressions, and missing tests for: {task}"
+      fix: "Fix review blockers while preserving behavior for: {task}"
+    artifacts: {design: plan.md, test: test.log, review: review.md, fix: diff.patch}
+    notes: A reusable command view of the native muxdev DAG.
+  spec-lite:
+    description: Compact spec-driven workflow for planning before implementation.
+    best_for: [Small to medium scoped tasks, Changes needing an explicit review trail]
+    phases: [research, planning, running, review]
+    supported_providers: [codex, claude-code, qwen, kimi]
+    commands:
+      research: "/spec-lite:research {task}"
+      planning: "/spec-lite:plan {task}"
+      running: "/spec-lite:execute {task}"
+      review: "/spec-lite:review {task}"
+    prompts:
+      research: "Gather repository facts, constraints, and unknowns before planning: {task}"
+      planning: "Turn research into a concise plan and acceptance criteria: {task}"
+      running: "Execute the plan in scoped steps and preserve evidence: {task}"
+      review: "Review implementation against the spec and tests: {task}"
+    artifacts:
+      research: .muxdev/spec/research.md
+      planning: .muxdev/spec/plan.md
+      running: .muxdev/spec/summary.md
+      review: .muxdev/spec/review.md
+    notes: A compact local spec workflow.
+  review-only:
+    description: Read-only workflow for independent reviewers.
+    best_for: [Independent review, Parallel reviewer fan-out]
+    phases: [review]
+    supported_providers: [codex, claude-code, qwen, kimi]
+    commands: {review: "/muxdev:review {task}"}
+    prompts:
+      review: "Perform a read-only review and lead with actionable blockers for: {task}"
+    artifacts: {review: review.md}
+    notes: Review agents must not write to the workspace.

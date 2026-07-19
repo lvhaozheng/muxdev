@@ -43,14 +43,12 @@ from ..config.runtime import (
 from ..core.platforms import follow_file_command, hidden_subprocess_kwargs, split_command_line
 from ..models import ApprovalStatus
 from ..api.mcp import handle_jsonrpc, mcp_doctor, server_manifest
-from ..services.orchestration import deep_agent_task_pack, workflow_to_langgraph
+from ..services.orchestration import workflow_graph
 from ..services.automation import render_why
 from ..services.design import latest_design_contract
 from ..config.loader import config_sources, load_config, path_config, validate_config
 from ..services.rag import LocalRagIndex
-from ..services.offline_render import OfflineRenderError, render_offline_video
-from ..services.tts_engine import TtsEngineError, synthesize_chunks
-from ..services.evidence import cleanup_legacy_evidence, load_evidence_artifacts, render_evidence_text, verify_run_evidence, write_evidence_run
+from ..services.evidence import load_evidence_artifacts, render_evidence_text, verify_run_evidence, write_evidence_run
 from ..services.attestation import verify_attestation_record
 from ..services.attestation_bundle import export_attestation_bundle, verify_attestation_bundle
 from ..services.trust import ProjectSigningKeyStore, TrustError
@@ -69,11 +67,10 @@ from ..services.routing_benchmark import (
 )
 from ..services.advanced_parallel import detect_parallel_conflicts, record_parallel_conflicts
 from ..services.dashboard_run import dashboard_path, write_run_dashboard
-from ..services.flows import FlowRegistry
 from ..services.multirepo import plan_multi_repo_orchestration
 from ..services.provider_learning import refresh_provider_learning
 from ..services.product_experience import build_product_experience, write_project_context
-from ..services.workflow_plugins import get_workflow_plugin, list_workflow_plugins, render_plugin_command
+from ..services.workflow_templates import get_workflow_template, list_workflow_templates, render_template_command
 from ..services.validation import load_validation_experiment, run_validation_experiment
 from ..services.storage_admin import (
     StorageArchiveError,
@@ -115,7 +112,7 @@ from ..daemon.process import daemon_status as daemon_process_status
 from ..daemon.process import start_daemon, stop_daemon
 from ..storage import Blackboard, MemoryStore, RunStore, compact_trace, read_trace
 from ..ui.repl import start_repl
-from ..ui.tui import status_panel
+from ..presentation import status_panel
 from ..workflows import SOFTWARE_DEV_WORKFLOW
 from .common import (
     _daemon_client,
@@ -166,16 +163,8 @@ preset_app = typer.Typer(help="Built-in gate and workflow presets")
 mcp_app = typer.Typer(help="MCP server tools")
 session_app = typer.Typer(help="Long-lived provider session tools")
 rag_app = typer.Typer(help="Local retrieval index tools")
-offline_render_app = typer.Typer(help="Offline PDF/PNG timeline video renderer")
-tts_engine_app = typer.Typer(help="GPT-SoVITS batch TTS tools")
 graph_app = typer.Typer(help="Workflow graph export tools")
-deep_agent_app = typer.Typer(help="Deep-agent integration tools")
 workflow_app = typer.Typer(help="Workflow template catalog tools")
-plugin_app = typer.Typer(
-    help="Deprecated plugin registry tools",
-    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
-)
-flow_app = typer.Typer(help="Scheduled flow tools")
 config_app = typer.Typer(help="Configuration inspection tools", invoke_without_command=True, no_args_is_help=False)
 memory_app = typer.Typer(help="Explicit project memory tools")
 parallel_app = typer.Typer(help="Advanced parallel-squad tools")
@@ -200,17 +189,12 @@ app.add_typer(attestation_app, name="attestation")
 app.add_typer(policy_app, name="policy")
 app.add_typer(trace_app, name="trace")
 app.add_typer(skill_app, name="skill")
-app.add_typer(plugin_app, name="plugin")
 app.add_typer(preset_app, name="preset")
 app.add_typer(mcp_app, name="mcp")
 app.add_typer(session_app, name="session")
 app.add_typer(rag_app, name="rag")
-app.add_typer(offline_render_app, name="offline-render")
-app.add_typer(tts_engine_app, name="tts-engine")
 app.add_typer(graph_app, name="graph")
-app.add_typer(deep_agent_app, name="deep-agent")
 app.add_typer(workflow_app, name="workflow")
-app.add_typer(flow_app, name="flow")
 app.add_typer(config_app, name="config")
 app.add_typer(memory_app, name="memory")
 app.add_typer(parallel_app, name="parallel")
@@ -394,7 +378,6 @@ def main(
             _submit_main_task(
                 "dev",
                 task=task,
-                profile=None,
                 gate=None,
                 role=None,
                 skill=None,
@@ -775,7 +758,6 @@ def _print_doctor_checks(payload: dict[str, object]) -> None:
 @app.command()
 def dev(
     task: Annotated[str | None, typer.Argument(help="Development task to submit.")] = None,
-    profile: Annotated[str | None, typer.Option("-p", "--profile", hidden=True)] = None,
     gate: Annotated[str | None, typer.Option("-g", "--gate", help="Gate: auto, safe, strict, ci.")] = None,
     simple: Annotated[bool, typer.Option("--simple", help="Force simple auto flow depth.")] = False,
     light: Annotated[bool, typer.Option("--light", help="Alias for --simple; force lightweight dev flow.")] = False,
@@ -803,7 +785,6 @@ def dev(
     _submit_main_task(
         "dev",
         task=task,
-        profile=profile,
         gate=gate,
         depth=_depth_override(simple=(simple or light), safe=safe_depth, deep=deep, parallel=parallel),
         role=role,
@@ -826,7 +807,6 @@ def dev(
 @app.command()
 def fix(
     task: Annotated[str | None, typer.Argument(help="Issue or bug to fix.")] = None,
-    profile: Annotated[str | None, typer.Option("-p", "--profile", hidden=True)] = None,
     gate: Annotated[str | None, typer.Option("-g", "--gate", help="Gate: auto, safe, strict, ci.")] = None,
     role: Annotated[list[str] | None, typer.Option("--role", help="Role provider override.")] = None,
     skill: Annotated[list[str] | None, typer.Option("-s", "--skill", help="Skill activation.")] = None,
@@ -841,7 +821,6 @@ def fix(
     _submit_main_task(
         "fix",
         task=task,
-        profile=profile,
         gate=gate,
         role=role,
         skill=skill,
@@ -862,7 +841,6 @@ def fix(
 @app.command()
 def review(
     task: Annotated[str | None, typer.Argument(help="Review task description.")] = None,
-    profile: Annotated[str | None, typer.Option("-p", "--profile", hidden=True)] = None,
     gate: Annotated[str | None, typer.Option("-g", "--gate", help="Gate: auto, safe, strict, ci.")] = None,
     role: Annotated[list[str] | None, typer.Option("--role", help="Role provider override.")] = None,
     skill: Annotated[list[str] | None, typer.Option("-s", "--skill", help="Skill activation.")] = None,
@@ -874,13 +852,12 @@ def review(
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     """Submit a review-only task."""
-    _submit_main_task("review", task=task, profile=profile, gate=gate, role=role, skill=skill, task_file=task_file, provider=provider, workflow="review", require_approval="", max_cost_usd=max_cost_usd, host=host, port=port, json_output=json_output, title="muxdev review")
+    _submit_main_task("review", task=task, gate=gate, role=role, skill=skill, task_file=task_file, provider=provider, workflow="review", require_approval="", max_cost_usd=max_cost_usd, host=host, port=port, json_output=json_output, title="muxdev review")
 
 
 @app.command("test")
 def test_command(
     task: Annotated[str | None, typer.Argument(help="Test task description.")] = None,
-    profile: Annotated[str | None, typer.Option("-p", "--profile", hidden=True)] = None,
     gate: Annotated[str | None, typer.Option("-g", "--gate", help="Gate: auto, safe, strict, ci.")] = None,
     role: Annotated[list[str] | None, typer.Option("--role", help="Role provider override.")] = None,
     skill: Annotated[list[str] | None, typer.Option("-s", "--skill", help="Skill activation.")] = None,
@@ -894,13 +871,12 @@ def test_command(
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     """Submit a test-only task."""
-    _submit_main_task("test", task=task, profile=profile, gate=gate, role=role, skill=skill, task_file=task_file, provider=provider, workflow="test", require_approval="", approve_plan=approve_plan, plan=plan, max_cost_usd=max_cost_usd, host=host, port=port, json_output=json_output, title="muxdev test")
+    _submit_main_task("test", task=task, gate=gate, role=role, skill=skill, task_file=task_file, provider=provider, workflow="test", require_approval="", approve_plan=approve_plan, plan=plan, max_cost_usd=max_cost_usd, host=host, port=port, json_output=json_output, title="muxdev test")
 
 
 @app.command()
 def design(
     task: Annotated[str | None, typer.Argument(help="Design task to submit.")] = None,
-    profile: Annotated[str | None, typer.Option("-p", "--profile", hidden=True)] = None,
     gate: Annotated[str | None, typer.Option("-g", "--gate", help="Gate: auto, safe, strict, ci.")] = None,
     simple: Annotated[bool, typer.Option("--simple", help="Force simple auto flow depth.")] = False,
     safe_depth: Annotated[bool, typer.Option("--safe", help="Force safe auto flow depth.")] = False,
@@ -922,7 +898,6 @@ def design(
     _submit_main_task(
         "design",
         task=task,
-        profile=profile,
         gate=gate or "auto",
         role=role,
         skill=skill,
@@ -945,7 +920,6 @@ def design(
 @app.command()
 def refactor(
     task: Annotated[str | None, typer.Argument(help="Refactor task to submit.")] = None,
-    profile: Annotated[str | None, typer.Option("-p", "--profile", hidden=True)] = None,
     gate: Annotated[str | None, typer.Option("-g", "--gate", help="Gate: auto, safe, strict, ci.")] = None,
     simple: Annotated[bool, typer.Option("--simple", help="Force simple auto flow depth.")] = False,
     safe_depth: Annotated[bool, typer.Option("--safe", help="Force safe auto flow depth.")] = False,
@@ -963,7 +937,7 @@ def refactor(
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     """Submit a refactor task through the auto-orchestrated dev workflow."""
-    _submit_main_task("refactor", task=task, profile=profile, gate=gate, role=role, skill=skill, task_file=task_file, provider=provider, workflow="refactor", require_approval="", approve_plan=approve_plan, plan=plan, max_cost_usd=max_cost_usd, host=host, port=port, json_output=json_output, title="muxdev refactor", depth=_depth_override(simple=simple, safe=safe_depth, deep=deep, parallel=parallel))
+    _submit_main_task("refactor", task=task, gate=gate, role=role, skill=skill, task_file=task_file, provider=provider, workflow="refactor", require_approval="", approve_plan=approve_plan, plan=plan, max_cost_usd=max_cost_usd, host=host, port=port, json_output=json_output, title="muxdev refactor", depth=_depth_override(simple=simple, safe=safe_depth, deep=deep, parallel=parallel))
 
 
 @feedback_app.command("add")
@@ -1623,30 +1597,6 @@ def evidence_verify(
     for error in payload.get("errors", []):
         lines.append(f"error: {error}")
     console.print(Panel("\n".join(lines), title="muxdev evidence verify"))
-
-
-@evidence_app.command("cleanup-legacy")
-def evidence_cleanup_legacy(
-    run_id: Annotated[str, typer.Argument(help="Run id, or 'latest'.")] = "latest",
-    yes: Annotated[bool, typer.Option("--yes", help="Confirm destructive legacy evidence cleanup.")] = False,
-    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
-) -> None:
-    """Drop v1 evidence tables and remove v1 evidence artifacts for one run."""
-    if not yes:
-        raise typer.BadParameter("cleanup-legacy requires --yes")
-    resolved, run_dir = _resolve_evidence_run(run_id)
-    with _evidence_blackboard(run_dir) as blackboard:
-        payload = cleanup_legacy_evidence(run_dir, blackboard, yes=yes)
-    payload["run_id"] = resolved
-    if json_output:
-        _print_json(payload)
-        return
-    lines = [
-        f"run_id: {resolved}",
-        f"removed files: {len(payload.get('removed_files', []))}",
-        f"dropped tables: {', '.join(payload.get('dropped_tables', []))}",
-    ]
-    console.print(Panel("\n".join(lines), title="muxdev evidence cleanup"))
 
 
 @app.command()
@@ -2888,156 +2838,22 @@ def rag_query(
     console.print(table)
 
 
-@offline_render_app.command("run")
-def offline_render_run(
-    input_path: Annotated[
-        Path,
-        typer.Option("--input", "-i", help="PDF file, PNG file, PNG directory, or PNG glob pattern."),
-    ] = Path("slides"),
-    timeline_path: Annotated[Path, typer.Option("--timeline", help="timeline.json path.")] = Path("timeline.json"),
-    output_path: Annotated[Path, typer.Option("--output", "-o", help="Output 1080p MP4 path.")] = Path("offline_render.mp4"),
-    work_dir: Annotated[Path | None, typer.Option("--work-dir", help="Intermediate render directory.")] = None,
-    ffmpeg: Annotated[str, typer.Option("--ffmpeg", help="FFmpeg executable or command prefix.")] = "ffmpeg",
-    pdf_renderer: Annotated[
-        str | None,
-        typer.Option("--pdf-renderer", help="pdftoppm-compatible executable or command prefix for PDF inputs."),
-    ] = None,
-    fps: Annotated[int, typer.Option("--fps", help="Output video frames per second.")] = 30,
-    width: Annotated[int, typer.Option("--width", help="Output video width.")] = 1920,
-    height: Annotated[int, typer.Option("--height", help="Output video height.")] = 1080,
-    page_gap: Annotated[int, typer.Option("--page-gap", help="Vertical gap between pages after scaling.")] = 40,
-    pdf_dpi: Annotated[int, typer.Option("--pdf-dpi", help="PDF rasterization DPI.")] = 180,
-    background: Annotated[str, typer.Option("--background", help="Page background color.")] = "#ffffff",
-    keep_frames: Annotated[bool, typer.Option("--keep-frames", help="Keep intermediate frame PNG files.")] = False,
-    timeout: Annotated[float, typer.Option("--timeout", help="FFmpeg encode timeout in seconds.")] = 300.0,
-    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
-) -> None:
-    """Render a timeline-driven scrolling video without browser or OBS."""
-    try:
-        payload = render_offline_video(
-            input_path=input_path,
-            timeline_path=timeline_path,
-            output_path=output_path,
-            work_dir=work_dir,
-            ffmpeg=ffmpeg,
-            pdf_renderer=pdf_renderer,
-            fps=fps,
-            width=width,
-            height=height,
-            page_gap=page_gap,
-            pdf_dpi=pdf_dpi,
-            background=background,
-            keep_frames=keep_frames,
-            encode_timeout=timeout,
-        ).to_dict()
-    except OfflineRenderError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    if json_output:
-        _print_json(payload)
-        return
-    lines = [
-        f"mode: {payload['mode']}",
-        f"input_kind: {payload['input_kind']}",
-        f"pages: {payload['pages']}",
-        f"frames: {payload['frames']}",
-        f"fps: {payload['fps']}",
-        f"size: {payload['width']}x{payload['height']}",
-        f"output: {payload['output_path']}",
-        f"work_dir: {payload['work_dir']}",
-    ]
-    console.print(Panel("\n".join(lines), title="Offline Render"))
-
-
-@tts_engine_app.command("run")
-def tts_engine_run(
-    chunks_dir: Annotated[Path, typer.Option("--chunks-dir", help="Directory containing chunks/*.txt input files.")] = Path("chunks"),
-    audio_dir: Annotated[Path, typer.Option("--audio-dir", help="Directory for generated audio/*.wav files.")] = Path("audio"),
-    timeline_path: Annotated[Path, typer.Option("--timeline", help="timeline.json output path.")] = Path("timeline.json"),
-    resume: Annotated[bool, typer.Option("--resume", help="Skip existing valid WAV files.")] = False,
-    retries: Annotated[int, typer.Option("--retries", help="Retries per failed segment.")] = 1,
-    api_url: Annotated[str | None, typer.Option("--api-url", help="GPT-SoVITS local API URL.")] = None,
-    api_method: Annotated[str, typer.Option("--api-method", help="API method: GET or POST.")] = "GET",
-    api_param: Annotated[list[str] | None, typer.Option("--api-param", help="Extra GPT-SoVITS API parameter as key=value.")] = None,
-    command: Annotated[
-        str | None,
-        typer.Option(
-            "--command",
-            help="Subprocess command template. Placeholders: {input}, {output}, {text}, {stem}, {index}.",
-        ),
-    ] = None,
-    script: Annotated[Path | None, typer.Option("--script", help="Inference script run as: python <script> --text-file <chunk> --output <wav>.")] = None,
-    python: Annotated[str, typer.Option("--python", help="Python executable for --script mode.")] = "python",
-    timeout: Annotated[float, typer.Option("--timeout", help="Per-segment attempt timeout in seconds.")] = 120.0,
-    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
-) -> None:
-    """Generate audio/*.wav from chunks/*.txt through GPT-SoVITS."""
-    try:
-        payload = synthesize_chunks(
-            chunks_dir=chunks_dir,
-            audio_dir=audio_dir,
-            timeline_path=timeline_path,
-            resume=resume,
-            retries=retries,
-            api_url=api_url,
-            api_method=api_method,
-            api_params=_key_value_options(api_param),
-            command=command,
-            script=script,
-            python=python,
-            timeout=timeout,
-        ).to_dict()
-    except TtsEngineError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    if json_output:
-        _print_json(payload)
-    else:
-        lines = [
-            f"ok: {payload['ok']}",
-            f"backend: {payload['backend']}",
-            f"chunks: {payload['chunks']}",
-            f"generated: {payload['generated']}",
-            f"skipped: {payload['skipped']}",
-            f"failed: {payload['failed']}",
-            f"audio_dir: {payload['audio_dir']}",
-            f"timeline: {payload['timeline_path']}",
-        ]
-        console.print(Panel("\n".join(lines), title="TTS Engine"))
-    if payload["failed"]:
-        raise typer.Exit(1)
-
-
 @graph_app.command("export")
 def graph_export(
     workflow: Annotated[str, typer.Option("--workflow", help="Workflow name or YAML path.")] = "software-dev",
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
-    """Export the muxdev workflow as a LangGraph-compatible node/edge graph."""
-    payload = workflow_to_langgraph(workflow)
+    """Export the muxdev workflow as a native node/edge DAG."""
+    payload = workflow_graph(workflow)
     if json_output:
         _print_json(payload)
         return
     console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Workflow Graph"))
-
-
-@deep_agent_app.command("plan")
-def deep_agent_plan(
-    task: Annotated[str, typer.Argument(help="Task to package for a deep-agent runtime.")],
-    workflow: Annotated[str, typer.Option("--workflow", help="Workflow name or YAML path.")] = "software-dev",
-    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
-) -> None:
-    """Produce a Deep-Agent-compatible task pack from a muxdev workflow."""
-    payload = deep_agent_task_pack(task, workflow, Path.cwd())
-    if json_output:
-        _print_json(payload)
-        return
-    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Deep-Agent Task Pack"))
-
-
 def _workflow_template_rows() -> list[dict[str, object]]:
-    return [plugin.to_dict() for plugin in list_workflow_plugins()]
+    return [template.to_dict() for template in list_workflow_templates()]
 
 
-def _print_workflow_templates(rows: list[dict[str, object]], *, deprecated: bool = False) -> None:
+def _print_workflow_templates(rows: list[dict[str, object]]) -> None:
     table = Table(title="Workflow Templates")
     for column in ("name", "phases", "supported_providers", "description"):
         table.add_column(column)
@@ -3048,8 +2864,6 @@ def _print_workflow_templates(rows: list[dict[str, object]], *, deprecated: bool
             ", ".join(row["supported_providers"]),
             str(row["description"]),
         )
-    if deprecated:
-        console.print("Deprecated: use 'muxdev workflow templates' instead.")
     console.print(table)
 
 
@@ -3065,18 +2879,6 @@ def workflow_templates(
     _print_workflow_templates(rows)
 
 
-@workflow_app.command("plugins")
-def workflow_plugins(
-    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
-) -> None:
-    """Deprecated alias for workflow templates."""
-    rows = _workflow_template_rows()
-    if json_output:
-        _print_json(rows)
-        return
-    _print_workflow_templates(rows, deprecated=True)
-
-
 @workflow_app.command("template")
 def workflow_template(
     name: Annotated[str, typer.Argument(help="Workflow template name.")],
@@ -3084,29 +2886,12 @@ def workflow_template(
 ) -> None:
     """Show a workflow template definition."""
     try:
-        payload = get_workflow_plugin(name).to_dict()
+        payload = get_workflow_template(name).to_dict()
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
     if json_output:
         _print_json(payload)
         return
-    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title=f"Workflow Template: {name}"))
-
-
-@workflow_app.command("plugin")
-def workflow_plugin(
-    name: Annotated[str, typer.Argument(help="Workflow template name.")],
-    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
-) -> None:
-    """Deprecated alias for workflow template."""
-    try:
-        payload = get_workflow_plugin(name).to_dict()
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    if json_output:
-        _print_json(payload)
-        return
-    console.print("Deprecated: use 'muxdev workflow template' instead.")
     console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title=f"Workflow Template: {name}"))
 
 
@@ -3120,136 +2905,13 @@ def workflow_render(
 ) -> None:
     """Render a workflow template phase command for a provider dialect."""
     try:
-        payload = render_plugin_command(name, phase, provider, task)
+        payload = render_template_command(name, phase, provider, task)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
     if json_output:
         _print_json(payload)
         return
     console.print(Panel("\n".join(f"{key}: {value}" for key, value in payload.items()), title="Workflow Command"))
-
-
-@flow_app.command("add")
-def flow_add(
-    name: Annotated[str, typer.Argument(help="Flow name.")],
-    task: Annotated[str, typer.Option("--task", help="Task to run when the flow is triggered.")],
-    schedule: Annotated[str, typer.Option("--schedule", help="Cron-style schedule expression.")],
-    provider: Annotated[str, typer.Option("--provider", help="Provider for the flow run.")] = "mock",
-    workflow: Annotated[str, typer.Option("--workflow", help="Workflow name or YAML path.")] = "software-dev",
-    gate_command: Annotated[str, typer.Option("--gate-command", help="Optional shell command gate to evaluate before execution.")] = "",
-    disabled: Annotated[bool, typer.Option("--disabled", help="Create the flow disabled.")] = False,
-    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
-) -> None:
-    """Add or replace a local scheduled flow definition."""
-    try:
-        flow = FlowRegistry(Path.cwd()).add(
-            name,
-            schedule=schedule,
-            task=task,
-            provider=provider,
-            workflow=workflow,
-            enabled=not disabled,
-            gate_command=gate_command,
-        )
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    payload = flow.to_dict()
-    if json_output:
-        _print_json(payload)
-        return
-    console.print(Panel("\n".join(f"{key}: {value}" for key, value in payload.items()), title="Flow Add"))
-
-
-@flow_app.command("list")
-def flow_list(
-    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
-) -> None:
-    """List local scheduled flow definitions."""
-    rows = [flow.to_dict() for flow in FlowRegistry(Path.cwd()).list()]
-    if json_output:
-        _print_json(rows)
-        return
-    table = Table(title="Flows")
-    for column in ("name", "schedule", "provider", "workflow", "enabled", "task"):
-        table.add_column(column)
-    for row in rows:
-        table.add_row(*(str(row.get(column) or "") for column in ("name", "schedule", "provider", "workflow", "enabled", "task")))
-    console.print(table)
-
-
-@flow_app.command("run")
-def flow_run(
-    name: Annotated[str, typer.Argument(help="Flow name.")],
-    execute: Annotated[bool, typer.Option("--execute", help="Execute the flow now. Without this, only print the run plan.")] = False,
-    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
-) -> None:
-    """Plan or manually execute a scheduled flow."""
-    registry = FlowRegistry(Path.cwd())
-    try:
-        if not execute:
-            payload = registry.plan_run(name)
-        else:
-            flow = registry.load(name)
-            if not flow.enabled:
-                payload = {
-                    "name": flow.name,
-                    "status": "disabled",
-                    "task": flow.task,
-                    "provider": flow.provider,
-                    "workflow": flow.workflow,
-                }
-                if json_output:
-                    _print_json(payload)
-                    return
-                console.print(Panel("\n".join(f"{key}: {value}" for key, value in payload.items()), title="Flow Run"))
-                return
-            if flow.gate_command:
-                import subprocess
-
-                decision = SafetyPolicyEngine().evaluate_shell(flow.gate_command)
-                if decision.decision == "deny":
-                    raise typer.BadParameter(f"flow gate denied by policy: {decision.reason}")
-                completed = subprocess.run(
-                    flow.gate_command,
-                    cwd=Path.cwd(),
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    shell=True,
-                    check=False,
-                    **hidden_subprocess_kwargs(),
-                )
-                if completed.returncode != 0:
-                    payload = {
-                        "name": flow.name,
-                        "status": "gate_failed",
-                        "gate": {
-                            "command": flow.gate_command,
-                            "returncode": completed.returncode,
-                            "stdout": completed.stdout or "",
-                            "stderr": completed.stderr or "",
-                        },
-                    }
-                    if json_output:
-                        _print_json(payload)
-                        return
-                    console.print(Panel("\n".join(f"{key}: {value}" for key, value in payload.items()), title="Flow Run"))
-                    return
-            result = SupervisorRuntime(Path.cwd()).run(flow.task, provider=flow.provider, workflow_name=flow.workflow)
-            payload = {
-                "name": flow.name,
-                "status": str(result.status),
-                "run_id": result.run_id,
-                "run_dir": str(result.run_dir),
-                "report": str(result.report_path) if result.report_path else None,
-            }
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    if json_output:
-        _print_json(payload)
-        return
-    console.print(Panel("\n".join(f"{key}: {value}" for key, value in payload.items()), title="Flow Run"))
 
 
 @skill_app.command("add")
@@ -3682,88 +3344,6 @@ def skill_abtest_command(
     console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Skill A/B"))
 
 
-@plugin_app.callback(invoke_without_command=True)
-def plugin_deprecated(
-    ctx: typer.Context,
-    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
-) -> None:
-    """Explain the removed plugin registry surface."""
-    if ctx.invoked_subcommand:
-        return
-    payload = {
-        "status": "removed",
-        "message": "muxdev no longer manages plugins; use muxdev skill ... or MCP/provider config.",
-    }
-    if json_output:
-        _print_json(payload)
-        raise typer.Exit(2)
-    console.print(payload["message"])
-    raise typer.Exit(2)
-
-
-def _removed_plugin_command(json_output: bool) -> None:
-    payload = {
-        "status": "removed",
-        "message": "muxdev no longer manages plugins; use muxdev skill ... or MCP/provider config.",
-    }
-    if json_output:
-        _print_json(payload)
-        raise typer.Exit(2)
-    console.print(payload["message"])
-    raise typer.Exit(2)
-
-
-@plugin_app.command("list")
-def plugin_list_removed(json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False) -> None:
-    """Removed: muxdev no longer manages plugins."""
-    _removed_plugin_command(json_output)
-
-
-@plugin_app.command("add")
-def plugin_add_removed(
-    source: Annotated[str, typer.Argument(help="Ignored plugin source.")],
-    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
-) -> None:
-    """Removed: muxdev no longer manages plugins."""
-    _removed_plugin_command(json_output)
-
-
-@plugin_app.command("validate")
-def plugin_validate_removed(
-    source: Annotated[str, typer.Argument(help="Ignored plugin source.")],
-    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
-) -> None:
-    """Removed: muxdev no longer validates plugin manifests."""
-    _removed_plugin_command(json_output)
-
-
-@plugin_app.command("show")
-def plugin_show_removed(
-    name: Annotated[str, typer.Argument(help="Ignored plugin name.")],
-    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
-) -> None:
-    """Removed: muxdev no longer manages plugins."""
-    _removed_plugin_command(json_output)
-
-
-@plugin_app.command("update")
-def plugin_update_removed(
-    name: Annotated[str, typer.Argument(help="Ignored plugin name.")],
-    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
-) -> None:
-    """Removed: muxdev no longer manages plugins."""
-    _removed_plugin_command(json_output)
-
-
-@plugin_app.command("remove")
-def plugin_remove_removed(
-    name: Annotated[str, typer.Argument(help="Ignored plugin name.")],
-    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
-) -> None:
-    """Removed: muxdev no longer manages plugins."""
-    _removed_plugin_command(json_output)
-
-
 @app.command()
 def repl() -> None:
     """Start the interactive muxdev REPL."""
@@ -3892,7 +3472,6 @@ def _submit_main_task(
     command_workflow: str,
     *,
     task: str | None,
-    profile: str | None,
     gate: str | None,
     role: list[str] | None,
     skill: list[str] | None,
@@ -3911,8 +3490,6 @@ def _submit_main_task(
     approve_plan: str = "auto",
     plan: bool = False,
 ) -> None:
-    if profile is not None:
-        typer.echo("warning: --profile is deprecated and no longer controls task execution", err=True)
     try:
         task = _task_with_design_contract(task, from_design)
         approve_plan_mode = _approve_plan_mode(approve_plan, plan=plan)
@@ -3925,7 +3502,6 @@ def _submit_main_task(
             command_workflow=command_workflow,
             provider=provider,
             workflow=workflow,
-            profile=profile,
             gate=gate,
             depth=depth,
             role_overrides=role,

@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
-from ..models import ApprovalStatus, PolicyDecision, ProviderActionKind, ProviderActionStatus, ReviewBlocker, ReviewResult, RunStatus, StageStatus, TestResult
+from ..models import ApprovalStatus, PolicyDecision, ProviderActionKind, ProviderActionStatus, ReviewBlocker, ReviewResult, RunStatus, StageStatus
 from ..clients.stream import StreamAdapter, StreamEventType
 from ..core.platforms import hidden_subprocess_kwargs
 from ..core.projects import canonical_workspace
@@ -29,10 +29,10 @@ from ..context import memory_refs as _memory_refs
 from ..context import task_with_context_packet as _task_with_context_packet
 from ..context import task_with_memory_context as _task_with_memory_context
 from ..context import write_context_packet as _write_context_packet
-from ..config.runtime import load_runtime_config, normalize_role
-from ..domain import ExecutionGuard, HarnessPolicySpec, LeaseLost, ReconciliationRequired, RoutingPolicySpec, TaskCancelled, new_run_id
+from ..config.runtime import normalize_role
+from ..domain import ExecutionGuard, HarnessPolicySpec, LeaseLost, ReconciliationRequired, RoutingPolicySpec, StageExecutionResult, TaskCancelled, new_run_id
 from ..application.lifecycle import LifecycleService
-from ..providers.adapters import ProviderAdapter, ProviderStageOutput, extract_json_object, get_runtime_provider
+from ..providers.adapters import ProviderAdapter, extract_json_object, get_runtime_provider
 from ..providers.policy import ensure_harness_policy
 from ..services.dashboard_run import write_run_dashboard
 from ..services.delivery_gate import evaluate_delivery_gate
@@ -61,17 +61,28 @@ from ..storage import Blackboard, RunStore, TraceWriter, append_ledger_event, ca
 from ..storage.contracts import (
     artifact_descriptor,
     write_blind_validator_panel,
+    write_json_artifact,
     write_role_result_contract,
     write_stage_contract,
 )
 from ..workflows import execution_batches, load_workflow, ordered_stage_ids, should_run_when
 from .stage_attempt import provider_actions_from_output as _provider_actions_from_output
-from .stage_attempt import provider_attempt_status as _provider_attempt_status
 from .stage_attempt import provider_failure_kind as _provider_failure_kind
 from .stage_attempt import next_provider_attempt as _next_provider_attempt
+from .stage_attempt import persist_stage_execution_result as _persist_stage_execution_result
 from .stage_attempt import run_provider_stage as _run_provider_stage
 from .stage_attempt import run_provider_stage_with_attempts as _run_provider_stage_with_attempts
-from .langgraph_engine import LangGraphWorkflowEngine
+from .parallel_merge import (
+    ParallelMergeError,
+    WorkerPatch,
+    WorkerWorkspace,
+    capture_worker_patch,
+    cleanup_worker_workspaces,
+    merge_worker_patches,
+    prepare_worker_workspace,
+    workspace_content_hash,
+)
+from .result_validation import ContractValidation, validate_review_result, validate_test_result
 from .worktree import WorktreeManager
 
 
@@ -165,12 +176,10 @@ class SupervisorRuntime:
         max_cost_usd: float = 0.5,
         role_providers: dict[str, str] | None = None,
         run_id: str | None = None,
-        profile: str | None = None,
         gate: str | None = None,
         skills: list[dict[str, object]] | None = None,
         ci_block_on_approval: bool = False,
         depth: str | None = None,
-        topology: str | None = None,
         automation: dict[str, object] | None = None,
         harness_policy: dict[str, object] | None = None,
         routing_policy: dict[str, object] | None = None,
@@ -621,48 +630,26 @@ class SupervisorRuntime:
         close_blackboard: bool,
     ) -> RunResult:
         workflow = _load_workflow_for_run(workflow_name, run_dir)
-        engine_name = _configured_workflow_engine(self.workspace, automation)
-        if engine_name == "native":
-            trace.write("native_runtime_selected", workflow=workflow.name)
-            return self._execute_native_workflow(
-                run_id=run_id,
-                run_dir=run_dir,
-                blackboard=blackboard,
-                trace=trace,
-                task=task,
-                provider=provider,
-                workflow_name=workflow_name,
-                provider_impls=provider_impls,
-                policy=policy,
-                worktree=worktree,
-                role_providers=role_providers,
-                skills=skills,
-                ci_block_on_approval=ci_block_on_approval,
-                automation=automation,
-                close_blackboard=close_blackboard,
-            )
-        return LangGraphWorkflowEngine(self.workspace).execute(
-            workflow=workflow,
+        # Old run metadata may still say ``langgraph``.  It is intentionally
+        # ignored here: every run now resumes through the same audited native
+        # scheduler and keeps the on-disk workflow/artifact contract intact.
+        trace.write("native_runtime_selected", workflow=workflow.name)
+        return self._execute_native_workflow(
             run_id=run_id,
-            task=task,
+            run_dir=run_dir,
+            blackboard=blackboard,
             trace=trace,
-            native_executor=lambda: self._execute_native_workflow(
-                run_id=run_id,
-                run_dir=run_dir,
-                blackboard=blackboard,
-                trace=trace,
-                task=task,
-                provider=provider,
-                workflow_name=workflow_name,
-                provider_impls=provider_impls,
-                policy=policy,
-                worktree=worktree,
-                role_providers=role_providers,
-                skills=skills,
-                ci_block_on_approval=ci_block_on_approval,
-                automation=automation,
-                close_blackboard=close_blackboard,
-            ),
+            task=task,
+            provider=provider,
+            workflow_name=workflow_name,
+            provider_impls=provider_impls,
+            policy=policy,
+            worktree=worktree,
+            role_providers=role_providers,
+            skills=skills,
+            ci_block_on_approval=ci_block_on_approval,
+            automation=automation,
+            close_blackboard=close_blackboard,
         )
 
     def _execute_native_workflow(
@@ -1022,27 +1009,16 @@ class SupervisorRuntime:
                     skills=stage_skills,
                     session_dir=run_dir / "provider_sessions",
                 )
-                artifact_path = run_dir / output.artifact_name
-                _atomic_write_text(artifact_path, redact(output.content))
-                blackboard.add_usage(run_id, stage_provider, output.tokens, output.cost_usd)
-                blackboard.add_artifact(run_id, stage.id, output.artifact_name, artifact_path, "stage_output")
-                trace.write(
-                    "provider_event",
-                    stage=stage.id,
-                    provider=stage_provider,
-                    returncode=output.returncode,
-                    artifact=str(artifact_path),
-                )
-                blackboard.complete_provider_attempt(
-                    run_id,
-                    stage.id,
+                artifact_path = _persist_stage_execution_result(
+                    blackboard,
+                    trace,
+                    run_dir=run_dir,
+                    run_id=run_id,
+                    stage_id=stage.id,
                     provider=stage_provider,
                     attempt=attempt,
-                    status=_provider_attempt_status(output),
-                    failure_kind=_provider_failure_kind(output),
-                    returncode=output.returncode,
-                    summary=output.summary,
-                    artifact_path=str(artifact_path),
+                    output=output,
+                    write_text=_atomic_write_text,
                 )
                 design_feedback = _design_feedback_request_from_output(stage, output)
                 if design_feedback:
@@ -1229,6 +1205,7 @@ class SupervisorRuntime:
                     return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
                 findings: list[dict[str, object]] = []
                 decision_text = "accept"
+                invalid_test_contract = False
                 if (
                     routing_review_snapshot is not None
                     and routing_review_snapshot_path is not None
@@ -1246,31 +1223,44 @@ class SupervisorRuntime:
                     _transition_run(blackboard, run_id, RunStatus.BLOCKED)
                     return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
                 if stage.output_schema == "TestResult" or stage.id == "test":
-                    parsed = extract_json_object(output.content) or {}
-                    test_result = TestResult(
-                        passed=bool(parsed.get("passed", True)),
-                        command=str(parsed.get("command", "pytest")),
-                        summary=str(parsed.get("summary", output.summary)),
+                    parsed = extract_json_object(output.content)
+                    test_result, validation = validate_test_result(
+                        parsed,
+                        fallback_summary=output.summary,
                     )
+                    validation_path = _record_result_validation(
+                        run_dir,
+                        run_id=run_id,
+                        stage_id=stage.id,
+                        provider=stage_provider,
+                        output=output,
+                        artifact_path=artifact_path,
+                        validation=validation,
+                    )
+                    blackboard.add_artifact(run_id, stage.id, validation_path.name, validation_path, "result_validation")
                     blackboard.add_test_result(run_id, stage.id, test_result.passed, test_result.command, test_result.summary)
                     if not test_result.passed:
                         decision_text = "reject"
-                        findings.append({"severity": "high", "type": "test_failure", "summary": test_result.summary})
+                        finding_type = "invalid_test_output" if not validation.valid else "test_failure"
+                        findings.append({"severity": "high", "type": finding_type, "summary": test_result.summary})
+                    if not validation.valid:
+                        invalid_test_contract = True
+                        blackboard.add_error(run_id, stage.id, "invalid_test_output", test_result.summary)
                 if _is_review_stage(stage):
                     parsed_review = extract_json_object(output.content)
-                    if routing_review_snapshot is not None and not parsed_review:
-                        review = ReviewResult(
-                            has_blockers=True,
-                            blockers=[
-                                ReviewBlocker(
-                                    type="invalid_review_output",
-                                    severity="high",
-                                    suggestion="Reviewer must return the configured ReviewResult JSON.",
-                                )
-                            ],
-                        )
-                    else:
-                        review = _parse_review_result(output.content)
+                    review, validation = validate_review_result(parsed_review)
+                    validation_path = _record_result_validation(
+                        run_dir,
+                        run_id=run_id,
+                        stage_id=stage.id,
+                        provider=stage_provider,
+                        output=output,
+                        artifact_path=artifact_path,
+                        validation=validation,
+                    )
+                    blackboard.add_artifact(run_id, stage.id, validation_path.name, validation_path, "result_validation")
+                    if not validation.valid:
+                        blackboard.add_error(run_id, stage.id, "invalid_review_output", "; ".join(validation.errors))
                     for blocker in review.blockers:
                         blackboard.add_review_blocker(
                             run_id,
@@ -1310,6 +1300,20 @@ class SupervisorRuntime:
                     worktree=worktree,
                     snapshot_ref=str(snapshot["path"]),
                 )
+                if invalid_test_contract:
+                    summary = "test stage did not produce a valid TestResult contract"
+                    LifecycleService(blackboard).transition_stage(
+                        run_id,
+                        stage.id,
+                        role=stage.role,
+                        status=StageStatus.FAILED,
+                        output_path=str(artifact_path),
+                        summary=summary,
+                    )
+                    _transition_run(blackboard, run_id, RunStatus.BLOCKED)
+                    trace.write("stage_failed", stage=stage.id, reason="invalid_test_output")
+                    _record_evidence_run(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
+                    return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
                 LifecycleService(blackboard).transition_stage(run_id, stage.id, role=stage.role, status=StageStatus.COMPLETED, output_path=str(artifact_path), summary=output.summary)
                 blackboard.add_checkpoint(run_id, stage.id, "stage_completed")
                 trace.write("stage_completed", stage=stage.id, output=str(artifact_path))
@@ -1439,6 +1443,11 @@ class SupervisorRuntime:
                 continue
             stage_providers: dict[str, str] = {}
             snapshots: dict[str, dict[str, object]] = {}
+            stage_worktrees: dict[str, Path] = {}
+            stage_workers: dict[str, WorkerWorkspace] = {}
+            worker_patches: list[WorkerPatch] = []
+            workers_root = run_dir / "parallel_worktrees"
+            batch_base_hash = workspace_content_hash(worktree)
             trace.write("parallel_batch_started", stages=[stage.id for stage in runnable], max_parallel=workflow.max_parallel)
             planned_writes = planned_stage_writes_from_automation(automation, [stage.id for stage in runnable])
             if planned_writes:
@@ -1467,6 +1476,12 @@ class SupervisorRuntime:
                 stage_providers[stage.id] = stage_provider
                 snapshot = _record_stage_snapshot(blackboard, run_dir=run_dir, run_id=run_id, stage_id=stage.id, worktree=worktree)
                 snapshots[stage.id] = snapshot
+                if stage.allow_write:
+                    worker = prepare_worker_workspace(worktree, workers_root=workers_root, stage_id=stage.id)
+                    stage_workers[stage.id] = worker
+                    stage_worktrees[stage.id] = worker.path
+                else:
+                    stage_worktrees[stage.id] = worktree
                 contract_path, contract_hash, _ = write_stage_contract(
                     run_dir,
                     run_id=run_id,
@@ -1505,7 +1520,7 @@ class SupervisorRuntime:
                         provider=stage_provider,
                         workflow=workflow.name,
                         task=task,
-                        worktree=worktree,
+                        worktree=stage_worktrees[stage.id],
                         skills=stage_skills,
                         automation=automation,
                         trace=trace,
@@ -1537,38 +1552,28 @@ class SupervisorRuntime:
                             context_packet_path,
                             context_packet_hash,
                         ),
-                        worktree=worktree,
+                        worktree=stage_worktrees[stage.id],
                         skills=stage_skills,
                         session_dir=run_dir / "provider_sessions",
                         run_id=run_id,
+                        role=stage.role,
+                        provider=stage_provider,
                         attempt=attempt,
                     )
-                    futures[future] = (stage, stage_provider, attempt)
+                    futures[future] = (stage, stage_provider, attempt, stage_worktrees[stage.id])
                 for future in as_completed(futures):
-                    stage, stage_provider, attempt = futures[future]
+                    stage, stage_provider, attempt, stage_worktree = futures[future]
                     output = future.result()
-                    artifact_path = run_dir / output.artifact_name
-                    _atomic_write_text(artifact_path, redact(output.content))
-                    blackboard.add_usage(run_id, stage_provider, output.tokens, output.cost_usd)
-                    blackboard.add_artifact(run_id, stage.id, output.artifact_name, artifact_path, "stage_output")
-                    trace.write(
-                        "provider_event",
-                        stage=stage.id,
-                        provider=stage_provider,
-                        returncode=output.returncode,
-                        artifact=str(artifact_path),
-                    )
-                    blackboard.complete_provider_attempt(
-                        run_id,
-                        stage.id,
+                    artifact_path = _persist_stage_execution_result(
+                        blackboard,
+                        trace,
+                        run_dir=run_dir,
+                        run_id=run_id,
+                        stage_id=stage.id,
                         provider=stage_provider,
                         attempt=attempt,
-                        status=_provider_attempt_status(output),
-                        failure_kind=_provider_failure_kind(output),
-                        returncode=output.returncode,
-                        summary=output.summary,
-                        artifact_path=str(artifact_path),
-                        harness_events=output.harness_events,
+                        output=output,
+                        write_text=_atomic_write_text,
                     )
                     design_feedback = _design_feedback_request_from_output(stage, output)
                     if design_feedback:
@@ -1621,7 +1626,7 @@ class SupervisorRuntime:
                             stage_id=stage.id,
                             role=stage.role,
                             provider=stage_provider,
-                            worktree=worktree,
+                            worktree=stage_worktree,
                             kind=_provider_failure_kind(output) or str(ProviderActionKind.PROVIDER_BLOCKED),
                             summary=output.summary,
                             snapshot_ref=str(snapshots.get(stage.id, {}).get("path") or ""),
@@ -1661,7 +1666,7 @@ class SupervisorRuntime:
                             stage_id=stage.id,
                             role=stage.role,
                             provider=stage_provider,
-                            worktree=worktree,
+                            worktree=stage_worktree,
                             kind=_provider_failure_kind(output) or "provider_exit",
                             summary=output.summary,
                             snapshot_ref=str(snapshots.get(stage.id, {}).get("path") or ""),
@@ -1691,7 +1696,7 @@ class SupervisorRuntime:
                             summary=output.summary,
                             findings=[{"severity": "high", "type": _provider_failure_kind(output) or "provider_exit", "summary": output.summary}],
                             artifact_path=artifact_path,
-                            worktree=worktree,
+                            worktree=stage_worktree,
                             snapshot_ref=None,
                         )
                         LifecycleService(blackboard).transition_stage(
@@ -1708,7 +1713,7 @@ class SupervisorRuntime:
                         _refresh_provider_learning(blackboard, run_id)
                         return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
                     snapshot = snapshots.get(stage.id, {})
-                    if stage.read_only and str(snapshot.get("diff_hash") or snapshot.get("patch_hash")) != _worktree_patch_hash(worktree):
+                    if stage.read_only and str(snapshot.get("diff_hash") or snapshot.get("patch_hash")) != _worktree_patch_hash(stage_worktree):
                         summary = f"read-only stage {stage.id} modified the worktree"
                         capsule_path = _record_session_capsule(
                             blackboard,
@@ -1717,7 +1722,7 @@ class SupervisorRuntime:
                             stage_id=stage.id,
                             role=stage.role,
                             provider=stage_provider,
-                            worktree=worktree,
+                            worktree=stage_worktree,
                             kind="read_only_write_violation",
                             summary=summary,
                             snapshot_ref=str(snapshot.get("path") or ""),
@@ -1747,7 +1752,7 @@ class SupervisorRuntime:
                             summary=summary,
                             findings=[{"severity": "high", "type": "read_only_write_violation", "summary": summary}],
                             artifact_path=artifact_path,
-                            worktree=worktree,
+                            worktree=stage_worktree,
                             snapshot_ref=str(snapshot.get("path") or ""),
                         )
                         LifecycleService(blackboard).transition_stage(run_id, stage.id, role=stage.role, status=StageStatus.FAILED, output_path=str(artifact_path), summary=summary)
@@ -1756,6 +1761,13 @@ class SupervisorRuntime:
                         trace.write("stage_failed", stage=stage.id, reason="read_only_write_violation")
                         _refresh_provider_learning(blackboard, run_id)
                         return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
+                    if stage.allow_write:
+                        worker_patch = capture_worker_patch(
+                            stage_workers[stage.id],
+                            patches_root=run_dir / "parallel_patches",
+                        )
+                        worker_patches.append(worker_patch)
+                        blackboard.add_artifact(run_id, stage.id, worker_patch.path.name, worker_patch.path, "parallel_patch")
                     _record_role_result(
                         blackboard,
                         run_dir=run_dir,
@@ -1767,7 +1779,7 @@ class SupervisorRuntime:
                         summary=output.summary,
                         findings=[],
                         artifact_path=artifact_path,
-                        worktree=worktree,
+                        worktree=stage_worktree,
                         snapshot_ref=None,
                     )
                     LifecycleService(blackboard).transition_stage(
@@ -1780,6 +1792,50 @@ class SupervisorRuntime:
                     )
                     blackboard.add_checkpoint(run_id, stage.id, "stage_completed")
                     trace.write("stage_completed", stage=stage.id, output=str(artifact_path))
+            if worker_patches:
+                actual_writes = {patch.stage_id: list(patch.touched_files) for patch in worker_patches}
+                conflicts = record_parallel_conflicts(
+                    blackboard,
+                    run_id=run_id,
+                    stage_id="parallel_merge",
+                    stage_writes=actual_writes,
+                )
+                if any(row.get("severity") == "high" for row in conflicts):
+                    report = write_parallel_conflict_report(run_dir, run_id=run_id, conflicts=conflicts)
+                    blackboard.add_artifact(run_id, None, report.name, report, "parallel_conflicts")
+                    blackboard.add_error(run_id, None, "parallel_write_conflict", "actual worker patches overlap")
+                    for patch in worker_patches:
+                        blackboard.reset_stage(run_id, patch.stage_id)
+                    _transition_run(blackboard, run_id, RunStatus.BLOCKED)
+                    cleanup_worker_workspaces(workers_root)
+                    return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
+                try:
+                    merged = merge_worker_patches(
+                        worktree,
+                        worker_patches,
+                        expected_base_hash=batch_base_hash,
+                        fencing_check=self._check_execution,
+                    )
+                except ParallelMergeError as exc:
+                    blackboard.add_error(run_id, None, "parallel_merge_failed", str(exc))
+                    for patch in worker_patches:
+                        blackboard.reset_stage(run_id, patch.stage_id)
+                    _transition_run(blackboard, run_id, RunStatus.BLOCKED)
+                    trace.write("parallel_merge_failed", error=str(exc))
+                    cleanup_worker_workspaces(workers_root)
+                    return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
+                merge_report, _ = write_json_artifact(
+                    run_dir / "parallel_patches" / "merge_report.json",
+                    {
+                        "contract_version": "muxdev.parallel_merge.v1",
+                        "base_hash": batch_base_hash,
+                        "merge_order": [item["stage_id"] for item in merged],
+                        "patches": merged,
+                    },
+                )
+                blackboard.add_artifact(run_id, None, merge_report.name, merge_report, "parallel_merge")
+                trace.write("parallel_patches_merged", patches=merged)
+                cleanup_worker_workspaces(workers_root)
             trace.write("parallel_batch_completed", stages=[stage.id for stage in runnable])
 
         diff_path = self.write_diff(run_dir, worktree)
@@ -2632,14 +2688,57 @@ def _is_runtime_archive_path(rel_path: str) -> bool:
 
 
 def _parse_review_result(content: str) -> ReviewResult:
-    parsed = extract_json_object(content)
-    if not parsed:
-        return ReviewResult(has_blockers=False, blockers=[])
-    blockers: list[ReviewBlocker] = []
-    for item in parsed.get("blockers", []) if isinstance(parsed.get("blockers"), list) else []:
-        if isinstance(item, dict):
-            blockers.append(ReviewBlocker.model_validate(item))
-    return ReviewResult(has_blockers=bool(parsed.get("has_blockers", blockers)), blockers=blockers)
+    """Compatibility helper used by tests and extensions; validation is fail-closed."""
+    result, _ = validate_review_result(extract_json_object(content))
+    return result
+
+
+def _record_result_validation(
+    run_dir: Path,
+    *,
+    run_id: str,
+    stage_id: str,
+    provider: str,
+    output: StageExecutionResult,
+    artifact_path: Path,
+    validation: ContractValidation,
+) -> Path:
+    path, _ = write_json_artifact(
+        run_dir / "contracts" / "results" / f"{stage_id}.json",
+        {
+            "contract_version": "muxdev.result_validation.v1",
+            "run_id": run_id,
+            "stage_id": stage_id,
+            "provider": provider,
+            "schema": validation.schema,
+            "valid": validation.valid,
+            "errors": list(validation.errors),
+            "provider_returncode": output.returncode,
+            "reported_test": {
+                "command": (validation.parsed or {}).get("command"),
+                "exit_code": (validation.parsed or {}).get("exit_code"),
+                "stdout": (validation.parsed or {}).get("stdout"),
+                "stderr": (validation.parsed or {}).get("stderr"),
+                "coverage": (validation.parsed or {}).get("coverage") or {},
+                "security_artifacts": (validation.parsed or {}).get("security_artifacts") or [],
+            } if validation.schema == "TestResult" else None,
+            "raw_output": {
+                "path": str(artifact_path),
+                "sha256": sha256_text(output.content),
+                "stream": "combined_provider_transcript",
+            },
+            "provider_streams": {
+                "transcript_path": output.transcript_path,
+                "chunks_path": output.chunks_path,
+                "stdout_sha256": output.stdout_hash,
+                "stderr_sha256": output.stderr_hash,
+                "stdout_bytes": output.stdout_bytes,
+                "stderr_bytes": output.stderr_bytes,
+            },
+            "parsed": validation.parsed,
+        },
+    )
+    return path
 
 
 def _has_external_confirmation_prompt(content: str) -> bool:
@@ -2734,7 +2833,7 @@ def _record_provider_actions(
     stage_id: str,
     provider: str,
     role: str | None,
-    output: ProviderStageOutput,
+    output: StageExecutionResult,
 ) -> list[str]:
     action_ids: list[str] = []
     for action in _provider_actions_from_output(output):
@@ -2925,7 +3024,7 @@ def _pending_design_feedback_requests(blackboard: Blackboard, run_id: str) -> li
     ]
 
 
-def _design_feedback_request_from_output(stage, output: ProviderStageOutput) -> dict[str, str] | None:
+def _design_feedback_request_from_output(stage, output: StageExecutionResult) -> dict[str, str] | None:
     if not _is_design_feedback_stage(stage):
         return None
     parsed = extract_json_object(output.content) or {}
@@ -3021,7 +3120,7 @@ def _can_use_parallel_runtime(workflow) -> bool:
     for stage in workflow.stages:
         if stage.type != "agent":
             return False
-        if stage.when or stage.allow_shell or stage.allow_write:
+        if stage.when or stage.allow_shell or stage.output_schema:
             return False
     return True
 
@@ -3062,19 +3161,6 @@ def _has_downstream_delivery_repair(stage, workflow) -> bool:
         if marker in str(candidate.when or ""):
             return True
     return False
-
-
-def _configured_workflow_engine(workspace: Path, automation: dict[str, object]) -> str:
-    value = automation.get("workflow_engine") if isinstance(automation, dict) else None
-    if not value:
-        try:
-            runtime = load_runtime_config(workspace).get("runtime", {})
-            if isinstance(runtime, dict):
-                value = runtime.get("workflow_engine")
-        except Exception:
-            value = None
-    normalized = str(value or "langgraph").strip().lower()
-    return "native" if normalized == "native" else "langgraph"
 
 
 def _load_workflow_for_run(workflow_name: str, run_dir: Path):

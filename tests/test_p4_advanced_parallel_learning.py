@@ -16,14 +16,14 @@ from muxdev.cli import app
 from muxdev.daemon.paths import default_daemon_paths
 from muxdev.daemon.tasks import TaskManager
 from muxdev.models import RunStatus
-from muxdev.providers.adapters import ProviderStageOutput
+from muxdev.domain import StageExecutionInput, StageExecutionResult
 from muxdev.runtime import SupervisorRuntime
 from muxdev.services.advanced_parallel import detect_parallel_conflicts, record_parallel_conflicts
 from muxdev.services.multirepo import plan_multi_repo_orchestration
 from muxdev.services.provider_learning import refresh_provider_learning
 from muxdev.services.semantic_merge import review_semantic_merge
 from muxdev.storage import Blackboard, MemoryStore
-from muxdev.ui.tui import daemon_help_text
+from muxdev.presentation.daemon_tui import daemon_help_text
 
 
 runner = CliRunner()
@@ -66,9 +66,10 @@ stages:
     )
 
     class ConflictProvider:
-        def run_stage(self, *, stage_id: str, task: str, worktree: Path, skills=None) -> ProviderStageOutput:
+        def execute(self, input: StageExecutionInput) -> StageExecutionResult:
+            _stage_id, _task, worktree, _skills = input.stage_id, input.task, input.worktree, list(input.skills)
             (worktree / "app.py").write_text("<<<<<<< ours\nx = 1\n=======\nx = 2\n>>>>>>> theirs\n", encoding="utf-8")
-            return ProviderStageOutput("code.md", "wrote conflict markers", "ok")
+            return StageExecutionResult("code.md", "wrote conflict markers", "ok")
 
     monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: ConflictProvider())
 
@@ -234,8 +235,8 @@ def test_p4_cli_and_tui_surface_commands() -> None:
         assert json.loads(multirepo.stdout)["mode"] == "design"
         assert "/dev <task>" in daemon_help_text()
         assert "/design <task>" in daemon_help_text()
-        assert "/parallel" in daemon_help_text()
-        assert "/learning" in daemon_help_text()
+        assert "/parallel" not in daemon_help_text()
+        assert "/learning" not in daemon_help_text()
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 

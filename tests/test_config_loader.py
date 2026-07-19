@@ -138,7 +138,7 @@ workflows:
       - id: only
         role: tester
         deps: []
-workflow_plugins:
+workflow_templates:
   custom:
     description: Custom project workflow template.
     phases: [planning]
@@ -169,10 +169,9 @@ command_dialects:
     assert graph.exit_code == 0
     assert json.loads(graph.stdout)["name"] == "tiny"
     assert templates.exit_code == 0
-    assert legacy_plugins.exit_code == 0
+    assert legacy_plugins.exit_code != 0
     assert template.exit_code == 0
     assert "custom" in {row["name"] for row in json.loads(templates.stdout)}
-    assert json.loads(legacy_plugins.stdout) == json.loads(templates.stdout)
     assert json.loads(template.stdout)["name"] == "custom"
     assert rendered.exit_code == 0
     assert json.loads(rendered.stdout)["command"] == "$custom-plan x"
