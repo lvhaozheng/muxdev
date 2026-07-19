@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from typer.testing import CliRunner
+import pytest
 
 from muxdev.cli import app
 from muxdev.config import runtime as runtime_config
@@ -19,6 +20,7 @@ from muxdev.storage import MemoryStore
 
 
 runner = CliRunner()
+pytestmark = pytest.mark.integration
 
 
 def test_auto_request_compiles_sensitive_dev_to_deep_workflow(monkeypatch) -> None:
@@ -124,14 +126,16 @@ def test_design_runtime_writes_pack_and_memory_proposal_file_without_auto_memory
         )
         contract = result.run_dir / "design" / "design_contract.json"
         proposals = result.run_dir / "design" / "memory_proposals.json"
+        contract_payload = json.loads(contract.read_text(encoding="utf-8"))
+        proposals_payload = json.loads(proposals.read_text(encoding="utf-8"))
         with MemoryStore(workspace) as store:
             status = store.status()
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 
     assert result.status == RunStatus.COMPLETED
-    assert json.loads(contract.read_text(encoding="utf-8"))["contract_version"] == "muxdev.design_contract.v1"
-    assert json.loads(proposals.read_text(encoding="utf-8"))[0]["status"] == "proposed"
+    assert contract_payload["contract_version"] == "muxdev.design_contract.v1"
+    assert proposals_payload[0]["status"] == "proposed"
     assert status["counts"].get("proposed", 0) == 0
 
 

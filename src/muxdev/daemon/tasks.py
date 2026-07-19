@@ -4,22 +4,28 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import shutil
 import subprocess
 import threading
+import weakref
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
+from uuid import uuid4
 
-from ..application import TaskRuntimeService
+from ..application import LifecycleService, TaskRuntimeService
 from ..clients.sessions import TmuxBackend
 from ..config.loader import path_config
 from ..core.projects import resolve_project_root
 from ..core.platforms import follow_file_command, hidden_subprocess_kwargs
 from ..core.text_cleaning import is_false_positive_provider_action
-from ..domain import RunSpec
+from ..domain import CancellationToken, ExecutionGuard, ExecutionLease, RunSpec
 from ..models import ApprovalStatus, ProviderActionStatus, RunStatus
+from ..providers import get_runtime_provider
+from ..providers.certification import certification_is_current
+from ..providers.policy import isolation_summary
 from ..runtime import SupervisorRuntime, new_run_id
 from ..services.dashboard_run import build_run_dashboard_payload, startup_dashboard_payload
 from ..services.deliverables import workflow_deliverable_status
@@ -27,12 +33,22 @@ from ..services.feedback import route_feedback
 from ..services.progress import enrich_provider_attempts, enrich_stages, progress_summary
 from ..services.provider_learning import refresh_provider_learning
 from ..services.provider_scores import build_provider_scores
-from ..storage import Blackboard
-from ..storage.repositories import ProviderActionsRepository, RunsRepository
+from ..services.routing import replay_route
+from ..services.routing_benchmark import (
+    build_benchmark_plan,
+    export_benchmark_results,
+    load_registered_routing_suite,
+    run_replay_benchmark,
+)
+from ..services.demo import list_demo_scenarios, load_demo_scenario, start_managed_demo
+from ..services.local_auth import LocalApiAuth
+from ..services.task_story import build_task_story, query_dashboard_task_summaries
+from ..storage import ActiveExecutionError, Blackboard, DurableExecutionQueue
+from ..storage.repositories import ProviderActionsRepository
 from ..storage.read_models import DashboardReadModel
 from .event_bus import EventBus
-from .paths import DaemonPaths, default_daemon_paths
-from .queue import TaskQueue
+from .paths import DaemonPaths, daemon_runtime_settings, default_daemon_paths
+from .queue import DurableWorkerPool
 
 
 TERMINAL_STATUSES = {str(RunStatus.COMPLETED), str(RunStatus.BLOCKED), str(RunStatus.ABORTED)}
@@ -135,22 +151,91 @@ def _is_real_attach_command(command: str) -> bool:
 class TaskManager:
     """Own all daemon-side writes to task state and artifacts."""
 
+    _instance_refs: ClassVar[list[weakref.ReferenceType["TaskManager"]]] = []
+
     paths: DaemonPaths = field(default_factory=default_daemon_paths)
     lock: threading.RLock = field(default_factory=threading.RLock)
     workers: dict[str, threading.Thread] = field(default_factory=dict)
     subscribers: set[asyncio.Queue[dict[str, Any]]] = field(default_factory=set)
-    queue: TaskQueue = field(init=False)
+    queue: DurableWorkerPool = field(init=False)
     events: EventBus = field(init=False)
+    storage_boot_error: str | None = field(init=False, default=None)
+    worker_count: int | None = None
+    lease_ms: int | None = None
+    heartbeat_ms: int | None = None
+    cancel_grace_ms: int | None = None
+    poll_ms: int = 250
+    execution_guards: dict[str, ExecutionGuard] = field(init=False, default_factory=dict)
+    auth: LocalApiAuth = field(init=False)
 
     def __post_init__(self) -> None:
-        self.queue = TaskQueue(lock=self.lock, workers=self.workers)
+        type(self)._instance_refs = [ref for ref in type(self)._instance_refs if ref() is not None]
+        type(self)._instance_refs.append(weakref.ref(self))
         self.events = EventBus(subscribers=self.subscribers)
         self.paths.ensure()
+        self.auth = LocalApiAuth(self.paths.data_dir)
+        daemon_settings = daemon_runtime_settings(self.paths)
+        self.worker_count = int(self.worker_count or daemon_settings["workers"])
+        self.lease_ms = int(self.lease_ms or daemon_settings["lease_ms"])
+        self.heartbeat_ms = int(self.heartbeat_ms or daemon_settings["heartbeat_ms"])
+        self.cancel_grace_ms = int(self.cancel_grace_ms or daemon_settings["cancel_grace_ms"])
+        try:
+            with self.board() as board:
+                board.list_runs()
+        except sqlite3.OperationalError as exc:
+            if "readonly" not in str(exc).lower() and "read-only" not in str(exc).lower():
+                raise
+            # A read-only legacy database must not prevent diagnostics-only API
+            # surfaces from starting. Any stateful operation still fails closed.
+            with Blackboard(self.paths.data_dir, db_path=self.paths.db_path, readonly=True) as board:
+                board.list_runs()
+            self.storage_boot_error = str(exc)
+        self.queue = DurableWorkerPool(
+            board_factory=self.board,
+            execute=self._execute_execution,
+            publish=self.broadcast,
+            worker_count=self.worker_count,
+            lease_ms=self.lease_ms,
+            heartbeat_ms=self.heartbeat_ms,
+            poll_ms=self.poll_ms,
+        )
+        if not self.storage_boot_error:
+            self._reconcile_legacy_runs()
+            with self.board() as board:
+                states = DurableExecutionQueue(board).status().get("queue", {})
+            if isinstance(states, dict) and any(int(states.get(state, 0) or 0) for state in ("queued", "retry_wait", "leased", "running", "cancel_requested")):
+                self.queue.start()
+
+    def _reconcile_legacy_runs(self) -> None:
+        """Baseline pre-v3 active Runs without guessing opaque outcomes."""
         with self.board() as board:
-            board.list_runs()
+            queue = DurableExecutionQueue(board)
+            for run in board.list_runs():
+                run_id = str(run["run_id"])
+                status = str(run.get("status") or "")
+                if status not in {str(RunStatus.CREATED), str(RunStatus.RUNNING)}:
+                    continue
+                if queue.latest_for_run(run_id, internal=True) is not None:
+                    continue
+                with board.unit_of_work():
+                    self._ensure_durable_run_spec(board, run_id, run=run)
+                    provider_running = board.conn.execute(
+                        "SELECT 1 FROM provider_attempts WHERE run_id=? AND status='running' LIMIT 1", (run_id,)
+                    ).fetchone()
+                    worktree_missing = status == str(RunStatus.RUNNING) and not Path(str(run["worktree"])).exists()
+                    reason = None
+                    if provider_running is not None:
+                        reason = "legacy opaque Provider outcome is unknown"
+                    elif worktree_missing:
+                        reason = "legacy running task has no recoverable worktree"
+                    queue.import_legacy_run(
+                        run_id,
+                        command="start" if status == str(RunStatus.CREATED) else "resume",
+                        ambiguous_reason=reason,
+                    )
 
     def board(self) -> Blackboard:
-        return Blackboard(self.paths.data_dir, db_path=self.paths.db_path)
+        return Blackboard(self.paths.data_dir, db_path=self.paths.db_path, event_sink=self.broadcast)
 
     def submit_task(
         self,
@@ -159,7 +244,6 @@ class TaskManager:
         workspace: Path,
         provider: str = "mock",
         workflow: str = "software-dev",
-        profile: str | None = None,
         gate: str | None = None,
         require_approval: set[str] | None = None,
         max_cost_usd: float = 0.5,
@@ -167,8 +251,8 @@ class TaskManager:
         skills: list[dict[str, object]] | None = None,
         ci_block_on_approval: bool = False,
         depth: str | None = None,
-        topology: str | None = None,
         automation: dict[str, object] | None = None,
+        routing_policy: dict[str, object] | None = None,
     ) -> dict[str, Any]:
         workspace = resolve_project_root(workspace)
         spec = RunSpec.from_submit_payload(
@@ -177,7 +261,6 @@ class TaskManager:
             provider=provider,
             workflow=workflow,
             run_id=new_run_id(),
-            profile=profile,
             gate=gate,
             require_approval=require_approval,
             max_cost_usd=max_cost_usd,
@@ -185,8 +268,8 @@ class TaskManager:
             skills=skills,
             ci_block_on_approval=ci_block_on_approval,
             depth=depth,
-            topology=topology,
             automation=automation,
+            routing_policy=routing_policy,
         )
         task_id = spec.run_id
         run_dir = self._project_run_dir(spec.workspace, task_id)
@@ -197,14 +280,11 @@ class TaskManager:
             encoding="utf-8",
         )
         with self.board() as board:
-            RunsRepository(board).create(spec, worktree=self._project_worktree_dir(spec.workspace, task_id))
-        thread = threading.Thread(
-            target=self._run_task,
-            args=(spec,),
-            name=f"muxdev-task-{task_id}",
-            daemon=True,
-        )
-        self.queue.start(task_id, thread)
+            job = DurableExecutionQueue(board).create_initial(
+                spec,
+                worktree=self._project_worktree_dir(spec.workspace, task_id),
+            )
+        self.queue.notify()
         self.broadcast({"type": "task_submitted", "task_id": task_id})
         return {
             "task_id": task_id,
@@ -214,17 +294,17 @@ class TaskManager:
             "gate": spec.gate,
             "depth": spec.depth,
             "skills": [skill.name for skill in spec.skills],
+            "job_id": job["job_id"],
         }
 
     def continue_task(self, task_id: str | None = None, *, max_cost_usd: float = 0.5) -> dict[str, Any]:
         resolved = self.resolve_task_id(task_id or "latest")
         run = self.get_run(resolved)
-        workspace = Path(run["workspace"])
         with self.board() as board:
             dismissed_actions = _dismiss_false_positive_provider_actions(board, resolved)
             pending_actions = ProviderActionsRepository(board).list_pending(resolved)
             if pending_actions:
-                board.set_run_status(resolved, RunStatus.AWAITING_PROVIDER_ACTION)
+                LifecycleService(board).transition_run(resolved, RunStatus.AWAITING_PROVIDER_ACTION)
                 return {
                     "task_id": resolved,
                     "run_id": resolved,
@@ -234,7 +314,7 @@ class TaskManager:
                 }
             pending_feedback = _pending_design_feedback_requests(board, resolved)
             if pending_feedback:
-                board.set_run_status(resolved, RunStatus.AWAITING_FEEDBACK)
+                LifecycleService(board).transition_run(resolved, RunStatus.AWAITING_FEEDBACK)
                 return {
                     "task_id": resolved,
                     "run_id": resolved,
@@ -242,31 +322,77 @@ class TaskManager:
                     "feedback_requests": pending_feedback,
                     "dismissed_provider_actions": dismissed_actions,
                 }
-        thread = threading.Thread(
-            target=self._resume_task,
-            args=(resolved, workspace),
-            kwargs={"max_cost_usd": max_cost_usd},
-            name=f"muxdev-continue-{resolved}",
-            daemon=True,
-        )
-
-        def mark_running() -> None:
-            if str(run.get("status") or "") == str(RunStatus.COMPLETED):
-                return
+        try:
             with self.board() as board:
-                board.set_run_status(resolved, RunStatus.RUNNING)
-
-        if not self.queue.start_if_idle(resolved, thread, before_start=mark_running):
+                queue = DurableExecutionQueue(board)
+                with board.unit_of_work():
+                    self._ensure_durable_run_spec(board, resolved, run=run)
+                    if str(run.get("status") or "") != str(RunStatus.COMPLETED):
+                        LifecycleService(board).transition_run(
+                            resolved,
+                            RunStatus.RUNNING,
+                            recovery_reason="user requested continue",
+                            idempotency_key=f"execution:continue:{uuid4().hex}",
+                        )
+                    job = queue.enqueue(
+                        resolved,
+                        command="resume",
+                        idempotency_key=f"continue:{uuid4().hex}",
+                        request={"max_cost_usd": max_cost_usd},
+                    )
+        except ActiveExecutionError:
             return {"task_id": resolved, "run_id": resolved, "status": "already_running"}
+        self.queue.notify()
         self.broadcast({"type": "task_continue_requested", "task_id": resolved})
-        return {"task_id": resolved, "run_id": resolved, "status": "continue_requested", "dismissed_provider_actions": dismissed_actions}
+        return {"task_id": resolved, "run_id": resolved, "job_id": job["job_id"], "status": "continue_requested", "dismissed_provider_actions": dismissed_actions}
 
-    def stop_task(self, task_id: str) -> dict[str, Any]:
+    def cancel_task(self, task_id: str, *, reason: str = "", wait: bool = False, timeout: float = 30.0) -> dict[str, Any]:
         resolved = self.resolve_task_id(task_id)
         with self.board() as board:
-            board.set_run_status(resolved, RunStatus.ABORTED)
-        self.broadcast({"type": "task_stopped", "task_id": resolved})
-        return {"task_id": resolved, "run_id": resolved, "status": str(RunStatus.ABORTED)}
+            result = DurableExecutionQueue(board).request_cancel(resolved, reason=reason)
+        self.queue.signal_cancel(resolved, reason)
+        if wait and result.get("status") == "cancel_requested":
+            self.queue.wait(resolved, timeout=timeout)
+            with self.board() as board:
+                latest = DurableExecutionQueue(board).latest_for_run(resolved)
+                result = {
+                    **result,
+                    "status": latest.get("state") if latest else result["status"],
+                    "run_status": str(board.get_run(resolved)["status"]),
+                }
+        self.broadcast({"type": "task_cancel_requested", "task_id": resolved, "status": result["status"]})
+        return {"task_id": resolved, **result}
+
+    def stop_task(self, task_id: str) -> dict[str, Any]:
+        """Compatibility alias for the durable cancellation contract."""
+        return self.cancel_task(task_id, reason="legacy task stop")
+
+    def task_executions(self, task_id: str) -> dict[str, Any]:
+        resolved = self.resolve_task_id(task_id)
+        with self.board() as board:
+            queue = DurableExecutionQueue(board)
+            return {"run_id": resolved, "jobs": queue.list_for_run(resolved), "events": queue.events_for_run(resolved)}
+
+    def reconcile_task(
+        self,
+        task_id: str,
+        *,
+        decision: str,
+        reason: str,
+        acknowledge_duplicate_risk: bool = False,
+    ) -> dict[str, Any]:
+        resolved = self.resolve_task_id(task_id)
+        with self.board() as board:
+            result = DurableExecutionQueue(board).reconcile(
+                resolved,
+                decision=decision,
+                reason=reason,
+                acknowledge_duplicate_risk=acknowledge_duplicate_risk,
+            )
+        if decision == "retry":
+            self.queue.notify()
+        self.broadcast({"type": "task_reconciled", "task_id": resolved, "decision": decision})
+        return {"task_id": resolved, **result}
 
     def list_tasks(self) -> list[dict[str, Any]]:
         with self.board() as board:
@@ -292,7 +418,7 @@ class TaskManager:
             run = board.get_run(resolved)
             workspace = Path(run["workspace"])
             run_dir = self._run_dir(resolved, run=run)
-            return DashboardReadModel(
+            payload = DashboardReadModel(
                 workspace,
                 run_dir,
                 resolved,
@@ -300,6 +426,186 @@ class TaskManager:
                 build_run_dashboard_payload,
                 context=self._task_context(resolved),
             ).load()
+            events = board.list_harness_events(resolved)
+            payload["harness"] = {
+                "event_count": len(events),
+                "latest_event": events[-1].to_dict() if events else None,
+                "attempts": isolation_summary(board, resolved)["attempts"],
+            }
+            payload["isolation"] = isolation_summary(board, resolved)
+            assignments = board.list_review_assignments(resolved)
+            payload["routing"] = {
+                "feature_set": board.latest_task_feature_set(resolved),
+                "current": board.latest_route_decision(resolved, kind="main"),
+            }
+            payload["heterogeneous_review"] = {
+                "assignments": assignments,
+                "current": assignments[-1] if assignments else None,
+            }
+            attestation = board.latest_delivery_attestation(resolved)
+            payload["attestation"] = (
+                {
+                    "attestation_id": attestation.get("attestation_id"),
+                    "generation": attestation.get("generation"),
+                    "status": attestation.get("status"),
+                    "payload_hash": attestation.get("payload_hash"),
+                    "key_id": attestation.get("key_id"),
+                    "public_key_fingerprint": attestation.get("public_key_fingerprint"),
+                    "evidence_valid": attestation.get("evidence_valid"),
+                    "identity_status": attestation.get("identity_status"),
+                    "warning": "unsigned delivery is not trusted production evidence" if attestation.get("status") != "signed" else None,
+                }
+                if attestation
+                else {"status": "legacy_unsigned", "history_complete": False}
+            )
+            return payload
+
+    def dashboard_tasks(self, *, cursor: str | None = None, limit: int = 50) -> dict[str, Any]:
+        with self.board() as board:
+            return query_dashboard_task_summaries(
+                board, cursor_secret=self.auth.cursor_secret, cursor=cursor, limit=limit
+            )
+
+    def task_story(self, task_id: str, *, cursor: str | None = None, limit: int = 200) -> dict[str, Any]:
+        resolved = self.resolve_task_id(task_id)
+        with self.board() as board:
+            return build_task_story(
+                board, resolved, cursor_secret=self.auth.cursor_secret, cursor=cursor, limit=limit
+            )
+
+    def demo_scenarios(self) -> list[dict[str, Any]]:
+        return list_demo_scenarios()
+
+    def demo_scenario(self, scenario_id: str) -> dict[str, Any]:
+        return load_demo_scenario(scenario_id)
+
+    def start_demo(self, scenario_id: str, *, workspace: Path) -> dict[str, Any]:
+        return start_managed_demo(self, scenario_id=scenario_id, workspace=workspace)
+
+    def provider_certifications(self, *, provider: str | None = None) -> list[dict[str, Any]]:
+        with self.board() as board:
+            rows = board.list_adapter_certifications(provider=provider)
+        adapters: dict[str, object] = {}
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            name = str(item.get("provider") or "")
+            try:
+                adapter = adapters.setdefault(name, get_runtime_provider(name))
+                if not certification_is_current(item, adapter.probe()):
+                    item["recorded_status"] = item.get("status")
+                    item["status"] = "stale"
+            except (OSError, ValueError):
+                item["recorded_status"] = item.get("status")
+                item["status"] = "stale"
+            result.append(item)
+        return result
+
+    def harness_events(self, task_id: str, *, stage_id: str | None = None) -> dict[str, Any]:
+        resolved = self.resolve_task_id(task_id)
+        with self.board() as board:
+            events = board.list_harness_events(resolved, stage_id=stage_id)
+        return {"run_id": resolved, "events": [event.to_dict() for event in events]}
+
+    def task_isolation(self, task_id: str) -> dict[str, object]:
+        resolved = self.resolve_task_id(task_id)
+        with self.board() as board:
+            return isolation_summary(board, resolved)
+
+    def task_route(self, task_id: str) -> dict[str, object]:
+        resolved = self.resolve_task_id(task_id)
+        with self.board() as board:
+            return {
+                "run_id": resolved,
+                "feature_set": board.latest_task_feature_set(resolved),
+                "decisions": board.list_route_decisions(resolved),
+                "current": board.latest_route_decision(resolved, kind="main"),
+            }
+
+    def task_review(self, task_id: str) -> dict[str, object]:
+        resolved = self.resolve_task_id(task_id)
+        with self.board() as board:
+            assignments = board.list_review_assignments(resolved)
+            return {
+                "run_id": resolved,
+                "assignments": assignments,
+                "current": assignments[-1] if assignments else None,
+            }
+
+    def routing_replay(self, task_id: str, *, benchmark_snapshot_id: str | None = None) -> dict[str, object]:
+        resolved = self.resolve_task_id(task_id)
+        with self.board() as board:
+            return replay_route(board, run_id=resolved, benchmark_snapshot_id=benchmark_snapshot_id)
+
+    def routing_snapshots(self) -> list[dict[str, Any]]:
+        with self.board() as board:
+            return board.list_benchmark_snapshots()
+
+    def routing_benchmark(
+        self,
+        suite_id: str,
+        *,
+        live: bool = False,
+        acknowledged: bool = False,
+        max_cost_usd: float | None = None,
+    ) -> dict[str, object]:
+        suite = load_registered_routing_suite(suite_id)
+        plan = build_benchmark_plan(
+            suite,
+            live=live,
+            acknowledged=acknowledged,
+            max_cost_usd=max_cost_usd,
+        )
+        snapshot_id = f"bench_{uuid4().hex}"
+        with self.board() as board:
+            snapshot = board.register_benchmark_snapshot(
+                snapshot_id=snapshot_id,
+                suite_name=str(suite.get("name") or suite_id),
+                payload=plan,
+            )
+        return {
+            "status": "live_plan_registered" if live else "offline_snapshot_registered",
+            "execution_started": False,
+            "snapshot": snapshot,
+            "plan": plan,
+        }
+
+    def benchmark_replay(self, suite_id: str = "trusted-routing-v1") -> dict[str, Any]:
+        with self.board() as board:
+            return run_replay_benchmark(board, suite_id=suite_id)
+
+    def benchmark_executions(self) -> list[dict[str, Any]]:
+        with self.board() as board:
+            return board.list_benchmark_executions()
+
+    def benchmark_execution(self, execution_id: str) -> dict[str, Any]:
+        with self.board() as board:
+            payload = board.get_benchmark_execution(execution_id)
+        if payload is None:
+            raise KeyError(f"benchmark execution not found: {execution_id}")
+        return payload
+
+    def benchmark_report(self, execution_id: str) -> dict[str, Any]:
+        payload = self.benchmark_execution(execution_id)
+        report = payload.get("report")
+        if not isinstance(report, dict):
+            raise KeyError(f"benchmark report not found: {execution_id}")
+        return report
+
+    def cancel_benchmark(self, execution_id: str) -> dict[str, Any]:
+        with self.board() as board:
+            current = board.get_benchmark_execution(execution_id)
+            if current is None:
+                raise KeyError(f"benchmark execution not found: {execution_id}")
+            if str(current.get("status")) in {"completed", "failed", "cancelled", "preflight_failed"}:
+                return current
+            updated = board.update_benchmark_execution(execution_id, status="cancelled")
+            board.append_benchmark_event(execution_id, "benchmark.cancelled", {"operator_source": "local_api"})
+            return updated
+
+    def export_benchmark(self, execution_id: str, output: Path) -> dict[str, Any]:
+        with self.board() as board:
+            return export_benchmark_results(board, execution_id, output)
 
     def approvals(self, *, status: str | None = None) -> list[dict[str, Any]]:
         with self.board() as board:
@@ -423,7 +729,7 @@ class TaskManager:
             reset_stages = _plan_feedback_reset_stages(board, resolved)
             for stage_id in reset_stages:
                 board.reset_stage(resolved, stage_id)
-            board.set_run_status(resolved, RunStatus.RUNNING)
+            LifecycleService(board).transition_run(resolved, RunStatus.RUNNING)
         result: dict[str, Any] = {
             "task_id": resolved,
             "run_id": resolved,
@@ -494,7 +800,7 @@ class TaskManager:
             reset_stages = _plan_feedback_reset_stages(board, run_id)
             for stage_id in reset_stages:
                 board.reset_stage(run_id, stage_id)
-            board.set_run_status(run_id, RunStatus.RUNNING)
+            LifecycleService(board).transition_run(run_id, RunStatus.RUNNING)
             updated = next(
                 (row for row in board.list_approvals(run_id=run_id) if row.get("approval_id") == resolved_id),
                 match,
@@ -653,15 +959,35 @@ class TaskManager:
         return {"task_id": resolved, "run_id": resolved, "agent": agent, "session_id": f"{resolved}:{agent}", "status": str(handoff.get("mode") or "transcript"), "handoff": handoff}
 
     def daemon_status(self) -> dict[str, Any]:
+        if self.storage_boot_error:
+            return {
+                "status": "degraded",
+                "tasks": 0,
+                "running_tasks": 0,
+                "queue_length": 0,
+                "data": str(self.paths.data_dir),
+                "database": str(self.paths.db_path),
+                "storage_error": self.storage_boot_error,
+            }
         tasks = self.list_tasks()
+        runtime = self.runtime_status()
         return {
             "status": "running",
             "tasks": len(tasks),
-            "running_tasks": sum(1 for task in tasks if task.get("status") == str(RunStatus.RUNNING)),
-            "queue_length": sum(1 for task in tasks if task.get("status") == str(RunStatus.CREATED)),
+            "running_tasks": sum(
+                1 for task in tasks
+                if task.get("status") in {str(RunStatus.ROUTING), str(RunStatus.RUNNING), str(RunStatus.REVIEWING)}
+            ),
+            "queue_length": int(runtime.get("queue", {}).get("queued", 0)) if isinstance(runtime.get("queue"), dict) else 0,
+            "runtime": runtime,
             "data": str(self.paths.data_dir),
             "database": str(self.paths.db_path),
         }
+
+    def runtime_status(self) -> dict[str, Any]:
+        if self.storage_boot_error:
+            return {"accepting": False, "status": "degraded", "storage_error": self.storage_boot_error}
+        return self.queue.status()
 
     def startup_payload(self) -> dict[str, Any]:
         return startup_dashboard_payload(Path.cwd())
@@ -679,6 +1005,25 @@ class TaskManager:
         with self.board() as board:
             return board.get_run(self.resolve_task_id(task_id))
 
+    def wait(self, task_id: str, *, timeout: float = 30.0) -> bool:
+        return self.queue.wait(self.resolve_task_id(task_id), timeout)
+
+    def close(self, *, timeout: float = 30.0) -> list[str]:
+        """Wait for daemon-owned worker threads during an orderly shutdown."""
+        remaining = self.queue.shutdown(timeout)
+        type(self)._instance_refs = [
+            ref for ref in type(self)._instance_refs
+            if (instance := ref()) is not None and instance is not self
+        ]
+        return remaining
+
+    @classmethod
+    def live_instances(cls) -> list["TaskManager"]:
+        """Return live managers for diagnostics and deterministic test cleanup."""
+        instances = [instance for ref in cls._instance_refs if (instance := ref()) is not None]
+        cls._instance_refs = [weakref.ref(instance) for instance in instances]
+        return instances
+
     async def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
         return await self.events.subscribe()
 
@@ -687,12 +1032,43 @@ class TaskManager:
 
     def broadcast(self, event: dict[str, Any]) -> None:
         self.events.publish(event)
+        run_id = str(event.get("run_id") or event.get("task_id") or "")
+        if run_id and event.get("type") != "task_story_invalidated":
+            self.events.publish({"type": "task_story_invalidated", "version": 1, "run_id": run_id})
 
-    def _run_task(self, spec: RunSpec) -> None:
-        self._runtime_service().run(spec)
+    def _execute_execution(self, lease: ExecutionLease, token: CancellationToken) -> str:
+        guard = ExecutionGuard(lease, token)
+        self.execution_guards[lease.run_id] = guard
+        try:
+            with self.board() as board:
+                queue = DurableExecutionQueue(board)
+                spec = queue.load_run_spec(lease.run_id)
+                job = queue.get_job(lease.job_id, internal=True)
+                run_status = str(board.get_run(lease.run_id)["status"])
+                request = json.loads(str(job.get("request_json") or "{}"))
+            if lease.command == "start" and run_status == str(RunStatus.CREATED):
+                outcome = self._run_task(spec)
+            else:
+                outcome = self._resume_task(
+                    lease.run_id,
+                    spec.workspace,
+                    max_cost_usd=float(request.get("max_cost_usd") or spec.policy.max_cost_usd),
+                )
+            if outcome:
+                return str(outcome)
+            return str(self.get_run(lease.run_id)["status"])
+        finally:
+            self.execution_guards.pop(lease.run_id, None)
 
-    def _resume_task(self, task_id: str, workspace: Path, *, max_cost_usd: float) -> None:
-        self._runtime_service().resume(task_id, workspace, max_cost_usd=max_cost_usd)
+    def _run_task(self, spec: RunSpec) -> str:
+        runtime = self._runtime_for_task(spec.workspace, spec.run_id)
+        result = runtime.run(spec.task, **spec.runtime_kwargs())
+        return str(result.status)
+
+    def _resume_task(self, task_id: str, workspace: Path, *, max_cost_usd: float) -> str:
+        runtime = self._runtime_for_task(workspace, task_id)
+        result = runtime.resume(task_id, max_cost_usd=max_cost_usd)
+        return str(result.status)
 
     def _runtime_service(self) -> TaskRuntimeService:
         return TaskRuntimeService(runtime_factory=self._runtime_for_task, board_factory=self.board, publish=self.broadcast)
@@ -701,16 +1077,31 @@ class TaskManager:
         if run_id:
             run_dir = self._run_dir(run_id)
             if self.paths.runs_dir == run_dir.parent:
-                return self._runtime(workspace, runs_dir=self.paths.runs_dir, worktrees_root=self.paths.worktrees_dir)
-        return self._runtime(workspace)
+                return self._runtime(
+                    workspace,
+                    runs_dir=self.paths.runs_dir,
+                    worktrees_root=self.paths.worktrees_dir,
+                    execution_guard=self.execution_guards.get(run_id),
+                )
+        return self._runtime(workspace, execution_guard=self.execution_guards.get(run_id or ""))
 
-    def _runtime(self, workspace: Path, *, runs_dir: Path | None = None, worktrees_root: Path | None = None) -> SupervisorRuntime:
+    def _runtime(
+        self,
+        workspace: Path,
+        *,
+        runs_dir: Path | None = None,
+        worktrees_root: Path | None = None,
+        execution_guard: ExecutionGuard | None = None,
+    ) -> SupervisorRuntime:
         return SupervisorRuntime(
             workspace,
             runs_dir=runs_dir,
             state_db=self.paths.db_path,
             worktrees_root=worktrees_root,
             write_dashboards=False,
+            state_event_sink=self.broadcast,
+            execution_guard=execution_guard,
+            cancel_grace_seconds=float(self.cancel_grace_ms or 10_000) / 1_000,
         )
 
     def _task_summary(
@@ -817,6 +1208,14 @@ class TaskManager:
             "recover_endpoint": f"/api/tasks/{run_id}/continue",
             "rollback_endpoint": f"/api/tasks/{run_id}/rollback",
             "report_endpoint": f"/api/tasks/{run_id}/report",
+            "execution": DurableExecutionQueue(board).latest_for_run(run_id),
+            "harness": {
+                "adapter_version": enriched_attempts[-1].get("adapter_version") if enriched_attempts else None,
+                "certification_id": enriched_attempts[-1].get("certification_id") if enriched_attempts else None,
+                "trust_tier": enriched_attempts[-1].get("trust_tier") if enriched_attempts else None,
+                "isolation_mode": enriched_attempts[-1].get("isolation_mode") if enriched_attempts else None,
+                "waiver_approval_id": enriched_attempts[-1].get("waiver_approval_id") if enriched_attempts else None,
+            },
         }
 
     def _task_context(self, task_id: str, *, run: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -828,6 +1227,37 @@ class TaskManager:
         except json.JSONDecodeError:
             return {}
         return data if isinstance(data, dict) else {}
+
+    def _ensure_durable_run_spec(self, board: Blackboard, run_id: str, *, run: dict[str, Any] | None = None) -> RunSpec:
+        queue = DurableExecutionQueue(board)
+        try:
+            return queue.load_run_spec(run_id)
+        except FileNotFoundError:
+            pass
+        run = run or board.get_run(run_id)
+        context = self._task_context(run_id, run=run)
+        policy = context.get("safety_policy", {}) if isinstance(context.get("safety_policy"), dict) else {}
+        approvals = policy.get("approval_types", []) if isinstance(policy.get("approval_types"), list) else []
+        roles = context.get("role_providers", {}) if isinstance(context.get("role_providers"), dict) else {}
+        skills = context.get("skills", []) if isinstance(context.get("skills"), list) else []
+        automation = context.get("automation", {}) if isinstance(context.get("automation"), dict) else {}
+        spec = RunSpec.from_submit_payload(
+            run_id=run_id,
+            task=str(run.get("task") or ""),
+            workspace=Path(str(run["workspace"])).expanduser().resolve(),
+            provider=str(run.get("provider") or "mock"),
+            workflow=str(run.get("workflow") or "software-dev"),
+            gate=str(context["gate"]) if context.get("gate") else None,
+            require_approval={str(item) for item in approvals},
+            max_cost_usd=float(policy.get("max_cost_usd") or 0.5),
+            role_providers={str(key): str(value) for key, value in roles.items() if value},
+            skills=[item for item in skills if isinstance(item, dict)],
+            ci_block_on_approval=bool(context.get("ci_block_on_approval")),
+            depth=str(context["depth"]) if context.get("depth") else None,
+            automation=automation,
+        )
+        queue.persist_run_spec(spec, legacy=True)
+        return spec
 
     def _run_dir(self, task_id: str, *, run: dict[str, Any] | None = None) -> Path:
         if run is None:
@@ -847,7 +1277,9 @@ class TaskManager:
 
     @staticmethod
     def _project_worktree_dir(workspace: Path, task_id: str) -> Path:
-        return path_config(workspace, "worktrees") / task_id
+        if (workspace / ".git").exists():
+            return path_config(workspace, "worktrees") / task_id
+        return path_config(workspace, "runs") / task_id / "worktree"
 
 
 def _rows_by_run(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:

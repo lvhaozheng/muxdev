@@ -21,7 +21,10 @@ def utc_now() -> str:
 
 class RunStatus(StrEnum):
     CREATED = "created"
+    ROUTING = "routing"
     RUNNING = "running"
+    REVIEWING = "reviewing"
+    ATTESTING = "attesting"
     AWAITING_APPROVAL = "awaiting_approval"
     AWAITING_PROVIDER_ACTION = "awaiting_provider_action"
     AWAITING_FEEDBACK = "awaiting_feedback"

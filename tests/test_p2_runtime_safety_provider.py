@@ -4,6 +4,8 @@ import shutil
 import uuid
 from pathlib import Path
 
+import pytest
+
 from fastapi.testclient import TestClient
 
 from muxdev.api.web import create_app
@@ -13,6 +15,9 @@ from muxdev.models import ProviderActionStatus, RunStatus
 from muxdev.providers.adapters import ProviderStageOutput
 from muxdev.runtime import SupervisorRuntime
 from muxdev.storage import Blackboard
+
+
+pytestmark = pytest.mark.integration
 
 
 def test_read_only_stage_write_violation_blocks_and_writes_capsule(monkeypatch) -> None:
@@ -186,7 +191,7 @@ def test_provider_action_writes_session_capsule_and_attempt(monkeypatch) -> None
     monkeypatch.setattr("muxdev.runtime.supervisor.get_runtime_provider", lambda name: AuthProvider())
 
     try:
-        result = SupervisorRuntime(workspace).run("auth action capsule", provider="mock")
+        result = SupervisorRuntime(workspace).run("provider action capsule", provider="mock")
 
         assert result.status == RunStatus.AWAITING_PROVIDER_ACTION
         with Blackboard(result.run_dir) as blackboard:

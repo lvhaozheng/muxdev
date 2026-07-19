@@ -12,8 +12,10 @@ from __future__ import annotations
 import json
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Annotated
+from uuid import uuid4
 
 import typer
 from rich.console import Console
@@ -49,6 +51,22 @@ from ..services.rag import LocalRagIndex
 from ..services.offline_render import OfflineRenderError, render_offline_video
 from ..services.tts_engine import TtsEngineError, synthesize_chunks
 from ..services.evidence import cleanup_legacy_evidence, load_evidence_artifacts, render_evidence_text, verify_run_evidence, write_evidence_run
+from ..services.attestation import verify_attestation_record
+from ..services.attestation_bundle import export_attestation_bundle, verify_attestation_bundle
+from ..services.trust import ProjectSigningKeyStore, TrustError
+from ..services.local_auth import LocalApiAuth
+from ..services.demo import load_demo_scenario
+from ..services.routing_benchmark import (
+    build_benchmark_plan,
+    export_benchmark_results,
+    evaluate_registered_fixture,
+    load_registered_routing_suite,
+    materialize_registered_fixture,
+    render_benchmark_csv,
+    render_benchmark_markdown,
+    run_live_benchmark,
+    verify_benchmark_results,
+)
 from ..services.advanced_parallel import detect_parallel_conflicts, record_parallel_conflicts
 from ..services.dashboard_run import dashboard_path, write_run_dashboard
 from ..services.flows import FlowRegistry
@@ -57,6 +75,14 @@ from ..services.provider_learning import refresh_provider_learning
 from ..services.product_experience import build_product_experience, write_project_context
 from ..services.workflow_plugins import get_workflow_plugin, list_workflow_plugins, render_plugin_command
 from ..services.validation import load_validation_experiment, run_validation_experiment
+from ..services.storage_admin import (
+    StorageArchiveError,
+    create_storage_backup,
+    replay_run_storage,
+    restore_storage_backup,
+    storage_status as build_storage_status,
+    verify_storage_backup,
+)
 from ..services.skills import (
     abtest_skill,
     activate_skill,
@@ -82,6 +108,7 @@ from ..services.skills import (
 )
 from ..runtime import SupervisorRuntime
 from ..core.safety import SafetyPolicyEngine
+from ..core.projects import resolve_project_root
 from ..clients.sessions import SessionManager, TmuxBackend
 from ..daemon.paths import DEFAULT_API_PORT, DEFAULT_HOST, DEFAULT_UI_PORT, default_daemon_paths
 from ..daemon.process import daemon_status as daemon_process_status
@@ -159,7 +186,17 @@ action_app = typer.Typer(help="Provider action handoff tools")
 feedback_app = typer.Typer(help="External feedback routing tools")
 cache_app = typer.Typer(help="Content-addressed cache tools")
 validate_app = typer.Typer(help="Multi-agent validation experiment tools")
+storage_app = typer.Typer(help="Reliable local storage, backup, and replay tools")
+task_app = typer.Typer(help="Durable daemon task execution tools")
+runtime_app = typer.Typer(help="Durable worker runtime diagnostics")
+routing_app = typer.Typer(help="Capability-constrained routing and replay tools")
+benchmark_app = typer.Typer(help="Trusted routing benchmark execution and reports")
+auth_app = typer.Typer(help="Private local daemon authentication")
+trust_app = typer.Typer(help="Per-project signing identity tools")
+attestation_app = typer.Typer(help="Signed delivery and offline verification tools")
 app.add_typer(provider_app, name="provider")
+app.add_typer(trust_app, name="trust")
+app.add_typer(attestation_app, name="attestation")
 app.add_typer(policy_app, name="policy")
 app.add_typer(trace_app, name="trace")
 app.add_typer(skill_app, name="skill")
@@ -184,7 +221,120 @@ app.add_typer(action_app, name="action")
 app.add_typer(feedback_app, name="feedback")
 app.add_typer(cache_app, name="cache")
 app.add_typer(validate_app, name="validate")
+app.add_typer(storage_app, name="storage")
+app.add_typer(task_app, name="task")
+app.add_typer(runtime_app, name="runtime")
+app.add_typer(routing_app, name="routing")
+app.add_typer(benchmark_app, name="benchmark")
+app.add_typer(auth_app, name="auth")
 console = Console(width=320)
+
+
+@storage_app.command("status")
+def storage_status_command(
+    scope: Annotated[str, typer.Option("--scope", help="daemon, project, or all.")] = "all",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Show schema, journal, integrity, and migration state."""
+    try:
+        payload = build_storage_status(
+            workspace=Path.cwd(),
+            daemon_paths=default_daemon_paths(),
+            scope=scope,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Storage Status"))
+
+
+@storage_app.command("backup")
+def storage_backup_command(
+    scope: Annotated[str, typer.Option("--scope", help="daemon, project, or all.")] = "all",
+    output: Annotated[Path | None, typer.Option("--output", help="Destination ZIP archive.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Create a consistent online SQLite backup archive."""
+    try:
+        payload = create_storage_backup(
+            workspace=Path.cwd(),
+            daemon_paths=default_daemon_paths(),
+            scope=scope,
+            output=output,
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Storage Backup"))
+
+
+@storage_app.command("verify")
+def storage_verify_command(
+    archive: Annotated[Path, typer.Argument(help="Backup ZIP archive.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Verify archive paths, hashes, schemas, and SQLite integrity."""
+    try:
+        payload = verify_storage_backup(archive)
+    except (StorageArchiveError, FileNotFoundError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        _print_json(payload)
+    else:
+        console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Storage Verify"))
+    if not payload["valid"]:
+        raise typer.Exit(code=1)
+
+
+@storage_app.command("restore")
+def storage_restore_command(
+    archive: Annotated[Path, typer.Argument(help="Verified backup ZIP archive.")],
+    yes: Annotated[bool, typer.Option("--yes", help="Confirm destructive database replacement.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Restore a verified archive while the daemon is stopped."""
+    if not yes:
+        raise typer.BadParameter("storage restore requires --yes")
+    paths = default_daemon_paths()
+    try:
+        payload = restore_storage_backup(
+            archive,
+            workspace=Path.cwd(),
+            daemon_paths=paths,
+            daemon_running=bool(daemon_process_status(paths).get("running")),
+        )
+    except (StorageArchiveError, FileNotFoundError, RuntimeError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Storage Restore"))
+
+
+@storage_app.command("replay")
+def storage_replay_command(
+    run_id: Annotated[str, typer.Argument(help="Run id to compare against its event replay.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Read-only compare a run projection with operational events."""
+    try:
+        payload = replay_run_storage(
+            run_id,
+            workspace=Path.cwd(),
+            daemon_paths=default_daemon_paths(),
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        _print_json(payload)
+    else:
+        console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Storage Replay"))
+    if not payload["matches"]:
+        raise typer.Exit(code=1)
 
 
 @evidence_app.callback()
@@ -268,10 +418,11 @@ def start(
     host: Annotated[str, typer.Option("--host", help="Daemon bind host.")] = DEFAULT_HOST,
     api_port: Annotated[int, typer.Option("--api-port", help="Daemon API port.")] = DEFAULT_API_PORT,
     ui_port: Annotated[int, typer.Option("--ui-port", help="Dashboard port.")] = DEFAULT_UI_PORT,
+    workers: Annotated[int | None, typer.Option("--workers", min=1, help="Override configured durable Worker count.")] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     """Start the muxdev daemon in the background."""
-    payload = start_daemon(host=host, api_port=api_port, ui_port=ui_port)
+    payload = start_daemon(host=host, api_port=api_port, ui_port=ui_port, workers=workers)
     if json_output:
         _print_json(payload)
         return
@@ -287,6 +438,7 @@ def serve(
     host: Annotated[str, typer.Option("--host", help="Daemon bind host.")] = DEFAULT_HOST,
     api_port: Annotated[int, typer.Option("--api-port", help="Daemon API port.")] = DEFAULT_API_PORT,
     ui_port: Annotated[int, typer.Option("--ui-port", help="Dashboard port.")] = DEFAULT_UI_PORT,
+    workers: Annotated[int | None, typer.Option("--workers", min=1, help="Override configured durable Worker count.")] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     """Run or manage the muxdev daemon."""
@@ -296,13 +448,16 @@ def serve(
         payload = stop_daemon(host=host, api_port=api_port, ui_port=ui_port)
     elif restart:
         stop_daemon(host=host, api_port=api_port, ui_port=ui_port)
-        payload = start_daemon(host=host, api_port=api_port, ui_port=ui_port)
+        payload = start_daemon(host=host, api_port=api_port, ui_port=ui_port, workers=workers)
     elif daemon:
-        payload = start_daemon(host=host, api_port=api_port, ui_port=ui_port)
+        payload = start_daemon(host=host, api_port=api_port, ui_port=ui_port, workers=workers)
     else:
         from ..daemon.server import main as serve_main
 
-        serve_main(["--host", host, "--api-port", str(api_port), "--ui-port", str(ui_port)])
+        serve_args = ["--host", host, "--api-port", str(api_port), "--ui-port", str(ui_port)]
+        if workers is not None:
+            serve_args.extend(["--workers", str(workers)])
+        serve_main(serve_args)
         return
     if json_output:
         _print_json(payload)
@@ -318,7 +473,9 @@ def dashboard(
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     """Print the daemon Dashboard URL."""
-    payload = {"dashboard": f"http://{host}:{ui_port}", "api": f"http://{host}:{api_port}"}
+    auth = LocalApiAuth(default_daemon_paths().data_dir)
+    nonce = auth.issue_bootstrap()
+    payload = {"dashboard": f"http://{host}:{ui_port}/auth/bootstrap?nonce={nonce}", "api": f"http://{host}:{api_port}", "expires_in_seconds": 60}
     if json_output:
         _print_json(payload)
         return
@@ -406,10 +563,32 @@ def doctor(
     host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
     api_port: Annotated[int, typer.Option("--api-port", help="Daemon API port.")] = DEFAULT_API_PORT,
     ui_port: Annotated[int, typer.Option("--ui-port", help="Dashboard port.")] = DEFAULT_UI_PORT,
+    production: Annotated[bool, typer.Option("--production", help="Include v0.2 auth, signing and storage release gates.")] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     """Check first-use readiness for daemon, providers, Git, memory, ports, and mock demo."""
     payload = runtime_config_check(Path.cwd(), host=host, api_port=api_port, ui_port=ui_port)
+    if production:
+        paths = default_daemon_paths().ensure()
+        try:
+            auth_status = LocalApiAuth(paths.data_dir).status()
+        except OSError as exc:
+            auth_status = {"enabled": False, "permission_status": "permission_degraded", "production_ready": False, "error": str(exc)}
+        try:
+            with Blackboard(paths.data_dir, db_path=paths.db_path) as board:
+                storage_health = board.storage_health(check_integrity=True)
+        except (OSError, ValueError) as exc:
+            storage_health = {"status": "unavailable", "error": str(exc)}
+        try:
+            trust_status = ProjectSigningKeyStore(resolve_project_root(Path.cwd())).status()
+        except (OSError, ValueError, TrustError) as exc:
+            trust_status = {"status": "unavailable", "error": str(exc)}
+        payload["production"] = {
+            "auth": auth_status,
+            "storage": storage_health,
+            "trust": trust_status,
+            "ready": bool(auth_status.get("production_ready") and storage_health.get("status") in {"healthy", "degraded"} and trust_status.get("status") not in {"unavailable", "permission_degraded"}),
+        }
     if json_output:
         _print_json(payload)
         return
@@ -420,11 +599,36 @@ def doctor(
 def demo(
     mock: Annotated[bool, typer.Option("--mock/--no-mock", help="Use the deterministic offline mock provider.")] = True,
     task: Annotated[str, typer.Option("--task", help="Demo task text.")] = "run the first muxdev mock task",
+    scenario: Annotated[str, typer.Option("--scenario", help="Registered demo scenario id.")] = "trusted-delivery-v1",
+    mode: Annotated[str, typer.Option("--mode", help="Demo mode: replay or live managed runtime.")] = "live",
+    open_dashboard: Annotated[bool, typer.Option("--open", help="Open the authorized local Dashboard after starting.")] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
-    """Run a complete offline demo so new users can see muxdev without provider setup."""
+    """Run a registered, explicitly simulated trusted-delivery demo."""
     if not mock:
         raise typer.BadParameter("demo currently supports the deterministic `--mock` path")
+    if mode not in {"replay", "live"}:
+        raise typer.BadParameter("--mode must be replay or live")
+    fixture = load_demo_scenario(scenario)
+    if mode == "replay":
+        payload = fixture
+        if open_dashboard:
+            import webbrowser
+
+            auth = LocalApiAuth(default_daemon_paths().data_dir)
+            webbrowser.open(f"http://{DEFAULT_HOST}:{DEFAULT_UI_PORT}/auth/bootstrap?nonce={auth.issue_bootstrap()}")
+        if json_output:
+            _print_json(payload)
+            return
+        lines = [
+            f"{payload['label']}",
+            f"scenario: {payload['scenario_id']}",
+            f"fixture: {payload['fixture_hash']}",
+            "",
+            *[f"{index}. {row['title']} ({row['seconds']}s)" for index, row in enumerate(payload["steps"], start=1)],
+        ]
+        console.print(Panel("\n".join(lines), title="muxdev trusted replay"))
+        return
     provider = "mock"
     result = SupervisorRuntime(Path.cwd()).run(
         task,
@@ -434,8 +638,21 @@ def demo(
         gate="auto",
         depth="simple",
         automation={"intent": "dev", "depth": "simple", "workflow": "dev-lite", "roles": ["requirements", "plan", "code", "test", "review"]},
+        routing_policy={
+            "mode": "auto",
+            "delivery_mode": "simulation",
+            "allowed_providers": ["mock", "replay"],
+            "reviewer_policy": "required",
+            "max_cost_usd": 0.0,
+        },
     )
     payload = {
+        "contract_version": fixture["contract_version"],
+        "scenario_id": scenario,
+        "fixture_hash": fixture["fixture_hash"],
+        "mode": "live",
+        "simulation": True,
+        "label": "SIMULATION / LIVE MANAGED RUNTIME",
         "run_id": result.run_id,
         "status": str(result.status),
         "provider": provider,
@@ -447,6 +664,12 @@ def demo(
             "muxdev start",
         ],
     }
+    if open_dashboard:
+        import webbrowser
+
+        auth = LocalApiAuth(default_daemon_paths().data_dir)
+        payload["dashboard"] = f"http://{DEFAULT_HOST}:{DEFAULT_UI_PORT}/auth/bootstrap?nonce={auth.issue_bootstrap()}"
+        webbrowser.open(str(payload["dashboard"]))
     if json_output:
         _print_json(payload)
         return
@@ -615,7 +838,25 @@ def fix(
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     """Submit a focused fix task."""
-    _submit_main_task("fix", task=task, profile=profile, gate=gate, role=role, skill=skill, task_file=task_file, provider=provider, workflow="fix", require_approval="", approve_plan=approve_plan, plan=plan, max_cost_usd=max_cost_usd, host=host, port=port, json_output=json_output, title="muxdev fix")
+    _submit_main_task(
+        "fix",
+        task=task,
+        profile=profile,
+        gate=gate,
+        role=role,
+        skill=skill,
+        task_file=task_file,
+        provider=provider,
+        workflow="fix",
+        require_approval="",
+        approve_plan="auto",
+        plan=False,
+        max_cost_usd=max_cost_usd,
+        host=host,
+        port=port,
+        json_output=json_output,
+        title="muxdev fix",
+    )
 
 
 @app.command()
@@ -1156,15 +1397,218 @@ def multirepo_dev(
     multirepo_plan(task=task, repo=repo, mode="dev", json_output=json_output)
 
 
+def _project_key_store() -> ProjectSigningKeyStore:
+    return ProjectSigningKeyStore(resolve_project_root(Path.cwd()))
+
+
+@trust_app.command("status")
+def trust_status(
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Show the current project's public signing identity and key health."""
+    payload = _project_key_store().status()
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel("\n".join(f"{key}: {value}" for key, value in payload.items()), title="muxdev trust status"))
+
+
+@trust_app.command("init")
+def trust_init(
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Create the per-project Ed25519 identity if it does not exist."""
+    try:
+        key = _project_key_store().initialize()
+    except TrustError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    payload = {
+        "project_id": key.project_id, "key_id": key.key_id,
+        "public_key_fingerprint": key.fingerprint,
+        "permission_status": key.permission_status,
+    }
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel("\n".join(f"{key}: {value}" for key, value in payload.items()), title="muxdev trust init"))
+
+
+@trust_app.command("rotate")
+def trust_rotate(
+    reason: Annotated[str, typer.Option("--reason", help="Auditable rotation reason.")],
+    yes: Annotated[bool, typer.Option("--yes", help="Confirm private-key destruction and rotation.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Rotate the project key and create a double-signed rotation record."""
+    if not yes:
+        raise typer.BadParameter("trust rotate requires --yes")
+    try:
+        payload = _project_key_store().rotate(reason=reason, confirmed=yes)
+    except TrustError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel("\n".join(f"{key}: {value}" for key, value in payload.items() if "signature" not in key), title="muxdev trust rotate"))
+
+
+@trust_app.command("public-key")
+def trust_public_key(
+    output: Annotated[Path | None, typer.Option("--output", help="Write the public PEM key to this path.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Export only the current public verification key."""
+    store = _project_key_store()
+    try:
+        pem = store.public_key_pem()
+        status = store.status()
+    except TrustError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if output:
+        target = output.expanduser().resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(pem)
+    payload = {
+        "project_id": status.get("project_id"), "key_id": status.get("key_id"),
+        "public_key_fingerprint": status.get("public_key_fingerprint"),
+        "output": str(output.expanduser().resolve()) if output else None,
+        "public_key_pem": None if output else pem.decode("ascii"),
+    }
+    if json_output:
+        _print_json(payload)
+        return
+    if output:
+        console.print(Panel(f"public key written: {payload['output']}", title="muxdev trust public-key"))
+    else:
+        console.print(pem.decode("ascii"), end="")
+
+
+@attestation_app.command("show")
+def attestation_show(
+    run_id: Annotated[str, typer.Argument(help="Run id, or 'latest'.")] = "latest",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Show the current immutable attestation generation for a Run."""
+    resolved, run_dir = _resolve_evidence_run(run_id)
+    with _evidence_blackboard(run_dir) as board:
+        record = board.latest_delivery_attestation(resolved)
+    if record is None:
+        payload = {"run_id": resolved, "status": "legacy_unsigned", "history_complete": False}
+    else:
+        payload = record
+    if json_output:
+        _print_json(payload)
+        return
+    lines = [
+        f"run_id: {resolved}", f"status: {payload.get('status')}",
+        f"attestation_id: {payload.get('attestation_id') or '-'}",
+        f"generation: {payload.get('generation') or '-'}",
+        f"fingerprint: {payload.get('public_key_fingerprint') or '-'}",
+    ]
+    console.print(Panel("\n".join(lines), title="muxdev attestation"))
+
+
+@attestation_app.command("export")
+def attestation_export(
+    run_id: Annotated[str, typer.Argument(help="Run id, or 'latest'.")],
+    output: Annotated[Path, typer.Option("--output", help="Destination .muxattest file.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Export a privacy-minimal, self-contained attestation bundle."""
+    resolved, run_dir = _resolve_evidence_run(run_id)
+    with _evidence_blackboard(run_dir) as board:
+        try:
+            payload = export_attestation_bundle(board, run_id=resolved, run_dir=run_dir, output=output)
+        except (FileNotFoundError, ValueError) as exc:
+            raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel("\n".join(f"{key}: {value}" for key, value in payload.items()), title="muxdev attestation export"))
+
+
+@attestation_app.command("verify")
+def attestation_verify(
+    target: Annotated[str, typer.Argument(help="Run id or .muxattest file.")],
+    trusted_fingerprint: Annotated[str | None, typer.Option("--trusted-fingerprint", help="Pinned SHA-256 public-key fingerprint.")] = None,
+    require_trusted: Annotated[bool, typer.Option("--require-trusted", help="Fail unless the pinned signer identity matches.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Verify a local record or a bundle without Provider/network access."""
+    candidate = Path(target).expanduser()
+    if candidate.is_file():
+        payload = verify_attestation_bundle(
+            candidate, trusted_fingerprint=trusted_fingerprint, require_trusted=require_trusted
+        )
+    else:
+        resolved, run_dir = _resolve_evidence_run(target)
+        with _evidence_blackboard(run_dir) as board:
+            record = board.latest_delivery_attestation(resolved)
+            evidence = verify_run_evidence(run_dir, resolved, board)
+        if record is None:
+            payload = {
+                "run_id": resolved, "integrity_valid": False,
+                "evidence_valid": bool(evidence.get("valid")), "identity_status": "unsigned",
+                "trusted": False, "valid": False,
+                "warnings": ["legacy completed Run has no DeliveryAttestation"], "errors": [],
+            }
+        else:
+            payload = verify_attestation_record(
+                dict(record.get("payload") or {}),
+                record.get("signature") if isinstance(record.get("signature"), dict) else None,
+                evidence_valid=bool(evidence.get("valid")),
+                trusted_fingerprint=trusted_fingerprint,
+                require_trusted=require_trusted,
+            )
+    if json_output:
+        _print_json(payload)
+    else:
+        lines = [
+            f"valid: {payload.get('valid')}", f"integrity_valid: {payload.get('integrity_valid')}",
+            f"evidence_valid: {payload.get('evidence_valid')}",
+            f"identity_status: {payload.get('identity_status')}", f"trusted: {payload.get('trusted')}",
+        ]
+        lines.extend(f"warning: {item}" for item in payload.get("warnings", []))
+        lines.extend(f"error: {item}" for item in payload.get("errors", []))
+        console.print(Panel("\n".join(lines), title="muxdev attestation verify"))
+    if not payload.get("valid"):
+        raise typer.Exit(code=1)
+
+
 @evidence_app.command("verify")
 def evidence_verify(
     run_id: Annotated[str, typer.Argument(help="Run id, or 'latest'.")] = "latest",
+    trusted_fingerprint: Annotated[str | None, typer.Option("--trusted-fingerprint", help="Pinned attestation signer fingerprint.")] = None,
+    require_trusted: Annotated[bool, typer.Option("--require-trusted", help="Require a trusted signed attestation.")] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
     """Verify Evidence v2 manifest, event chain, and artifact hashes."""
     resolved, run_dir = _resolve_evidence_run(run_id)
     with _evidence_blackboard(run_dir) as blackboard:
         payload = verify_run_evidence(run_dir, resolved, blackboard)
+        record = blackboard.latest_delivery_attestation(resolved)
+    if record:
+        attestation = verify_attestation_record(
+            dict(record.get("payload") or {}),
+            record.get("signature") if isinstance(record.get("signature"), dict) else None,
+            evidence_valid=bool(payload.get("valid")),
+            trusted_fingerprint=trusted_fingerprint,
+            require_trusted=require_trusted,
+        )
+        high_risk = str(((record.get("payload") or {}).get("risk") or {}).get("risk_level") or "normal") == "high"
+        if high_risk and not attestation.get("valid"):
+            payload["valid"] = False
+        if require_trusted and not attestation.get("trusted"):
+            payload["valid"] = False
+    else:
+        attestation = {
+            "integrity_valid": False, "evidence_valid": bool(payload.get("valid")),
+            "identity_status": "unsigned", "trusted": False, "valid": False,
+            "warnings": ["legacy_unsigned/history_incomplete"], "errors": [],
+        }
+        if require_trusted:
+            payload["valid"] = False
+    payload["attestation"] = attestation
     if json_output:
         _print_json(payload)
         return
@@ -1174,6 +1618,7 @@ def evidence_verify(
         f"events: {payload.get('events', 0)}",
         f"artifacts: {payload.get('artifacts', 0)}",
         f"head_hash: {payload.get('head_hash') or '-'}",
+        f"attestation: {attestation.get('identity_status')}",
     ]
     for error in payload.get("errors", []):
         lines.append(f"error: {error}")
@@ -1293,6 +1738,391 @@ def stop(
         _print_json(payload)
         return
     console.print(Panel("\n".join(f"{key}: {value}" for key, value in payload.items()), title="Stop"))
+
+
+@task_app.command("cancel")
+def task_cancel(
+    task_id: Annotated[str, typer.Argument(help="Task/run id to cancel.")],
+    reason: Annotated[str, typer.Option("--reason", help="Auditable cancellation reason.")] = "",
+    wait: Annotated[bool, typer.Option("--wait", help="Wait for cancellation acknowledgement.")] = False,
+    timeout: Annotated[float, typer.Option("--timeout", help="Maximum wait in seconds.")] = 30.0,
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Persist a cancellation request and optionally await acknowledgement."""
+    payload = _daemon_client(host, port).cancel_task(task_id, reason=reason, wait=wait, timeout=timeout)
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel("\n".join(f"{key}: {value}" for key, value in payload.items()), title="Task Cancel"))
+
+
+@task_app.command("stop")
+def task_stop_alias(
+    task_id: Annotated[str, typer.Argument(help="Task/run id to stop.")],
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Compatibility alias for `muxdev task cancel`."""
+    payload = _daemon_client(host, port).stop_task(task_id)
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel("\n".join(f"{key}: {value}" for key, value in payload.items()), title="Task Stop"))
+
+
+@task_app.command("executions")
+def task_executions(
+    task_id: Annotated[str, typer.Argument(help="Task/run id.")],
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Show durable jobs and their immutable execution events."""
+    payload = _daemon_client(host, port).task_executions(task_id)
+    if json_output:
+        _print_json(payload)
+        return
+    table = Table(title=f"Executions: {payload.get('run_id')}")
+    for column in ("job_id", "command", "state", "attempt", "max_attempts", "heartbeat_age_ms"):
+        table.add_column(column)
+    for row in payload.get("jobs", []):
+        table.add_row(*(str(row.get(column) if row.get(column) is not None else "") for column in ("job_id", "command", "state", "attempt", "max_attempts", "heartbeat_age_ms")))
+    console.print(table)
+
+
+@task_app.command("harness-events")
+def task_harness_events(
+    task_id: Annotated[str, typer.Argument(help="Task/run id.")],
+    stage: Annotated[str | None, typer.Option("--stage", help="Filter to a workflow stage.")] = None,
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Show redacted, hash-chained Provider Attempt events."""
+    payload = _daemon_client(host, port).task_harness_events(task_id, stage=stage)
+    if json_output:
+        _print_json(payload)
+        return
+    table = Table(title=f"Harness Events: {payload.get('run_id')}")
+    for column in ("stage_id", "provider", "attempt", "sequence", "event_type", "source", "event_hash"):
+        table.add_column(column)
+    for row in payload.get("events", []):
+        table.add_row(*(str(row.get(column) or "") for column in ("stage_id", "provider", "attempt", "sequence", "event_type", "source", "event_hash")))
+    console.print(table)
+
+
+@task_app.command("isolation")
+def task_isolation(
+    task_id: Annotated[str, typer.Argument(help="Task/run id.")],
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Show actual Adapter certification, isolation, gaps, and waiver metadata."""
+    payload = _daemon_client(host, port).task_isolation(task_id)
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title=f"Task Isolation: {payload.get('run_id')}"))
+
+
+@task_app.command("route")
+def task_route(
+    task_id: Annotated[str, typer.Argument(help="Task/run id.")],
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Explain immutable task features, candidate exclusions, and selection."""
+    payload = _daemon_client(host, port).task_route(task_id)
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title=f"Task Route: {payload.get('run_id')}"))
+
+
+@task_app.command("review")
+def task_review(
+    task_id: Annotated[str, typer.Argument(help="Task/run id.")],
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Show heterogeneous reviewer assignment, snapshot, verdict, and waiver."""
+    payload = _daemon_client(host, port).task_review(task_id)
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title=f"Task Review: {payload.get('run_id')}"))
+
+
+@routing_app.command("replay")
+def routing_replay_command(
+    task_id: Annotated[str, typer.Argument(help="Task/run id whose immutable route should be replayed.")],
+    benchmark: Annotated[str | None, typer.Option("--benchmark", help="Registered benchmark snapshot id.")] = None,
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Replay a stored decision without probing or calling any Provider."""
+    payload = _daemon_client(host, port).routing_replay(task_id, benchmark_snapshot_id=benchmark)
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Routing Replay (simulation)"))
+
+
+@routing_app.command("snapshots")
+def routing_snapshots_command(
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """List server-registered routing benchmark snapshots."""
+    payload = _daemon_client(host, port).routing_snapshots()
+    if json_output:
+        _print_json(payload)
+        return
+    table = Table(title="Routing Benchmark Snapshots")
+    for column in ("snapshot_id", "suite_name", "case_count", "snapshot_hash", "registered_at"):
+        table.add_column(column)
+    for row in payload:
+        table.add_row(*(str(row.get(column) or "") for column in ("snapshot_id", "suite_name", "case_count", "snapshot_hash", "registered_at")))
+    console.print(table)
+
+
+@routing_app.command("benchmark")
+def routing_benchmark_command(
+    suite: Annotated[str, typer.Argument(help="Registered suite id.")] = "trusted-routing-v1",
+    live: Annotated[bool, typer.Option("--live", help="Prepare a real-provider benchmark plan.")] = False,
+    yes: Annotated[bool, typer.Option("--yes", help="Acknowledge potential real Provider cost.")] = False,
+    max_cost_usd: Annotated[float | None, typer.Option("--max-cost-usd", help="Required total live benchmark budget.")] = None,
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Register a held-out benchmark snapshot; live execution remains explicit."""
+    if live and not yes:
+        raise typer.BadParameter("--live requires --yes")
+    if live and (max_cost_usd is None or max_cost_usd <= 0):
+        raise typer.BadParameter("--live requires a positive --max-cost-usd")
+    payload = _daemon_client(host, port).routing_benchmark(
+        suite,
+        live=live,
+        acknowledged=yes,
+        max_cost_usd=max_cost_usd,
+    )
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Trusted Routing Benchmark"))
+
+
+@benchmark_app.command("plan")
+def benchmark_plan_command(
+    suite: Annotated[str, typer.Argument(help="Registered suite id.")] = "trusted-routing-v1",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Validate a registered suite and print its immutable execution plan."""
+    payload = load_registered_routing_suite(suite)
+    plan = build_benchmark_plan(payload, live=False)
+    if json_output:
+        _print_json(plan)
+        return
+    console.print(Panel(json.dumps(plan, ensure_ascii=False, indent=2), title="Benchmark Plan"))
+
+
+@benchmark_app.command("run")
+def benchmark_run_command(
+    suite: Annotated[str, typer.Argument(help="Registered suite id.")] = "trusted-routing-v1",
+    mode: Annotated[str, typer.Option("--mode", help="Execution mode: replay or live.")] = "replay",
+    yes: Annotated[bool, typer.Option("--yes", help="Acknowledge real Provider cost.")] = False,
+    max_cost_usd: Annotated[float | None, typer.Option("--max-cost-usd", help="Required total live budget.")] = None,
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Run the deterministic Replay track or an explicitly cost-bearing live track."""
+    if mode not in {"replay", "live"}:
+        raise typer.BadParameter("--mode must be replay or live")
+    if mode == "replay":
+        payload = _daemon_client(host, port).benchmark_replay(suite)
+    else:
+        if not yes or max_cost_usd is None or max_cost_usd <= 0:
+            raise typer.BadParameter("live benchmark requires --yes and a positive --max-cost-usd")
+        if daemon_process_status().get("running"):
+            raise typer.BadParameter("stop the daemon before CLI-only live benchmark execution")
+        from ..daemon.tasks import TaskManager
+
+        paths = default_daemon_paths().ensure()
+        manager = TaskManager(paths=paths, worker_count=1)
+        try:
+            with manager.board() as board:
+                payload = run_live_benchmark(
+                    board,
+                    suite_id=suite,
+                    acknowledged=yes,
+                    max_cost_usd=max_cost_usd,
+                    runner=lambda case, provider: _execute_registered_live_case(paths, case, provider),
+                )
+        finally:
+            manager.close(timeout=30.0)
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title=f"Benchmark {mode}"))
+
+
+@benchmark_app.command("status")
+def benchmark_status_command(
+    execution_id: Annotated[str | None, typer.Argument(help="Execution id; omit to list all.")] = None,
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    client = _daemon_client(host, port)
+    payload = client.benchmark_execution(execution_id) if execution_id else client.benchmark_executions()
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Benchmark Status"))
+
+
+@benchmark_app.command("cancel")
+def benchmark_cancel_command(
+    execution_id: Annotated[str, typer.Argument(help="Execution id.")],
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    payload = _daemon_client(host, port).benchmark_cancel(execution_id)
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Benchmark Cancel"))
+
+
+@benchmark_app.command("report")
+def benchmark_report_command(
+    execution_id: Annotated[str, typer.Argument(help="Execution id.")],
+    format: Annotated[str, typer.Option("--format", help="json, md or csv.")] = "json",
+    output: Annotated[Path | None, typer.Option("--output", help="Optional deterministic result ZIP.")] = None,
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+) -> None:
+    if format not in {"json", "md", "csv"}:
+        raise typer.BadParameter("--format must be json, md or csv")
+    client = _daemon_client(host, port)
+    record = client.benchmark_report(execution_id)
+    payload = record.get("payload", record)
+    if output:
+        if daemon_process_status().get("running"):
+            raise typer.BadParameter("stop the daemon before exporting a local benchmark result bundle")
+        paths = default_daemon_paths().ensure()
+        with Blackboard(paths.data_dir, db_path=paths.db_path) as board:
+            _print_json(export_benchmark_results(board, execution_id, output))
+        return
+    if format == "md":
+        typer.echo(render_benchmark_markdown(payload), nl=False)
+    elif format == "csv":
+        typer.echo(render_benchmark_csv(payload), nl=False)
+    else:
+        _print_json(record)
+
+
+@benchmark_app.command("verify")
+def benchmark_verify_command(
+    target: Annotated[str, typer.Argument(help="Result ZIP path or execution id.")],
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    path = Path(target)
+    if path.exists():
+        payload = verify_benchmark_results(path)
+    else:
+        report = _daemon_client(host, port).benchmark_report(target)
+        payload = {"valid": bool(report.get("report_hash")), "report_hash": report.get("report_hash"), "status": report.get("status"), "errors": []}
+    if json_output:
+        _print_json(payload)
+    else:
+        console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Benchmark Verification"))
+    if not payload.get("valid"):
+        raise typer.Exit(1)
+
+
+@auth_app.command("status")
+def auth_status_command(
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    payload = LocalApiAuth(default_daemon_paths().data_dir).status()
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Local API Authentication"))
+
+
+@auth_app.command("rotate")
+def auth_rotate_command(
+    yes: Annotated[bool, typer.Option("--yes", help="Invalidate current CLI and browser sessions.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    if not yes:
+        raise typer.BadParameter("auth rotation requires --yes")
+    if daemon_process_status().get("running"):
+        raise typer.BadParameter("stop the daemon before rotating its local API token")
+    payload = LocalApiAuth(default_daemon_paths().data_dir).rotate()
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Local API Token Rotated"))
+
+
+@task_app.command("reconcile")
+def task_reconcile(
+    task_id: Annotated[str, typer.Argument(help="Task/run id requiring reconciliation.")],
+    retry: Annotated[bool, typer.Option("--retry", help="Retry despite possible duplicate Provider effects.")] = False,
+    abort: Annotated[bool, typer.Option("--abort", help="Abort without replaying Provider effects.")] = False,
+    reason: Annotated[str, typer.Option("--reason", help="Required audit reason.")] = "",
+    yes: Annotated[bool, typer.Option("--yes", help="Acknowledge retry duplicate-side-effect risk.")] = False,
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Resolve an ambiguous opaque Provider execution."""
+    if retry == abort:
+        raise typer.BadParameter("choose exactly one of --retry or --abort")
+    if not reason.strip():
+        raise typer.BadParameter("--reason is required")
+    if retry and not yes:
+        raise typer.BadParameter("--retry requires --yes to acknowledge possible duplicate Provider side effects")
+    payload = _daemon_client(host, port).reconcile_task(
+        task_id,
+        decision="retry" if retry else "abort",
+        reason=reason,
+        acknowledge_duplicate_risk=bool(retry and yes),
+    )
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel("\n".join(f"{key}: {value}" for key, value in payload.items()), title="Task Reconcile"))
+
+
+@runtime_app.command("status")
+def durable_runtime_status(
+    host: Annotated[str, typer.Option("--host", help="Daemon API host.")] = DEFAULT_HOST,
+    port: Annotated[int, typer.Option("--port", help="Daemon API port.")] = DEFAULT_API_PORT,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """Show bounded Worker Pool, queue, lease, and reconciliation health."""
+    payload = _daemon_client(host, port).runtime_status()
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(Panel(json.dumps(payload, ensure_ascii=False, indent=2), title="Durable Runtime"))
 
 
 @app.command()
@@ -3081,6 +3911,8 @@ def _submit_main_task(
     approve_plan: str = "auto",
     plan: bool = False,
 ) -> None:
+    if profile is not None:
+        typer.echo("warning: --profile is deprecated and no longer controls task execution", err=True)
     try:
         task = _task_with_design_contract(task, from_design)
         approve_plan_mode = _approve_plan_mode(approve_plan, plan=plan)
@@ -3137,6 +3969,7 @@ def _submit_main_task(
             "skills": active_skills,
             "ci_block_on_approval": request["ci_block_on_approval"],
             "automation": request["automation"],
+            "routing_policy": request.get("routing_policy", {}),
         }
     )
     payload.setdefault("gate", request["gate"])
@@ -3308,15 +4141,18 @@ def _run_record_for_dir(run_dir: Path) -> dict[str, object] | None:
         target = run_dir.resolve()
     except OSError:
         return None
-    with Blackboard(daemon_paths.data_dir, db_path=daemon_paths.db_path) as board:
-        for row in board.list_runs():
-            run_id = str(row.get("run_id") or "")
-            candidate = path_config(Path(str(row.get("workspace") or ".")), "runs") / run_id
-            try:
-                if candidate.resolve() == target:
-                    return row
-            except OSError:
-                continue
+    try:
+        with Blackboard(daemon_paths.data_dir, db_path=daemon_paths.db_path, readonly=True) as board:
+            for row in board.list_runs():
+                run_id = str(row.get("run_id") or "")
+                candidate = path_config(Path(str(row.get("workspace") or ".")), "runs") / run_id
+                try:
+                    if candidate.resolve() == target:
+                        return row
+                except OSError:
+                    continue
+    except Exception:
+        return None
     return None
 
 
@@ -3541,3 +4377,88 @@ def _search_workspace(workspace: Path, query: str, *, limit: int) -> list[dict[s
                 if len(rows) >= limit:
                     break
     return rows
+
+
+def _execute_registered_live_case(paths: object, case: object, provider: str) -> dict[str, object]:
+    """Execute one registered case through the normal signed Runtime path."""
+    if not isinstance(case, dict):
+        raise ValueError("benchmark case must be a mapping")
+    case_id = str(case.get("id") or "")
+    if not case_id or Path(case_id).name != case_id:
+        raise ValueError("benchmark case id is unsafe")
+    data_dir = Path(getattr(paths, "data_dir"))
+    project = (data_dir / "benchmark-workspaces" / case_id / provider / uuid4().hex).resolve()
+    expected_parent = (data_dir / "benchmark-workspaces" / case_id / provider).resolve()
+    if project.parent != expected_parent:
+        raise ValueError("benchmark workspace escaped controlled root")
+    materialize_registered_fixture(case, project)
+    (project / ".muxdev").mkdir(parents=True, exist_ok=True)
+    runtime = SupervisorRuntime(
+        project,
+        runs_dir=Path(getattr(paths, "runs_dir")),
+        state_db=Path(getattr(paths, "db_path")),
+        worktrees_root=Path(getattr(paths, "worktrees_dir")),
+        write_dashboards=False,
+    )
+    risk_tags = [str(value) for value in case.get("risk_tags", [])]
+    started = time.monotonic()
+    result = runtime.run(
+        f"Complete registered benchmark case {case_id}. Work only inside the controlled fixture and produce SOLUTION.md.",
+        provider=provider,
+        workflow_name="dev-lite",
+        require_approval=set(),
+        max_cost_usd=float(case.get("max_cost_usd") or 0.5),
+        gate="strict" if risk_tags else "auto",
+        depth="simple",
+        harness_policy={"risk_level": "high" if risk_tags else "ordinary", "risk_tags": risk_tags},
+        routing_policy={
+            "mode": "fixed", "delivery_mode": "production", "fixed_provider": provider,
+            "allowed_providers": [provider], "reviewer_policy": "auto",
+            "max_cost_usd": float(case.get("max_cost_usd") or 0.5),
+        },
+    )
+    with Blackboard(data_dir, db_path=Path(getattr(paths, "db_path"))) as board:
+        attestation = board.latest_delivery_attestation(result.run_id)
+        usage = board.table_rows("usage_records", run_id=result.run_id)
+        tests = board.table_rows("test_results", run_id=result.run_id)
+        blockers = board.table_rows("review_blockers", run_id=result.run_id)
+        reviews = board.list_review_assignments(result.run_id)
+        run_projection = board.get_run(result.run_id)
+    evaluator_workspace = Path(str(run_projection.get("worktree") or project)).resolve()
+    evaluator = evaluate_registered_fixture(case, evaluator_workspace)
+    completed = str(result.status) == "completed"
+    evidence_valid = bool(attestation and attestation.get("evidence_valid"))
+    signed = bool(attestation and attestation.get("status") == "signed")
+    runtime_test_rate = (sum(int(row.get("passed") or 0) for row in tests) / len(tests)) if tests else 1.0
+    test_rate = min(float(evaluator["functional_score"]), runtime_test_rate)
+    high_blockers = sum(1 for row in blockers if str(row.get("severity") or "").lower() in {"high", "critical"})
+    static_score = 1.0 if completed and not high_blockers else 0.0
+    independent_reviews = [
+        row for row in reviews
+        if str(row.get("reviewer_provider") or "") not in {"", provider}
+        and str(row.get("status") or "") in {"completed", "accepted", "passed"}
+    ]
+    review_score = 1.0 if independent_reviews and not high_blockers else 0.0
+    quality = 0.60 * test_rate + 0.15 * static_score + 0.15 * review_score + 0.10 * float(evidence_valid and signed)
+    return {
+        "run_id": result.run_id,
+        "status": "completed" if completed else str(result.status),
+        "eligible": completed or not risk_tags,
+        "policy_safe_refusal": bool(risk_tags and not completed),
+        "capability_mismatch": False,
+        "functional_score": test_rate,
+        "static_score": static_score,
+        "blind_review_score": review_score,
+        "evidence_score": float(evidence_valid and signed),
+        "quality_score": round(quality, 6),
+        "verified_success": bool(completed and quality >= 0.75 and not high_blockers),
+        "cost_usd": round(sum(float(row.get("cost_usd") or 0) for row in usage), 6),
+        "latency_seconds": round(time.monotonic() - started, 6),
+        "attestation_valid": bool(signed),
+        "evidence_complete": evidence_valid,
+        "reviewer_covered": bool(independent_reviews),
+        "benchmark_judge": "independent_production_review" if independent_reviews else "missing",
+        "evaluator_hash": evaluator["evaluator_hash"],
+        "human_interventions": 0,
+        "recoveries": 0,
+    }

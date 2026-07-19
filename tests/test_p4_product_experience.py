@@ -8,6 +8,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
+import pytest
 
 from muxdev.api.web import create_app, render_live_dashboard_html
 from muxdev.cli import app
@@ -20,6 +21,7 @@ from muxdev.services.product_experience import build_product_experience
 
 
 runner = CliRunner()
+pytestmark = pytest.mark.integration
 
 
 def test_project_setup_writes_muxdev_context_and_provider_setup(monkeypatch) -> None:

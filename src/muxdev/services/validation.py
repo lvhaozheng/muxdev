@@ -576,6 +576,8 @@ def _run_direct_cli_strategy(
             worktree=worktree.path,
             skills=[],
             session_dir=run_dir / "provider_sessions",
+            run_id=run_id,
+            attempt=1,
         )
         output_path.write_text(redact(output.content), encoding="utf-8")
         board.add_usage(run_id, provider, output.tokens, output.cost_usd)
@@ -592,6 +594,7 @@ def _run_direct_cli_strategy(
             returncode=output.returncode,
             summary=output.summary,
             artifact_path=str(output_path),
+            harness_events=output.harness_events,
         )
         diff_text = _worktree_diff_text(worktree.path)
         diff_path.write_text(diff_text, encoding="utf-8")

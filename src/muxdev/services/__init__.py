@@ -8,6 +8,8 @@ from .multirepo import plan_multi_repo_orchestration
 from .provider_learning import refresh_provider_learning
 from .rag import LocalRagIndex
 from .reports import generate_final_report
+from .attestation import AttestationRequiredError, DeliveryAttestationService, verify_attestation_record
+from .attestation_bundle import AttestationBundleError, export_attestation_bundle, verify_attestation_bundle
 from .semantic_merge import review_semantic_merge
 from .skills import SkillRegistry, write_skill_lock
 from .flows import FlowDefinition, FlowRegistry
@@ -30,6 +32,12 @@ __all__ = [
     "deep_agent_task_pack",
     "detect_parallel_conflicts",
     "generate_final_report",
+    "AttestationRequiredError",
+    "DeliveryAttestationService",
+    "verify_attestation_record",
+    "AttestationBundleError",
+    "export_attestation_bundle",
+    "verify_attestation_bundle",
     "get_workflow_plugin",
     "list_workflow_plugins",
     "load_evidence_artifacts",

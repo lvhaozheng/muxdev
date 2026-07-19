@@ -301,7 +301,8 @@ def resolve_task_request(
         if value:
             roles[role] = value
     roles.update(parse_role_overrides(role_overrides))
-    default_provider = provider or choose_default_provider(effective)
+    configured_fallback = choose_default_provider(effective)
+    default_provider = provider or "auto"
     role_providers: dict[str, str] = {}
     for role, value in roles.items():
         if not value:
@@ -310,6 +311,14 @@ def resolve_task_request(
         role_providers[legacy_role(role)] = value
     if roles and not provider:
         default_provider = next(iter(roles.values()))
+    fixed_fallback = provider or (default_provider if default_provider != "auto" else configured_fallback)
+    routing_policy = {
+        "mode": "fixed" if provider or default_provider != "auto" else "auto",
+        "delivery_mode": "simulation" if fixed_fallback in {"mock", "replay"} else "production",
+        "fixed_provider": fixed_fallback,
+        "reviewer_policy": "auto",
+        "minimum_samples": 5,
+    }
     approvals = set(GATES[selected_gate]["require_approval"])
     approvals.update(require_approval or set())
     skill_inputs = list(skill_specs or [])
@@ -335,6 +344,7 @@ def resolve_task_request(
         "skill_specs": skill_inputs,
         "ci_block_on_approval": bool(GATES[selected_gate].get("block_on_approval")),
         "automation": automation.to_dict(),
+        "routing_policy": routing_policy,
         "config": effective,
     }
 

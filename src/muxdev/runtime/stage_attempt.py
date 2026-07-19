@@ -32,11 +32,37 @@ def run_provider_stage_with_attempts(
     attempt = next_provider_attempt(blackboard, run_id, stage_id, provider)
     max_attempt = attempt + PROVIDER_MAX_ATTEMPTS - 1
     while attempt <= max_attempt:
-        blackboard.start_provider_attempt(run_id, stage_id, provider=provider, role=role, attempt=attempt)
+        certification = getattr(provider_impl, "certification_report", None)
+        blackboard.start_provider_attempt(
+            run_id,
+            stage_id,
+            provider=provider,
+            role=role,
+            attempt=attempt,
+            certification_id=getattr(certification, "certification_id", None),
+            adapter_version=getattr(provider_impl, "adapter_version", None),
+            trust_tier=str(getattr(provider_impl, "trust_tier", "opaque")),
+            isolation_mode=str(getattr(provider_impl, "isolation_mode", "process")),
+            waiver_approval_id=getattr(provider_impl, "waiver_approval_id", None),
+        )
         trace.write("provider_attempt_started", stage=stage_id, provider=provider, attempt=attempt)
-        output = run_provider_stage(provider_impl, stage_id=stage_id, task=task, worktree=worktree, skills=skills, session_dir=session_dir)
+        output = run_provider_stage(
+            provider_impl, stage_id=stage_id, task=task, worktree=worktree,
+            skills=skills, session_dir=session_dir, run_id=run_id, attempt=attempt,
+        )
         failure_kind = provider_failure_kind(output)
         has_action = bool(provider_actions_from_output(output))
+        blackboard.complete_provider_attempt(
+            run_id,
+            stage_id,
+            provider=provider,
+            attempt=attempt,
+            status=provider_attempt_status(output),
+            failure_kind=failure_kind,
+            returncode=output.returncode,
+            summary=output.summary,
+            harness_events=output.harness_events,
+        )
         if output.returncode != 0 and not has_action and failure_kind in TRANSIENT_RETRY_FAILURES and attempt < max_attempt:
             blackboard.complete_provider_attempt(
                 run_id,
@@ -135,6 +161,8 @@ def run_provider_stage(
     worktree: Path,
     skills: list[dict[str, object]],
     session_dir: Path | None = None,
+    run_id: str | None = None,
+    attempt: int = 1,
 ) -> ProviderStageOutput:
     kwargs = provider_stage_kwargs(
         provider_impl,
@@ -143,6 +171,8 @@ def run_provider_stage(
         worktree=worktree,
         skills=skills,
         session_dir=session_dir,
+        run_id=run_id,
+        attempt=attempt,
     )
     return provider_impl.run_stage(**kwargs)
 
@@ -155,6 +185,8 @@ def provider_stage_kwargs(
     worktree: Path,
     skills: list[dict[str, object]],
     session_dir: Path | None,
+    run_id: str | None = None,
+    attempt: int = 1,
 ) -> dict[str, object]:
     kwargs: dict[str, object] = {"stage_id": stage_id, "task": task, "worktree": worktree}
     try:
@@ -171,6 +203,10 @@ def provider_stage_kwargs(
         kwargs["skills"] = skills
     if session_dir is not None and (accepts_extra or "session_dir" in parameters):
         kwargs["session_dir"] = session_dir
+    if run_id is not None and (accepts_extra or "run_id" in parameters):
+        kwargs["run_id"] = run_id
+    if accepts_extra or "attempt" in parameters:
+        kwargs["attempt"] = attempt
     return kwargs
 
 

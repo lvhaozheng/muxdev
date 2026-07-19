@@ -9,6 +9,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
+import pytest
 
 from muxdev.api.web import create_app, render_dashboard_html, render_live_dashboard_html
 from muxdev.cli import app
@@ -26,6 +27,7 @@ from muxdev.ui.tui import daemon_help_text
 
 
 runner = CliRunner()
+pytestmark = pytest.mark.integration
 
 
 def test_parallel_conflict_detection_and_recording() -> None:

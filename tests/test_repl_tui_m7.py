@@ -8,6 +8,7 @@ import importlib
 from io import StringIO
 from pathlib import Path
 
+import pytest
 from rich.console import Console
 
 from muxdev.ui.repl import handle_repl_command
@@ -114,6 +115,7 @@ def test_daemon_tui_only_clears_on_initial_render(monkeypatch) -> None:
     assert prompts == ["muxdev › ", "muxdev › ", "muxdev › "]
 
 
+@pytest.mark.integration
 def test_daemon_tui_command_results_use_chat_format(monkeypatch) -> None:
     cli_app_module = importlib.import_module("muxdev.cli.tui")
 

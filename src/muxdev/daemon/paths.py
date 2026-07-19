@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import os
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+
+from ..core.private_paths import muxdev_private_home
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -38,6 +41,12 @@ class DaemonPaths:
                         f"dashboard_port = {DEFAULT_UI_PORT}",
                         f"api_port = {DEFAULT_API_PORT}",
                         "",
+                        "[daemon]",
+                        "workers = 2",
+                        "lease_seconds = 30",
+                        "heartbeat_seconds = 5",
+                        "cancel_grace_seconds = 10",
+                        "",
                     ]
                 ),
                 encoding="utf-8",
@@ -47,7 +56,7 @@ class DaemonPaths:
 
 def default_daemon_paths(env: dict[str, str] | None = None) -> DaemonPaths:
     env = os.environ if env is None else env
-    home = Path(env.get("MUXDEV_HOME") or Path.home() / ".muxdev").expanduser()
+    home = muxdev_private_home(env)
     data = home / "data"
     return DaemonPaths(
         home=home,
@@ -60,3 +69,25 @@ def default_daemon_paths(env: dict[str, str] | None = None) -> DaemonPaths:
         log_path=data / "logs" / "daemon.log",
         pid_path=data / "muxdev.pid",
     )
+
+
+def daemon_runtime_settings(paths: DaemonPaths) -> dict[str, int]:
+    defaults = {
+        "workers": 2,
+        "lease_ms": 30_000,
+        "heartbeat_ms": 5_000,
+        "cancel_grace_ms": 10_000,
+    }
+    try:
+        payload = tomllib.loads(paths.config_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return defaults
+    daemon = payload.get("daemon", {}) if isinstance(payload, dict) else {}
+    if not isinstance(daemon, dict):
+        return defaults
+    return {
+        "workers": max(1, int(daemon.get("workers", defaults["workers"]))),
+        "lease_ms": max(1_000, int(float(daemon.get("lease_seconds", 30)) * 1_000)),
+        "heartbeat_ms": max(100, int(float(daemon.get("heartbeat_seconds", 5)) * 1_000)),
+        "cancel_grace_ms": max(100, int(float(daemon.get("cancel_grace_seconds", 10)) * 1_000)),
+    }

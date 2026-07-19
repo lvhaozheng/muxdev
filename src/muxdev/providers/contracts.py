@@ -53,6 +53,7 @@ class ProviderDescriptor:
     runtime_kind: ProviderRuntimeKind = ProviderRuntimeKind.HEADLESS_CLI
     roles: frozenset[str] = frozenset()
     capabilities: ProviderCapabilities = field(default_factory=ProviderCapabilities)
+    trust_tier: str = "opaque"
     metadata: Mapping[str, object] = field(default_factory=dict)
 
 

@@ -7,15 +7,18 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
+import pytest
 
 from muxdev.cli import app
 from muxdev.api.web import create_app, render_live_dashboard_html
+from muxdev.daemon.paths import default_daemon_paths
 from muxdev.models.validation import ComparisonReport, StrategyRun, ValidationExperiment, ValidationMetric, ValidationSuite
 from muxdev.services.observability_export import LangSmithPayloadExporter, LangfusePayloadExporter, LocalValidationTraceExporter
 from muxdev.services.validation import compare_validation_metrics, run_validation_experiment
 
 
 runner = CliRunner()
+pytestmark = pytest.mark.integration
 
 
 def _workspace(name: str) -> Path:
@@ -228,9 +231,10 @@ def test_validation_api_and_live_dashboard_surface_experiments(monkeypatch) -> N
         )
         (validation_dir / "experiment.json").write_text(experiment.model_dump_json(indent=2), encoding="utf-8")
 
-        client = TestClient(create_app())
-        rows = client.get("/api/validation/experiments", params={"workspace": str(workspace)}).json()
-        detail = client.get("/api/validation/experiments/val_api", params={"workspace": str(workspace)}).json()
+        daemon_paths = default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure()
+        with TestClient(create_app(paths=daemon_paths)) as client:
+            rows = client.get("/api/validation/experiments", params={"workspace": str(workspace)}).json()
+            detail = client.get("/api/validation/experiments/val_api", params={"workspace": str(workspace)}).json()
         html = render_live_dashboard_html()
 
         assert rows[0]["experiment_id"] == "val_api"

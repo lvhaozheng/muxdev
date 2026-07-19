@@ -39,6 +39,9 @@ def start_daemon(
     api_port: int = DEFAULT_API_PORT,
     ui_port: int = DEFAULT_UI_PORT,
     paths: DaemonPaths | None = None,
+    workers: int | None = None,
+    lease_seconds: float | None = None,
+    heartbeat_seconds: float | None = None,
 ) -> dict[str, Any]:
     paths = (paths or default_daemon_paths()).ensure()
     current = daemon_status(paths)
@@ -80,6 +83,12 @@ def start_daemon(
         "--ui-port",
         str(ui_port),
     ]
+    if workers is not None:
+        command.extend(["--workers", str(max(1, int(workers)))])
+    if lease_seconds is not None:
+        command.extend(["--lease-seconds", str(max(1.0, float(lease_seconds)))])
+    if heartbeat_seconds is not None:
+        command.extend(["--heartbeat-seconds", str(max(0.1, float(heartbeat_seconds)))])
     with paths.log_path.open("ab") as log:
         log.write(f"\n--- muxdev daemon start {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n".encode("utf-8"))
         process = subprocess.Popen(

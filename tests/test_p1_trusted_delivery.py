@@ -9,6 +9,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
+import pytest
 
 from muxdev.api.web import create_app
 from muxdev.cli import app
@@ -21,6 +22,7 @@ from muxdev.storage import Blackboard
 
 
 runner = CliRunner()
+pytestmark = pytest.mark.integration
 
 
 def test_run_writes_trusted_delivery_evidence() -> None:
@@ -101,6 +103,7 @@ def test_cli_evidence_verify_reports_valid_run() -> None:
 def test_daemon_rollback_to_stage_snapshot() -> None:
     workspace = _workspace_temp("p1-rollback")
     try:
+        (workspace / ".muxdev").mkdir()
         manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())
         client = TestClient(create_app(task_manager=manager))
         submitted = client.post(
@@ -108,7 +111,7 @@ def test_daemon_rollback_to_stage_snapshot() -> None:
             json={"task": "rollback stage snapshot smoke", "workspace": str(workspace), "provider": "mock"},
         ).json()
         task_id = submitted["task_id"]
-        _wait_for_status(client, task_id, "completed")
+        _wait_for_status(client, manager, task_id, "completed")
 
         verified = runner.invoke(app, ["evidence", "verify", task_id, "--json"], env={"MUXDEV_HOME": str(workspace / "home")})
         rollback = client.post(f"/api/tasks/{task_id}/rollback?to_stage=implement").json()
@@ -124,15 +127,12 @@ def test_daemon_rollback_to_stage_snapshot() -> None:
         shutil.rmtree(workspace, ignore_errors=True)
 
 
-def _wait_for_status(client: TestClient, task_id: str, expected: str) -> None:
-    import time
-
-    for _ in range(80):
-        status = client.get(f"/api/tasks/{task_id}").json()["run"]["status"]
-        if status == expected:
-            return
-        time.sleep(0.1)
-    raise AssertionError(f"task did not reach {expected}")
+def _wait_for_status(client: TestClient, manager: TaskManager, task_id: str, expected: str) -> None:
+    finished = manager.wait(task_id, timeout=30.0)
+    detail = client.get(f"/api/tasks/{task_id}").json()
+    status = detail["run"]["status"]
+    assert finished, f"worker did not finish; active={manager.queue.active_task_ids()} detail={detail}"
+    assert status == expected, f"task reached {status}, expected {expected}; detail={detail}"
 
 
 @contextmanager

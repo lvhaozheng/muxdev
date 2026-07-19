@@ -199,6 +199,7 @@ def test_headless_backend_decodes_windows_cli_output() -> None:
     assert "\u547d\u4ee4\u884c\u592a\u957f" in result.stdout
 
 
+@pytest.mark.integration
 def test_headless_backend_enforces_idle_timeout_without_output() -> None:
     result = HeadlessSubprocessBackend().run(
         [sys.executable, "-c", "import time; time.sleep(5)"],

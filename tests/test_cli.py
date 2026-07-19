@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from typer.testing import CliRunner
+import pytest
 
 from muxdev.cli import app
 from muxdev.runtime import SupervisorRuntime
@@ -68,6 +69,7 @@ class FakeDaemonClient:
         return {"task_id": task_id, "run_id": task_id, "status": "rolled_back", "to_stage": to_stage}
 
 
+@pytest.mark.integration
 def test_provider_detect_json_contains_all_providers() -> None:
     result = runner.invoke(app, ["provider", "detect", "--json"])
 
@@ -84,6 +86,7 @@ def test_provider_detect_json_contains_all_providers() -> None:
     ]
 
 
+@pytest.mark.integration
 def test_provider_detect_human_table_has_m0_columns() -> None:
     result = runner.invoke(app, ["provider", "detect"])
 
@@ -127,6 +130,7 @@ def test_removed_top_level_aliases_are_unknown_commands() -> None:
         assert result.exit_code != 0, command
 
 
+@pytest.mark.integration
 def test_root_task_submits_default_dev_task(monkeypatch) -> None:
     fake = FakeDaemonClient()
     monkeypatch.setattr("muxdev.cli.main._daemon_client", lambda *_args, **_kwargs: fake)
@@ -139,6 +143,7 @@ def test_root_task_submits_default_dev_task(monkeypatch) -> None:
     assert "Task submitted: run_fake" in result.stdout
 
 
+@pytest.mark.integration
 def test_doctor_json_reports_runtime_config() -> None:
     result = runner.invoke(app, ["doctor", "--json"])
 
@@ -157,6 +162,7 @@ def test_doctor_json_reports_runtime_config() -> None:
     } <= {item["id"] for item in payload["checks"]}
 
 
+@pytest.mark.integration
 def test_demo_mock_runs_complete_offline() -> None:
     temp_dir = _workspace_temp()
     try:
@@ -172,6 +178,7 @@ def test_demo_mock_runs_complete_offline() -> None:
     assert payload["report"]
 
 
+@pytest.mark.integration
 def test_init_wizard_writes_project_config_and_next_steps() -> None:
     temp_dir = _workspace_temp()
     try:
@@ -188,6 +195,7 @@ def test_init_wizard_writes_project_config_and_next_steps() -> None:
     assert "muxdev demo --mock" in payload["next"]
 
 
+@pytest.mark.integration
 def test_dev_submits_daemon_task_with_resolved_main_path_options(monkeypatch) -> None:
     fake = FakeDaemonClient()
     monkeypatch.setattr("muxdev.cli.main._daemon_client", lambda *_args, **_kwargs: fake)
@@ -216,7 +224,8 @@ def test_dev_submits_daemon_task_with_resolved_main_path_options(monkeypatch) ->
     submitted = fake.submitted[0]
     assert submitted["task"] == "ship daemon task"
     assert submitted["workflow"] == "dev"
-    assert submitted["profile"] == "solo"
+    assert "profile" not in submitted
+    assert "--profile is deprecated" in result.stderr
     assert submitted["gate"] == "strict"
     assert submitted["role_providers"]["code"] == "mock"
     assert "skills" in submitted
@@ -225,6 +234,8 @@ def test_dev_submits_daemon_task_with_resolved_main_path_options(monkeypatch) ->
 def test_continue_dashboard_and_tui_json_use_daemon_client(monkeypatch) -> None:
     fake = FakeDaemonClient()
     monkeypatch.setattr("muxdev.cli.main._daemon_client", lambda *_args, **_kwargs: fake)
+    auth_home = (Path(".test_workspaces") / f"cli-auth-{uuid.uuid4().hex}").resolve()
+    monkeypatch.setenv("MUXDEV_HOME", str(auth_home))
 
     continued = runner.invoke(app, ["continue", "run_fake", "--json"])
     dashboard = runner.invoke(app, ["dashboard", "--json"])
@@ -237,7 +248,9 @@ def test_continue_dashboard_and_tui_json_use_daemon_client(monkeypatch) -> None:
     assert continued.exit_code == 0
     assert json.loads(continued.stdout)["status"] == "running"
     assert dashboard.exit_code == 0
-    assert json.loads(dashboard.stdout)["dashboard"] == "http://127.0.0.1:8787"
+    dashboard_payload = json.loads(dashboard.stdout)
+    assert dashboard_payload["dashboard"].startswith("http://127.0.0.1:8787/auth/bootstrap?nonce=")
+    assert dashboard_payload["expires_in_seconds"] == 60
     assert tui.exit_code == 0
     assert json.loads(tui.stdout)["run"]["run_id"] == "run_fake"
     assert actions.exit_code == 0
@@ -275,6 +288,7 @@ def test_new_creates_muxdev_project_scaffold() -> None:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+@pytest.mark.integration
 def test_trace_skip_merge_metrics_and_search_commands() -> None:
     temp_dir = _workspace_temp()
     try:
@@ -311,6 +325,7 @@ def test_trace_skip_merge_metrics_and_search_commands() -> None:
     assert json.loads(search.stdout)[0]["path"] == "sample.py"
 
 
+@pytest.mark.integration
 def test_detach_updates_local_agent_session() -> None:
     temp_dir = _workspace_temp()
     try:

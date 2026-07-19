@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 
 from typer.testing import CliRunner
+import pytest
 
 from muxdev.cli import app
 from muxdev.models import RunStatus
@@ -15,6 +16,7 @@ from muxdev.storage import Blackboard, MemoryStore
 
 
 runner = CliRunner()
+pytestmark = pytest.mark.integration
 
 
 def test_layered_memory_inbox_promote_and_query_isolates_temporary_context() -> None:

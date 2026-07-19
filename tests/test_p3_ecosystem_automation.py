@@ -7,6 +7,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
+import pytest
 
 from muxdev.api.mcp import handle_jsonrpc, mcp_doctor, server_manifest
 from muxdev.api.web import create_app, render_dashboard_html, render_live_dashboard_html
@@ -18,6 +19,7 @@ from muxdev.storage import Blackboard
 
 
 runner = CliRunner()
+pytestmark = pytest.mark.integration
 
 
 def test_feedback_router_submits_ci_rescue_and_records_cache() -> None:
@@ -267,8 +269,8 @@ def test_dashboard_renders_p3_ecosystem_sections() -> None:
     english_live = render_live_dashboard_html(lang="en")
     assert "Memory Context" not in english_live
     assert "Role Sessions" not in english_live
-    assert "Workflow Templates" in english_live
-    assert "Role and CLI/provider Mapping" in english_live
+    assert "Workflow Templates" not in english_live
+    assert "Agent Harness Capability Matrix" not in english_live
 
 
 def _workspace_temp(prefix: str) -> Path:

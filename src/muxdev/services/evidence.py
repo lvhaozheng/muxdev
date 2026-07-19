@@ -148,7 +148,7 @@ def verify_run_evidence(run_dir: Path, run_id: str, blackboard: Blackboard | Non
                 errors.append("manifest event_count mismatch")
             if manifest.get("head_hash") != chain.get("head_hash"):
                 errors.append("manifest head_hash mismatch")
-        errors.extend(_verify_artifact_refs(events))
+        errors.extend(_verify_artifact_refs(events, run_dir=run_dir))
         errors.extend(_verify_persisted_hashes(run_dir, run_id, board))
         return {
             "run_id": run_id,
@@ -243,11 +243,11 @@ def _collect_events(run_dir: Path, run_id: str, blackboard: Blackboard) -> list[
         )
 
     task_path = run_dir / "task.md"
-    refs = [_artifact_ref(task_path, producer="runtime")] if task_path.exists() else []
+    refs = [_artifact_ref(task_path, producer="runtime", run_dir=run_dir)] if task_path.exists() else []
     add(kind="task", claim=f"Task recorded for workflow {run.get('workflow')}", strength="A", artifact_refs=refs)
     diff_path = run_dir / "diff.patch"
     if diff_path.exists():
-        add(kind="change", claim="Run diff artifact recorded", strength="A", artifact_refs=[_artifact_ref(diff_path, producer="runtime")])
+        add(kind="change", claim="Run diff artifact recorded", strength="A", artifact_refs=[_artifact_ref(diff_path, producer="runtime", run_dir=run_dir)])
 
     for row in blackboard.table_rows("stages", run_id=run_id):
         add(
@@ -298,7 +298,7 @@ def _collect_events(run_dir: Path, run_id: str, blackboard: Blackboard) -> list[
             stage_id=row.get("stage_id"),
             claim=f"Artifact {row.get('name') or path.name} recorded as {row.get('kind')}",
             strength="B",
-            artifact_refs=[_artifact_ref(path, producer=str(row.get("kind") or "artifact"))],
+            artifact_refs=[_artifact_ref(path, producer=str(row.get("kind") or "artifact"), run_dir=run_dir)],
             metrics={"kind": row.get("kind")},
         )
 
@@ -341,7 +341,7 @@ def _collect_events(run_dir: Path, run_id: str, blackboard: Blackboard) -> list[
             claim=f"Blind validator decision: {decision}",
             status="passed" if decision == "accept" else "blocked",
             strength="A",
-            artifact_refs=[_artifact_ref(path, producer="blind_validator")] if path else [],
+            artifact_refs=[_artifact_ref(path, producer="blind_validator", run_dir=run_dir)] if path else [],
             metrics={"validator_id": row.get("validator_id"), "decision": decision},
             tags=["validator"],
         )
@@ -397,7 +397,7 @@ def _collect_events(run_dir: Path, run_id: str, blackboard: Blackboard) -> list[
             claim=f"Semantic merge review decision: {decision}",
             status="passed" if decision == "accept" else "blocked",
             strength="A",
-            artifact_refs=[_artifact_ref(path, producer="semantic_merge")] if path else [],
+            artifact_refs=[_artifact_ref(path, producer="semantic_merge", run_dir=run_dir)] if path else [],
             metrics={"review_id": row.get("review_id"), "patch_hash": row.get("patch_hash")},
             tags=["semantic_merge"],
         )
@@ -450,7 +450,7 @@ def _build_manifest(run_dir: Path, run_id: str, events: list[EvidenceEvent]) -> 
         layers[event.layer] = layers.get(event.layer, 0) + 1
         kinds[event.kind] = kinds.get(event.kind, 0) + 1
         for ref in event.artifact_refs:
-            artifacts.add(ref.path)
+            artifacts.add(ref.relative_path or ref.path)
     return EvidenceManifest(
         run_id=run_id,
         event_count=len(events),
@@ -460,8 +460,8 @@ def _build_manifest(run_dir: Path, run_id: str, events: list[EvidenceEvent]) -> 
         required_matrix=matrix,
         missing_required=missing,
         head_hash=events[-1].event_hash if events else None,
-        events_path=str(run_dir / "evidence" / "events.jsonl"),
-        manifest_path=str(run_dir / "evidence" / "manifest.json"),
+        events_path="evidence/events.jsonl",
+        manifest_path="evidence/manifest.json",
     )
 
 
@@ -600,13 +600,29 @@ def _verify_event_chain(events: list[dict[str, Any]]) -> dict[str, Any]:
     return {"valid": not errors, "head_hash": head_hash, "errors": errors}
 
 
-def _verify_artifact_refs(events: list[dict[str, Any]]) -> list[str]:
+def _verify_artifact_refs(events: list[dict[str, Any]], *, run_dir: Path) -> list[str]:
     errors: list[str] = []
     for raw in events:
         for ref in raw.get("artifact_refs", []) if isinstance(raw.get("artifact_refs"), list) else []:
             if not isinstance(ref, dict):
                 continue
-            path = Path(str(ref.get("path") or ""))
+            if ref.get("scope") == "run" and ref.get("relative_path"):
+                relative = Path(str(ref["relative_path"]))
+                if relative.is_absolute() or ".." in relative.parts:
+                    errors.append(f"unsafe run artifact path: {relative}")
+                    continue
+                path = (run_dir / relative).resolve()
+                try:
+                    if not path.is_relative_to(run_dir.resolve()):
+                        errors.append(f"run artifact escapes run directory: {relative}")
+                        continue
+                except OSError:
+                    errors.append(f"invalid run artifact path: {relative}")
+                    continue
+            else:
+                if not ref.get("path"):
+                    continue
+                path = Path(str(ref.get("path")))
             expected = ref.get("sha256")
             if not path.exists():
                 errors.append(f"missing artifact: {path}")
@@ -635,8 +651,21 @@ def _verify_persisted_hashes(run_dir: Path, run_id: str, blackboard: Blackboard)
     return errors
 
 
-def _artifact_ref(path: Path, *, producer: str) -> ArtifactRef:
-    return ArtifactRef(path=str(path), sha256=sha256_file(path) if path.exists() and path.is_file() else None, producer=producer)
+def _artifact_ref(path: Path, *, producer: str, run_dir: Path | None = None) -> ArtifactRef:
+    resolved = path.expanduser().resolve()
+    relative: str | None = None
+    if run_dir is not None:
+        try:
+            relative = resolved.relative_to(run_dir.expanduser().resolve()).as_posix()
+        except ValueError:
+            relative = None
+    return ArtifactRef(
+        path=None,
+        scope="run" if relative else "local",
+        relative_path=relative,
+        sha256=sha256_file(resolved) if resolved.exists() and resolved.is_file() else None,
+        producer=producer,
+    )
 
 
 def _event_id(run_id: str, index: int, kind: str) -> str:

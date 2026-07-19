@@ -26,7 +26,9 @@ def test_qwen_adapter_uses_headless_prompt_mode(monkeypatch) -> None:
 
     assert isinstance(adapter, HeadlessCliProviderAdapter)
     assert adapter.command[:2] == ["qwen", "--bare"]
-    assert ["--output-format", "stream-json"] == adapter.command[4:6]
+    assert "--sandbox" in adapter.command
+    assert adapter.command[adapter.command.index("--output-format") + 1] == "stream-json"
+    assert adapter.command[adapter.command.index("--max-tool-calls") + 1] == "40"
 
 
 def test_codex_adapter_sends_prompt_via_stdin(monkeypatch) -> None:
@@ -75,7 +77,7 @@ def test_codex_adapter_uses_muxdev_writable_codex_home(monkeypatch) -> None:
     codex_home = Path(str(captured["env"]["CODEX_HOME"]))
     assert codex_home == muxdev_home / "data" / "provider_state" / "codex"
     assert (codex_home / "auth.json").read_text(encoding="utf-8") == '{"token":"redacted"}'
-    assert (codex_home / "config.toml").read_text(encoding="utf-8") == 'model = "test"\n'
+    assert not (codex_home / "config.toml").exists()
 
 
 def test_headless_cli_failure_summary_includes_output_excerpt() -> None:

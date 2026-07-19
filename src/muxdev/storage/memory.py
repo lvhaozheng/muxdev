@@ -11,13 +11,13 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
 from ..config.loader import path_config
 from ..models import utc_now
+from .sqlite import Migration, SQLiteEngine, UnitOfWork, add_missing_columns, apply_migrations, execute_script
 
 
 DEFAULT_TTL_DAYS = 180
@@ -46,14 +46,20 @@ MEMORY_ITEM_COLUMNS: dict[str, str] = {
 class MemoryStore:
     """Project-local memory database facade."""
 
-    def __init__(self, workspace: Path, db_path: Path | None = None):
-        self.workspace = workspace
-        self.db_path = db_path or path_config(workspace, "runtime_root") / "memory.sqlite"
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.db_path)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=OFF")
-        self._init_schema()
+    def __init__(self, workspace: Path, db_path: Path | None = None, *, readonly: bool = False):
+        self.workspace = Path(workspace).expanduser().resolve()
+        self.db_path = Path(db_path or path_config(self.workspace, "runtime_root") / "memory.sqlite").expanduser().resolve()
+        self.engine = SQLiteEngine(self.db_path, component="memory", readonly=readonly)
+        self.conn = self.engine.connection
+        try:
+            apply_migrations(
+                self.engine,
+                (Migration(1, "memory_baseline", "memory-v1-layered-memory", self._create_v1_schema),),
+                backup_root=self.db_path.parent / "backups" / "migrations",
+            )
+        except BaseException:
+            self.engine.close()
+            raise
 
     def __enter__(self) -> "MemoryStore":
         return self
@@ -62,10 +68,11 @@ class MemoryStore:
         self.close()
 
     def close(self) -> None:
-        self.conn.close()
+        self.engine.close()
 
-    def _init_schema(self) -> None:
-        self.conn.executescript(
+    def _create_v1_schema(self, conn: object) -> None:
+        execute_script(
+            conn,
             """
             CREATE TABLE IF NOT EXISTS memory_items (
               id TEXT PRIMARY KEY,
@@ -119,8 +126,13 @@ class MemoryStore:
             );
             """
         )
-        self._ensure_memory_item_columns()
-        self.conn.commit()
+        add_missing_columns(conn, "memory_items", MEMORY_ITEM_COLUMNS)
+
+    def storage_health(self, *, check_integrity: bool = True) -> dict[str, object]:
+        return self.engine.health(check_integrity=check_integrity).to_dict()
+
+    def unit_of_work(self) -> UnitOfWork:
+        return UnitOfWork(self.engine)
 
     def status(self) -> dict[str, object]:
         rows = self.conn.execute("SELECT status, COUNT(*) AS count FROM memory_items GROUP BY status").fetchall()
@@ -522,12 +534,6 @@ class MemoryStore:
             (status, quarantine_target, utc_now(), contradiction_id),
         )
         self.conn.commit()
-
-    def _ensure_memory_item_columns(self) -> None:
-        existing = {row["name"] for row in self.conn.execute("PRAGMA table_info(memory_items)").fetchall()}
-        for column, declaration in MEMORY_ITEM_COLUMNS.items():
-            if column not in existing:
-                self.conn.execute(f"ALTER TABLE memory_items ADD COLUMN {column} {declaration}")
 
     def _mark_used(self, memory_ids: list[str]) -> None:
         if not memory_ids:

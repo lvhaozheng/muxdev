@@ -34,7 +34,9 @@ EvidenceLevel = Literal["E0", "E1", "E2", "E3"]
 class ArtifactRef(BaseModel):
     """Content-addressed artifact reference used by evidence events."""
 
-    path: str
+    path: str | None = None
+    scope: Literal["run", "local", "bundle"] = "local"
+    relative_path: str | None = None
     sha256: str | None = None
     media_type: str | None = None
     producer: str | None = None

@@ -10,15 +10,19 @@ workflow semantics.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Callable
+from uuid import uuid4
 
 from ..models import ApprovalStatus, PolicyDecision, ProviderActionKind, ProviderActionStatus, ReviewBlocker, ReviewResult, RunStatus, StageStatus, TestResult
 from ..clients.stream import StreamAdapter, StreamEventType
 from ..core.platforms import hidden_subprocess_kwargs
+from ..core.projects import canonical_workspace
 from ..core.redaction import redact
 from ..core.text_cleaning import has_external_confirmation
 from ..context import memory_refs as _memory_refs
@@ -26,19 +30,29 @@ from ..context import task_with_context_packet as _task_with_context_packet
 from ..context import task_with_memory_context as _task_with_memory_context
 from ..context import write_context_packet as _write_context_packet
 from ..config.runtime import load_runtime_config, normalize_role
-from ..domain import new_run_id
+from ..domain import ExecutionGuard, HarnessPolicySpec, LeaseLost, ReconciliationRequired, RoutingPolicySpec, TaskCancelled, new_run_id
+from ..application.lifecycle import LifecycleService
 from ..providers.adapters import ProviderAdapter, ProviderStageOutput, extract_json_object, get_runtime_provider
-from ..providers.planner import ProviderPlanner
+from ..providers.policy import ensure_harness_policy
 from ..services.dashboard_run import write_run_dashboard
 from ..services.delivery_gate import evaluate_delivery_gate
 from ..services.deliverables import publish_workflow_deliverables, workflow_deliverable_status
 from ..services.design import write_design_pack
 from ..services.advanced_parallel import planned_stage_writes_from_automation, record_parallel_conflicts, write_parallel_conflict_report
 from ..services.provider_learning import refresh_provider_learning
-from ..services.provider_scores import recommend_provider
+from ..services.routing import extract_task_features, route_task
+from ..services.routing_review import (
+    ensure_reviewer_policy,
+    finish_review_assignment,
+    incomplete_current_reviews,
+    prepare_review_snapshot,
+    reviewer_prompt,
+    verify_review_snapshot,
+)
 from ..services.prompt_templates import render_stage_prompt
 from ..services.evidence import write_evidence_run
 from ..services.reports import generate_final_report
+from ..services.attestation import AttestationRequiredError, DeliveryAttestationService
 from ..services.semantic_merge import review_semantic_merge
 from ..services.session_capsules import write_session_capsule
 from ..services.skills import resolve_active_skills
@@ -79,15 +93,62 @@ class SupervisorRuntime:
         state_db: Path | None = None,
         worktrees_root: Path | None = None,
         write_dashboards: bool = True,
+        state_event_sink: Callable[[dict[str, Any]], None] | None = None,
+        execution_guard: ExecutionGuard | None = None,
+        cancel_grace_seconds: float = 10.0,
     ):
-        self.workspace = workspace
-        self.store = RunStore(workspace, runs_dir=runs_dir)
-        self.state_db = state_db
-        self.worktrees_root = worktrees_root
+        # Discovery happens at the submission boundary. Resume must use the
+        # exact canonical root persisted in the RunSpec.
+        self.workspace = canonical_workspace(workspace)
+        self.store = RunStore(self.workspace, runs_dir=runs_dir)
+        self.state_db = Path(state_db).expanduser().resolve() if state_db is not None else None
+        self.worktrees_root = Path(worktrees_root).expanduser().resolve() if worktrees_root is not None else None
         self.write_dashboards = write_dashboards
+        self.state_event_sink = state_event_sink
+        self.execution_guard = execution_guard
+        self.cancel_grace_seconds = max(0.0, float(cancel_grace_seconds))
 
     def _blackboard(self, run_dir: Path) -> Blackboard:
-        return Blackboard(run_dir, db_path=self.state_db)
+        return Blackboard(
+            run_dir,
+            db_path=self.state_db,
+            event_sink=self.state_event_sink,
+            execution_guard=self.execution_guard,
+        )
+
+    def _check_execution(self) -> None:
+        if self.execution_guard is not None:
+            self.execution_guard.check()
+
+    def _runtime_provider(self, provider: str) -> ProviderAdapter:
+        implementation = get_runtime_provider(provider)
+        setter = getattr(implementation, "set_cancellation_token", None)
+        if callable(setter) and self.execution_guard is not None:
+            setter(self.execution_guard.cancellation, grace_seconds=self.cancel_grace_seconds)
+        return implementation
+
+    def _routing_adapters(
+        self,
+        *,
+        provider: str,
+        routing_policy: RoutingPolicySpec,
+        harness_policy: HarnessPolicySpec,
+    ) -> dict[str, ProviderAdapter]:
+        names: set[str] = set(routing_policy.allowed_providers)
+        if routing_policy.delivery_mode == "simulation":
+            names.update({"mock", "replay"} if routing_policy.mode == "auto" or harness_policy.risk_level == "high" else {provider})
+        else:
+            names.update({"codex", "qwen"} if routing_policy.mode == "auto" or harness_policy.risk_level == "high" else {provider})
+        if routing_policy.fixed_provider:
+            names.add(routing_policy.fixed_provider)
+        names.discard("auto")
+        adapters: dict[str, ProviderAdapter] = {}
+        for name in sorted(names):
+            try:
+                adapters[name] = self._runtime_provider(name)
+            except (OSError, ValueError):
+                continue
+        return adapters
 
     def _write_run_dashboard(self, run_dir: Path, run_id: str, *, blackboard: Blackboard | None = None) -> Path | None:
         if not self.write_dashboards:
@@ -111,6 +172,8 @@ class SupervisorRuntime:
         depth: str | None = None,
         topology: str | None = None,
         automation: dict[str, object] | None = None,
+        harness_policy: dict[str, object] | None = None,
+        routing_policy: dict[str, object] | None = None,
     ) -> RunResult:
         """Create a fresh run and execute its workflow until completion or pause."""
         run_id = run_id or new_run_id()
@@ -133,9 +196,16 @@ class SupervisorRuntime:
             skills or [],
             _resolve_workflow_role_skills(self.workspace, task=task, workflow=workflow, provider=provider),
         )
-        provider_impls = {provider: get_runtime_provider(provider)}
-        for role_provider in role_providers.values():
-            provider_impls.setdefault(role_provider, get_runtime_provider(role_provider))
+        resolved_harness_policy = (
+            HarnessPolicySpec.from_payload(harness_policy)
+            if harness_policy is not None
+            else HarnessPolicySpec.derive(task=task, gate=gate, automation=automation)
+        )
+        resolved_routing_policy = RoutingPolicySpec.derive(
+            provider=provider,
+            max_cost_usd=max_cost_usd,
+            payload=routing_policy,
+        )
 
         task_context = {
             "workflow_name": workflow_name,
@@ -151,6 +221,8 @@ class SupervisorRuntime:
                 "max_cost_usd": policy.policy.max_cost_usd,
                 "strict_approval": policy.policy.strict_approval,
             },
+            "harness_policy": resolved_harness_policy.to_payload(),
+            "routing_policy": resolved_routing_policy.to_payload(),
         }
         (run_dir / "task.md").write_text(redact(task) + "\n", encoding="utf-8")
         (run_dir / "workflow.yaml").write_text(workflow.model_dump_json(indent=2), encoding="utf-8")
@@ -163,8 +235,6 @@ class SupervisorRuntime:
             workspace=self.workspace,
             worktree=worktree.path,
         )
-        for role in sorted({stage.role for stage in workflow.stages if stage.role}):
-            blackboard.upsert_agent(run_id, role, role_providers.get(role, provider))
         blackboard.add_artifact(run_id, None, "task.md", run_dir / "task.md", "task")
         blackboard.add_artifact(run_id, None, "task_context.json", run_dir / "task_context.json", "context")
         _record_ledger(blackboard, run_dir, run_id, "run_started", payload={"workflow": workflow.name, "provider": provider})
@@ -178,10 +248,9 @@ class SupervisorRuntime:
             intent=(automation or {}).get("intent"),
             skills=[skill.get("name") for skill in skills],
         )
-        blackboard.set_run_status(run_id, RunStatus.RUNNING)
         clarification = _task_intake_clarification(automation or {}, task)
         if clarification:
-            action_id = blackboard.create_provider_action(
+            action_id = LifecycleService(blackboard).request_provider_action(
                 run_id=run_id,
                 stage_id=str(clarification.get("stage_id") or "task_intake"),
                 provider="muxdev",
@@ -192,12 +261,113 @@ class SupervisorRuntime:
                 choices=[choice for choice in clarification.get("choices", []) if isinstance(choice, dict)],
                 auto_policy="manual",
             )
-            blackboard.upsert_stage(run_id, str(clarification.get("stage_id") or "task_intake"), role="requirements", status=StageStatus.RUNNING, summary="waiting for clarification")
-            blackboard.set_run_status(run_id, RunStatus.AWAITING_PROVIDER_ACTION)
+            LifecycleService(blackboard).transition_stage(run_id, str(clarification.get("stage_id") or "task_intake"), role="requirements", status=StageStatus.RUNNING, summary="waiting for clarification")
+            _transition_run(blackboard, run_id, RunStatus.AWAITING_PROVIDER_ACTION)
             trace.write("clarification_requested", stage=str(clarification.get("stage_id") or "task_intake"), action_id=action_id)
             self._write_run_dashboard(run_dir, run_id, blackboard=blackboard)
             blackboard.close()
             return RunResult(run_id, RunStatus.AWAITING_PROVIDER_ACTION, run_dir, None)
+        self._check_execution()
+        _transition_run(blackboard, run_id, RunStatus.ROUTING)
+        routing_adapters = self._routing_adapters(
+            provider=provider,
+            routing_policy=resolved_routing_policy,
+            harness_policy=resolved_harness_policy,
+        )
+        feature_set = blackboard.record_task_feature_set(
+            extract_task_features(
+                run_id=run_id,
+                task=task,
+                workspace=self.workspace,
+                harness_policy=resolved_harness_policy,
+                routing_policy=resolved_routing_policy,
+                automation=automation,
+            )
+        )
+        route_decision = route_task(
+            blackboard,
+            feature_set=feature_set,
+            routing_policy=resolved_routing_policy,
+            harness_policy=resolved_harness_policy,
+            adapters=routing_adapters,
+        )
+        trace.write(
+            "route_decision",
+            decision_id=route_decision.decision_id,
+            decision_hash=route_decision.decision_hash,
+            selected_main=route_decision.selected_main_provider,
+            selected_reviewer=route_decision.selected_reviewer_provider,
+            reasons=list(route_decision.reason_codes),
+        )
+        if not route_decision.selected_main_provider:
+            blackboard.add_error(run_id, None, "routing_no_candidate", "no eligible main Provider satisfies the task policy")
+            _transition_run(blackboard, run_id, RunStatus.BLOCKED)
+            self._write_run_dashboard(run_dir, run_id, blackboard=blackboard)
+            blackboard.close()
+            return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
+        provider = route_decision.selected_main_provider
+        if route_decision.selected_reviewer_provider:
+            role_providers = {
+                **role_providers,
+                "review": route_decision.selected_reviewer_provider,
+                "reviewer": route_decision.selected_reviewer_provider,
+                "secure": route_decision.selected_reviewer_provider,
+            }
+        selected_names = {provider}
+        if route_decision.selected_reviewer_provider:
+            selected_names.add(route_decision.selected_reviewer_provider)
+        provider_impls = {name: routing_adapters[name] for name in selected_names if name in routing_adapters}
+        if provider not in provider_impls:
+            blackboard.add_error(run_id, None, "routing_provider_unavailable", f"selected Provider is unavailable: {provider}")
+            _transition_run(blackboard, run_id, RunStatus.BLOCKED)
+            self._write_run_dashboard(run_dir, run_id, blackboard=blackboard)
+            blackboard.close()
+            return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
+        for role in sorted({stage.role for stage in workflow.stages if stage.role}):
+            blackboard.upsert_agent(run_id, role, role_providers.get(role, provider))
+        preflight = ensure_harness_policy(
+            blackboard,
+            run_id=run_id,
+            adapters=provider_impls,
+            policy=resolved_harness_policy,
+        )
+        trace.write(
+            "harness_preflight",
+            status=preflight.status,
+            approval_id=preflight.approval_id,
+            subject_hash=canonical_hash(preflight.subject),
+            reason=preflight.reason,
+        )
+        if preflight.status != "ready":
+            status = RunStatus.AWAITING_APPROVAL if preflight.status == "awaiting_approval" else RunStatus.BLOCKED
+            if status == RunStatus.BLOCKED:
+                blackboard.add_error(run_id, None, "harness_policy", preflight.reason)
+            _transition_run(blackboard, run_id, status)
+            self._write_run_dashboard(run_dir, run_id, blackboard=blackboard)
+            blackboard.close()
+            return RunResult(run_id, status, run_dir, None)
+        reviewer_preflight = ensure_reviewer_policy(
+            blackboard,
+            run_id=run_id,
+            decision=route_decision,
+            harness_policy=resolved_harness_policy,
+            routing_policy=resolved_routing_policy,
+        )
+        trace.write(
+            "reviewer_preflight",
+            status=reviewer_preflight.status,
+            approval_id=reviewer_preflight.approval_id,
+            reason=reviewer_preflight.reason,
+        )
+        if reviewer_preflight.status != "ready":
+            status = RunStatus.AWAITING_APPROVAL if reviewer_preflight.status == "awaiting_approval" else RunStatus.BLOCKED
+            if status == RunStatus.BLOCKED:
+                blackboard.add_error(run_id, None, "reviewer_policy", reviewer_preflight.reason)
+            _transition_run(blackboard, run_id, status)
+            self._write_run_dashboard(run_dir, run_id, blackboard=blackboard)
+            blackboard.close()
+            return RunResult(run_id, status, run_dir, None)
+        _transition_run(blackboard, run_id, RunStatus.RUNNING)
         result = self._execute_workflow(
             run_id=run_id,
             run_dir=run_dir,
@@ -238,23 +408,28 @@ class SupervisorRuntime:
                 return RunResult(run_id, RunStatus.AWAITING_APPROVAL, run_dir, None)
             pending_actions = blackboard.list_provider_actions(status=str(ProviderActionStatus.PENDING), run_id=run_id)
             if pending_actions:
-                blackboard.set_run_status(run_id, RunStatus.AWAITING_PROVIDER_ACTION)
+                _transition_run(blackboard, run_id, RunStatus.AWAITING_PROVIDER_ACTION)
                 trace.write("resume_waiting_provider_action", actions=[row["action_id"] for row in pending_actions])
                 self._write_run_dashboard(run_dir, run_id, blackboard=blackboard)
                 return RunResult(run_id, RunStatus.AWAITING_PROVIDER_ACTION, run_dir, None)
             pending_feedback = _pending_design_feedback_requests(blackboard, run_id)
             if pending_feedback:
-                blackboard.set_run_status(run_id, RunStatus.AWAITING_FEEDBACK)
+                _transition_run(blackboard, run_id, RunStatus.AWAITING_FEEDBACK)
                 trace.write("resume_waiting_design_feedback", feedback_ids=[row["feedback_id"] for row in pending_feedback])
                 self._write_run_dashboard(run_dir, run_id, blackboard=blackboard)
                 return RunResult(run_id, RunStatus.AWAITING_FEEDBACK, run_dir, None)
             worktree = Path(run["worktree"])
             if not worktree.exists():
                 message = f"worktree missing: {worktree}"
-                blackboard.add_error(run_id, None, "missing_worktree", message)
+                LifecycleService(blackboard).fail_worker(
+                    run_id,
+                    error_type="missing_worktree",
+                    message=message,
+                    idempotency_key="worker-failed:missing-worktree",
+                )
                 trace.write("resume_missing_worktree", worktree=str(worktree), action=on_missing_worktree)
                 if on_missing_worktree == "abort":
-                    blackboard.set_run_status(run_id, RunStatus.ABORTED)
+                    _transition_run(blackboard, run_id, RunStatus.ABORTED)
                     self._write_run_dashboard(run_dir, run_id, blackboard=blackboard)
                     return RunResult(run_id, RunStatus.ABORTED, run_dir, None)
                 report_path = generate_final_report(run_dir, run_id, blackboard)
@@ -307,10 +482,92 @@ class SupervisorRuntime:
                     strict_approval=bool(stored_policy.get("strict_approval")),
                 )
             )
-            provider_impls = {provider: get_runtime_provider(provider)}
-            for role_provider in role_providers.values():
-                provider_impls.setdefault(role_provider, get_runtime_provider(role_provider))
-            blackboard.set_run_status(run_id, RunStatus.RUNNING)
+            self._check_execution()
+            harness_policy = HarnessPolicySpec.from_payload(
+                task_context.get("harness_policy") if isinstance(task_context.get("harness_policy"), dict) else {}
+            )
+            routing_policy = RoutingPolicySpec.from_payload(
+                task_context.get("routing_policy") if isinstance(task_context.get("routing_policy"), dict) else {},
+                fallback_provider=provider,
+                max_cost_usd=max_cost_usd,
+            )
+            route_row = blackboard.latest_route_decision(run_id, kind="main")
+            routing_adapters = self._routing_adapters(
+                provider=provider,
+                routing_policy=routing_policy,
+                harness_policy=harness_policy,
+            )
+            if route_row is None:
+                feature_set = blackboard.record_task_feature_set(
+                    extract_task_features(
+                        run_id=run_id,
+                        task=str(run["task"]),
+                        workspace=self.workspace,
+                        harness_policy=harness_policy,
+                        routing_policy=routing_policy,
+                        automation=automation,
+                    )
+                )
+                route_decision = route_task(
+                    blackboard,
+                    feature_set=feature_set,
+                    routing_policy=routing_policy,
+                    harness_policy=harness_policy,
+                    adapters=routing_adapters,
+                    idempotency_key="route:legacy-import:v1",
+                )
+            else:
+                route_decision = blackboard.route_decision_from_row(route_row)
+            if not route_decision.selected_main_provider:
+                blackboard.add_error(run_id, None, "routing_no_candidate", "stored route has no eligible main Provider")
+                _transition_run(blackboard, run_id, RunStatus.BLOCKED)
+                return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
+            provider = route_decision.selected_main_provider
+            if provider not in routing_adapters:
+                routing_adapters[provider] = self._runtime_provider(provider)
+            if route_decision.selected_reviewer_provider:
+                reviewer_name = route_decision.selected_reviewer_provider
+                if reviewer_name not in routing_adapters:
+                    routing_adapters[reviewer_name] = self._runtime_provider(reviewer_name)
+                role_providers = {**role_providers, "review": reviewer_name, "reviewer": reviewer_name, "secure": reviewer_name}
+            selected_names = {provider}
+            if route_decision.selected_reviewer_provider:
+                selected_names.add(route_decision.selected_reviewer_provider)
+            provider_impls = {name: routing_adapters[name] for name in selected_names}
+            preflight = ensure_harness_policy(
+                blackboard,
+                run_id=run_id,
+                adapters=provider_impls,
+                policy=harness_policy,
+            )
+            trace.write(
+                "harness_preflight",
+                status=preflight.status,
+                approval_id=preflight.approval_id,
+                subject_hash=canonical_hash(preflight.subject),
+                reason=preflight.reason,
+            )
+            if preflight.status != "ready":
+                status = RunStatus.AWAITING_APPROVAL if preflight.status == "awaiting_approval" else RunStatus.BLOCKED
+                if status == RunStatus.BLOCKED:
+                    blackboard.add_error(run_id, None, "harness_policy", preflight.reason)
+                _transition_run(blackboard, run_id, status)
+                self._write_run_dashboard(run_dir, run_id, blackboard=blackboard)
+                return RunResult(run_id, status, run_dir, None)
+            reviewer_preflight = ensure_reviewer_policy(
+                blackboard,
+                run_id=run_id,
+                decision=route_decision,
+                harness_policy=harness_policy,
+                routing_policy=routing_policy,
+            )
+            if reviewer_preflight.status != "ready":
+                status = RunStatus.AWAITING_APPROVAL if reviewer_preflight.status == "awaiting_approval" else RunStatus.BLOCKED
+                if status == RunStatus.BLOCKED:
+                    blackboard.add_error(run_id, None, "reviewer_policy", reviewer_preflight.reason)
+                _transition_run(blackboard, run_id, status)
+                return RunResult(run_id, status, run_dir, None)
+            _transition_run(blackboard, run_id, RunStatus.RUNNING)
             trace.write("run_resumed", provider=provider, worktree=str(worktree), skills=[skill.get("name") for skill in skills if isinstance(skill, dict)])
             result = self._execute_workflow(
                 run_id=run_id,
@@ -449,7 +706,11 @@ class SupervisorRuntime:
                 for row in blackboard.table_rows("stages", run_id=run_id)
                 if row["status"] in {StageStatus.COMPLETED, StageStatus.SKIPPED}
             }
-            if workflow.max_parallel > 1 and _can_use_parallel_runtime(workflow):
+            if (
+                workflow.max_parallel > 1
+                and _can_use_parallel_runtime(workflow)
+                and not blackboard.list_review_assignments(run_id)
+            ):
                 return self._execute_parallel_workflow(
                     run_id=run_id,
                     run_dir=run_dir,
@@ -471,6 +732,7 @@ class SupervisorRuntime:
             ordered = ordered_stage_ids(workflow)
             index = 0
             while index < len(ordered):
+                self._check_execution()
                 stage_id = ordered[index]
                 stage = by_id[stage_id]
                 if stage.id in completed:
@@ -483,16 +745,16 @@ class SupervisorRuntime:
                         max_loops = _effective_max_loops(stage, automation)
                         review_stage = _loop_review_stage(stage)
                         blackboard.add_error(run_id, stage.id, "review_blockers", f"{review_stage} blockers remain after {max_loops} revision loop(s)")
-                        blackboard.set_run_status(run_id, RunStatus.BLOCKED)
+                        _transition_run(blackboard, run_id, RunStatus.BLOCKED)
                         trace.write("loop_blocked", stage=stage.id, review_stage=review_stage, loop=context.get("loop"), max_loops=max_loops, reason="review blockers remain")
                         trace.write("run_blocked", stage=stage.id, reason="review blockers remain", review_stage=review_stage, loop=context.get("loop"), max_loops=max_loops)
                         return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
-                    blackboard.upsert_stage(run_id, stage.id, role=stage.role, status=StageStatus.SKIPPED, summary="when condition false")
+                    LifecycleService(blackboard).transition_stage(run_id, stage.id, role=stage.role, status=StageStatus.SKIPPED, summary="when condition false")
                     trace.write("stage_skipped", stage=stage.id)
                     index += 1
                     continue
                 blackboard.add_checkpoint(run_id, stage.id, "stage_started")
-                blackboard.upsert_stage(run_id, stage.id, role=stage.role, status=StageStatus.RUNNING)
+                LifecycleService(blackboard).transition_stage(run_id, stage.id, role=stage.role, status=StageStatus.RUNNING)
                 trace.write("stage_started", stage=stage.id, role=stage.role, type=stage.type)
                 if stage.type == "delivery_gate":
                     stage_provider = "muxdev"
@@ -505,6 +767,26 @@ class SupervisorRuntime:
                         role=stage.role,
                         fallback=provider,
                         role_providers=role_providers,
+                    )
+                routing_review_snapshot: dict[str, Any] | None = None
+                routing_review_snapshot_path: Path | None = None
+                active_review_assignment = next(
+                    (
+                        item for item in reversed(blackboard.list_review_assignments(run_id))
+                        if str(item.get("reviewer_provider") or "") == stage_provider
+                        and str(item.get("status") or "") not in {"waived", "completed"}
+                    ),
+                    None,
+                )
+                if stage.id in {"review", "final_design_review"} and active_review_assignment is not None:
+                    _transition_run(blackboard, run_id, RunStatus.REVIEWING)
+                    routing_review_snapshot, routing_review_snapshot_path = prepare_review_snapshot(
+                        blackboard,
+                        run_dir=run_dir,
+                        run_id=run_id,
+                        stage_id=stage.id,
+                        worktree=worktree,
+                        reviewer_provider=stage_provider,
                     )
                 snapshot = _record_stage_snapshot(blackboard, run_dir=run_dir, run_id=run_id, stage_id=stage.id, worktree=worktree)
                 stage_contract_path, stage_contract_hash, _ = write_stage_contract(
@@ -584,7 +866,7 @@ class SupervisorRuntime:
                         worktree=worktree,
                         snapshot_ref=str(snapshot["path"]),
                     )
-                    blackboard.upsert_stage(run_id, stage.id, role=stage.role, status=StageStatus.COMPLETED, output_path=str(artifact_path), summary=summary)
+                    LifecycleService(blackboard).transition_stage(run_id, stage.id, role=stage.role, status=StageStatus.COMPLETED, output_path=str(artifact_path), summary=summary)
                     blackboard.add_checkpoint(run_id, stage.id, "stage_completed")
                     trace.write(
                         "delivery_gate_completed",
@@ -598,7 +880,7 @@ class SupervisorRuntime:
                     completed.add(stage.id)
                     if blockers and not _has_downstream_delivery_repair(stage, workflow):
                         blackboard.add_error(run_id, stage.id, "delivery_gate_blockers", f"{stage.id} blockers remain with no automatic repair stage")
-                        blackboard.set_run_status(run_id, RunStatus.BLOCKED)
+                        _transition_run(blackboard, run_id, RunStatus.BLOCKED)
                         trace.write("run_blocked", stage=stage.id, reason="delivery gate blockers remain")
                         return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
                     index += 1
@@ -627,10 +909,10 @@ class SupervisorRuntime:
                         policy,
                         subject=subject,
                     ):
-                        blackboard.set_run_status(run_id, _approval_wait_status(ci_block_on_approval))
-                        blackboard.upsert_stage(run_id, stage.id, role=stage.role, status=StageStatus.RUNNING, summary="waiting for approval")
+                        _transition_run(blackboard, run_id, _approval_wait_status(ci_block_on_approval))
+                        LifecycleService(blackboard).transition_stage(run_id, stage.id, role=stage.role, status=StageStatus.RUNNING, summary="waiting for approval")
                         return RunResult(run_id, _approval_wait_status(ci_block_on_approval), run_dir, None)
-                    blackboard.upsert_stage(run_id, stage.id, role=stage.role, status=StageStatus.COMPLETED, summary="approval not required")
+                    LifecycleService(blackboard).transition_stage(run_id, stage.id, role=stage.role, status=StageStatus.COMPLETED, summary="approval not required")
                     blackboard.add_checkpoint(run_id, stage.id, "stage_completed")
                     trace.write("stage_completed", stage=stage.id)
                     index += 1
@@ -655,7 +937,7 @@ class SupervisorRuntime:
                         policy,
                         subject=subject,
                     ):
-                        blackboard.set_run_status(run_id, _approval_wait_status(ci_block_on_approval))
+                        _transition_run(blackboard, run_id, _approval_wait_status(ci_block_on_approval))
                         return RunResult(run_id, _approval_wait_status(ci_block_on_approval), run_dir, None)
 
                 if stage.allow_shell:
@@ -669,7 +951,7 @@ class SupervisorRuntime:
                         standard=decision.standard.to_dict() if decision.standard else {},
                     )
                     if decision.decision == PolicyDecision.DENY:
-                        blackboard.set_run_status(run_id, RunStatus.BLOCKED)
+                        _transition_run(blackboard, run_id, RunStatus.BLOCKED)
                         return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
                     if self._approval_gate(
                         blackboard,
@@ -688,16 +970,18 @@ class SupervisorRuntime:
                             extra={"command": "pytest"},
                         ),
                     ):
-                        blackboard.set_run_status(run_id, _approval_wait_status(ci_block_on_approval))
+                        _transition_run(blackboard, run_id, _approval_wait_status(ci_block_on_approval))
                         return RunResult(run_id, _approval_wait_status(ci_block_on_approval), run_dir, None)
 
                 budget = policy.evaluate_budget(blackboard.usage_total_cost(run_id), 0.01)
                 trace.write("budget_check", stage=stage.id, decision=str(budget.decision), reason=budget.reason)
                 if budget.decision == PolicyDecision.DENY:
-                    blackboard.set_run_status(run_id, RunStatus.PAUSED_BUDGET)
+                    _transition_run(blackboard, run_id, RunStatus.PAUSED_BUDGET)
                     return RunResult(run_id, RunStatus.PAUSED_BUDGET, run_dir, None)
 
-                provider_impl = provider_impls.setdefault(stage_provider, get_runtime_provider(stage_provider))
+                if stage_provider not in provider_impls:
+                    provider_impls[stage_provider] = self._runtime_provider(stage_provider)
+                provider_impl = provider_impls[stage_provider]
                 stage_skills = _skills_for_stage(skills, role=stage.role, stage_id=stage.id)
                 if stage_skills:
                     trace.write("skills_activated", stage=stage.id, role=stage.role, skills=[skill.get("name") for skill in stage_skills])
@@ -718,6 +1002,13 @@ class SupervisorRuntime:
                     rag_query=stage.rag_query,
                     loop_state=_loop_state(stage, context, automation),
                 )
+                rendered_stage_task = _task_with_context_packet(
+                    _render_stage_task(bound_task, workflow_name=workflow.name, stage=stage, trace=trace),
+                    context_packet_path,
+                    context_packet_hash,
+                )
+                if routing_review_snapshot is not None:
+                    rendered_stage_task += reviewer_prompt(routing_review_snapshot)
                 output, attempt = _run_provider_stage_with_attempts(
                     blackboard,
                     trace,
@@ -726,18 +1017,13 @@ class SupervisorRuntime:
                     role=stage.role,
                     provider=stage_provider,
                     provider_impl=provider_impl,
-                    task=_task_with_context_packet(
-                        _render_stage_task(bound_task, workflow_name=workflow.name, stage=stage, trace=trace),
-                        context_packet_path,
-                        context_packet_hash,
-                    ),
+                    task=rendered_stage_task,
                     worktree=worktree,
                     skills=stage_skills,
                     session_dir=run_dir / "provider_sessions",
                 )
                 artifact_path = run_dir / output.artifact_name
-                artifact_path.parent.mkdir(parents=True, exist_ok=True)
-                artifact_path.write_text(redact(output.content), encoding="utf-8")
+                _atomic_write_text(artifact_path, redact(output.content))
                 blackboard.add_usage(run_id, stage_provider, output.tokens, output.cost_usd)
                 blackboard.add_artifact(run_id, stage.id, output.artifact_name, artifact_path, "stage_output")
                 trace.write(
@@ -781,8 +1067,8 @@ class SupervisorRuntime:
                         summary=output.summary,
                         artifact_path=str(artifact_path),
                     )
-                    blackboard.set_run_status(run_id, RunStatus.AWAITING_FEEDBACK)
-                    blackboard.upsert_stage(
+                    _transition_run(blackboard, run_id, RunStatus.AWAITING_FEEDBACK)
+                    LifecycleService(blackboard).transition_stage(
                         run_id,
                         stage.id,
                         role=stage.role,
@@ -828,8 +1114,8 @@ class SupervisorRuntime:
                         artifact_path=str(artifact_path),
                         capsule_path=str(capsule_path),
                     )
-                    blackboard.set_run_status(run_id, RunStatus.AWAITING_PROVIDER_ACTION)
-                    blackboard.upsert_stage(
+                    _transition_run(blackboard, run_id, RunStatus.AWAITING_PROVIDER_ACTION)
+                    LifecycleService(blackboard).transition_stage(
                         run_id,
                         stage.id,
                         role=stage.role,
@@ -880,7 +1166,7 @@ class SupervisorRuntime:
                         worktree=worktree,
                         snapshot_ref=str(snapshot["path"]),
                     )
-                    blackboard.upsert_stage(
+                    LifecycleService(blackboard).transition_stage(
                         run_id,
                         stage.id,
                         role=stage.role,
@@ -889,10 +1175,12 @@ class SupervisorRuntime:
                         summary=output.summary,
                     )
                     blackboard.add_error(run_id, stage.id, _provider_failure_kind(output) or "provider_exit", output.summary)
-                    blackboard.set_run_status(run_id, RunStatus.BLOCKED)
+                    _transition_run(blackboard, run_id, RunStatus.BLOCKED)
                     trace.write("stage_failed", stage=stage.id, returncode=output.returncode)
                     return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
-                if stage.read_only and str(snapshot.get("diff_hash") or snapshot["patch_hash"]) != _worktree_patch_hash(worktree):
+                if (
+                    stage.read_only or routing_review_snapshot is not None
+                ) and str(snapshot.get("diff_hash") or snapshot["patch_hash"]) != _worktree_patch_hash(worktree):
                     summary = f"read-only stage {stage.id} modified the worktree"
                     capsule_path = _record_session_capsule(
                         blackboard,
@@ -934,13 +1222,29 @@ class SupervisorRuntime:
                         worktree=worktree,
                         snapshot_ref=str(snapshot["path"]),
                     )
-                    blackboard.upsert_stage(run_id, stage.id, role=stage.role, status=StageStatus.FAILED, output_path=str(artifact_path), summary=summary)
+                    LifecycleService(blackboard).transition_stage(run_id, stage.id, role=stage.role, status=StageStatus.FAILED, output_path=str(artifact_path), summary=summary)
                     blackboard.add_error(run_id, stage.id, "read_only_write_violation", summary)
-                    blackboard.set_run_status(run_id, RunStatus.BLOCKED)
+                    _transition_run(blackboard, run_id, RunStatus.BLOCKED)
                     trace.write("stage_failed", stage=stage.id, reason="read_only_write_violation")
                     return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
                 findings: list[dict[str, object]] = []
                 decision_text = "accept"
+                if (
+                    routing_review_snapshot is not None
+                    and routing_review_snapshot_path is not None
+                    and not verify_review_snapshot(
+                        routing_review_snapshot_path,
+                        str(routing_review_snapshot.get("snapshot_hash") or ""),
+                    )
+                ):
+                    summary = "heterogeneous review snapshot failed integrity verification"
+                    blackboard.add_error(run_id, stage.id, "review_snapshot_mismatch", summary)
+                    LifecycleService(blackboard).transition_stage(
+                        run_id, stage.id, role=stage.role, status=StageStatus.FAILED,
+                        output_path=str(artifact_path), summary=summary,
+                    )
+                    _transition_run(blackboard, run_id, RunStatus.BLOCKED)
+                    return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
                 if stage.output_schema == "TestResult" or stage.id == "test":
                     parsed = extract_json_object(output.content) or {}
                     test_result = TestResult(
@@ -953,7 +1257,20 @@ class SupervisorRuntime:
                         decision_text = "reject"
                         findings.append({"severity": "high", "type": "test_failure", "summary": test_result.summary})
                 if _is_review_stage(stage):
-                    review = _parse_review_result(output.content)
+                    parsed_review = extract_json_object(output.content)
+                    if routing_review_snapshot is not None and not parsed_review:
+                        review = ReviewResult(
+                            has_blockers=True,
+                            blockers=[
+                                ReviewBlocker(
+                                    type="invalid_review_output",
+                                    severity="high",
+                                    suggestion="Reviewer must return the configured ReviewResult JSON.",
+                                )
+                            ],
+                        )
+                    else:
+                        review = _parse_review_result(output.content)
                     for blocker in review.blockers:
                         blackboard.add_review_blocker(
                             run_id,
@@ -970,6 +1287,15 @@ class SupervisorRuntime:
                     if review.has_blockers:
                         decision_text = "reject"
                         findings.extend(blocker.model_dump() for blocker in review.blockers)
+                    if routing_review_snapshot is not None:
+                        finish_review_assignment(
+                            blackboard,
+                            run_id=run_id,
+                            reviewer_provider=stage_provider,
+                            snapshot_hash=str(routing_review_snapshot.get("snapshot_hash") or ""),
+                            findings=findings,
+                        )
+                        _transition_run(blackboard, run_id, RunStatus.RUNNING)
                 _record_role_result(
                     blackboard,
                     run_dir=run_dir,
@@ -984,7 +1310,7 @@ class SupervisorRuntime:
                     worktree=worktree,
                     snapshot_ref=str(snapshot["path"]),
                 )
-                blackboard.upsert_stage(run_id, stage.id, role=stage.role, status=StageStatus.COMPLETED, output_path=str(artifact_path), summary=output.summary)
+                LifecycleService(blackboard).transition_stage(run_id, stage.id, role=stage.role, status=StageStatus.COMPLETED, output_path=str(artifact_path), summary=output.summary)
                 blackboard.add_checkpoint(run_id, stage.id, "stage_completed")
                 trace.write("stage_completed", stage=stage.id, output=str(artifact_path))
                 completed.add(stage.id)
@@ -1018,7 +1344,7 @@ class SupervisorRuntime:
             semantic = _record_semantic_merge_review(blackboard, run_dir=run_dir, run_id=run_id, task=task, patch_text=diff_path.read_text(encoding="utf-8", errors="replace"))
             if semantic.get("decision") == "reject":
                 _refresh_provider_learning(blackboard, run_id)
-                blackboard.set_run_status(run_id, RunStatus.BLOCKED)
+                _transition_run(blackboard, run_id, RunStatus.BLOCKED)
                 blackboard.add_error(run_id, None, "semantic_merge_reject", "semantic merge reviewer rejected the patch")
                 _record_evidence_run(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
                 trace.write("run_blocked", reason="semantic merge reviewer rejected the patch", semantic_review_hash=semantic.get("review_hash"))
@@ -1026,7 +1352,7 @@ class SupervisorRuntime:
             validator = _record_blind_validator(blackboard, run_dir=run_dir, run_id=run_id, task_hash=task_hash, patch_hash=sha256_file(diff_path))
             if validator.get("decision") == "reject":
                 _refresh_provider_learning(blackboard, run_id)
-                blackboard.set_run_status(run_id, RunStatus.BLOCKED)
+                _transition_run(blackboard, run_id, RunStatus.BLOCKED)
                 blackboard.add_error(run_id, None, "blind_validator_reject", "blind validator rejected the patch")
                 _record_evidence_run(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
                 trace.write("run_blocked", reason="blind validator rejected the patch", validator_hash=validator.get("validator_hash"))
@@ -1048,7 +1374,7 @@ class SupervisorRuntime:
                         extra={"patch_hash": sha256_file(diff_path), "validator_hash": validator.get("validator_hash"), "semantic_review_hash": semantic.get("review_hash")},
                     ),
                 ):
-                blackboard.set_run_status(run_id, _approval_wait_status(ci_block_on_approval))
+                _transition_run(blackboard, run_id, _approval_wait_status(ci_block_on_approval))
                 return RunResult(run_id, _approval_wait_status(ci_block_on_approval), run_dir, None)
             _apply_approved_worktree_changes(
                 blackboard,
@@ -1058,6 +1384,7 @@ class SupervisorRuntime:
                 workspace=self.workspace,
                 worktree=worktree,
             )
+            self._check_execution()
             return _finalize_workflow_success(
                 blackboard,
                 trace,
@@ -1069,8 +1396,11 @@ class SupervisorRuntime:
                 automation=automation,
                 diff_path=diff_path,
             )
+        except (TaskCancelled, LeaseLost, ReconciliationRequired):
+            trace.write("execution_stopped", reason="cancelled_or_lease_lost")
+            raise
         except Exception as exc:
-            blackboard.set_run_status(run_id, RunStatus.BLOCKED)
+            _transition_run(blackboard, run_id, RunStatus.BLOCKED)
             blackboard.add_error(run_id, None, "exception", str(exc))
             trace.write("error", error=redact(str(exc)))
             raise
@@ -1103,6 +1433,7 @@ class SupervisorRuntime:
         workflow_hash = sha256_file(run_dir / "workflow.yaml") if (run_dir / "workflow.yaml").exists() else sha256_text(workflow.model_dump_json())
         policy_hash = _policy_hash(policy)
         for batch in execution_batches(workflow):
+            self._check_execution()
             runnable = [by_id[stage_id] for stage_id in batch if stage_id not in completed]
             if not runnable:
                 continue
@@ -1119,11 +1450,11 @@ class SupervisorRuntime:
                     if any(row.get("severity") == "high" for row in conflicts):
                         _refresh_provider_learning(blackboard, run_id)
                         blackboard.add_error(run_id, None, "parallel_conflict", "parallel-squad write conflict requires serialized handoff")
-                        blackboard.set_run_status(run_id, RunStatus.BLOCKED)
+                        _transition_run(blackboard, run_id, RunStatus.BLOCKED)
                         return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
             for stage in runnable:
                 blackboard.add_checkpoint(run_id, stage.id, "stage_started")
-                blackboard.upsert_stage(run_id, stage.id, role=stage.role, status=StageStatus.RUNNING)
+                LifecycleService(blackboard).transition_stage(run_id, stage.id, role=stage.role, status=StageStatus.RUNNING)
                 trace.write("stage_started", stage=stage.id, role=stage.role, type=stage.type)
                 stage_provider = _stage_provider_for(
                     blackboard,
@@ -1152,14 +1483,16 @@ class SupervisorRuntime:
                 budget = policy.evaluate_budget(blackboard.usage_total_cost(run_id), 0.01)
                 trace.write("budget_check", stage=stage.id, decision=str(budget.decision), reason=budget.reason)
                 if budget.decision == PolicyDecision.DENY:
-                    blackboard.set_run_status(run_id, RunStatus.PAUSED_BUDGET)
+                    _transition_run(blackboard, run_id, RunStatus.PAUSED_BUDGET)
                     return RunResult(run_id, RunStatus.PAUSED_BUDGET, run_dir, None)
 
             futures = {}
             with ThreadPoolExecutor(max_workers=min(workflow.max_parallel, len(runnable))) as executor:
                 for stage in runnable:
                     stage_provider = stage_providers[stage.id]
-                    provider_impl = provider_impls.setdefault(stage_provider, get_runtime_provider(stage_provider))
+                    if stage_provider not in provider_impls:
+                        provider_impls[stage_provider] = self._runtime_provider(stage_provider)
+                    provider_impl = provider_impls[stage_provider]
                     stage_skills = _skills_for_stage(skills, role=stage.role, stage_id=stage.id)
                     if stage_skills:
                         trace.write("skills_activated", stage=stage.id, role=stage.role, skills=[skill.get("name") for skill in stage_skills])
@@ -1181,7 +1514,19 @@ class SupervisorRuntime:
                         loop_state={},
                     )
                     attempt = _next_provider_attempt(blackboard, run_id, stage.id, stage_provider)
-                    blackboard.start_provider_attempt(run_id, stage.id, provider=stage_provider, role=stage.role, attempt=attempt)
+                    certification = getattr(provider_impl, "certification_report", None)
+                    blackboard.start_provider_attempt(
+                        run_id,
+                        stage.id,
+                        provider=stage_provider,
+                        role=stage.role,
+                        attempt=attempt,
+                        certification_id=getattr(certification, "certification_id", None),
+                        adapter_version=getattr(provider_impl, "adapter_version", None),
+                        trust_tier=str(getattr(provider_impl, "trust_tier", "opaque")),
+                        isolation_mode=str(getattr(provider_impl, "isolation_mode", "process")),
+                        waiver_approval_id=getattr(provider_impl, "waiver_approval_id", None),
+                    )
                     trace.write("provider_attempt_started", stage=stage.id, provider=stage_provider, attempt=attempt)
                     future = executor.submit(
                         _run_provider_stage,
@@ -1195,14 +1540,15 @@ class SupervisorRuntime:
                         worktree=worktree,
                         skills=stage_skills,
                         session_dir=run_dir / "provider_sessions",
+                        run_id=run_id,
+                        attempt=attempt,
                     )
                     futures[future] = (stage, stage_provider, attempt)
                 for future in as_completed(futures):
                     stage, stage_provider, attempt = futures[future]
                     output = future.result()
                     artifact_path = run_dir / output.artifact_name
-                    artifact_path.parent.mkdir(parents=True, exist_ok=True)
-                    artifact_path.write_text(redact(output.content), encoding="utf-8")
+                    _atomic_write_text(artifact_path, redact(output.content))
                     blackboard.add_usage(run_id, stage_provider, output.tokens, output.cost_usd)
                     blackboard.add_artifact(run_id, stage.id, output.artifact_name, artifact_path, "stage_output")
                     trace.write(
@@ -1222,6 +1568,7 @@ class SupervisorRuntime:
                         returncode=output.returncode,
                         summary=output.summary,
                         artifact_path=str(artifact_path),
+                        harness_events=output.harness_events,
                     )
                     design_feedback = _design_feedback_request_from_output(stage, output)
                     if design_feedback:
@@ -1246,8 +1593,8 @@ class SupervisorRuntime:
                             summary=output.summary,
                             artifact_path=str(artifact_path),
                         )
-                        blackboard.set_run_status(run_id, RunStatus.AWAITING_FEEDBACK)
-                        blackboard.upsert_stage(
+                        _transition_run(blackboard, run_id, RunStatus.AWAITING_FEEDBACK)
+                        LifecycleService(blackboard).transition_stage(
                             run_id,
                             stage.id,
                             role=stage.role,
@@ -1294,8 +1641,8 @@ class SupervisorRuntime:
                             artifact_path=str(artifact_path),
                             capsule_path=str(capsule_path),
                         )
-                        blackboard.set_run_status(run_id, RunStatus.AWAITING_PROVIDER_ACTION)
-                        blackboard.upsert_stage(
+                        _transition_run(blackboard, run_id, RunStatus.AWAITING_PROVIDER_ACTION)
+                        LifecycleService(blackboard).transition_stage(
                             run_id,
                             stage.id,
                             role=stage.role,
@@ -1347,7 +1694,7 @@ class SupervisorRuntime:
                             worktree=worktree,
                             snapshot_ref=None,
                         )
-                        blackboard.upsert_stage(
+                        LifecycleService(blackboard).transition_stage(
                             run_id,
                             stage.id,
                             role=stage.role,
@@ -1356,7 +1703,7 @@ class SupervisorRuntime:
                             summary=output.summary,
                         )
                         blackboard.add_error(run_id, stage.id, _provider_failure_kind(output) or "provider_exit", output.summary)
-                        blackboard.set_run_status(run_id, RunStatus.BLOCKED)
+                        _transition_run(blackboard, run_id, RunStatus.BLOCKED)
                         trace.write("stage_failed", stage=stage.id, returncode=output.returncode)
                         _refresh_provider_learning(blackboard, run_id)
                         return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
@@ -1403,9 +1750,9 @@ class SupervisorRuntime:
                             worktree=worktree,
                             snapshot_ref=str(snapshot.get("path") or ""),
                         )
-                        blackboard.upsert_stage(run_id, stage.id, role=stage.role, status=StageStatus.FAILED, output_path=str(artifact_path), summary=summary)
+                        LifecycleService(blackboard).transition_stage(run_id, stage.id, role=stage.role, status=StageStatus.FAILED, output_path=str(artifact_path), summary=summary)
                         blackboard.add_error(run_id, stage.id, "read_only_write_violation", summary)
-                        blackboard.set_run_status(run_id, RunStatus.BLOCKED)
+                        _transition_run(blackboard, run_id, RunStatus.BLOCKED)
                         trace.write("stage_failed", stage=stage.id, reason="read_only_write_violation")
                         _refresh_provider_learning(blackboard, run_id)
                         return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
@@ -1423,7 +1770,7 @@ class SupervisorRuntime:
                         worktree=worktree,
                         snapshot_ref=None,
                     )
-                    blackboard.upsert_stage(
+                    LifecycleService(blackboard).transition_stage(
                         run_id,
                         stage.id,
                         role=stage.role,
@@ -1440,7 +1787,7 @@ class SupervisorRuntime:
         semantic = _record_semantic_merge_review(blackboard, run_dir=run_dir, run_id=run_id, task=task, patch_text=diff_path.read_text(encoding="utf-8", errors="replace"))
         if semantic.get("decision") == "reject":
             _refresh_provider_learning(blackboard, run_id)
-            blackboard.set_run_status(run_id, RunStatus.BLOCKED)
+            _transition_run(blackboard, run_id, RunStatus.BLOCKED)
             blackboard.add_error(run_id, None, "semantic_merge_reject", "semantic merge reviewer rejected the patch")
             _record_evidence_run(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
             trace.write("run_blocked", reason="semantic merge reviewer rejected the patch", semantic_review_hash=semantic.get("review_hash"))
@@ -1448,7 +1795,7 @@ class SupervisorRuntime:
         validator = _record_blind_validator(blackboard, run_dir=run_dir, run_id=run_id, task_hash=task_hash, patch_hash=sha256_file(diff_path))
         if validator.get("decision") == "reject":
             _refresh_provider_learning(blackboard, run_id)
-            blackboard.set_run_status(run_id, RunStatus.BLOCKED)
+            _transition_run(blackboard, run_id, RunStatus.BLOCKED)
             blackboard.add_error(run_id, None, "blind_validator_reject", "blind validator rejected the patch")
             _record_evidence_run(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
             trace.write("run_blocked", reason="blind validator rejected the patch", validator_hash=validator.get("validator_hash"))
@@ -1470,7 +1817,7 @@ class SupervisorRuntime:
                 extra={"patch_hash": sha256_file(diff_path), "validator_hash": validator.get("validator_hash"), "semantic_review_hash": semantic.get("review_hash")},
             ),
         ):
-            blackboard.set_run_status(run_id, _approval_wait_status(ci_block_on_approval))
+            _transition_run(blackboard, run_id, _approval_wait_status(ci_block_on_approval))
             return RunResult(run_id, _approval_wait_status(ci_block_on_approval), run_dir, None)
         _apply_approved_worktree_changes(
             blackboard,
@@ -1564,11 +1911,11 @@ class SupervisorRuntime:
             return False
         if not stale_subject and not existing and decision.decision == PolicyDecision.DENY:
             raise PermissionError(f"approval denied by policy: {approval_type}")
-        approval_id = blackboard.create_approval(run_id, stage_id, approval_type, reason, subject=subject)
+        approval_id = LifecycleService(blackboard).request_approval(run_id, stage_id, approval_type, reason, subject=subject)
         trace.write("approval_requested", stage=stage_id, approval_id=approval_id, approval_type=approval_type, subject_hash=subject_hash)
         if stale_subject or decision.decision == PolicyDecision.APPROVE:
             return True
-        blackboard.decide_approval(approval_id, ApprovalStatus.APPROVED)
+        LifecycleService(blackboard).decide_approval(approval_id, ApprovalStatus.APPROVED)
         trace.write("approval_decided", stage=stage_id, approval_id=approval_id, status="approved", subject_hash=subject_hash)
         return False
 
@@ -1990,7 +2337,21 @@ def _finalize_workflow_success(
     automation: dict[str, object],
     diff_path: Path,
 ) -> RunResult:
-    blackboard.set_run_status(run_id, RunStatus.COMPLETED)
+    incomplete_reviews = incomplete_current_reviews(blackboard, run_id)
+    if incomplete_reviews:
+        blackboard.add_error(
+            run_id,
+            None,
+            "heterogeneous_review_incomplete",
+            "required heterogeneous review did not reach a verified terminal decision",
+        )
+        _transition_run(blackboard, run_id, RunStatus.BLOCKED)
+        trace.write(
+            "run_blocked",
+            reason="required heterogeneous review incomplete",
+            reviews=[str(item.get("review_id") or "") for item in incomplete_reviews],
+        )
+        return RunResult(run_id, RunStatus.BLOCKED, run_dir, None)
     try:
         status = publish_workflow_deliverables(
             blackboard,
@@ -2019,10 +2380,75 @@ def _finalize_workflow_success(
     final_missing = [str(item) for item in final_status.get("missing", [])]
     if final_missing:
         return _block_missing_deliverables(blackboard, trace, run_dir=run_dir, run_id=run_id, missing=final_missing)
-    _refresh_provider_learning(blackboard, run_id)
     _record_ledger(blackboard, run_dir, run_id, "run_completed", payload={"report": str(report_path), "patch_hash": sha256_file(diff_path)})
-    trace.write("run_completed", report=str(report_path))
+    try:
+        attestation = DeliveryAttestationService(
+            blackboard, run_dir=run_dir, workspace=workspace
+        ).finalize(
+            run_id=run_id,
+            task=task,
+            workflow=workflow,
+            diff_path=diff_path,
+            report_path=report_path,
+        )
+    except AttestationRequiredError as exc:
+        trace.write("run_blocked", reason="attestation required", error=redact(str(exc)))
+        return RunResult(run_id, RunStatus.BLOCKED, run_dir, report_path)
+    _record_verified_routing_outcome(blackboard, run_id)
+    if str(attestation.get("status") or "") == "signed":
+        _refresh_provider_learning(blackboard, run_id)
+    # The privacy-minimal signed report remains immutable. The local report can
+    # still be regenerated to expose the committed terminal projection.
+    report_path = generate_final_report(run_dir, run_id, blackboard)
+    trace.write(
+        "run_completed",
+        report=str(report_path),
+        attestation_id=attestation.get("attestation_id"),
+        signature_status=attestation.get("status"),
+    )
     return RunResult(run_id, RunStatus.COMPLETED, run_dir, report_path)
+
+
+def _record_verified_routing_outcome(blackboard: Blackboard, run_id: str) -> None:
+    decision = blackboard.latest_route_decision(run_id, kind="main")
+    features = blackboard.latest_task_feature_set(run_id)
+    if not decision or not features:
+        return
+    evaluations = blackboard.table_rows("evidence_evaluations", run_id=run_id)
+    evaluation = evaluations[-1] if evaluations else {}
+    missing = evaluation.get("missing_evidence")
+    if not isinstance(missing, list):
+        missing = []
+    confidence = float(evaluation.get("confidence") or 0.0)
+    evidence_complete = not missing and confidence >= 0.8
+    if not evidence_complete:
+        return
+    tests = blackboard.table_rows("test_results", run_id=run_id)
+    blockers = blackboard.table_rows("review_blockers", run_id=run_id)
+    high_blockers = [row for row in blockers if str(row.get("severity") or "").lower() in {"high", "critical"}]
+    tests_passed = bool(tests) and all(bool(row.get("passed")) for row in tests)
+    verified_success = tests_passed and not high_blockers
+    quality_score = max(0.0, min(1.0, confidence * (1.0 if verified_success else 0.5)))
+    source = "simulation" if str(features.get("delivery_mode")) == "simulation" else "production"
+    attestation = blackboard.latest_delivery_attestation(run_id)
+    if source == "production" and (
+        not attestation
+        or str(attestation.get("status") or "") != "signed"
+        or not bool(attestation.get("evidence_valid"))
+    ):
+        return
+    blackboard.record_routing_outcome(
+        run_id=run_id,
+        decision_id=str(decision.get("decision_id") or "") or None,
+        provider=str(decision.get("selected_main_provider") or "unknown"),
+        task_type=str(features.get("task_type") or "unknown"),
+        verified_success=verified_success,
+        quality_score=quality_score,
+        evidence_complete=True,
+        safety_violation=bool(high_blockers),
+        cost_usd=blackboard.usage_total_cost(run_id),
+        source=source,
+    )
 
 
 def _repair_completed_run_deliverables(
@@ -2061,8 +2487,27 @@ def _repair_completed_run_deliverables(
     missing = [str(item) for item in status.get("missing", [])]
     if missing:
         return _block_missing_deliverables(blackboard, trace, run_dir=run_dir, run_id=run_id, missing=missing)
-    blackboard.set_run_status(run_id, RunStatus.COMPLETED)
-    trace.write("completed_run_deliverables_repaired", report=str(report_path))
+    _record_evidence_run(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
+    try:
+        attestation = DeliveryAttestationService(
+            blackboard, run_dir=run_dir, workspace=workspace
+        ).finalize(
+            run_id=run_id,
+            task=task,
+            workflow=workflow,
+            diff_path=run_dir / "diff.patch",
+            report_path=report_path,
+            repair=True,
+        )
+    except AttestationRequiredError as exc:
+        trace.write("completed_run_repair_blocked", reason="attestation required", error=redact(str(exc)))
+        return RunResult(run_id, RunStatus.BLOCKED, run_dir, report_path)
+    report_path = generate_final_report(run_dir, run_id, blackboard)
+    trace.write(
+        "completed_run_deliverables_repaired",
+        report=str(report_path),
+        attestation_id=attestation.get("attestation_id"),
+    )
     return RunResult(run_id, RunStatus.COMPLETED, run_dir, report_path)
 
 
@@ -2109,7 +2554,7 @@ def _block_missing_deliverables(
     missing: list[str],
 ) -> RunResult:
     message = "missing required deliverables: " + ", ".join(missing)
-    blackboard.set_run_status(run_id, RunStatus.BLOCKED)
+    _transition_run(blackboard, run_id, RunStatus.BLOCKED)
     blackboard.add_error(run_id, None, "missing_deliverable", message)
     trace.write("run_blocked", reason="missing_deliverable", missing=missing)
     _record_evidence_run(blackboard, run_dir=run_dir, run_id=run_id, trace=trace)
@@ -2215,19 +2660,17 @@ def _stage_provider_for(
     fallback: str,
     role_providers: dict[str, str],
 ) -> str:
-    planner = ProviderPlanner(
-        role_providers=role_providers,
-        recommender=lambda selected_role, selected_fallback: recommend_provider(
-            blackboard,
-            role=selected_role,
-            fallback=selected_fallback,
-        ),
+    del blackboard  # routing history is task-level and immutable in v0.2
+    explicit = role_providers.get(role or "")
+    selected = explicit or fallback
+    trace.write(
+        "provider_route_decision",
+        stage=stage_id,
+        role=role,
+        provider=selected,
+        reason="explicit reviewer override" if explicit else "task-level RouteDecision",
     )
-    route = planner.select(role=role, fallback=fallback)
-    payload = route.trace_payload()
-    payload.pop("role", None)
-    trace.write("provider_route_decision", stage=stage_id, role=role, **payload)
-    return route.provider
+    return selected
 
 
 def _record_session_capsule(
@@ -2314,7 +2757,7 @@ def _record_provider_actions(
             )
         )
         action_ids.append(
-            blackboard.create_provider_action(
+            LifecycleService(blackboard).request_provider_action(
                 run_id=run_id,
                 stage_id=stage_id,
                 provider=provider,
@@ -2642,6 +3085,43 @@ def _load_workflow_for_run(workflow_name: str, run_dir: Path):
         if archived.is_file():
             return load_workflow(str(archived))
         raise exc
+
+
+def _transition_run(
+    blackboard: Blackboard,
+    run_id: str,
+    status: RunStatus | str,
+    *,
+    idempotency_key: str | None = None,
+) -> object:
+    current = blackboard.get_run(run_id)
+    if str(current.get("status") or "") == str(status):
+        return None
+    recovery_reason = None
+    if str(current.get("status") or "") in {str(RunStatus.BLOCKED), str(RunStatus.COMPLETED)}:
+        if str(status) not in {str(current.get("status") or ""), str(RunStatus.ABORTED)}:
+            recovery_reason = "runtime resume"
+    return LifecycleService(blackboard).transition_run(
+        run_id,
+        status,
+        recovery_reason=recovery_reason,
+        idempotency_key=idempotency_key,
+    )
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Publish a complete stage file without exposing partial contents."""
+    target = Path(path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.muxdev-tmp-{uuid4().hex}")
+    try:
+        with temporary.open("x", encoding="utf-8", newline="") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _approval_wait_status(ci_block_on_approval: bool) -> RunStatus:

@@ -22,6 +22,7 @@ def generate_final_report(run_dir: Path, run_id: str, blackboard: Blackboard) ->
     validators = blackboard.table_rows("validator_panels", run_id=run_id)
     manifests = blackboard.table_rows("evidence_manifests", run_id=run_id)
     evaluations = blackboard.table_rows("evidence_evaluations", run_id=run_id)
+    attestation = blackboard.latest_delivery_attestation(run_id)
     deliverable_status = workflow_deliverable_status(
         blackboard,
         run_dir=run_dir,
@@ -107,6 +108,21 @@ def generate_final_report(run_dir: Path, run_id: str, blackboard: Blackboard) ->
             lines.append(f"- validator {validator['validator_id']}: {validator['decision']} {validator['validator_hash']}")
     else:
         lines.append("- validators: none")
+    lines.extend(["", "## Delivery Attestation"])
+    if attestation:
+        lines.extend(
+            [
+                f"- ID: {attestation.get('attestation_id')}",
+                f"- Generation: {attestation.get('generation')}",
+                f"- Signature status: {attestation.get('status')}",
+                f"- Identity: {attestation.get('identity_status')}",
+                f"- Public key fingerprint: {attestation.get('public_key_fingerprint') or '-'}",
+            ]
+        )
+        if attestation.get("status") != "signed":
+            lines.append("- WARNING: unsigned completion is not trusted production evidence")
+    else:
+        lines.append("- legacy_unsigned/history_incomplete")
     path = run_dir / "final_report.md"
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     blackboard.add_artifact(run_id, None, "final_report.md", path, "report")

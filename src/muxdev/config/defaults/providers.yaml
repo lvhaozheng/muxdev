@@ -41,7 +41,7 @@ providers:
     probe: generic
     runtime:
       kind: headless_cli
-      command: [qwen, --bare, --approval-mode, auto, --output-format, stream-json, -p]
+      command: [qwen, --bare, --sandbox, --approval-mode, auto, --output-format, stream-json, --max-tool-calls, "40", -p]
       prompt_template: "You are running muxdev stage '{stage_id}'. Keep output concise. If you modify files, stay inside the current workspace. Task: {task}"
   kimi:
     mode: local CLI

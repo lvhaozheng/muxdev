@@ -11,6 +11,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
+import pytest
 
 from muxdev.api.web import create_app
 from muxdev.cli import app
@@ -22,6 +23,7 @@ from muxdev.services.design import DESIGN_PACK_FILES
 from muxdev.storage import MemoryStore
 
 
+pytestmark = pytest.mark.integration
 runner = CliRunner()
 
 
@@ -87,17 +89,19 @@ def test_daemon_api_task_lifecycle_and_websocket() -> None:
     assert "muxdev Shareable Run Review" in review_page
     assert "Sensitive transcript hidden" in review_page
     assert "daemon api smoke" in review_page
-    assert "<title>muxdev 控制台</title>" in page
-    assert "命令面板" in page
+    assert "<title>muxdev Dashboard</title>" in page
+    assert "muxdev 可信任务控制台" in page
+    assert "命令面板" not in page
     assert "Command Palette" not in page
     assert "<title>muxdev Dashboard</title>" in english_page
-    assert "Command Palette" in english_page
+    assert "Command Palette" not in english_page
+    assert "Why this agent" in english_page
     assert f'data-task-id="{task_id}"' in task_english_page
     assert "Copy tmux command" not in english_page
     assert "design-memory" not in english_page
     assert "design-v2" not in task_english_page
     assert "dev-light" not in task_english_page
-    assert "data-clamp" in task_english_page
+    assert "task_story_invalidated" in task_english_page
     assert hello["type"] == "hello"
 
 
@@ -141,32 +145,21 @@ def test_live_dashboard_renders_minimal_sections_and_i18n() -> None:
 
     assert 'lang="zh-CN"' in html
     assert 'data-task-id="run_demo"' in html
-    assert 'data-view-button="overview"' in html
-    assert 'data-view-button="projects"' in html
-    assert 'data-view-button="config"' in html
-    assert "/dashboard/overview" in html
-    assert "terminal?agent=" in html
-    assert "feedback-and-continue" in html
-    assert "submitPlanFeedback" in html
-    assert "submitProviderResponse" in html
-    assert "optionalTaskActions" in html
-    assert "delivery_repair" in html
-    assert 'data-feedback-optional="true"' in html
-    assert "auto_submit:!optional" in html
+    assert "/dashboard/tasks?limit=100" in html
+    assert "/story" in html
+    assert "task_story_invalidated" in html
+    assert "trusted-delivery-v1" in html
     assert "data-draft-key" in html
-    assert "refresh_deferred" in html
-    assert "setInterval(()=>refresh(),30000)" in html
-    assert "provider-actions" in html
+    assert "setInterval(()=>loadTasks().catch(()=>{}),15000)" in html
     assert "Validation Experiments" not in html
     assert "Product Experience" not in html
     assert "Command Palette" not in html
     assert "<title>muxdev Dashboard</title>" in english
     assert 'lang="en"' in english
-    assert "Ready CLI Tools" in english
-    assert "Needs My Action" in english
-    assert "Workflow Templates" in english
-    assert "Delivery Repair" in english
-    assert "Model Role / CLI Routing" in english
+    assert "Why this agent" in english
+    assert "Execution and recovery timeline" in english
+    assert "Certification, isolation and delivery trust" in english
+    assert "Advanced diagnostics" in english
     assert "data-fold" in english
 
 
@@ -407,7 +400,7 @@ def test_dashboard_overview_keeps_unmarked_nested_workspace_as_project(monkeypat
     try:
         import muxdev.core.projects as projects_module
 
-        monkeypatch.setattr(projects_module, "_has_project_marker", lambda path: False)
+        monkeypatch.setattr(projects_module, "_has_project_marker", lambda path, **_kwargs: False)
         nested = workspace / "plain" / "docs" / "design"
         nested.mkdir(parents=True)
         manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())

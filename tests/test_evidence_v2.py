@@ -9,6 +9,7 @@ from pathlib import Path
 
 from rich.console import Console
 from typer.testing import CliRunner
+import pytest
 
 from muxdev.cli import app
 from muxdev.models import RunStatus
@@ -18,6 +19,9 @@ from muxdev.services.dashboard_run import build_run_dashboard_payload
 from muxdev.services.evidence import verify_run_evidence
 from muxdev.storage import Blackboard
 from muxdev.ui.tui import status_panel
+
+
+pytestmark = pytest.mark.integration
 
 
 runner = CliRunner()

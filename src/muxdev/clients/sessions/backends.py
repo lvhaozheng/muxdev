@@ -11,12 +11,14 @@ import json
 import locale
 import os
 import queue
+import signal
 import subprocess
 import shutil
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 from time import time
+from typing import Any
 
 from ...core.platforms import hidden_subprocess_kwargs, is_windows, shell_join
 from ..stream import StreamAdapter, StreamEvent
@@ -48,9 +50,16 @@ class HeadlessSubprocessBackend:
         chunks_path: Path | None = None,
         input_text: str | None = None,
         env: dict[str, str] | None = None,
+        cancellation_token: Any | None = None,
+        cancel_grace_seconds: float = 10.0,
     ) -> SessionResult:
         """Execute a command, parse stream events, and enforce an idle timeout."""
         try:
+            if cancellation_token is not None:
+                cancellation_token.raise_if_stopped()
+            popen_kwargs = hidden_subprocess_kwargs(new_process_group=True)
+            if not is_windows():
+                popen_kwargs["start_new_session"] = True
             process = subprocess.Popen(
                 command,
                 cwd=cwd,
@@ -58,7 +67,7 @@ class HeadlessSubprocessBackend:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 env=_provider_subprocess_env(env),
-                **hidden_subprocess_kwargs(),
+                **popen_kwargs,
             )
             events: list[StreamEvent] = []
             stdout_parts: list[str] = []
@@ -88,6 +97,14 @@ class HeadlessSubprocessBackend:
             input_writer.start()
             try:
                 while True:
+                    if cancellation_token is not None and (
+                        cancellation_token.cancelled or cancellation_token.lease_lost
+                    ):
+                        cooperative, forced = _cancel_process_tree(process, grace_seconds=cancel_grace_seconds)
+                        recorder = getattr(cancellation_token, "record_process_cancellation", None)
+                        if callable(recorder):
+                            recorder(cooperative=cooperative, forced=forced)
+                        cancellation_token.raise_if_stopped()
                     if process.poll() is not None and lines.empty() and not reader.is_alive():
                         break
                     try:
@@ -238,6 +255,10 @@ class DockerBackend:
         timeout: float = 30,
         transcript_path: Path | None = None,
         chunks_path: Path | None = None,
+        network_enabled: bool = False,
+        memory_limit: str = "1g",
+        cpu_limit: str = "1.0",
+        pids_limit: int = 128,
     ) -> SessionResult:
         if not self.docker:
             return SessionResult(127, "", "docker command not found", [])
@@ -245,6 +266,20 @@ class DockerBackend:
             self.docker,
             "run",
             "--rm",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,noexec,nosuid,size=64m",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--pids-limit",
+            str(max(16, int(pids_limit))),
+            "--memory",
+            memory_limit,
+            "--cpus",
+            cpu_limit,
+            *([] if network_enabled else ["--network", "none"]),
             "-v",
             f"{cwd}:/workspace",
             "-w",
@@ -278,7 +313,26 @@ def _terminate_process_tree(process: subprocess.Popen[object]) -> None:
             **hidden_subprocess_kwargs(),
         )
         return
-    process.kill()
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        process.kill()
+
+
+def _cancel_process_tree(process: subprocess.Popen[object], *, grace_seconds: float) -> tuple[bool, bool]:
+    """Request cooperative exit, then terminate the exact controlled process tree."""
+    if process.poll() is not None:
+        return True, False
+    try:
+        if is_windows():
+            process.send_signal(getattr(signal, "CTRL_BREAK_EVENT", signal.SIGTERM))
+        else:
+            os.killpg(process.pid, signal.SIGINT)
+        process.wait(timeout=max(0.0, float(grace_seconds)))
+        return True, False
+    except (OSError, subprocess.TimeoutExpired):
+        _terminate_process_tree(process)
+        return False, True
 
 
 def _decode_process_output(data: bytes | str) -> str:
@@ -302,9 +356,45 @@ def _decode_process_output(data: bytes | str) -> str:
 
 
 def _provider_subprocess_env(overrides: dict[str, str] | None = None) -> dict[str, str]:
-    """Keep provider-spawned shells from creating noisy transient Python files."""
-    env = os.environ.copy()
-    env.update(overrides or {})
+    """Build an explicit Provider environment instead of copying daemon secrets."""
+    inherited = {
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "TEMP",
+        "TMP",
+        "HOME",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "ALL_PROXY",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONIOENCODING",
+        "PYTHONUTF8",
+        "PYTEST_ADDOPTS",
+        "PYTHONWARNINGS",
+    }
+    explicit = {
+        "CODEX_HOME",
+        "QWEN_RUNTIME_DIR",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONIOENCODING",
+        "PYTHONUTF8",
+        "PYTEST_ADDOPTS",
+        "PYTHONWARNINGS",
+    }
+    env = {key: value for key, value in os.environ.items() if key.upper() in inherited}
+    env.update({key: value for key, value in (overrides or {}).items() if key.upper() in explicit})
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("PYTHONUTF8", "1")

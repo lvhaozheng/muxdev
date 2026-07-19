@@ -9,6 +9,7 @@ import httpx
 import click
 
 from ..daemon.paths import DEFAULT_API_PORT, DEFAULT_HOST
+from ..daemon.paths import default_daemon_paths
 
 
 class DaemonConnectionError(click.ClickException):
@@ -58,6 +59,108 @@ class DaemonClient:
 
     def stop_task(self, task_id: str) -> dict[str, Any]:
         return self._request("POST", f"/api/tasks/{task_id}/stop")
+
+    def cancel_task(self, task_id: str, *, reason: str = "", wait: bool = False, timeout: float = 30.0) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/tasks/{task_id}/cancel",
+            json={"reason": reason, "wait": wait, "timeout": timeout},
+        )
+
+    def task_executions(self, task_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/tasks/{task_id}/executions")
+
+    def reconcile_task(
+        self,
+        task_id: str,
+        *,
+        decision: str,
+        reason: str,
+        acknowledge_duplicate_risk: bool = False,
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/tasks/{task_id}/reconcile",
+            json={
+                "decision": decision,
+                "reason": reason,
+                "acknowledge_duplicate_risk": acknowledge_duplicate_risk,
+            },
+        )
+
+    def runtime_status(self) -> dict[str, Any]:
+        return self._request("GET", "/api/runtime/status")
+
+    def provider_certifications(self, provider: str | None = None) -> Any:
+        path = f"/api/providers/{provider}/certification" if provider else "/api/providers/certifications"
+        return self._request("GET", path)
+
+    def task_harness_events(self, task_id: str, *, stage: str | None = None) -> dict[str, Any]:
+        suffix = f"?stage={stage}" if stage else ""
+        return self._request("GET", f"/api/tasks/{task_id}/harness-events{suffix}")
+
+    def task_isolation(self, task_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/tasks/{task_id}/isolation")
+
+    def task_route(self, task_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/tasks/{task_id}/route")
+
+    def task_review(self, task_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/tasks/{task_id}/review")
+
+    def routing_replay(self, task_id: str, *, benchmark_snapshot_id: str | None = None) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/api/routing/replays",
+            json={"run_id": task_id, "benchmark_snapshot_id": benchmark_snapshot_id},
+        )
+
+    def routing_snapshots(self) -> list[dict[str, Any]]:
+        return self._request("GET", "/api/routing/snapshots")
+
+    def routing_benchmark(
+        self,
+        suite_id: str,
+        *,
+        live: bool = False,
+        acknowledged: bool = False,
+        max_cost_usd: float | None = None,
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/api/routing/benchmarks",
+            json={
+                "suite_id": suite_id,
+                "live": live,
+                "acknowledged": acknowledged,
+                "max_cost_usd": max_cost_usd,
+            },
+        )
+
+    def dashboard_tasks(self, *, cursor: str | None = None, limit: int = 50) -> dict[str, Any]:
+        query = f"?limit={max(1, min(int(limit), 100))}"
+        if cursor:
+            query += f"&cursor={cursor}"
+        return self._request("GET", f"/api/dashboard/tasks{query}")
+
+    def task_story(self, task_id: str, *, cursor: str | None = None) -> dict[str, Any]:
+        suffix = f"?cursor={cursor}" if cursor else ""
+        return self._request("GET", f"/api/tasks/{task_id}/story{suffix}")
+
+    def benchmark_replay(self, suite_id: str = "trusted-routing-v1") -> dict[str, Any]:
+        return self._request("POST", "/api/benchmarks/replays", json={"suite_id": suite_id})
+
+    def benchmark_executions(self) -> list[dict[str, Any]]:
+        return self._request("GET", "/api/benchmarks/executions")
+
+    def benchmark_execution(self, execution_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/benchmarks/executions/{execution_id}")
+
+    def benchmark_report(self, execution_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/benchmarks/executions/{execution_id}/report")
+
+    def benchmark_cancel(self, execution_id: str) -> dict[str, Any]:
+        return self._request("POST", f"/api/benchmarks/executions/{execution_id}/cancel", json={})
 
     def approvals(self, *, status: str | None = None) -> list[dict[str, Any]]:
         path = "/api/approvals" + (f"?status={status}" if status else "")
@@ -161,7 +264,14 @@ class DaemonClient:
             # Some developer environments use proxy placeholders that return
             # 502 for localhost, which made the TUI look broken even when the
             # daemon URL was otherwise correct.
-            with httpx.Client(base_url=self.base_url, timeout=self.timeout, trust_env=False) as client:
+            headers = dict(kwargs.pop("headers", {}) or {})
+            try:
+                from ..services.local_auth import LocalApiAuth
+
+                headers.update(LocalApiAuth(default_daemon_paths().data_dir).authorization_headers())
+            except (OSError, RuntimeError):
+                pass
+            with httpx.Client(base_url=self.base_url, timeout=self.timeout, trust_env=False, headers=headers) as client:
                 response = client.request(method, path, **kwargs)
                 response.raise_for_status()
                 return response.json()

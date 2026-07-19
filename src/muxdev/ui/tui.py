@@ -208,8 +208,7 @@ def daemon_tasks_text(rows: list[dict[str, Any]]) -> str:
     lines = ["Recent tasks:"]
     for row in rows[:12]:
         reason = _task_error_reason(row)
-        lines.append(
-            "  {task_id:<20} {status:<18} stage={stage:<10} time={elapsed:<7} approvals={approvals:<2} actions={actions:<2} feedback={feedback:<2} tokens={tokens:<6} {task}".format(
+        line = "  {task_id:<20} {status:<18} stage={stage:<10} time={elapsed:<7} approvals={approvals:<2} actions={actions:<2} feedback={feedback:<2} tokens={tokens:<6} {task}".format(
                 task_id=_clip(row.get("task_id") or row.get("run_id") or "-", 20),
                 status=_clip(row.get("status") or "-", 18),
                 stage=_clip(row.get("current_stage") or "-", 10),
@@ -220,7 +219,7 @@ def daemon_tasks_text(rows: list[dict[str, Any]]) -> str:
                 tokens=row.get("tokens", 0),
                 task=_clip(row.get("task") or "", 28),
             )
-        )
+        lines.append(_clip(line, 149))
         if row.get("current_activity"):
             lines.append(f"    activity: {_clip(row.get('current_activity'), 100)}")
         if reason:

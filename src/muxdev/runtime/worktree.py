@@ -14,6 +14,7 @@ from pathlib import Path
 
 from ..config.loader import path_config
 from ..core.platforms import hidden_subprocess_kwargs
+from ..domain import ReconciliationRequired
 
 
 @dataclass(frozen=True)
@@ -29,14 +30,18 @@ class WorktreeManager:
     """Create an isolated filesystem workspace for one run."""
 
     def __init__(self, workspace: Path, worktrees_root: Path | None = None):
-        self.workspace = workspace
-        self.worktrees_root = worktrees_root
+        self.workspace = Path(workspace).expanduser().resolve()
+        self.worktrees_root = Path(worktrees_root).expanduser().resolve() if worktrees_root is not None else None
 
     def prepare(self, run_id: str, run_dir: Path) -> WorktreeResult:
         """Prepare a run worktree using Git when possible, else fallback copies."""
         if self._is_git_repo(self.workspace):
             worktree_path = (self.worktrees_root or path_config(self.workspace, "worktrees")) / run_id
             worktree_path.parent.mkdir(parents=True, exist_ok=True)
+            if worktree_path.exists():
+                if (worktree_path / ".git").exists():
+                    return WorktreeResult(worktree_path, "git_worktree_reused", "reused durable run worktree")
+                raise ReconciliationRequired(f"existing worktree is incomplete and was not removed: {worktree_path}")
             result = subprocess.run(
                 ["git", "worktree", "add", "-b", f"muxdev/{run_id}", str(worktree_path), "HEAD"],
                 cwd=self.workspace,
@@ -56,6 +61,10 @@ class WorktreeManager:
             return WorktreeResult(fallback, "git_worktree_fallback_copy", result.stderr.strip())
 
         worktree_path = run_dir / "worktree"
+        if worktree_path.exists():
+            if (worktree_path / ".git").exists():
+                return WorktreeResult(worktree_path, "workspace_copy_reused", "reused durable copied worktree")
+            raise ReconciliationRequired(f"existing copied worktree is incomplete and was not removed: {worktree_path}")
         shutil.copytree(self.workspace, worktree_path, ignore=self._fallback_copy_ignore(run_dir))
         self._init_fallback_git_repo(worktree_path, commit_baseline=True)
         return WorktreeResult(worktree_path, "workspace_copy", "workspace is not a git repository root; copied workspace")
@@ -84,7 +93,7 @@ class WorktreeManager:
             targets.append(self.worktrees_root.resolve())
 
         def ignore(directory: str, names: list[str]) -> set[str]:
-            ignored = {".git", ".muxdev", ".pytest_cache", "__pycache__"}
+            ignored = {".git", ".muxdev", ".pytest_cache", ".test_workspaces", "__pycache__"}
             current = Path(directory).resolve()
             for name in names:
                 if name.startswith("pytest-cache-files-"):

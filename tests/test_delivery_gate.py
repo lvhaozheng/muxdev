@@ -3,11 +3,16 @@ import uuid
 import shutil
 from pathlib import Path
 
+import pytest
+
 from muxdev.models import RunStatus
 from muxdev.providers.adapters import ProviderStageOutput
 from muxdev.runtime.supervisor import SupervisorRuntime
 from muxdev.services.delivery_gate import delivery_rule_for_skill_payload, evaluate_delivery_gate, extract_delivery_standard
 from muxdev.storage import Blackboard
+
+
+pytestmark = pytest.mark.integration
 
 
 def test_delivery_standard_extraction_and_rule_hash() -> None:

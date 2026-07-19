@@ -6,8 +6,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  verify:
-    name: ${{ matrix.os }} / py${{ matrix.python-version }}
+  quick:
+    name: quick / ${{ matrix.os }} / py${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -19,7 +19,73 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Build and install wheel
+        run: |
+          python -m pip install build pytest
+          python -m build --wheel --outdir wheelhouse
+          python scripts/install_built_wheel.py wheelhouse
+      - name: Check patch whitespace
+        run: git diff --check
+      - name: Verify import, provider detection, docs, and quick suite
+        run: python scripts/verify_cross_platform.py --suite quick
+      - name: Upload failure log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quick-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: .test_workspaces/test-logs/*.log
+          if-no-files-found: warn
+
+  integration:
+    name: integration / ${{ matrix.os }} / py3.12
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Install package
         run: python -m pip install -e ".[test]"
-      - name: Verify
-        run: python scripts/verify_cross_platform.py
+      - name: Run complete suite
+        run: python scripts/verify_cross_platform.py --suite full
+      - name: Upload failure log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-${{ matrix.os }}-py3.12
+          path: .test_workspaces/test-logs/*.log
+          if-no-files-found: warn
+
+  release:
+    name: release / replay-security-package / py3.12
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install release toolchain
+        run: python -m pip install -e ".[test,release]"
+      - name: Replay, auth, archive and product release suite
+        run: python -m pytest -q tests/test_v02_product_release.py tests/test_v02_signed_attestation.py
+      - name: Build reproducible RC artifacts
+        run: python scripts/build_release_candidate.py
+      - name: Install built wheel in a clean environment
+        run: |
+          python -m venv .test_workspaces/release-venv
+          .test_workspaces/release-venv/bin/python scripts/install_built_wheel.py release-artifacts
+          .test_workspaces/release-venv/bin/python -m muxdev --version
+          .test_workspaces/release-venv/bin/muxdev demo --scenario trusted-delivery-v1 --mode replay --json
+          .test_workspaces/release-venv/bin/muxdev benchmark plan trusted-routing-v1 --json
+          .test_workspaces/release-venv/bin/python scripts/smoke_installed_wheel.py .test_workspaces/release-wheel-smoke
+      - name: Upload local RC artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: muxdev-0.2.0rc1-local-artifacts
+          path: release-artifacts/
+          if-no-files-found: error

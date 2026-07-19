@@ -65,6 +65,7 @@ def test_missing_providers_are_unavailable() -> None:
     by_name = {probe.provider: probe for probe in probes}
 
     assert by_name["mock"].status == ProviderStatus.READY
+    assert by_name["mock"].trust_tier == "managed"
     assert by_name["codex"].status == ProviderStatus.UNAVAILABLE
     assert by_name["codex"].headless == CapabilityState.NOT_INSTALLED
     assert by_name["qwen"].status == ProviderStatus.UNAVAILABLE
@@ -82,6 +83,7 @@ def test_codex_help_maps_to_static_capabilities() -> None:
     assert probe.skill == CapabilityState.SUPPORTED
     assert probe.attach == CapabilityState.SUPPORTED
     assert probe.status == ProviderStatus.READY
+    assert probe.trust_tier == "opaque"
 
 
 def test_detect_includes_all_m0_providers() -> None:

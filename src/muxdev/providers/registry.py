@@ -62,6 +62,7 @@ class ProviderProbe:
     attach: CapabilityState
     status: ProviderStatus
     notes: str
+    trust_tier: str = "opaque"
 
     def to_dict(self) -> dict[str, object]:
         data = asdict(self)
@@ -217,6 +218,7 @@ def _mock_probe() -> ProviderProbe:
         attach=CapabilityState.SUPPORTED,
         status=ProviderStatus.READY,
         notes=str(_provider_config("mock").get("notes", "built-in deterministic provider for workflow and matrix tests")),
+        trust_tier="managed",
     )
 
 

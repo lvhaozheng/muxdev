@@ -4,9 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "muxdev"
-version = "0.1.0"
-description = "Local AI Coding CLI control plane"
+dynamic = ["version"]
+description = "Local-first trusted delivery and routing control plane for coding agents"
+readme = "README.md"
+license = {file = "LICENSE"}
 requires-python = ">=3.11"
+authors = [{name = "muxdev contributors"}]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Operating System :: OS Independent",
+]
 dependencies = [
   "pydantic>=2",
   "pyyaml>=6",
@@ -19,12 +31,24 @@ dependencies = [
   "langgraph>=0.2",
   "pillow>=10",
   "pypdfium2>=4.30",
+  "cryptography>=43",
 ]
 
 [project.optional-dependencies]
 test = [
   "pytest>=8",
 ]
+release = [
+  "build>=1.2",
+  "twine>=5",
+  "cyclonedx-bom>=4",
+  "pip-audit>=2.7",
+]
+
+[project.urls]
+Documentation = "https://github.com/lvhaozheng/muxdev#readme"
+Source = "https://github.com/lvhaozheng/muxdev"
+Issues = "https://github.com/lvhaozheng/muxdev/issues"
 
 [project.scripts]
 muxdev = "muxdev.cli:app"
@@ -32,10 +56,21 @@ muxdev = "muxdev.cli:app"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.dynamic]
+version = {attr = "muxdev._version.__version__"}
+
 [tool.setuptools.package-data]
 "muxdev.config.defaults" = ["*.yaml"]
+"muxdev.benchmarks" = ["*.yaml"]
+"muxdev.demo_fixtures" = ["*.json"]
 "muxdev.skills" = ["*/SKILL.md", "*/muxdev.skill.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+cache_dir = ".test_workspaces/.pytest_cache"
+addopts = "--basetemp=.test_workspaces/pytest-tmp"
+markers = [
+  "integration: exercises the daemon, a complete runtime, worktrees, or pause/resume delivery",
+  "release: browser, benchmark, performance, archive, or packaging validation kept outside the core suite",
+]

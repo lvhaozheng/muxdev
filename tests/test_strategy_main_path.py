@@ -3,12 +3,12 @@ from __future__ import annotations
 import json
 import importlib
 import shutil
-import time
 import uuid
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
+import pytest
 
 from muxdev.api.web import create_app
 from muxdev.cli import app
@@ -39,14 +39,16 @@ def test_setup_check_does_not_write_and_yes_writes_toml(monkeypatch) -> None:
 
         written = setup_muxdev(workspace, yes=True, env={"MUXDEV_HOME": str(home)})
         effective = load_runtime_config(workspace, env={"MUXDEV_HOME": str(home)})
+        config_exists = (home / "config.toml").exists()
+        cache_exists = (home / "cache" / "providers.json").exists()
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 
     assert written["written"] is True
     assert "profile" not in effective
     assert effective["gate"] == "safe"
-    assert (home / "config.toml").exists()
-    assert (home / "cache" / "providers.json").exists()
+    assert config_exists
+    assert cache_exists
 
 
 def test_resolve_task_request_maps_new_and_legacy_roles(monkeypatch) -> None:
@@ -204,9 +206,11 @@ def test_skill_scan_priority_and_role_binding() -> None:
     assert "content" not in active[0]
 
 
+@pytest.mark.integration
 def test_daemon_api_persists_gate_and_skills_without_profile_topology() -> None:
     workspace = _workspace_temp("daemon-context")
     try:
+        (workspace / ".muxdev").mkdir()
         manager = TaskManager(paths=default_daemon_paths({"MUXDEV_HOME": str(workspace / "home")}).ensure())
         client = TestClient(create_app(task_manager=manager))
         submitted = client.post(
@@ -221,7 +225,7 @@ def test_daemon_api_persists_gate_and_skills_without_profile_topology() -> None:
             },
         ).json()
         task_id = submitted["task_id"]
-        _wait_for_status(client, task_id, "completed")
+        _wait_for_status(client, manager, task_id, "completed")
         detail = client.get(f"/api/tasks/{task_id}").json()
         tasks = client.get("/api/tasks").json()
     finally:
@@ -269,6 +273,25 @@ def test_cli_dev_submits_resolved_daemon_payload(monkeypatch) -> None:
     assert json.loads(result.stdout)["task_id"] == "task-1"
 
 
+def test_cli_fix_uses_auto_plan_contract(monkeypatch) -> None:
+    monkeypatch.setattr(runtime_config, "detect_providers", lambda: [_probe("mock", ProviderStatus.READY)])
+    submitted: dict[str, object] = {}
+
+    class FakeClient:
+        def submit_task(self, payload: dict[str, object]) -> dict[str, object]:
+            submitted.update(payload)
+            return {"task_id": "task-fix", "run_id": "task-fix", "status": "created"}
+
+    cli_main_module = importlib.import_module("muxdev.cli.main")
+    monkeypatch.setattr(cli_main_module, "_daemon_client", lambda *args, **kwargs: FakeClient())
+
+    result = runner.invoke(app, ["fix", "repair regression", "--provider", "mock", "--json"])
+
+    assert result.exit_code == 0, result.stdout
+    assert submitted["workflow"] == "fix"
+    assert submitted["automation"]["approve_plan_mode"] == "auto"
+
+
 def _probe(name: str, status: ProviderStatus) -> ProviderProbe:
     return ProviderProbe(
         provider=name,
@@ -295,13 +318,12 @@ def _write_skill(path: Path, name: str, description: str) -> None:
     )
 
 
-def _wait_for_status(client: TestClient, task_id: str, expected: str) -> None:
-    for _ in range(80):
-        status = client.get(f"/api/tasks/{task_id}").json()["run"]["status"]
-        if status == expected:
-            return
-        time.sleep(0.1)
-    raise AssertionError(f"task did not reach {expected}")
+def _wait_for_status(client: TestClient, manager: TaskManager, task_id: str, expected: str) -> None:
+    finished = manager.wait(task_id, timeout=30.0)
+    detail = client.get(f"/api/tasks/{task_id}").json()
+    status = detail["run"]["status"]
+    assert finished, f"worker did not finish; active={manager.queue.active_task_ids()} detail={detail}"
+    assert status == expected, f"task reached {status}, expected {expected}; detail={detail}"
 
 
 def _workspace_temp(prefix: str) -> Path:

@@ -17,6 +17,9 @@ from muxdev.services.design import DESIGN_PACK_FILES, design_document_quality_is
 from muxdev.storage import Blackboard
 
 
+pytestmark = pytest.mark.integration
+
+
 def _complete_design_payload(summary: str = "Complete design") -> dict[str, object]:
     return {
         "summary": summary,
@@ -64,7 +67,7 @@ def test_mock_run_creates_m1_artifacts(workspace: Path) -> None:
     result = SupervisorRuntime(workspace).run("add rate limiting", provider="mock")
 
     assert result.status == RunStatus.COMPLETED
-    assert result.run_dir.parent == workspace / ".muxdev" / "runs"
+    assert result.run_dir.parent == (workspace / ".muxdev" / "runs").resolve()
     assert (result.run_dir / "blackboard.sqlite").exists()
     assert (result.run_dir / "trace.jsonl").exists()
     assert (result.run_dir / "final_report.md").exists()
@@ -128,7 +131,7 @@ def test_git_worktree_fallback_baselines_no_head_repo_and_ignores_generated_file
     run_dir = workspace / ".muxdev" / "runs" / "run_no_head"
     run_dir.mkdir(parents=True)
 
-    monkeypatch.setattr(WorktreeManager, "_is_git_repo", staticmethod(lambda path: path == workspace))
+    monkeypatch.setattr(WorktreeManager, "_is_git_repo", staticmethod(lambda path: path == workspace.resolve()))
     monkeypatch.setattr("muxdev.runtime.worktree.shutil.which", lambda name: "git" if name == "git" else None)
     git_calls: list[list[str]] = []
 
@@ -219,7 +222,7 @@ def test_design_workflow_publishes_user_visible_design_document(workspace: Path)
         design_artifacts = [row for row in blackboard.table_rows("artifacts") if row["kind"] == "project_design_doc"]
     finally:
         blackboard.close()
-    assert [Path(row["path"]) for row in design_artifacts] == [user_design_doc]
+    assert [Path(row["path"]).resolve() for row in design_artifacts] == [user_design_doc.resolve()]
 
 
 def test_design_doc_extracts_structured_payload_from_provider_stream(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
@@ -671,7 +674,7 @@ def test_completed_continue_recovers_design_doc_from_run_design_files(monkeypatc
         design_artifacts = [row for row in blackboard.table_rows("artifacts", run_id=result.run_id) if row["kind"] == "project_design_doc"]
     finally:
         blackboard.close()
-    assert [Path(row["path"]) for row in design_artifacts] == [user_doc]
+    assert [Path(row["path"]).resolve() for row in design_artifacts] == [user_doc.resolve()]
 
 
 def test_design_provider_question_pauses_and_response_reaches_next_context(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:
@@ -708,6 +711,11 @@ def test_design_provider_question_pauses_and_response_reaches_next_context(monke
                 "design_doc": {
                     "problem_statement": "设计一个贪吃蛇游戏。",
                     "scope": ["Design a browser snake game handoff.", "Keep this run design-only."],
+                    "requirements": [
+                        "Keyboard and touch controls must be equally discoverable.",
+                        "The board, score, pause state, and restart action must remain visible and understandable.",
+                        "Movement, food placement, collision, growth, and score updates must be deterministic and testable.",
+                    ],
                     "user_preferences": {"style": preference},
                     "audience": "Children and casual browser players",
                     "platform": "Browser desktop and mobile",
@@ -720,6 +728,18 @@ def test_design_provider_question_pauses_and_response_reaches_next_context(monke
                     "acceptance_criteria": ["风格符合用户偏好。"],
                     "test_strategy": ["Inspect section completeness.", "Future smoke tests cover controls, pause, restart, scoring, and collision."],
                     "proposed_design": {"platform": "Canvas", "modules": ["GameEngine", "Renderer"]},
+                    "state_model": {
+                        "idle": "Show instructions and wait for the first direction input.",
+                        "running": "Advance the snake on a fixed tick and process queued input.",
+                        "paused": "Freeze simulation while keeping the current board visible.",
+                        "gameOver": "Show the final score and expose an immediate restart action.",
+                    },
+                    "data_model": {
+                        "snake": "Ordered grid coordinates from head to tail.",
+                        "food": "One unoccupied grid coordinate.",
+                        "score": "Integer increased by ten for each food item.",
+                    },
+                    "data_flow": ["Capture input", "Validate direction", "Advance state", "Resolve collision and food", "Render frame"],
                     "implementation_sequence": ["实现核心玩法", "打磨像素风表现"],
                     "risks_and_mitigations": ["儿童用户需要更清晰的失败反馈。"],
                     "open_questions": ["Confirm final visual theme and difficulty tuning."],
@@ -740,13 +760,26 @@ def test_design_provider_question_pauses_and_response_reaches_next_context(monke
         blackboard.close()
 
     resumed = runtime.resume(paused.run_id)
+    resumed_blackboard = Blackboard(resumed.run_dir)
+    try:
+        resume_errors = resumed_blackboard.table_rows("error_details", run_id=resumed.run_id)
+    finally:
+        resumed_blackboard.close()
+    assert resumed.status == RunStatus.COMPLETED, resume_errors
     content = (workspace / "docs" / "design" / "design.md").read_text(encoding="utf-8")
+    contract = json.loads((resumed.run_dir / "design" / "design_contract.json").read_text(encoding="utf-8"))
+    blackboard = Blackboard(resumed.run_dir)
+    try:
+        project_docs = [row for row in blackboard.table_rows("artifacts", run_id=resumed.run_id) if row["kind"] == "project_design_doc"]
+    finally:
+        blackboard.close()
 
     assert paused.status == RunStatus.AWAITING_PROVIDER_ACTION
-    assert resumed.status == RunStatus.COMPLETED
     assert provider.seen_preference is True
     assert "面向儿童，像素风，浏览器优先" in content
     assert "## 用户偏好" in content
+    assert contract["run_id"] == resumed.run_id
+    assert [Path(row["path"]).resolve() for row in project_docs] == [(workspace / "docs" / "design" / "design.md").resolve()]
 
 
 def test_structured_design_feedback_pauses_and_reruns_with_feedback(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> None:

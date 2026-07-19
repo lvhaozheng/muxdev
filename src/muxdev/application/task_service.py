@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 from ..domain import RunSpec
 from ..models import RunStatus
+from .lifecycle import LifecycleService
 
 
 RuntimeFactory = Callable[..., Any]
@@ -45,8 +46,11 @@ class TaskRuntimeService:
 
     def _record_worker_exception(self, task_id: str, exc: Exception) -> None:
         with self.board_factory() as board:
-            board.set_run_status(task_id, RunStatus.BLOCKED)
-            board.add_error(task_id, None, "worker_exception", str(exc))
+            LifecycleService(board).fail_worker(
+                task_id,
+                error_type="worker_exception",
+                message=str(exc),
+            )
         self.publish({"type": "task_updated", "task_id": task_id, "status": str(RunStatus.BLOCKED)})
 
 

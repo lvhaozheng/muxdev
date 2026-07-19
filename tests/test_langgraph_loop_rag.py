@@ -5,9 +5,14 @@ import shutil
 import uuid
 from pathlib import Path
 
+import pytest
+
 from muxdev.context import build_context_packet, task_with_context_packet
 from muxdev.runtime import LangGraphWorkflowEngine, SupervisorRuntime
 from muxdev.workflows import load_workflow
+
+
+pytestmark = pytest.mark.integration
 
 
 def test_langgraph_graph_spec_preserves_loop_metadata() -> None:
