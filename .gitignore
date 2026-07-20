@@ -12,4 +12,13 @@ src/*.egg-info/
 pytest-cache-files-*/
 build/
 dist/
-release-artifacts/
+release-artifacts/*
+!release-artifacts/architecture-metrics.json
+!release-artifacts/simplification-report.md
+!release-artifacts/evidence-v3-example.json
+!release-artifacts/architecture-diagrams.md
+!release-artifacts/open-source-research.md
+!release-artifacts/ai-agent-infrastructure-case-study.md
+!release-artifacts/interview-narratives.md
+!release-artifacts/resume-bullets.md
+!release-artifacts/verification-report.md

@@ -1,37 +1,19 @@
-"""Workflow loading and DAG utilities.
-
-Workflows can come from a YAML file path or from the merged dynamic config. The
-engine validates dependencies, returns deterministic topological order, and
-groups independent stages into batches for the supervisor's safe parallel path.
-"""
+"""Validation and deterministic ordering for four fixed workflows."""
 
 from __future__ import annotations
 
-import re
 from collections import defaultdict, deque
-from pathlib import Path
-
-import yaml
 
 from ..config.loader import load_config
-from ..config.runtime import WORKFLOW_ALIASES
 from ..models import WorkflowDefinition
 
 
-SOFTWARE_DEV_WORKFLOW = yaml.safe_dump(load_config().get("workflows", {}).get("software-dev", {}), sort_keys=False)
-
-
-def load_workflow(name_or_path: str) -> WorkflowDefinition:
-    """Load a workflow by filesystem path or configured workflow name."""
-    path = Path(name_or_path)
-    if path.is_file():
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    else:
-        name_or_path = WORKFLOW_ALIASES.get(name_or_path, name_or_path)
-        workflows = load_config().get("workflows", {})
-        if name_or_path not in workflows:
-            raise ValueError(f"unknown workflow: {name_or_path}")
-        data = workflows[name_or_path]
+def load_workflow(name: str) -> WorkflowDefinition:
+    """Load one of change, design, review, or test."""
+    workflows = load_config().get("workflows", {})
+    if name not in {"change", "design", "review", "test"} or name not in workflows:
+        raise ValueError(f"unknown workflow: {name}")
+    data = workflows[name]
     workflow = WorkflowDefinition.model_validate(data)
     validate_dag(workflow)
     return workflow
@@ -69,57 +51,15 @@ def ordered_stage_ids(workflow: WorkflowDefinition) -> list[str]:
     return ordered
 
 
-def execution_batches(workflow: WorkflowDefinition) -> list[list[str]]:
-    """Return dependency-safe batches for parallel stage execution."""
-    indegree = {stage.id: 0 for stage in workflow.stages}
-    graph: dict[str, list[str]] = defaultdict(list)
-    order = {stage.id: index for index, stage in enumerate(workflow.stages)}
-    for stage in workflow.stages:
-        for dep in stage.deps:
-            graph[dep].append(stage.id)
-            indegree[stage.id] += 1
-
-    ready = [stage.id for stage in workflow.stages if indegree[stage.id] == 0]
-    batches: list[list[str]] = []
-    seen = 0
-    while ready:
-        batch = sorted(ready, key=order.__getitem__)
-        batches.append(batch)
-        seen += len(batch)
-        next_ready: list[str] = []
-        for stage_id in batch:
-            for child in graph[stage_id]:
-                indegree[child] -= 1
-                if indegree[child] == 0:
-                    next_ready.append(child)
-        ready = next_ready
-    if seen != len(workflow.stages):
-        raise ValueError(f"workflow {workflow.name} contains a cycle")
-    return batches
-
-
 def should_run_when(expression: str | None, context: dict[str, object]) -> bool:
-    """Evaluate the intentionally tiny workflow condition language."""
+    """Evaluate the two conditions used by the fixed workflow definitions."""
     if not expression:
         return True
-    normalized = expression.replace("&&", "and")
-    if "||" in normalized:
-        return any(should_run_when(part.strip(), context) for part in normalized.split("||"))
-    bool_match = re.fullmatch(r"([A-Za-z_][\w]*)\.([A-Za-z_][\w]*)", normalized.strip())
-    if bool_match:
-        item = context.get(bool_match.group(1), {})
-        return bool(item.get(bool_match.group(2))) if isinstance(item, dict) else False
-    if normalized == "review.has_blockers and loop < 2":
+    if expression == "profile.strict":
+        profile = context.get("profile", {})
+        return bool(profile.get("strict")) if isinstance(profile, dict) else False
+    if expression == "review.has_blockers and loop < 2":
         review = context.get("review", {})
         has_blockers = bool(review.get("has_blockers")) if isinstance(review, dict) else False
-        loop = int(context.get("loop", 0))
-        return has_blockers and loop < 2
-    match = re.fullmatch(r"([A-Za-z_][\w]*)\.has_blockers\s+and\s+loop\s+<\s+([A-Za-z_][\w]*|\d+)", normalized.strip())
-    if match:
-        review = context.get(match.group(1), {})
-        has_blockers = bool(review.get("has_blockers")) if isinstance(review, dict) else False
-        loop = int(context.get("loop", 0))
-        limit_token = match.group(2)
-        limit = int(limit_token) if limit_token.isdigit() else int(context.get(limit_token, 0) or 0)
-        return has_blockers and loop < limit
-    return False
+        return has_blockers and int(context.get("loop", 0)) < 2
+    raise ValueError(f"unsupported workflow condition: {expression}")

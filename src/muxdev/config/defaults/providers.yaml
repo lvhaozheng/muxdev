@@ -23,20 +23,7 @@ providers:
         - --skip-git-repo-check
         - --sandbox
         - workspace-write
-      resume_command:
-        - codex
-        - --ask-for-approval
-        - never
-        - exec
-        - resume
-        - --json
-        - --skip-git-repo-check
-        - --sandbox
-        - workspace-write
-        - "{session_id}"
-        - "-"
       prompt_transport: stdin
-      prompt_template: "You are running muxdev stage '{stage_id}'. Keep output concise. If you modify files, stay inside the current workspace. Task: {task}"
   claude-code:
     mode: local CLI
     commands: [claude, claude-code]
@@ -45,8 +32,6 @@ providers:
     runtime:
       kind: headless_cli
       command: [claude, -p, "{prompt}", --output-format, stream-json, --verbose]
-      resume_command: [claude, --resume, "{session_id}", -p, "{prompt}", --output-format, stream-json, --verbose]
-      prompt_template: "You are running muxdev stage '{stage_id}'. Keep output concise. If you modify files, stay inside the current workspace. Task: {task}"
   qwen:
     mode: local CLI
     commands: [qwen]
@@ -55,8 +40,6 @@ providers:
     runtime:
       kind: headless_cli
       command: [qwen, --bare, --sandbox, --approval-mode, auto, --output-format, stream-json, --max-tool-calls, "40", -p]
-      resume_command: [qwen, --bare, --sandbox, --approval-mode, auto, --output-format, stream-json, --max-tool-calls, "40", --resume, "{session_id}", -p]
-      prompt_template: "You are running muxdev stage '{stage_id}'. Keep output concise. If you modify files, stay inside the current workspace. Task: {task}"
   kimi:
     mode: local CLI
     commands: [kimi]
@@ -65,7 +48,6 @@ providers:
     runtime:
       kind: headless_cli
       command: [kimi]
-      prompt_template: "You are running muxdev stage '{stage_id}'. Keep output concise. If you modify files, stay inside the current workspace. Task: {task}"
   trae:
     mode: IDE/shell
     commands: [trae]
@@ -74,7 +56,6 @@ providers:
     runtime:
       kind: headless_cli
       command: [trae]
-      prompt_template: "You are running muxdev stage '{stage_id}'. Keep output concise. If you modify files, stay inside the current workspace. Task: {task}"
   antigravity:
     mode: beta
     commands: [antigravity]
@@ -83,4 +64,3 @@ providers:
     runtime:
       kind: headless_cli
       command: [antigravity]
-      prompt_template: "You are running muxdev stage '{stage_id}'. Keep output concise. If you modify files, stay inside the current workspace. Task: {task}"

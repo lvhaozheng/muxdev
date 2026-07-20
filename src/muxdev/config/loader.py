@@ -1,15 +1,4 @@
-"""Layered configuration loader for muxdev.
-
-The loader implements muxdev's "defaults plus overrides" contract:
-
-1. package defaults define stable M0-M7 behavior,
-2. user config captures machine-specific preferences,
-3. project config captures shared repository policy, and
-4. MUXDEV_CONFIG provides a highest-priority experimental/CI override.
-
-Runtime code should depend on this module instead of hard-coding provider lists,
-workflow definitions, command dialects, or `.muxdev` subpaths.
-"""
+"""Layer the four compact configuration sources with local overrides."""
 
 from __future__ import annotations
 
@@ -27,23 +16,14 @@ import yaml
 DEFAULT_CONFIG_FILES = (
     "paths.yaml",
     "providers.yaml",
-    "accounts.yaml",
-    "installers.yaml",
     "workflows.yaml",
-    "prompt_templates.yaml",
-    "workflow_templates.yaml",
-    "ui.yaml",
+    "evidence_policies.yaml",
 )
 
 KNOWN_SECTIONS = {
-    "accounts",
-    "command_dialects",
-    "installers",
+    "evidence_policies",
     "paths",
-    "prompt_templates",
     "providers",
-    "ui",
-    "workflow_templates",
     "workflows",
 }
 
@@ -61,10 +41,8 @@ class ConfigSource:
 def load_config(workspace: Path | None = None, env: dict[str, str] | None = None) -> dict[str, Any]:
     """Return the fully merged configuration for a workspace.
 
-    Missing external files are skipped silently because the bundled defaults are
-    sufficient for a working offline installation. The mock provider is enforced
-    after merging so users cannot accidentally remove muxdev's deterministic
-    fallback provider.
+    Missing override files are skipped. The deterministic Mock Provider remains
+    available so policy and recovery behavior can be exercised offline.
     """
     workspace = Path.cwd() if workspace is None else workspace
     env = os.environ if env is None else env

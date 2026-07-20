@@ -1,8 +1,8 @@
-version = 1
+version = 2
 
 [activation]
-roles = ["code", "implementer"]
-stages = ["implement", "scaffold", "code", "refactor", "fix"]
+roles = ["code"]
+stages = ["implement", "fix"]
 auto = true
 
 [permissions]

@@ -2,20 +2,18 @@
 
 from __future__ import annotations
 
-import shutil
+import os
 import tomllib
 from pathlib import Path
 from typing import Any
 
 from ...config.loader import deep_merge
-from ...config.runtime import global_skills_path, muxdev_home, normalize_role, project_skills_path
 from .model import SkillInfo
 from .parser import (
     first_heading,
     parse_muxdev_policy,
     parse_skill_document,
     skill_auto,
-    skill_delivery_gate,
     skill_file_patterns,
     skill_keywords,
     skill_permissions,
@@ -43,7 +41,7 @@ GLOBAL_SCAN_DIRS = [".muxdev/skills", ".agents/skills", ".codex/skills", ".claud
 
 def load_skills_config(workspace: Path, *, env: dict[str, str] | None = None) -> dict[str, Any]:
     config: dict[str, Any] = {"version": 1, "dirs": [], "auto": True, "sync": "auto", "bind": {}, "skill": {}}
-    for path in (global_skills_path(env), project_skills_path(workspace)):
+    for path in (_muxdev_home(env) / "skills.toml", workspace / ".muxdev" / "skills.toml"):
         if path.exists():
             config = deep_merge(config, _read_toml(path))
     if not isinstance(config.get("bind"), dict):
@@ -125,42 +123,11 @@ def skill_from_file(path: Path, *, source: str, priority: int, config: dict[str,
         file_patterns=file_patterns,
         risk_level=skill_risk_level(meta, local_policy),
         permissions=skill_permissions(local_policy),
-        delivery_gate=skill_delivery_gate(local_policy),
         auto=skill_auto(local_policy, config_policy),
         source_path=str(path.parent),
         validation_errors=errors,
         validation_warnings=warnings,
     )
-
-
-def add_skill_directory(workspace: Path, source: str, *, name: str | None = None, global_scope: bool = False) -> SkillInfo:
-    root = (Path.home() / ".agents" / "skills") if global_scope else workspace / ".agents" / "skills"
-    source_path = Path(source).expanduser()
-    if source.startswith("builtin:"):
-        skill_name = name or source.split(":", 1)[1]
-        target = root / _safe_name(skill_name)
-        target.mkdir(parents=True, exist_ok=True)
-        (target / "SKILL.md").write_text(_minimal_skill_text(skill_name), encoding="utf-8")
-        return skill_from_file(target / "SKILL.md", source="global" if global_scope else "project", priority=100)
-    if source_path.exists():
-        skill_name = name or source_path.stem
-        if source_path.is_dir() and (source_path / "SKILL.md").exists():
-            parsed = skill_from_file(source_path / "SKILL.md", source="source", priority=0)
-            skill_name = name or parsed.name
-        target = root / _safe_name(skill_name)
-        target.mkdir(parents=True, exist_ok=True)
-        if source_path.is_dir():
-            copy_tree_contents(source_path, target)
-        else:
-            shutil.copy2(source_path, target / source_path.name)
-        if not (target / "SKILL.md").exists():
-            (target / "SKILL.md").write_text(_minimal_skill_text(skill_name), encoding="utf-8")
-        return skill_from_file(target / "SKILL.md", source="global" if global_scope else "project", priority=100)
-    skill_name = name or source
-    target = root / _safe_name(skill_name)
-    target.mkdir(parents=True, exist_ok=True)
-    (target / "SKILL.md").write_text(_minimal_skill_text(skill_name), encoding="utf-8")
-    return skill_from_file(target / "SKILL.md", source="global" if global_scope else "project", priority=100)
 
 
 def _scan_roots(workspace: Path, config: dict[str, Any], *, env: dict[str, str] | None = None) -> list[tuple[int, str, Path]]:
@@ -170,7 +137,7 @@ def _scan_roots(workspace: Path, config: dict[str, Any], *, env: dict[str, str] 
         root = Path(text).expanduser() if text.startswith("~") else (workspace / text).resolve()
         roots.append((800 - index, "configured", root))
     roots.extend((700 - index, "project", workspace / item) for index, item in enumerate(PROJECT_SCAN_DIRS))
-    home = muxdev_home(env).parent
+    home = _muxdev_home(env).parent
     roots.extend((400 - index, "global", home / item) for index, item in enumerate(GLOBAL_SCAN_DIRS))
     roots.append((100, "builtin", _builtin_skills_dir()))
     return roots
@@ -201,20 +168,15 @@ def _validate_basic(
         warnings.append("muxdev.skill.toml version is newer than this muxdev build")
     if bool(config_policy.get("disabled", False)):
         warnings.append("skill is disabled by policy")
+    if "delivery_gate" in local_policy:
+        warnings.append("legacy [delivery_gate] is ignored; move requirements to evidence-policy.yaml")
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        content = ""
+    if "## Delivery Standard" in content:
+        warnings.append("legacy Delivery Standard text is guidance only and cannot change the Evidence Policy")
     return errors, warnings
-
-
-def copy_tree_contents(source: Path, target: Path) -> None:
-    for child in source.iterdir():
-        destination = target / child.name
-        if child.is_dir():
-            shutil.copytree(child, destination, dirs_exist_ok=True)
-        else:
-            shutil.copy2(child, destination)
-
-
-def _minimal_skill_text(skill_name: str) -> str:
-    return f"---\nname: {skill_name}\ndescription: Local muxdev skill.\n---\n# {skill_name}\n\nLocal muxdev skill.\n"
 
 
 def _safe_name(value: str) -> str:
@@ -230,14 +192,11 @@ def _builtin_skills_dir() -> Path:
     return current.parents[3] / "skills"
 
 
+def _muxdev_home(env: dict[str, str] | None = None) -> Path:
+    values = os.environ if env is None else env
+    return Path(values.get("MUXDEV_HOME") or Path.home() / ".muxdev").expanduser()
+
+
 def _read_toml(path: Path) -> dict[str, Any]:
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     return data if isinstance(data, dict) else {}
-
-
-def role_bindings(config: dict[str, Any], role: str) -> list[str]:
-    bind = config.get("bind", {})
-    values = bind.get(normalize_role(role), []) if isinstance(bind, dict) else []
-    if isinstance(values, str):
-        return [values]
-    return [str(item) for item in values] if isinstance(values, list) else []

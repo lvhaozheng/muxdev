@@ -1,104 +1,192 @@
-"""Evidence v2 domain models."""
+"""Evidence v3 contracts: objective records, deterministic gates, clear scores."""
 
 from __future__ import annotations
 
-from typing import Literal
+import hashlib
+import json
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from . import utc_now
 
 
-EvidenceLayer = Literal["core", "approval", "evaluation", "learning"]
-EvidenceKind = Literal[
-    "task",
-    "stage",
-    "change",
-    "test",
-    "review",
-    "security",
-    "runtime",
-    "approval",
-    "artifact",
-    "learning",
-    "policy",
-]
-EvidenceStatus = Literal["observed", "passed", "failed", "missing", "approved", "rejected", "blocked"]
-EvidenceStrength = Literal["A", "B", "C", "D", "E", "X"]
-EvaluationLabel = Literal["ready", "reviewable", "risky", "blocked"]
-StandardSeverity = Literal["P0", "P1", "P2", "P3"]
-RiskLevel = Literal["R0", "R1", "R2", "R3"]
-EvidenceLevel = Literal["E0", "E1", "E2", "E3"]
+EvidenceKind = Literal["artifact", "check", "review", "interaction", "runtime"]
+RequirementStatus = Literal["satisfied", "missing", "failed", "not_applicable"]
+GateStatus = Literal["PASS", "BLOCKED", "WAITING_HUMAN"]
 
 
-class ArtifactRef(BaseModel):
-    """Content-addressed artifact reference used by evidence events."""
-
-    path: str | None = None
-    scope: Literal["run", "local", "bundle"] = "local"
-    relative_path: str | None = None
-    sha256: str | None = None
-    media_type: str | None = None
-    producer: str | None = None
+def canonical_hash(value: object) -> str:
+    raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
-class EvidenceEvent(BaseModel):
-    """One append-only evidence event.
-
-    Evidence events are the fact source. Manifests and evaluations are derived
-    views over this stream and can be regenerated from it.
-    """
-
+class EvidenceRequirement(BaseModel):
     id: str
+    description: str
+    required: bool = True
+    accepted_kinds: list[EvidenceKind]
+    subject_selector: Literal["run", "any"] = "run"
+    require_reproducible: bool = False
+    require_integrity: bool = True
+    require_independent: bool = False
+
+
+class EvidencePolicy(BaseModel):
+    policy_id: str
+    version: int = 1
+    requirements: list[EvidenceRequirement]
+    policy_hash: str = ""
+
+    @model_validator(mode="after")
+    def freeze_hash(self) -> "EvidencePolicy":
+        identifiers = [item.id for item in self.requirements]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("Evidence requirement ids must be unique")
+        expected = canonical_hash(
+            {
+                "policy_id": self.policy_id,
+                "version": self.version,
+                "requirements": [item.model_dump(mode="json") for item in self.requirements],
+            }
+        )
+        if self.policy_hash and self.policy_hash != expected:
+            raise ValueError("Evidence policy hash does not match its content")
+        self.policy_hash = expected
+        return self
+
+
+class EvidenceRecord(BaseModel):
+    record_id: str
     run_id: str
     stage_id: str | None = None
-    layer: EvidenceLayer = "core"
+    requirement_id: str
     kind: EvidenceKind
-    claim: str
-    status: EvidenceStatus = "observed"
-    strength: EvidenceStrength = "C"
-    standard_id: str | None = None
-    severity: StandardSeverity | None = None
-    risk_level: RiskLevel | None = None
-    evidence_level: EvidenceLevel | None = None
-    subject_hash: str | None = None
-    prev_hash: str | None = None
-    event_hash: str | None = None
-    artifact_refs: list[ArtifactRef] = Field(default_factory=list)
-    metrics: dict[str, object] = Field(default_factory=dict)
-    tags: list[str] = Field(default_factory=list)
-    source: str = "muxdev"
+    subject_digest: str
+    producer: str
     created_at: str = Field(default_factory=utc_now)
+    schema_version: int = 3
+    integrity_valid: bool = True
 
 
-class EvidenceManifest(BaseModel):
-    """Lightweight run evidence manifest."""
+class ArtifactEvidence(EvidenceRecord):
+    kind: Literal["artifact"] = "artifact"
+    path: str
+    digest: str
+    size: int
+    media_type: str = "application/octet-stream"
 
-    contract_version: str = "muxdev.evidence.v2"
+
+class CheckEvidence(EvidenceRecord):
+    kind: Literal["check"] = "check"
+    argv: list[str]
+    cwd: str = "."
+    cwd_digest: str
+    exit_code: int
+    declared_exit_code: int | None = None
+    declared_status: Literal["passed", "failed", "skipped", "unavailable"] | None = None
+    duration_ms: int = 0
+    stdout_digest: str | None = None
+    stderr_digest: str | None = None
+    stdout_summary: str = ""
+    stderr_summary: str = ""
+    summary: str = ""
+    reproducible: bool = True
+
+    @property
+    def passed(self) -> bool:
+        return self.exit_code == 0
+
+
+class ReviewFinding(BaseModel):
+    finding_id: str
+    category: str = "correctness"
+    severity: Literal["low", "medium", "high"] = "medium"
+    message: str
+    file: str | None = None
+    line: int | None = None
+    remediation: str
+    resolved: bool = False
+
+
+class ReviewEvidence(EvidenceRecord):
+    kind: Literal["review"] = "review"
+    target_digest: str
+    reviewer: str
+    executor: str | None = None
+    independent: bool = False
+    findings: list[ReviewFinding] = Field(default_factory=list)
+    residual_risk: str = ""
+
+
+class InteractionEvidence(EvidenceRecord):
+    kind: Literal["interaction"] = "interaction"
+    interaction_type: Literal["approval", "rejection", "feedback"]
+    decision: Literal["approved", "rejected", "provided", "pending"]
+    actor: str | None = None
+
+
+class RuntimeEvidence(EvidenceRecord):
+    kind: Literal["runtime"] = "runtime"
+    event_type: str
+    status: Literal["observed", "passed", "failed", "pending"] = "observed"
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+AnyEvidenceRecord = Annotated[
+    ArtifactEvidence | CheckEvidence | ReviewEvidence | InteractionEvidence | RuntimeEvidence,
+    Field(discriminator="kind"),
+]
+
+
+class RequirementEvaluation(BaseModel):
+    requirement_id: str
+    status: RequirementStatus
+    record_ids: list[str] = Field(default_factory=list)
+    reason: str
+    remediation: str | None = None
+
+
+class ScoreDimension(BaseModel):
+    numerator: int
+    denominator: int
+    percent: float | None
+    failed_requirements: list[str] = Field(default_factory=list)
+
+
+class EvidenceScorecard(BaseModel):
+    completeness: ScoreDimension
+    reproducibility: ScoreDimension
+    integrity: ScoreDimension
+    independence: ScoreDimension
+    overall: float | None
+
+
+class GateBlocker(BaseModel):
+    code: str
+    requirement_id: str
+    reason: str
+    record_ids: list[str] = Field(default_factory=list)
+    remediation: str
+
+
+class GateDecision(BaseModel):
+    status: GateStatus
+    policy_hash: str
+    requirements: list[RequirementEvaluation]
+    blockers: list[GateBlocker] = Field(default_factory=list)
+    scorecard: EvidenceScorecard
+    evaluated_at: str = Field(default_factory=utc_now)
+
+
+class EvidenceReport(BaseModel):
+    contract_version: Literal["muxdev.evidence.v3"] = "muxdev.evidence.v3"
     run_id: str
-    event_count: int
-    artifact_count: int
-    layers: dict[str, int] = Field(default_factory=dict)
-    kinds: dict[str, int] = Field(default_factory=dict)
-    required_matrix: dict[str, bool] = Field(default_factory=dict)
-    missing_required: list[str] = Field(default_factory=list)
-    head_hash: str | None = None
-    events_path: str
-    manifest_path: str
-    created_at: str = Field(default_factory=utc_now)
-
-
-class EvidenceEvaluation(BaseModel):
-    """Gate-first delivery evaluation derived from Evidence v2 events."""
-
-    contract_version: str = "muxdev.evidence_evaluation.v2"
-    run_id: str
-    label: EvaluationLabel
-    confidence: float
-    gates: dict[str, str] = Field(default_factory=dict)
-    components: dict[str, float] = Field(default_factory=dict)
-    standard_scores: dict[str, object] = Field(default_factory=dict)
-    reasons: list[str] = Field(default_factory=list)
-    missing_evidence: list[str] = Field(default_factory=list)
-    next_actions: list[dict[str, str]] = Field(default_factory=list)
-    created_at: str = Field(default_factory=utc_now)
+    subject: dict[str, Any]
+    policy: EvidencePolicy
+    records: list[AnyEvidenceRecord]
+    decision: GateDecision
+    integrity: dict[str, Any]
+    routing: dict[str, Any] = Field(default_factory=dict)
+    reviewer: dict[str, Any] = Field(default_factory=dict)
+    generated_at: str = Field(default_factory=utc_now)

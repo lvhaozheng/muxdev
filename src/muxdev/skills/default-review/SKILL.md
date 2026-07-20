@@ -1,34 +1,15 @@
 ---
 name: default-review
-description: Default muxdev review role skill for plan, design, implementation, test, and docs review stages that find bugs, regressions, safety issues, missing tests, and contract drift.
-keywords: [review, blocker, regression, correctness]
-metadata:
-  compatible_roles: [review, reviewer]
+description: Review plans, designs, changes, tests, or documentation for correctness and delivery risk. Use whenever an independent or skeptical review result is required.
 ---
-# Default Review Skill
 
-Use this skill when the stage reviews a plan, design, patch, test result, documentation update, or delivery claim.
+# Review a frozen subject
 
-## Operating Rules
+- Review only the supplied subject and identify it with the provided digest.
+- Lead with actionable findings ordered by realistic severity.
+- Focus on correctness, regressions, unsafe behavior, missing verification, compatibility, and maintainability.
+- Include file and line references when available and a concrete remediation for every finding.
+- Treat absent information as missing context, not proof that a defect exists.
+- State residual risk when no findings remain.
 
-- Lead with actionable findings ordered by severity.
-- Focus on correctness, regressions, missing tests, safety, and maintainability.
-- Include file and line references when available.
-- Treat missing evidence as a risk, not as proof of failure.
-- If there are no blockers, say so clearly and name residual risk.
-- For design reviews, block shallow summaries that do not cover goal/scope, users/platform, interactions or system design, UI/states, rules/data, acceptance criteria, test strategy, risks, roadmap, and open questions.
-- For design reviews, block acceptance criteria that merely say no implementation files were created, the stage was read-only, or runtime verification did not happen.
-
-## Output Shape
-
-- Blockers
-- Non-blocking concerns
-- Missing evidence
-- Decision
-
-## Delivery Standard
-
-- Required deliverable: findings ordered by severity, evidence, suggestions, missing evidence, decision, and residual risk.
-- Pass when no blocking issue remains and design documents meet the complete single-file design standard when reviewing design stages.
-- Block when high severity defects, unmet acceptance criteria, missing critical tests, incomplete design documents, shallow summaries, non-delivery acceptance criteria, or unresolved safety or compatibility risk remain.
-- Evidence: review result with file or line references when available, plus design-document coverage evidence for design reviews.
+Return only the workflow's declared `ReviewResult`; the runtime establishes reviewer independence and the Gate Engine derives the outcome.

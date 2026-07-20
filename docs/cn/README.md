@@ -1,48 +1,34 @@
-# muxdev 文档
+# muxdev 中文参考
 
-<!-- section:overview -->
-## 概览
+muxdev 的产品定义是“AI Agent 可信交付控制面”，不是通用多 Agent 平台。
 
-muxdev 是包裹在编码智能体 CLI 外的一套本地优先控制面。它把用户请求转换为持久化任务，选择原生 Workflow DAG，在隔离工作区中调用类型化 Provider 适配器，执行审批与验证门禁，并记录之后可检查、可回放的证据。
+## 执行模型
 
-本文档只描述当前真实代码。已经过期的路线图、课程稿、阶段周报、面试材料和飞书生成物已被有意删除。
+四个工作流为 `change / design / review / test`。Profile 只改变必需阶段、Evidence Requirement、独立/安全评审、人工确认、签名、超时、重试和成本上限；不会动态生成工作流。
 
-<!-- section:audience -->
-## 适合谁阅读
+一次运行由 `TaskService` 管理生命周期，`RunEngine` 依次持久化 Job、Stage 和 typed append-only event。已完成阶段不会在恢复时重复执行；无法证明安全重放的外部 Provider 阶段会被阻断并要求协调。变更工作流最多执行两轮固定的 fix → test → review 修复循环。
 
-- 希望运行安全离线演示或受控 Codex/Qwen 工作流的使用者。
-- 负责守护进程、恢复、备份和可信交付的运维人员。
-- 扩展 Provider、Workflow、Skill、存储或验证逻辑的贡献者。
-- 想理解“持久化智能体运行时”和“聊天循环”差异的应届毕业生。
+## Evidence 与门禁
 
-<!-- section:map -->
-## 文档地图
+EvidencePolicy 是唯一规则源，五种记录为 Artifact、Check、Review、Interaction 和 Runtime。Runtime 会重放 TestResult 中的 argv，并以实际退出码、耗时、stdout/stderr 摘要和摘要值产生 CheckEvidence；Provider 的 `passed`、confidence、Evidence 或 delivery decision 均不能决定 Gate。
 
-- [快速开始](getting-started.md)：安装并运行第一个可信任务。
-- [架构](architecture.md)：边界、执行链与存储设计。
-- [概念速查](concepts.md)：核心机制速查表与深入解释。
-- [配置](configuration.md)：优先级、Provider、Workflow、门禁和 Skill。
-- [运维](operations.md)：守护进程、恢复、备份与诊断。
-- [安全与信任](security-and-trust.md)：威胁模型、审批、证据和签名。
-- [开发](development.md)：仓库结构、测试、扩展点和兼容规则。
+Gate 的每个失败项都包含稳定 `requirement_id`、原因、Evidence 引用和修复建议。四维 Scorecard 展示分子、分母和失败 Requirement；分母为零显示 N/A。分数只解释质量，因此高分运行仍可能因缺少批准而 BLOCKED。
 
-英文文档：[English](../en/README.md)。
+运行只产生 `evidence-report.json`。`muxdev evidence export <run-id>` 可额外生成 DSSE Envelope，绑定报告摘要但不复制业务事实。
 
-<!-- section:quickstart -->
-## 快速开始
+## 常用命令
 
 ```powershell
-python -m pip install -e ".[test]"
-muxdev setup --project
-muxdev demo --scenario trusted-delivery-v1 --mode replay
-muxdev dev "add a small validated change" --provider mock --json
-muxdev status latest
-muxdev evidence latest
+muxdev init
+muxdev run "task" --workflow change --profile lite --provider mock
+muxdev show <run-id>
+muxdev resume <run-id>
+muxdev approve <interaction-id>
+muxdev evidence show <run-id>
+muxdev evidence verify <run-id>
+muxdev route explain <run-id>
+muxdev skill verify default-test
+muxdev migrate status
 ```
 
-内置的 `mock` 和 `replay` Provider 不需要外部账号。连接真实 Provider CLI 前，请先阅读[快速开始](getting-started.md)。
-
-<!-- section:status -->
-## 产品状态
-
-当前仓库仍是候选发布版本，不能据此声称某个真实 Provider 普遍更好。Replay Benchmark 是确定性的工程检查；真实质量结论必须来自单独授权且有预算上限的现场 Benchmark。v7 SQLite 与已有运行 artifact 继续可读，但已废弃的 v0.2 命令别名不再支持。
+项目级 Skill 只能指导执行，不能扩大权限或改变 EvidencePolicy。旧 `[delivery_gate]` 和 `## Delivery Standard` 仅产生迁移警告；生产门禁必须迁移到 `evidence-policy.yaml`。

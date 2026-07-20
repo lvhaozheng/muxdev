@@ -1,14 +1,14 @@
-version = 1
+version = 2
 
 [activation]
-roles = ["test", "tester"]
-stages = ["test", "targeted_test", "smoke_check", "run_smoke"]
+roles = ["test", "test_strategy"]
+stages = ["test_plan", "test"]
 auto = true
 
 [permissions]
 read_workspace = true
 write_workspace = false
-shell = true
+shell = false
 network = false
 secrets = false
 

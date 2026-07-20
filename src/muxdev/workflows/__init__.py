@@ -1,10 +1,8 @@
-"""Built-in workflow definitions and DAG helpers."""
+"""Four fixed workflow definitions and deterministic ordering."""
 
-from .engine import SOFTWARE_DEV_WORKFLOW, execution_batches, load_workflow, ordered_stage_ids, should_run_when, validate_dag
+from .engine import load_workflow, ordered_stage_ids, should_run_when, validate_dag
 
 __all__ = [
-    "SOFTWARE_DEV_WORKFLOW",
-    "execution_batches",
     "load_workflow",
     "ordered_stage_ids",
     "should_run_when",

@@ -1,9 +1,4 @@
-"""Strict validation for provider-produced stage contracts.
-
-Provider exit code zero only proves that the CLI process finished.  It does not
-prove that a test or review stage returned the contract muxdev asked for.  This
-module keeps that distinction explicit and fail-closed.
-"""
+"""Fail-closed validation for provider-produced stage contracts."""
 
 from __future__ import annotations
 
@@ -12,7 +7,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from ..models import ReviewBlocker, ReviewResult, TestResult
+from ..models import ReviewFinding, ReviewResult, TestCheck, TestResult
 
 
 @dataclass(frozen=True)
@@ -23,22 +18,13 @@ class ContractValidation:
     parsed: dict[str, Any] | None
 
 
+FORBIDDEN_DECISION_FIELDS = {"delivery_decision", "confidence", "evidence", "missing_evidence"}
+
+
 def validate_test_result(parsed: dict[str, Any] | None, *, fallback_summary: str) -> tuple[TestResult, ContractValidation]:
-    errors: list[str] = []
-    if not parsed:
-        errors.append("missing TestResult JSON object")
-    else:
-        if not isinstance(parsed.get("passed"), bool):
-            errors.append("TestResult.passed must be a boolean")
-        if not isinstance(parsed.get("command"), str) or not str(parsed.get("command") or "").strip():
-            errors.append("TestResult.command must be a non-empty string")
-        if not isinstance(parsed.get("exit_code"), int) or isinstance(parsed.get("exit_code"), bool):
-            errors.append("TestResult.exit_code must be an integer")
-        if not isinstance(parsed.get("summary"), str) or not str(parsed.get("summary") or "").strip():
-            errors.append("TestResult.summary must be a non-empty string")
-        if isinstance(parsed.get("passed"), bool) and isinstance(parsed.get("exit_code"), int):
-            if bool(parsed["passed"]) != (int(parsed["exit_code"]) == 0):
-                errors.append("TestResult.passed must agree with exit_code")
+    errors = _base_errors(parsed, required={"checks"}, forbidden=FORBIDDEN_DECISION_FIELDS | {"passed", "command"})
+    if parsed and not isinstance(parsed.get("checks"), list):
+        errors.append("TestResult.checks must be a list")
     if not errors:
         try:
             result = TestResult.model_validate(parsed)
@@ -46,40 +32,40 @@ def validate_test_result(parsed: dict[str, Any] | None, *, fallback_summary: str
             errors.append(str(exc))
         else:
             return result, ContractValidation("TestResult", True, (), parsed)
-
     summary = "; ".join(errors) or "invalid TestResult"
-    return (
-        TestResult(passed=False, command="unreported", exit_code=-1, summary=f"{summary}. Provider summary: {fallback_summary}"),
-        ContractValidation("TestResult", False, tuple(errors), parsed),
+    fallback = TestResult(
+        checks=[
+            TestCheck(
+                id="invalid_test_output", status="failed", exit_code=-1,
+                summary=f"{summary}. Provider summary: {fallback_summary}",
+            )
+        ]
     )
+    return fallback, ContractValidation("TestResult", False, tuple(errors), parsed)
 
 
 def validate_review_result(parsed: dict[str, Any] | None) -> tuple[ReviewResult, ContractValidation]:
-    errors: list[str] = []
-    if not parsed:
-        errors.append("missing ReviewResult JSON object")
-    else:
-        if not isinstance(parsed.get("has_blockers"), bool):
-            errors.append("ReviewResult.has_blockers must be a boolean")
-        if not isinstance(parsed.get("blockers"), list):
-            errors.append("ReviewResult.blockers must be a list")
+    forbidden = FORBIDDEN_DECISION_FIELDS | {"has_blockers", "blockers"}
+    errors = _base_errors(parsed, required={"target_subject", "findings"}, forbidden=forbidden)
+    if parsed and not isinstance(parsed.get("findings"), list):
+        errors.append("ReviewResult.findings must be a list")
     if not errors:
         try:
             result = ReviewResult.model_validate(parsed)
         except ValidationError as exc:
             errors.append(str(exc))
         else:
-            if result.has_blockers != bool(result.blockers):
-                errors.append("ReviewResult.has_blockers must agree with blockers")
-            else:
-                return result, ContractValidation("ReviewResult", True, (), parsed)
+            return result, ContractValidation("ReviewResult", True, (), parsed)
+    finding = ReviewFinding(
+        type="invalid_review_output", severity="high", message="Reviewer returned an invalid structured contract.",
+        remediation="Return target_subject, findings, and residual_risk without a delivery decision.",
+    )
+    return ReviewResult(target_subject="invalid", findings=[finding]), ContractValidation("ReviewResult", False, tuple(errors), parsed)
 
-    blocker = ReviewBlocker(
-        type="invalid_review_output",
-        severity="high",
-        suggestion="Reviewer must return a valid ReviewResult JSON contract; unstructured prose cannot clear the gate.",
-    )
-    return (
-        ReviewResult(has_blockers=True, blockers=[blocker]),
-        ContractValidation("ReviewResult", False, tuple(errors), parsed),
-    )
+
+def _base_errors(parsed: dict[str, Any] | None, *, required: set[str], forbidden: set[str]) -> list[str]:
+    if not parsed:
+        return ["missing JSON object"]
+    errors = [f"missing required field: {field}" for field in sorted(required - set(parsed))]
+    errors.extend(f"provider-controlled decision field is forbidden: {field}" for field in sorted(forbidden & set(parsed)))
+    return errors

@@ -1,33 +1,14 @@
 ---
 name: default-test
-description: Default muxdev testing role skill for smoke, targeted, and regression verification with reproducible commands and honest missing-evidence reporting.
-keywords: [test, verify, qa, regression]
-metadata:
-  compatible_roles: [test, tester]
+description: Plan and execute reproducible verification. Use for test planning, targeted tests, smoke checks, regressions, and acceptance-criteria validation.
 ---
-# Default Test Skill
 
-Use this skill when the stage executes or reports behavior verification.
+# Verify behavior
 
-## Operating Rules
+- Map acceptance criteria to the smallest relevant deterministic checks first.
+- Expand to integration, migration, compatibility, negative, or manual checks when risk requires it.
+- Provide each executable check as an argv vector that the runtime can replay without a shell.
+- Distinguish passed, failed, skipped, and unavailable checks; explain every skip.
+- Identify whether a failure is related to the delivered change without hiding unrelated failures.
 
-- Choose the smallest test set that covers the changed behavior first.
-- Expand to broader regression checks when the change touches shared contracts.
-- Report exact commands, exit codes, and relevant output summaries.
-- Distinguish passed checks, failed checks, skipped checks, and checks that could not be run.
-- When tests fail, identify whether the failure appears task-related.
-
-## Output Shape
-
-- Command or method
-- Result
-- Coverage of acceptance criteria
-- Missing evidence
-- Follow-up recommendation
-
-## Delivery Standard
-
-- Required deliverable: command or method, result, acceptance criteria covered, failures, skipped checks, and follow-up recommendation.
-- Pass when relevant checks pass and configured project coverage thresholds pass when coverage configuration exists.
-- Block when relevant checks fail, tests were skipped without a reason, or configured coverage thresholds fail.
-- Evidence: reproducible command output, exit status, coverage result when configured, and skipped-check rationale.
+Return the workflow's declared `TestResult`. Report what you observed, but the runtime replay is authoritative for command arguments, output digests, exit codes, and `CheckEvidence`.

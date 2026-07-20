@@ -1,1642 +1,226 @@
-"""Static task dashboard writer and lightweight web serving helpers."""
+"""Fixed 18-endpoint HTTP adapter for the compact control plane."""
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
-import html
 import json
-import re
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
-from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
-from .. import __version__
-from .models import (
-    ApprovalFeedbackRequest,
-    BenchmarkReplayRequest,
-    CancelRequest,
-    ContinueRequest,
-    ControlledAttestationRequest,
-    DemoRunRequest,
-    FeedbackRequest,
-    MultiRepoPlanRequest,
-    ProviderActionResponseRequest,
-    ReconcileRequest,
-    RoutingBenchmarkRequest,
-    RoutingReplayRequest,
-    StorageBackupRequest,
-    TaskCreateRequest,
-)
-from .minimal_dashboard import render_minimal_dashboard_html as render_workbench_dashboard_html
-from ..core.projects import resolve_project_root
-from ..core.canonical import canonical_sha256
-from ..models import ApprovalStatus, ProviderActionStatus
+from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, HTMLResponse
+from pydantic import BaseModel, Field
+
+from ..application import TaskService
 from ..providers import detect_providers
-from ..presentation.dashboard import (
-    build_dashboard_overview,
-    dashboard_hidden_projects_path,
-    dashboard_hidden_tasks_path,
-    hide_dashboard_project,
-    hide_dashboard_task,
-    load_hidden_projects,
-    load_hidden_tasks,
-    restore_dashboard_project,
-    restore_dashboard_task,
-)
-from ..services.product_experience import build_product_experience
-from ..services.skills import activate_skill, build_skill_catalog, scan_skills, score_skill, set_skill_policy, skill_show
-from ..services.skills.events import read_skill_events
-from ..services.skills import verify_skill_lock, write_skill_lock
-from ..services.ux import build_provider_health, build_setup_status, build_task_ux_summary, build_ux_overview
-from ..services.validation import list_validation_experiments, load_validation_experiment
-from ..services.storage_admin import (
-    StorageArchiveError,
-    create_storage_backup,
-    storage_status as build_storage_status,
-    verify_controlled_backup,
-)
-from ..services.attestation_bundle import verify_attestation_bundle
-from ..services.trust import ProjectSigningKeyStore
-from ..services.local_auth import COOKIE_NAME, request_is_authenticated
-from ..services.routing_benchmark import TRUSTED_ROUTING_SUITE_ID, load_registered_routing_suite
-from ..storage import MemoryStore
+from ..runtime import RunEngine
+from ..services.evidence_verify import verify_evidence_report
+from ..services.router import ProviderRouter
+from ..services.skills import scan_skills
+from ..storage import ControlStore
 
 
-def render_dashboard_html(payload: dict[str, Any]) -> str:
-    """Render a run-level task collaboration dashboard as static HTML."""
-    app = payload.get("app", {})
-    run = payload.get("run") or {}
-    summary = payload.get("summary", {})
-    title_status = _escape(summary.get("dashboard_status", run.get("status", "ready")))
-    task = _escape(run.get("task", "No task has been started yet."))
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="5">
-  <title>muxdev Mission Control task detail</title>
-  <style>
-    :root {{
-      color-scheme: light;
-      --bg: #f7f8fa;
-      --panel: #ffffff;
-      --ink: #1f2937;
-      --muted: #6b7280;
-      --line: #d8dee8;
-      --accent: #0f766e;
-      --warn: #b45309;
-      --bad: #b91c1c;
-      --good: #15803d;
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0;
-      background: var(--bg);
-      color: var(--ink);
-      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      font-size: 14px;
-      line-height: 1.45;
-    }}
-    header {{
-      padding: 20px 28px 14px;
-      border-bottom: 1px solid var(--line);
-      background: #ffffff;
-      position: sticky;
-      top: 0;
-      z-index: 1;
-    }}
-    h1 {{ margin: 0; font-size: 22px; font-weight: 700; letter-spacing: 0; }}
-    h2 {{ margin: 0 0 10px; font-size: 15px; font-weight: 700; letter-spacing: 0; }}
-    h3 {{ margin: 0 0 6px; font-size: 13px; color: var(--muted); font-weight: 700; letter-spacing: 0; text-transform: uppercase; }}
-    code {{ background: #eef2f7; border: 1px solid #d8dee8; border-radius: 4px; padding: 1px 5px; }}
-    .subhead {{ color: var(--muted); margin-top: 4px; overflow-wrap: anywhere; }}
-    .layout {{ padding: 18px 28px 32px; display: grid; gap: 14px; grid-template-columns: repeat(12, minmax(0, 1fr)); }}
-    .panel {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; min-width: 0; }}
-    .span-12 {{ grid-column: span 12; }}
-    .span-8 {{ grid-column: span 8; }}
-    .span-6 {{ grid-column: span 6; }}
-    .span-4 {{ grid-column: span 4; }}
-    .span-3 {{ grid-column: span 3; }}
-    .metric {{ display: grid; gap: 3px; }}
-    .metric strong {{ font-size: 20px; }}
-    .muted {{ color: var(--muted); }}
-    .status {{ display: inline-flex; align-items: center; border-radius: 999px; padding: 2px 8px; border: 1px solid var(--line); font-weight: 700; }}
-    .status.completed {{ color: var(--good); border-color: #bbf7d0; background: #f0fdf4; }}
-    .status.running {{ color: var(--accent); border-color: #99f6e4; background: #f0fdfa; }}
-    .status.awaiting_approval, .status.awaiting_provider_action, .status.awaiting_feedback, .status.needs_approval, .status.paused_budget {{ color: var(--warn); border-color: #fde68a; background: #fffbeb; }}
-    .status.blocked, .status.failed, .status.aborted {{ color: var(--bad); border-color: #fecaca; background: #fef2f2; }}
-    .progress {{ width: 100%; height: 8px; background: #e5e7eb; border-radius: 999px; overflow: hidden; }}
-    .progress > div {{ height: 100%; width: {_number(summary.get("progress", 0))}%; background: var(--accent); }}
-    table {{ width: 100%; border-collapse: collapse; table-layout: fixed; }}
-    th, td {{ border-bottom: 1px solid #eef2f7; padding: 8px 6px; text-align: left; vertical-align: top; overflow-wrap: anywhere; }}
-    th {{ color: var(--muted); font-size: 12px; font-weight: 700; }}
-    tr:last-child td {{ border-bottom: 0; }}
-    .task {{ white-space: pre-wrap; overflow-wrap: anywhere; }}
-    .commands {{ display: grid; gap: 6px; }}
-    .commands code {{ display: block; overflow-x: auto; white-space: nowrap; }}
-    .terminal {{ border-color: #c7d2fe; background: #eef2ff; }}
-    @media (max-width: 900px) {{
-      .layout {{ grid-template-columns: 1fr; padding: 14px; }}
-      .span-12, .span-8, .span-6, .span-4, .span-3 {{ grid-column: span 1; }}
-      header {{ padding: 16px 14px 12px; }}
-    }}
-  </style>
-</head>
-<body>
-  <header>
-    <h1>muxdev Mission Control <span class="status {title_status}">{title_status}</span></h1>
-    <div class="subhead">{_escape(app.get("workspace", ""))}</div>
-  </header>
-  <main class="layout">
-    <section class="panel span-8">
-      <h2>Task</h2>
-      <div class="task">{task}</div>
-    </section>
-    <section class="panel span-4 {_terminal_class(summary)}">
-      <h2>Run</h2>
-      {_kv("Run ID", run.get("run_id", "none"))}
-      {_kv("Status", run.get("status", summary.get("dashboard_status", "ready")))}
-      {_kv("Workflow", run.get("workflow", "-"))}
-      {_kv("Provider", run.get("provider", "-"))}
-      {_kv("Worktree", run.get("worktree", "-"))}
-    </section>
-    <section class="panel span-12">
-      <h2>Signed Delivery Attestation</h2>
-      {_table([payload.get("attestation", {"status": "legacy_unsigned"})], ["attestation_id", "generation", "status", "identity_status", "public_key_fingerprint", "evidence_valid", "warning"])}
-    </section>
-    {_ux_section(payload)}
-    {_scorecard_section(payload)}
-    {_summary_cards(summary)}
-    <section class="panel span-8">
-      <h2>Task Timeline</h2>
-      {_table(payload.get("stages", []), ["stage_id", "role", "status", "started_at", "completed_at", "summary"])}
-    </section>
-    <section class="panel span-4">
-      <h2>Agents / CLI</h2>
-      {_table(payload.get("agents", []), ["role", "provider", "session_id", "status"])}
-      <h3>Provider Health</h3>
-      {_provider_health(app)}
-    </section>
-    <section class="panel span-6">
-      <h2>Approval Risk Review</h2>
-      {_table(payload.get("approvals", []), ["approval_id", "stage_id", "type", "status", "reason", "decided_at"])}
-    </section>
-    <section class="panel span-6">
-      <h2>Provider Action Wizard</h2>
-      {_table(_provider_action_rows(payload.get("provider_actions", [])), ["action_id", "stage_id", "provider", "kind", "input_kind", "status", "prompt", "choices", "default_choice", "response", "attach"])}
-    </section>
-    <section class="panel span-6">
-      <h2>Provider Attempts</h2>
-      {_table(payload.get("provider_attempts", []), ["stage_id", "role", "provider", "attempt", "status", "failure_kind", "returncode", "summary"])}
-    </section>
-    <section class="panel span-6">
-      <h2>Session Capsules</h2>
-      {_table(payload.get("session_capsules", []), ["capsule_id", "stage_id", "provider", "kind", "status", "path"])}
-    </section>
-    <section class="panel span-6">
-      <h2>Feedback Router</h2>
-      {_table(payload.get("feedback_events", []), ["feedback_id", "source", "kind", "status", "route_to", "severity", "content"])}
-    </section>
-    <section class="panel span-6">
-      <h2>CI Rescue</h2>
-      {_table(payload.get("ci_rescues", []), ["rescue_id", "feedback_id", "rescue_run_id", "route_to", "status", "summary"])}
-    </section>
-    <section class="panel span-6">
-      <h2>Cache / Skills</h2>
-      <h3>CAS Cache</h3>
-      {_table(payload.get("cache_entries", []), ["cache_key", "kind", "path", "value_hash"])}
-      <h3>Skill Lock</h3>
-      {_table(payload.get("skill_locks", []), ["skill_name", "skill_version", "skill_hash", "status", "path"])}
-    </section>
-    <section class="panel span-6">
-      <h2>Memory / Guardrails</h2>
-      <h3>Memory Context</h3>
-      {_table(payload.get("memory_context", []), ["layer", "scope_id", "id", "kind", "role", "promotion_state", "claim"])}
-      <h3>Guardrail Events</h3>
-      {_table(payload.get("guardrail_events", []), ["event_id", "tool", "decision", "reason", "created_at"])}
-    </section>
-    <section class="panel span-6">
-      <h2>Advanced Parallel</h2>
-      <h3>Parallel Conflicts</h3>
-      {_table(payload.get("parallel_conflicts", []), ["conflict_id", "stages", "files", "severity", "status", "resolution"])}
-      <h3>Semantic Merge</h3>
-      {_table(payload.get("semantic_merge_reviews", []), ["review_id", "decision", "patch_hash", "findings", "path"])}
-    </section>
-    <section class="panel span-6">
-      <h2>Long-Term Learning</h2>
-      <h3>Provider Learning</h3>
-      {_table(payload.get("provider_learning", []), ["provider", "role", "attempts", "successes", "failures", "human_actions", "score"])}
-      <h3>Multi-Repo Orchestration</h3>
-      {_table(payload.get("multi_repo_orchestrations", []), ["orchestration_id", "mode", "status", "task", "plan_path"])}
-    </section>
-    <section class="panel span-6">
-      <h2>Next Actions</h2>
-      {_action_hints(payload)}
-    </section>
-    <section class="panel span-6">
-      <h2>Results</h2>
-      <h3>Tests</h3>
-      {_table(payload.get("test_results", []), ["stage_id", "passed", "command", "summary"])}
-      <h3>Review Blockers</h3>
-      {_table(payload.get("review_blockers", []), ["stage_id", "type", "severity", "file", "line", "suggestion"])}
-      <h3>Errors</h3>
-      {_table(payload.get("errors", []), ["stage_id", "type", "message", "created_at"])}
-    </section>
-    <section class="panel span-6">
-      <h2>Evidence / Artifacts Center</h2>
-      {_table(payload.get("artifacts", []), ["name", "kind", "stage_id", "path", "created_at"])}
-    </section>
-    <section class="panel span-6">
-      <h2>Usage</h2>
-      {_table(payload.get("usage", []), ["provider", "tokens", "cost_usd", "created_at"])}
-    </section>
-    <section class="panel span-6">
-      <h2>Recent Trace Events</h2>
-      {_trace_table(payload.get("trace", []))}
-    </section>
-  </main>
-</body>
-</html>
-"""
+router = APIRouter()
 
 
-def render_run_review_html(payload: dict[str, Any]) -> str:
-    """Render a sanitized, shareable review page for one run."""
-    run = payload.get("run") if isinstance(payload.get("run"), dict) else {}
-    ux = payload.get("ux") if isinstance(payload.get("ux"), dict) else {}
-    evaluation = payload.get("evidence_evaluation") if isinstance(payload.get("evidence_evaluation"), dict) else {}
-    if not evaluation:
-        evaluations = payload.get("evidence_evaluations") if isinstance(payload.get("evidence_evaluations"), list) else []
-        evaluation = evaluations[0] if evaluations and isinstance(evaluations[0], dict) else {}
-    safe_artifacts = [
-        row
-        for row in payload.get("artifacts", [])
-        if isinstance(row, dict) and str(row.get("kind") or "") not in {"provider_transcript", "session_transcript", "raw_transcript", "provider_raw_output"}
-    ]
-    next_actions = ux.get("next_actions") if isinstance(ux.get("next_actions"), list) else []
-    actions = "".join(
-        f"<li><strong>{_escape(action.get('label') or action.get('kind') or 'action')}</strong>"
-        + (f"<br><span class=\"muted\">{_escape(action.get('endpoint'))}</span>" if action.get("endpoint") else "")
-        + (f"<br><code>{_escape(action.get('command'))}</code>" if action.get("command") else "")
-        + "</li>"
-        for action in next_actions[:5]
-        if isinstance(action, dict)
-    )
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>muxdev Shareable Run Review</title>
-  <style>
-    :root {{ --bg:#f6f7f9; --panel:#fff; --ink:#17202a; --muted:#64748b; --line:#d9e0ea; --accent:#0f766e; --warn:#a16207; --bad:#b91c1c; --good:#15803d; }}
-    * {{ box-sizing:border-box; }}
-    body {{ margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 ui-sans-serif,system-ui,"Segoe UI",sans-serif; }}
-    header {{ padding:18px 24px; background:#fff; border-bottom:1px solid var(--line); }}
-    main {{ padding:18px 24px 28px; display:grid; gap:14px; grid-template-columns:repeat(12,minmax(0,1fr)); }}
-    h1 {{ margin:0; font-size:22px; letter-spacing:0; }} h2 {{ margin:0 0 10px; font-size:16px; }}
-    .panel {{ grid-column:span 12; background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; min-width:0; }}
-    .span-6 {{ grid-column:span 6; }}
-    .meta,.muted {{ color:var(--muted); font-size:12px; overflow-wrap:anywhere; }}
-    .status {{ display:inline-flex; border:1px solid var(--line); border-radius:999px; padding:2px 8px; font-weight:700; }}
-    .completed,.trusted {{ color:var(--good); background:#f0fdf4; border-color:#bbf7d0; }}
-    .running,.reviewable,.collecting {{ color:var(--accent); background:#f0fdfa; border-color:#99f6e4; }}
-    .blocked,.aborted,.failed,.risky {{ color:var(--bad); background:#fef2f2; border-color:#fecaca; }}
-    .chips {{ display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }}
-    .chips span {{ border:1px solid var(--line); border-radius:999px; padding:1px 7px; background:#fff; font-size:12px; }}
-    table {{ width:100%; border-collapse:collapse; table-layout:fixed; }} th,td {{ border-bottom:1px solid #edf1f7; padding:7px 6px; text-align:left; vertical-align:top; overflow-wrap:anywhere; }} th {{ color:var(--muted); font-size:12px; }}
-    code {{ background:#eef2f7; border:1px solid #d8dee8; border-radius:4px; padding:1px 5px; }}
-    @media (max-width:900px) {{ main {{ grid-template-columns:1fr; padding:14px; }} .span-6 {{ grid-column:span 1; }} header {{ padding:16px 14px; }} }}
-  </style>
-</head>
-<body>
-  <header>
-    <h1>muxdev Shareable Run Review <span class="status {_escape(str(run.get('status') or 'ready'))}">{_escape(run.get('status') or '-')}</span></h1>
-    <div class="meta">Sensitive transcript hidden. Provider raw output, websocket trace, and local session logs are intentionally excluded.</div>
-  </header>
-  <main>
-    <section class="panel">
-      <h2>Delivery Summary</h2>
-      <strong>{_escape(ux.get('headline') or run.get('task') or run.get('run_id') or 'muxdev task')}</strong>
-      <div>{_escape(run.get('task') or '')}</div>
-      <div class="meta">{_escape(ux.get('why') or '')}</div>
-      <div class="chips">
-        <span>run {_escape(run.get('run_id') or '-')}</span>
-        <span>workflow {_escape(run.get('workflow') or '-')}</span>
-        <span>provider {_escape(run.get('provider') or '-')}</span>
-        <span>stage {_escape(ux.get('current_stage') or run.get('current_stage') or '-')}</span>
-      </div>
-    </section>
-    <section class="panel span-6">
-      <h2>Delivery Confidence</h2>
-      <p><span class="status {_escape(str(evaluation.get('label') or 'collecting'))}">{_escape(evaluation.get('label') or 'collecting')} {_number(float(evaluation.get('confidence') or 0) * 100)}%</span></p>
-      <div class="meta">{_escape(' / '.join(str(reason) for reason in (evaluation.get('reasons') or [])[:4]))}</div>
-      {_table([{"missing": ", ".join(str(item) for item in evaluation.get("missing_evidence", []) or []), "path": evaluation.get("path") or ""}], ["missing", "path"])}
-    </section>
-    <section class="panel span-6">
-      <h2>Review Actions</h2>
-      <ul>{actions or '<li class="muted">No open review action.</li>'}</ul>
-    </section>
-    <section class="panel span-6">
-      <h2>Tests</h2>
-      {_table(payload.get("test_results", []), ["stage_id", "passed", "command", "summary"])}
-    </section>
-    <section class="panel span-6">
-      <h2>Review Blockers</h2>
-      {_table(payload.get("review_blockers", []), ["stage_id", "type", "severity", "file", "line", "suggestion"])}
-    </section>
-    <section class="panel span-6">
-      <h2>Evidence Center</h2>
-      {_table(safe_artifacts, ["name", "kind", "stage_id", "path", "created_at"])}
-    </section>
-    <section class="panel span-6">
-      <h2>Semantic Merge</h2>
-      {_table(payload.get("semantic_merge_reviews", []), ["review_id", "decision", "patch_hash", "findings", "path"])}
-    </section>
-  </main>
-</body>
-</html>"""
+class RunRequest(BaseModel):
+    task: str = Field(min_length=1)
+    workflow: str = "change"
+    profile: str = "standard"
+    provider: str | None = "mock"
+    max_cost_usd: float = Field(default=0.5, gt=0)
 
 
-def render_task_terminal_html(payload: dict[str, Any], handoff: dict[str, Any], *, agent: str = "implementer") -> str:
-    """Render a read-only browser view of a task's CLI transcript or trace."""
-    run = payload.get("run") if isinstance(payload.get("run"), dict) else {}
-    run_id = str(run.get("run_id") or handoff.get("run_id") or handoff.get("task_id") or "")
-    task = str(run.get("task") or run_id or "muxdev task")
-    handoff_payload = handoff.get("handoff") if isinstance(handoff.get("handoff"), dict) else {}
-    command = _terminal_command_text(handoff_payload.get("command"))
-    mode = str(handoff_payload.get("mode") or "trace")
-    session = str(handoff_payload.get("session") or "")
-    fallback_reason = str(handoff_payload.get("fallback_reason") or "")
-    transcript_path = str(handoff_payload.get("path") or handoff_payload.get("transcript_path") or "")
-    transcript = _read_terminal_tail(transcript_path)
-    source = transcript_path if transcript else "trace.jsonl"
-    if not transcript:
-        trace = payload.get("trace") if isinstance(payload.get("trace"), list) else []
-        transcript = _trace_tail(trace)
-    if not transcript:
-        transcript = "No transcript or trace output is available yet."
-    live_mode = mode in {"native_cli", "tmux"}
-    title = "Live model CLI" if live_mode else "Transcript fallback"
-    command_label = "Attach command" if live_mode else "Transcript command"
-    command_block = f"<code>{_escape(command)}</code>" if command else "<span class=\"muted\">No attach command is available.</span>"
-    session_block = f"<span class=\"pill\">session {_escape(session)}</span>" if session else ""
-    fallback_block = f"<span class=\"pill\">{_escape(fallback_reason)}</span>" if fallback_reason else ""
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="3">
-  <title>{_escape(title)}</title>
-  <style>
-    :root {{ --bg:#0e1116; --panel:#151a22; --ink:#e5e7eb; --muted:#9ca3af; --line:#2d3440; --accent:#2dd4bf; }}
-    * {{ box-sizing:border-box; }}
-    body {{ margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 ui-sans-serif,system-ui,"Segoe UI",sans-serif; }}
-    header {{ padding:16px 20px; background:var(--panel); border-bottom:1px solid var(--line); position:sticky; top:0; }}
-    h1 {{ margin:0; font-size:18px; letter-spacing:0; }}
-    main {{ padding:16px 20px 28px; display:grid; gap:12px; }}
-    .meta,.muted {{ color:var(--muted); overflow-wrap:anywhere; }}
-    .panel {{ border:1px solid var(--line); border-radius:8px; background:var(--panel); padding:12px; }}
-    .toolbar {{ display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }}
-    .pill {{ border:1px solid var(--line); border-radius:999px; padding:2px 8px; color:var(--accent); }}
-    code {{ background:#0b0f14; border:1px solid var(--line); border-radius:5px; padding:2px 6px; overflow-wrap:anywhere; }}
-    pre {{ margin:0; white-space:pre-wrap; overflow-wrap:anywhere; font:13px/1.45 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace; }}
-    a {{ color:var(--accent); }}
-  </style>
-</head>
-<body>
-  <header>
-    <h1>{_escape(title)}</h1>
-    <div class="meta">{_escape(task)}</div>
-    <div class="toolbar">
-      <span class="pill">run {_escape(run_id)}</span>
-      <span class="pill">agent {_escape(agent)}</span>
-      <span class="pill">mode {_escape(mode)}</span>
-      {session_block}
-      {fallback_block}
-      <a href="/tasks/{_escape(run_id)}">dashboard</a>
-    </div>
-  </header>
-  <main>
-    <section class="panel">
-      <div class="meta">{_escape(command_label)}</div>
-      {command_block}
-    </section>
-    <section class="panel">
-      <div class="meta">Model execution output from {_escape(source)}</div>
-      <pre>{_escape(transcript)}</pre>
-    </section>
-  </main>
-</body>
-</html>"""
+class InteractionResponse(BaseModel):
+    status: str
+    response: str | None = None
 
 
-def write_dashboard(path: Path, payload: dict[str, Any]) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(render_dashboard_html(payload), encoding="utf-8")
-    return path
+def _workspace(request: Request) -> Path:
+    return request.app.state.workspace
 
 
-def _ux_section(payload: dict[str, Any]) -> str:
-    ux = payload.get("ux") if isinstance(payload.get("ux"), dict) else {}
-    if not ux:
-        return ""
-    actions = "".join(
-        f"<li><strong>{_escape(action.get('label', '-'))}</strong>: {_escape(action.get('description', ''))}"
-        + (f"<br><code>{_escape(action.get('command'))}</code>" if action.get("command") else "")
-        + (f"<br><span class=\"muted\">{_escape(action.get('endpoint'))}</span>" if action.get("endpoint") else "")
-        + "</li>"
-        for action in ux.get("next_actions", [])[:5]
-        if isinstance(action, dict)
-    )
-    deliverables = "".join(
-        f"<li>{_escape(item.get('label', item.get('kind', '-')))}"
-        + (f" <span class=\"muted\">{_escape(item.get('path'))}</span>" if item.get("path") else "")
-        + "</li>"
-        for item in ux.get("deliverables", [])[:5]
-        if isinstance(item, dict)
-    )
-    return f"""
-    <section class="panel span-12">
-      <h2>Current Focus</h2>
-      <p><span class="status {_escape(ux.get('user_state', ''))}">{_escape(ux.get('user_state', '-'))}</span></p>
-      <h3>{_escape(ux.get('headline', '-'))}</h3>
-      <p>{_escape(ux.get('why', ''))}</p>
-      <h3>Next Actions</h3>
-      <ul>{actions or "<li>No immediate action required.</li>"}</ul>
-      <h3>Deliverables</h3>
-      <ul>{deliverables or "<li>No deliverables yet.</li>"}</ul>
-    </section>
-    """
-
-
-def _scorecard_section(payload: dict[str, Any]) -> str:
-    scorecard = payload.get("evidence_scorecard")
-    if not isinstance(scorecard, dict):
-        return ""
-    reasons = "".join(f"<li>{_escape(reason)}</li>" for reason in scorecard.get("top_reasons", [])[:4])
-    missing = "".join(f"<li>{_escape(item)}</li>" for item in scorecard.get("missing_evidence", [])[:4]) or "<li>none</li>"
-    return f"""
-    <section class="panel span-12">
-      <h2>Delivery Scorecard</h2>
-      <div class="metric"><strong>{_escape(scorecard.get('score', 0))} / 100</strong><span class="status {_escape(scorecard.get('label', ''))}">{_escape(scorecard.get('label', '-'))}</span></div>
-      {_kv("Recommendation", scorecard.get("recommendation", "-"))}
-      <h3>Why</h3>
-      <ul>{reasons or "<li>No positive evidence recorded yet.</li>"}</ul>
-      <h3>Missing Evidence</h3>
-      <ul>{missing}</ul>
-    </section>
-    """
-
-
-def _summary_cards(summary: dict[str, Any]) -> str:
-    cards = [
-        ("Progress", f"{_number(summary.get('progress', 0))}%", '<div class="progress"><div></div></div>'),
-        ("Stages", f"{_escape(summary.get('stage_done', 0))}/{_escape(summary.get('stage_total', 0))}", "completed / total"),
-        ("Pending Approvals", str(summary.get("pending_approvals", 0)), "human gates"),
-        ("Provider Actions", str(summary.get("pending_provider_actions", 0)), "CLI/session handoffs"),
-        ("Usage", f"{summary.get('tokens', 0)} tokens", f"${float(summary.get('cost_usd') or 0):.4f}"),
-    ]
-    return "\n".join(
-        f'<section class="panel span-3 metric"><h3>{label}</h3><strong>{value}</strong><span class="muted">{detail}</span></section>'
-        for label, value, detail in cards
-    )
-
-
-def _table(rows: list[dict[str, Any]], columns: list[str]) -> str:
-    if not rows:
-        return '<div class="muted">No records yet.</div>'
-    head = "".join(f"<th>{_escape(column)}</th>" for column in columns)
-    body = "".join(
-        "<tr>" + "".join(f"<td>{_format_cell(row.get(column, ''))}</td>" for column in columns) + "</tr>"
-        for row in rows
-    )
-    return f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
-
-
-def _trace_table(rows: list[dict[str, Any]]) -> str:
-    normalized = [
-        {
-            "time": row.get("time", ""),
-            "type": row.get("type", ""),
-            "stage": row.get("stage", ""),
-            "data": json.dumps(row.get("data", {}), ensure_ascii=False),
-        }
-        for row in rows[-12:]
-    ]
-    return _table(normalized, ["time", "type", "stage", "data"])
-
-
-def _action_hints(payload: dict[str, Any]) -> str:
-    pending = [row for row in payload.get("approvals", []) if row.get("status") == "pending"]
-    provider_actions = [row for row in payload.get("provider_actions", []) if row.get("status") == "pending"]
-    run_id = (payload.get("run") or {}).get("run_id", "latest")
-    commands = []
-    if provider_actions:
-        action = provider_actions[0]
-        if action.get("attach_command"):
-            commands.append(str(action["attach_command"]))
-        commands.append(f"muxdev action handled {action.get('action_id', '<action_id>')}")
-        commands.append(f"muxdev continue {action.get('run_id', run_id)}")
-    if pending:
-        approval_id = pending[0].get("approval_id", "<approval_id>")
-        commands.extend([f"muxdev approve {approval_id}", f"muxdev deny {approval_id}"])
-    commands.extend(
-        [
-            f"muxdev continue {run_id}",
-            f"muxdev report {run_id}",
-            f"muxdev trace view {run_id}",
-            f"muxdev diff {run_id}",
-        ]
-    )
-    return '<div class="commands">' + "".join(f"<code>{_escape(command)}</code>" for command in commands) + "</div>"
-
-
-def _provider_action_rows(rows: object) -> list[dict[str, Any]]:
-    if not isinstance(rows, list):
-        return []
-    normalized: list[dict[str, Any]] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        options = row.get("choices") or row.get("options")
-        if not isinstance(options, list):
-            try:
-                options = json.loads(str(row.get("choices_json") or row.get("options_json") or "[]"))
-            except json.JSONDecodeError:
-                options = []
-        normalized.append(
-            {
-                "action_id": row.get("action_id"),
-                "stage_id": row.get("stage_id"),
-                "provider": row.get("provider"),
-                "kind": row.get("kind"),
-                "input_kind": row.get("input_kind"),
-                "status": row.get("status"),
-                "prompt": row.get("prompt_text"),
-                "choices": ", ".join(str(option.get("label") or option.get("value")) for option in options if isinstance(option, dict)) or "-",
-                "default_choice": row.get("default_choice") or "-",
-                "response": row.get("response") if row.get("response") is not None else "-",
-                "attach": row.get("attach_command") or row.get("transcript_path"),
-            }
-        )
-    return normalized
-
-
-def _provider_health(app: dict[str, Any]) -> str:
-    providers = app.get("providers", {}) if isinstance(app, dict) else {}
-    return (
-        f"{_kv('Ready', ', '.join(providers.get('ready', [])) or '-')}"
-        f"{_kv('Partial', ', '.join(providers.get('partial', [])) or '-')}"
-        f"{_kv('Known', providers.get('total', 0))}"
-    )
-
-
-def _kv(label: str, value: object) -> str:
-    return f'<p><strong>{_escape(label)}:</strong> {_format_cell(value)}</p>'
-
-
-def _format_cell(value: object) -> str:
-    if value is None or value == "":
-        return '<span class="muted">-</span>'
-    if isinstance(value, (list, dict)):
-        return _escape(json.dumps(value, ensure_ascii=False))
-    return _escape(value)
-
-
-def _escape(value: object) -> str:
-    return html.escape(str(value), quote=True)
-
-
-def _terminal_command_text(command: object) -> str:
-    if isinstance(command, list):
-        return " ".join(str(part) for part in command)
-    if isinstance(command, tuple):
-        return " ".join(str(part) for part in command)
-    return str(command or "")
-
-
-def _read_terminal_tail(path: str, *, max_bytes: int = 96_000) -> str:
-    if not path:
-        return ""
+@contextmanager
+def _tasks(workspace: Path):
+    engine = RunEngine(workspace)
     try:
-        transcript = Path(path)
-        if not transcript.exists() or not transcript.is_file():
-            return ""
-        with transcript.open("rb") as handle:
-            size = transcript.stat().st_size
-            if size > max_bytes:
-                handle.seek(size - max_bytes)
-            return handle.read().decode("utf-8", errors="replace")
-    except OSError:
-        return ""
+        yield TaskService(engine, engine.store)
+    finally:
+        engine.store.close()
 
 
-def _trace_tail(rows: object, *, limit: int = 120) -> str:
-    if not isinstance(rows, list):
-        return ""
-    tail = rows[-limit:]
-    return "\n".join(json.dumps(row, ensure_ascii=False, default=str) for row in tail if isinstance(row, dict))
+def _run_or_404(store: ControlStore, run_id: str) -> dict[str, Any]:
+    run = store.get_run(run_id)
+    if not run:
+        raise HTTPException(404, f"run not found: {run_id}")
+    return run
 
 
-def _number(value: object) -> int:
-    try:
-        return max(0, min(100, int(float(value))))
-    except (TypeError, ValueError):
-        return 0
+def _report_path(run: dict[str, Any], workspace: Path) -> Path:
+    metadata = run.get("metadata") if isinstance(run.get("metadata"), dict) else {}
+    return Path(str(metadata.get("run_dir") or workspace / ".muxdev" / "runs" / run["run_id"])) / "evidence-report.json"
 
 
-def _terminal_class(summary: dict[str, Any]) -> str:
-    return "terminal" if summary.get("terminal") else ""
+@router.get("/", response_class=HTMLResponse)
+def dashboard() -> str:
+    return _dashboard_html()
 
 
-def create_app(
-    *,
-    task_manager: object | None = None,
-    paths: object | None = None,
-    enforce_auth: bool = False,
-) -> FastAPI:
-    """Create the daemon FastAPI app used by API and Dashboard ports."""
-    from ..daemon.tasks import TaskManager
+@router.get("/health")
+def health(request: Request) -> dict[str, object]:
+    with ControlStore(_workspace(request)) as store:
+        return {"status": "ok", "database": str(store.path), "tables": len(store.table_names())}
 
-    if task_manager is not None:
-        manager = task_manager
-    elif paths is not None:
-        manager = TaskManager(paths=paths)
-    else:
-        manager = TaskManager()
-    @asynccontextmanager
-    async def lifespan(_: FastAPI):
-        try:
-            yield
-        finally:
-            close = getattr(manager, "close", None)
-            if callable(close):
-                close(timeout=30.0)
 
-    auth = getattr(manager, "auth", None)
-    if auth is None:
-        from ..services.local_auth import LocalApiAuth
-
-        auth = LocalApiAuth(Path.cwd() / ".test_workspaces" / "route-inspection-auth")
-    app = FastAPI(title="muxdev daemon", version=__version__, lifespan=lifespan)
-    app.state.local_auth = auth
-    app.state.enforce_auth = bool(enforce_auth)
-
-    @app.middleware("http")
-    async def local_security(request: Request, call_next: Any) -> Any:
-        request.state.csp_nonce = uuid4().hex
-        try:
-            content_length = int(request.headers.get("content-length") or 0)
-        except ValueError:
-            return JSONResponse({"detail": "invalid Content-Length"}, status_code=400)
-        if content_length < 0:
-            return JSONResponse({"detail": "invalid Content-Length"}, status_code=400)
-        if content_length > 1024 * 1024:
-            return JSONResponse({"detail": "request body exceeds 1 MiB"}, status_code=413)
-        path = request.url.path
-        public = path in {"/", "/api/health", "/auth/bootstrap"}
-        if enforce_auth and not public and not request_is_authenticated(auth, headers=request.headers, cookies=request.cookies):
-            return JSONResponse({"detail": "local muxdev authentication required"}, status_code=401)
-        if request.method not in {"GET", "HEAD", "OPTIONS"}:
-            try:
-                _require_local_origin(request)
-            except HTTPException as exc:
-                return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
-        response = await call_next(request)
-        response.headers["Cache-Control"] = "no-store"
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["Referrer-Policy"] = "no-referrer"
-        nonce = request.state.csp_nonce
-        response.headers["Content-Security-Policy"] = f"default-src 'self'; connect-src 'self' ws:; img-src 'self' data:; style-src 'self' 'nonce-{nonce}'; script-src 'self' 'nonce-{nonce}'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
-        return response
-
-    @app.get("/auth/bootstrap")
-    def auth_bootstrap(nonce: str = "") -> RedirectResponse:
-        cookie = auth.exchange_bootstrap(nonce)
-        if cookie is None:
-            raise HTTPException(status_code=401, detail="bootstrap nonce is invalid or expired")
-        response = RedirectResponse(url="/", status_code=303)
-        response.set_cookie(COOKIE_NAME, cookie, httponly=True, samesite="strict", secure=False, max_age=8 * 60 * 60)
-        return response
-
-    @app.get("/", response_class=HTMLResponse)
-    def dashboard(request: Request, lang: str | None = None) -> str:
-        if enforce_auth and not request_is_authenticated(auth, headers=request.headers, cookies=request.cookies):
-            return _auth_landing_html()
-        return render_live_dashboard_html(lang=lang, nonce=request.state.csp_nonce)
-
-    @app.get("/tasks/{task_id}", response_class=HTMLResponse)
-    def task_page(request: Request, task_id: str, lang: str | None = None) -> str:
-        return render_live_dashboard_html(task_id=task_id, lang=lang, nonce=request.state.csp_nonce)
-
-    @app.get("/tasks/{task_id}/terminal", response_class=HTMLResponse)
-    def task_terminal_page(task_id: str, agent: str = "implementer") -> str:
-        try:
-            detail = manager.queries.detail(task_id)
-            handoff = manager.attach_command(task_id, agent=agent)
-            return render_task_terminal_html(detail, handoff, agent=agent)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.get("/review/{task_id}", response_class=HTMLResponse)
-    def task_review_page(task_id: str) -> str:
-        try:
-            return render_run_review_html(manager.queries.detail(task_id))
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.get("/api/health")
-    def health() -> dict[str, object]:
-        return {"status": "ok", "service": "muxdev", "version": __version__}
-
-    @app.get("/api/storage/status")
-    def storage_status(scope: str = "all") -> dict[str, object]:
-        try:
-            return build_storage_status(
-                workspace=Path.cwd(),
-                daemon_paths=manager.paths,
-                scope=scope,
-                include_paths=False,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    @app.get("/api/trust/status")
-    def project_trust_status() -> dict[str, object]:
-        payload = ProjectSigningKeyStore(resolve_project_root(Path.cwd()), muxdev_home=manager.paths.home).status()
-        return {
-            "contract_version": payload.get("contract_version"),
-            "project_id": payload.get("project_id"),
-            "initialized": payload.get("initialized"),
-            "key_id": payload.get("key_id"),
-            "public_key_fingerprint": payload.get("public_key_fingerprint"),
-            "private_key_available": payload.get("private_key_available"),
-            "permission_status": payload.get("permission_status"),
-        }
-
-    @app.get("/api/tasks/{run_id}/attestation")
-    def task_attestation(run_id: str) -> dict[str, object]:
-        try:
-            record = manager.queries.attestation(run_id)
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail="task not found") from exc
-        if record is None:
-            return {"run_id": run_id, "status": "legacy_unsigned", "history_complete": False}
-        return {
-            "run_id": run_id,
-            "attestation_id": record.get("attestation_id"),
-            "generation": record.get("generation"),
-            "status": record.get("status"),
-            "payload_hash": record.get("payload_hash"),
-            "key_id": record.get("key_id"),
-            "public_key_fingerprint": record.get("public_key_fingerprint"),
-            "evidence_valid": record.get("evidence_valid"),
-            "identity_status": record.get("identity_status"),
-            "created_at": record.get("created_at"),
-            "error": record.get("error"),
-        }
-
-    @app.post("/api/tasks/{run_id}/attestation-exports")
-    def task_attestation_export(
-        run_id: str,
-        http_request: Request,
-        request: ControlledAttestationRequest | None = None,
-    ) -> dict[str, object]:
-        del request
-        _require_local_origin(http_request)
-        exports_root = (manager.paths.data_dir / "attestation-exports").resolve()
-        exports_root.mkdir(parents=True, exist_ok=True)
-        output = exports_root / f"bundle_{uuid4().hex}.muxattest"
-        try:
-            payload = manager.commands.export_attestation(run_id, output)
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail="attestation not found") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return {
-            "export_id": payload["export_id"],
-            "run_id": run_id,
-            "attestation_id": payload["attestation_id"],
-            "sha256": payload["sha256"],
-            "size_bytes": payload["size_bytes"],
-            "member_count": payload["member_count"],
-        }
-
-    @app.post("/api/attestation-exports/{export_id}/verify")
-    def task_attestation_export_verify(
-        export_id: str,
-        http_request: Request,
-        request: ControlledAttestationRequest | None = None,
-    ) -> dict[str, object]:
-        del request
-        _require_local_origin(http_request)
-        if not re.fullmatch(r"atex_[0-9a-f]{32}", export_id):
-            raise HTTPException(status_code=400, detail="invalid export id")
-        record = manager.queries.attestation_export(export_id)
-        if record is None:
-            raise HTTPException(status_code=404, detail="attestation export not found")
-        exports_root = (manager.paths.data_dir / "attestation-exports").resolve()
-        archive = Path(str(record.get("bundle_path") or "")).resolve()
-        if archive.parent != exports_root or not archive.is_file():
-            raise HTTPException(status_code=409, detail="controlled attestation export is unavailable")
-        payload = verify_attestation_bundle(archive)
-        return {
-            "export_id": export_id,
-            "run_id": record.get("run_id"),
-            "attestation_id": record.get("attestation_id"),
-            "integrity_valid": payload.get("integrity_valid"),
-            "evidence_valid": payload.get("evidence_valid"),
-            "identity_status": payload.get("identity_status"),
-            "trusted": payload.get("trusted"),
-            "valid": payload.get("valid"),
-            "warnings": payload.get("warnings"),
-            "errors": payload.get("errors"),
-        }
-
-    @app.post("/api/storage/backups")
-    def storage_backup(http_request: Request, request: StorageBackupRequest | None = None) -> dict[str, object]:
-        _require_local_origin(http_request)
-        try:
-            payload = create_storage_backup(
-                workspace=Path.cwd(),
-                daemon_paths=manager.paths,
-                scope=request.scope if request else "all",
-            )
-        except (ValueError, FileNotFoundError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {
-            "backup_id": payload["backup_id"],
-            "scope": payload["scope"],
-            "database_count": payload["database_count"],
-            "sha256": payload["sha256"],
-            "databases": payload["databases"],
-        }
-
-    @app.post("/api/storage/backups/{backup_id}/verify")
-    def storage_backup_verify(backup_id: str, request: Request) -> dict[str, object]:
-        _require_local_origin(request)
-        try:
-            payload = verify_controlled_backup(manager.paths, backup_id)
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail="backup not found") from exc
-        except (StorageArchiveError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        payload.pop("archive", None)
-        return payload
-
-    @app.get("/api/runs/{run_id}/replay")
-    def state_replay(run_id: str) -> dict[str, object]:
-        try:
-            return manager.queries.replay(run_id)
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-    def _dashboard_project_store() -> Path:
-        return dashboard_hidden_projects_path(manager.paths.data_dir)
-
-    def _dashboard_task_store() -> Path:
-        return dashboard_hidden_tasks_path(manager.paths.data_dir)
-
-    def _dashboard_payload(root: Path, *, include_hidden: bool = False, include_global_config: bool = True) -> dict[str, object]:
-        tasks = manager.queries.list_tasks()
-        approvals = manager.queries.approvals(status=str(ApprovalStatus.PENDING))
-        actions = manager.queries.provider_actions(status=str(ProviderActionStatus.PENDING))
-        provider_health = _provider_health_payload() if include_global_config else _deferred_provider_health_payload()
-        ecosystem = manager.ecosystem_state() if include_global_config else {}
-        memory_governance = _memory_governance_payload(root) if include_global_config else {}
-        return build_dashboard_overview(
-            root,
-            daemon=manager.daemon_status(),
-            tasks=tasks,
-            approvals=approvals,
-            provider_actions=actions,
-            provider_health=provider_health,
-            ecosystem=ecosystem,
-            hidden_projects=load_hidden_projects(_dashboard_project_store()),
-            hidden_tasks=load_hidden_tasks(_dashboard_task_store()),
-            include_hidden=include_hidden,
-            include_global_config=include_global_config,
-            memory_governance=memory_governance,
+@router.post("/runs", status_code=201)
+def create_run(body: RunRequest, request: Request) -> dict[str, object]:
+    with _tasks(_workspace(request)) as tasks:
+        result = tasks.create(
+            body.task,
+            provider=body.provider,
+            workflow_name=body.workflow,
+            profile=body.profile,
+            max_cost_usd=body.max_cost_usd,
         )
+    return {"run_id": result.run_id, "status": str(result.status), "evidence": str(result.report_path)}
 
-    @app.get("/api/daemon/status")
-    def daemon_status() -> dict[str, object]:
-        return manager.daemon_status()
 
-    @app.get("/api/runtime/status")
-    def runtime_status() -> dict[str, object]:
-        return manager.runtime_status()
+@router.get("/runs")
+def list_runs(request: Request, status: str | None = None, limit: int = Query(100, ge=1, le=1000)) -> list[dict[str, Any]]:
+    with _tasks(_workspace(request)) as tasks:
+        return tasks.list(status=status, limit=limit)
 
-    @app.get("/api/dashboard/overview")
-    def dashboard_overview(workspace: str | None = None, include_hidden: bool = False, include_global_config: bool = True) -> dict[str, object]:
-        root = Path(workspace or Path.cwd()).resolve()
-        return _dashboard_payload(root, include_hidden=include_hidden, include_global_config=include_global_config)
 
-    @app.get("/api/dashboard/tasks")
-    def dashboard_tasks(cursor: str | None = None, limit: int = 50) -> dict[str, object]:
+@router.get("/runs/{run_id}")
+def get_run(run_id: str, request: Request) -> dict[str, object]:
+    with _tasks(_workspace(request)) as tasks:
         try:
-            return manager.dashboard_tasks(cursor=cursor, limit=limit)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    @app.delete("/api/dashboard/projects/{project_id}")
-    def dashboard_hide_project(project_id: str, workspace: str | None = None) -> dict[str, object]:
-        root = Path(workspace or Path.cwd()).resolve()
-        overview = _dashboard_payload(root, include_hidden=True)
-        project = next((item for item in overview.get("projects", []) if item.get("id") == project_id), None)
-        return hide_dashboard_project(_dashboard_project_store(), project_id, project=project)
-
-    @app.post("/api/dashboard/projects/{project_id}/restore")
-    def dashboard_restore_project(project_id: str) -> dict[str, object]:
-        return restore_dashboard_project(_dashboard_project_store(), project_id)
-
-    @app.delete("/api/dashboard/tasks/{task_id}")
-    def dashboard_hide_task(task_id: str, workspace: str | None = None) -> dict[str, object]:
-        root = Path(workspace or Path.cwd()).resolve()
-        overview = _dashboard_payload(root, include_hidden=True, include_global_config=False)
-        task = _find_dashboard_task(overview, task_id)
-        return hide_dashboard_task(_dashboard_task_store(), task_id, task=task)
-
-    @app.post("/api/dashboard/tasks/{task_id}/restore")
-    def dashboard_restore_task(task_id: str) -> dict[str, object]:
-        return restore_dashboard_task(_dashboard_task_store(), task_id)
-
-    @app.get("/api/ux/overview")
-    def ux_overview() -> dict[str, object]:
-        tasks = manager.queries.list_tasks()
-        approvals = manager.queries.approvals(status=str(ApprovalStatus.PENDING))
-        actions = manager.queries.provider_actions(status=str(ProviderActionStatus.PENDING))
-        return build_ux_overview(
-            daemon=manager.daemon_status(),
-            tasks=tasks,
-            approvals=approvals,
-            provider_actions=actions,
-            selected_task=tasks[0] if tasks else None,
-        )
-
-    @app.get("/api/setup/status")
-    def setup_status() -> dict[str, object]:
-        payload = build_setup_status(
-            workspace=str(Path.cwd()),
-            daemon={**manager.daemon_status(), "status": "ok"},
-            provider_health=_provider_health_payload(),
-        )
-        payload["product_experience"] = build_product_experience(Path.cwd(), tasks=manager.queries.list_tasks(), provider_health=payload["provider_health"])
-        return payload
-
-    @app.get("/api/providers/health")
-    def providers_health() -> dict[str, object]:
-        return _provider_health_payload()
-
-    @app.get("/api/providers/certifications")
-    def provider_certifications() -> list[dict[str, object]]:
-        return manager.provider_certifications()
-
-    @app.get("/api/providers/{name}/certification")
-    def provider_certification(name: str) -> dict[str, object]:
-        rows = manager.provider_certifications(provider=name)
-        return rows[0] if rows else {"provider": name, "status": "uncertified"}
-
-    @app.get("/api/product/experience")
-    def product_experience(workspace: str | None = None) -> dict[str, object]:
-        root = Path(workspace or Path.cwd()).resolve()
-        return build_product_experience(root, tasks=manager.queries.list_tasks(), provider_health=_provider_health_payload())
-
-    @app.get("/api/validation/experiments")
-    def validation_experiments(workspace: str | None = None) -> list[dict[str, object]]:
-        root = Path(workspace or Path.cwd()).resolve()
-        return list_validation_experiments(root)
-
-    @app.get("/api/validation/experiments/{experiment_id}")
-    def validation_experiment(experiment_id: str, workspace: str | None = None) -> dict[str, object]:
-        root = Path(workspace or Path.cwd()).resolve()
-        try:
-            return load_validation_experiment(root, experiment_id).model_dump()
+            return tasks.get(run_id)
         except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise HTTPException(404, f"run not found: {run_id}") from exc
 
-    @app.get("/api/skills/catalog")
-    def skills_catalog(workspace: str | None = None) -> dict[str, object]:
-        root = Path(workspace or Path.cwd()).resolve()
-        return build_skill_catalog(root).to_dict()
 
-    @app.get("/api/skills/lock")
-    def skills_lock(workspace: str | None = None) -> dict[str, object]:
-        return verify_skill_lock(Path(workspace or Path.cwd()).resolve())
+@router.post("/runs/{run_id}/resume")
+def resume_run(run_id: str, request: Request, background: BackgroundTasks) -> dict[str, str]:
+    with ControlStore(_workspace(request)) as store:
+        _run_or_404(store, run_id)
+    background.add_task(_resume_background, _workspace(request), run_id)
+    return {"run_id": run_id, "status": "queued"}
 
-    @app.post("/api/skills/lock")
-    def skills_lock_write(workspace: str | None = None, memory: bool = True) -> dict[str, object]:
-        return write_skill_lock(Path(workspace or Path.cwd()).resolve(), promote_memory=memory)
 
-    @app.get("/api/skills/events")
-    def skills_events(workspace: str | None = None) -> list[dict[str, object]]:
-        return read_skill_events(Path(workspace or Path.cwd()).resolve())
+def _resume_background(workspace: Path, run_id: str) -> None:
+    with _tasks(workspace) as tasks:
+        tasks.resume(run_id)
 
-    @app.get("/api/skills")
-    def skills_list(workspace: str | None = None, include_disabled: bool = False) -> list[dict[str, object]]:
-        return [skill.to_dict() for skill in scan_skills(Path(workspace or Path.cwd()).resolve(), include_disabled=include_disabled)]
 
-    @app.get("/api/skills/scorecards")
-    def skills_scorecards(workspace: str | None = None, last: str = "30d") -> list[dict[str, object]]:
-        root = Path(workspace or Path.cwd()).resolve()
-        return [score_skill(root, str(skill.get("name")), last=last) for skill in build_skill_catalog(root).to_dict().get("skills", []) if skill.get("name")]
+@router.post("/runs/{run_id}/cancel")
+def cancel_run(run_id: str, request: Request) -> dict[str, str]:
+    with _tasks(_workspace(request)) as tasks:
+        tasks.cancel(run_id)
+    return {"run_id": run_id, "status": "aborted"}
 
-    @app.get("/skills", response_class=HTMLResponse)
-    def skills_page(workspace: str | None = None) -> str:
-        root = Path(workspace or Path.cwd()).resolve()
-        skills = build_skill_catalog(root).to_dict().get("skills", [])
-        rows = "".join(f"<li><strong>{_escape(row.get('name'))}</strong> <span>{_escape(row.get('description', ''))}</span></li>" for row in skills)
-        return f"<!doctype html><title>muxdev Skills</title><h1>muxdev Skills</h1><ul>{rows}</ul>"
 
-    @app.get("/api/skills/{name}")
-    def skills_detail(name: str, workspace: str | None = None) -> dict[str, object]:
+@router.get("/runs/{run_id}/events")
+def get_events(run_id: str, request: Request, after: int = Query(0, ge=0)) -> list[dict[str, Any]]:
+    with ControlStore(_workspace(request)) as store:
+        _run_or_404(store, run_id)
+        return store.events(run_id, after=after)
+
+
+@router.get("/runs/{run_id}/artifacts")
+def get_artifacts(run_id: str, request: Request) -> list[dict[str, Any]]:
+    with ControlStore(_workspace(request)) as store:
+        _run_or_404(store, run_id)
+        return store.artifacts(run_id)
+
+
+@router.get("/artifacts/{artifact_id}")
+def download_artifact(artifact_id: str, request: Request) -> FileResponse:
+    with ControlStore(_workspace(request)) as store:
+        artifact = store.artifact(artifact_id)
+    if not artifact or not Path(str(artifact["path"])).is_file():
+        raise HTTPException(404, "artifact not found")
+    return FileResponse(str(artifact["path"]), media_type=str(artifact["media_type"]), filename=str(artifact["name"]))
+
+
+@router.get("/runs/{run_id}/evidence")
+def get_evidence(run_id: str, request: Request) -> dict[str, Any]:
+    with ControlStore(_workspace(request)) as store:
+        run = _run_or_404(store, run_id)
+    path = _report_path(run, _workspace(request))
+    if not path.is_file():
+        raise HTTPException(404, "evidence report not found")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@router.post("/runs/{run_id}/evidence/verify")
+def verify_evidence(run_id: str, request: Request) -> dict[str, object]:
+    with ControlStore(_workspace(request)) as store:
+        run = _run_or_404(store, run_id)
+        return verify_evidence_report(_report_path(run, _workspace(request)), store=store)
+
+
+@router.get("/interactions")
+def list_interactions(request: Request, run_id: str, pending_only: bool = False) -> list[dict[str, Any]]:
+    with ControlStore(_workspace(request)) as store:
+        _run_or_404(store, run_id)
+        return store.interactions(run_id, pending_only=pending_only)
+
+
+@router.post("/interactions/{interaction_id}/respond")
+def respond_interaction(interaction_id: str, body: InteractionResponse, request: Request) -> dict[str, Any]:
+    with _tasks(_workspace(request)) as tasks:
         try:
-            return skill_show(Path(workspace or Path.cwd()).resolve(), name)
-        except (FileNotFoundError, ValueError) as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.post("/api/skills/{name}/trust")
-    def skills_trust(name: str, trust: str, workspace: str | None = None) -> dict[str, object]:
-        return set_skill_policy(Path(workspace or Path.cwd()).resolve(), name, trust=trust)
-
-    @app.post("/api/skills/{name}/activate")
-    def skills_activate(name: str, role: str | None = None, provider: str = "mock", workspace: str | None = None) -> dict[str, object]:
-        return activate_skill(Path(workspace or Path.cwd()).resolve(), name, role=role, provider=provider).to_dict(include_content=True)
-
-    @app.get("/api/skills/{name}/score")
-    def skills_score(name: str, workspace: str | None = None, last: str = "30d") -> dict[str, object]:
-        return score_skill(Path(workspace or Path.cwd()).resolve(), name, last=last)
-
-    @app.post("/api/tasks")
-    def create_task(request: TaskCreateRequest) -> dict[str, object]:
-        try:
-            workspace = resolve_project_root(Path(request.workspace or Path.cwd()))
-        except (FileNotFoundError, NotADirectoryError, OSError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return manager.commands.submit(
-            task=request.task,
-            workspace=workspace,
-            provider=request.provider,
-            workflow=request.workflow,
-            gate=request.gate,
-            require_approval=set(request.require_approval),
-            max_cost_usd=request.max_cost_usd,
-            role_providers=request.role_providers,
-            skills=request.skills,
-            ci_block_on_approval=request.ci_block_on_approval,
-            depth=request.depth,
-            automation=request.automation,
-            routing_policy=request.routing_policy,
-        )
-
-    @app.get("/api/tasks")
-    def list_tasks() -> list[dict[str, object]]:
-        return manager.queries.list_tasks()
-
-    @app.get("/api/tasks/{task_id}")
-    def task_detail(task_id: str) -> dict[str, object]:
-        try:
-            return manager.queries.detail(task_id)
+            return tasks.respond(interaction_id, status=body.status, response=body.response)
         except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise HTTPException(404, "interaction not found") from exc
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+
+@router.get("/providers")
+def list_providers() -> list[dict[str, object]]:
+    return [item.to_dict() for item in detect_providers()]
+
+
+@router.get("/skills")
+def list_skills(request: Request) -> list[dict[str, object]]:
+    return [item.to_dict() for item in scan_skills(_workspace(request), include_disabled=True)]
+
+
+@router.get("/routing/{run_id}")
+def explain_route(run_id: str, request: Request) -> dict[str, Any]:
+    with ControlStore(_workspace(request)) as store:
+        try:
+            return ProviderRouter(store).explain(run_id)
         except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise HTTPException(404, str(exc)) from exc
 
-    @app.get("/api/tasks/{task_id}/ux")
-    def task_ux(task_id: str) -> dict[str, object]:
+
+@router.post("/routing/{run_id}/replay")
+def replay_route(run_id: str, request: Request) -> dict[str, Any]:
+    with ControlStore(_workspace(request)) as store:
         try:
-            return build_task_ux_summary(manager.queries.detail(task_id))
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            return ProviderRouter(store).replay(run_id)
         except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise HTTPException(404, str(exc)) from exc
 
-    @app.post("/api/tasks/{task_id}/continue")
-    def continue_task(task_id: str, request: ContinueRequest | None = None) -> dict[str, object]:
-        try:
-            return manager.commands.continue_task(task_id, max_cost_usd=(request.max_cost_usd if request else 0.5))
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    @app.post("/api/tasks/{task_id}/stop")
-    def stop_task(task_id: str, request: Request) -> dict[str, object]:
-        _require_local_origin(request)
-        try:
-            return manager.commands.stop(task_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+def create_app(workspace: Path | None = None) -> FastAPI:
+    application = FastAPI(title="muxdev", version="3")
+    application.state.workspace = (workspace or Path.cwd()).resolve()
+    application.include_router(router)
+    return application
 
-    @app.get("/api/tasks/{task_id}/story")
-    def task_story(task_id: str, cursor: str | None = None, limit: int = 200) -> dict[str, object]:
-        try:
-            return manager.queries.story(task_id, cursor=cursor, limit=limit)
-        except (KeyError, FileNotFoundError) as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @app.get("/api/demo/scenarios")
-    def demo_scenarios() -> list[dict[str, object]]:
-        return manager.demo_scenarios()
+def write_dashboard(workspace: Path, output: Path) -> Path:
+    del workspace
+    output.write_text(_dashboard_html(), encoding="utf-8")
+    return output
 
-    @app.get("/api/demo/scenarios/{scenario_id}")
-    def demo_scenario(scenario_id: str) -> dict[str, object]:
-        try:
-            return manager.demo_scenario(scenario_id)
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    @app.post("/api/demo/scenarios/{scenario_id}/run")
-    def demo_run(scenario_id: str, request: DemoRunRequest) -> dict[str, object]:
-        try:
-            workspace = resolve_project_root(Path(request.workspace or Path.cwd()))
-            return manager.start_demo(scenario_id, workspace=workspace)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    @app.post("/api/tasks/{task_id}/cancel")
-    def cancel_task(task_id: str, http_request: Request, request: CancelRequest | None = None) -> dict[str, object]:
-        _require_local_origin(http_request)
-        try:
-            payload = request or CancelRequest()
-            return manager.coordinator.cancel(task_id, reason=payload.reason, wait=payload.wait, timeout=payload.timeout)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-    @app.get("/api/tasks/{task_id}/executions")
-    def task_executions(task_id: str) -> dict[str, object]:
-        try:
-            return manager.coordinator.executions(task_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.get("/api/tasks/{task_id}/harness-events")
-    def task_harness_events(task_id: str, stage: str | None = None) -> dict[str, object]:
-        try:
-            return manager.harness_events(task_id, stage_id=stage)
-        except (KeyError, FileNotFoundError) as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.get("/api/tasks/{task_id}/isolation")
-    def task_isolation(task_id: str) -> dict[str, object]:
-        try:
-            return manager.task_isolation(task_id)
-        except (KeyError, FileNotFoundError) as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.get("/api/tasks/{task_id}/route")
-    def task_route(task_id: str) -> dict[str, object]:
-        try:
-            return manager.task_route(task_id)
-        except (KeyError, FileNotFoundError) as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.get("/api/tasks/{task_id}/review")
-    def task_review(task_id: str) -> dict[str, object]:
-        try:
-            return manager.task_review(task_id)
-        except (KeyError, FileNotFoundError) as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.get("/api/routing/snapshots")
-    def routing_snapshots() -> list[dict[str, object]]:
-        return manager.routing_snapshots()
-
-    @app.post("/api/routing/replays")
-    def routing_replay(http_request: Request, request: RoutingReplayRequest) -> dict[str, object]:
-        _require_local_origin(http_request)
-        try:
-            return manager.routing_replay(request.run_id, benchmark_snapshot_id=request.benchmark_snapshot_id)
-        except (KeyError, FileNotFoundError) as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.post("/api/routing/benchmarks")
-    def routing_benchmark(http_request: Request, request: RoutingBenchmarkRequest) -> dict[str, object]:
-        _require_local_origin(http_request)
-        try:
-            if request.live:
-                raise HTTPException(status_code=405, detail="live benchmark execution is CLI-only")
-            return manager.routing_benchmark(
-                request.suite_id,
-                live=request.live,
-                acknowledged=request.acknowledged,
-                max_cost_usd=request.max_cost_usd,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    @app.get("/api/benchmarks/suites")
-    def benchmark_suites() -> list[dict[str, object]]:
-        suite = load_registered_routing_suite(TRUSTED_ROUTING_SUITE_ID)
-        return [{"suite_id": TRUSTED_ROUTING_SUITE_ID, "suite_hash": canonical_sha256(suite), "case_count": len(suite["cases"]), "contract_version": suite["contract_version"]}]
-
-    @app.get("/api/benchmarks/executions")
-    def benchmark_executions() -> list[dict[str, object]]:
-        return manager.benchmark_executions()
-
-    @app.get("/api/benchmarks/executions/{execution_id}")
-    def benchmark_execution(execution_id: str) -> dict[str, object]:
-        try:
-            return manager.benchmark_execution(execution_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.get("/api/benchmarks/executions/{execution_id}/report")
-    def benchmark_report(execution_id: str) -> dict[str, object]:
-        try:
-            return manager.benchmark_report(execution_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.post("/api/benchmarks/replays")
-    def benchmark_replay(request: BenchmarkReplayRequest) -> dict[str, object]:
-        try:
-            return manager.benchmark_replay(request.suite_id)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    @app.post("/api/benchmarks/executions/{execution_id}/cancel")
-    def benchmark_cancel(execution_id: str) -> dict[str, object]:
-        try:
-            return manager.cancel_benchmark(execution_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.get("/api/auth/status")
-    def auth_status() -> dict[str, object]:
-        return auth.status()
-
-    @app.get("/metrics", response_class=PlainTextResponse)
-    def runtime_metrics() -> str:
-        runtime = manager.runtime_status()
-        queue = runtime.get("queue", {}) if isinstance(runtime, dict) else {}
-        lines = ["# HELP muxdev_runtime_queue Jobs by durable state", "# TYPE muxdev_runtime_queue gauge"]
-        for status, value in sorted(queue.items() if isinstance(queue, dict) else []):
-            lines.append(f'muxdev_runtime_queue{{status="{str(status)}"}} {int(value or 0)}')
-        lines.append(f"muxdev_runtime_workers_busy {int(runtime.get('busy_workers') or 0) if isinstance(runtime, dict) else 0}")
-        return "\n".join(lines) + "\n"
-
-    @app.post("/api/tasks/{task_id}/reconcile")
-    def reconcile_task(task_id: str, http_request: Request, request: ReconcileRequest) -> dict[str, object]:
-        _require_local_origin(http_request)
-        try:
-            return manager.reconcile_task(
-                task_id,
-                decision=request.decision,
-                reason=request.reason,
-                acknowledge_duplicate_risk=request.acknowledge_duplicate_risk,
-            )
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    @app.get("/api/tasks/{task_id}/diff")
-    def task_diff(task_id: str) -> dict[str, object]:
-        try:
-            return manager.queries.diff(task_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.get("/api/tasks/{task_id}/report")
-    def task_report(task_id: str) -> dict[str, object]:
-        try:
-            return manager.queries.report(task_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.post("/api/tasks/{task_id}/rollback")
-    def rollback_task(task_id: str, to_stage: str | None = None) -> dict[str, object]:
-        try:
-            return manager.commands.rollback(task_id, to_stage=to_stage)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.get("/api/tasks/{task_id}/attach-command")
-    def attach_command(task_id: str, agent: str = "implementer") -> dict[str, object]:
-        try:
-            return manager.attach_command(task_id, agent=agent)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.get("/api/provider-actions")
-    def provider_actions(status: str | None = None) -> list[dict[str, object]]:
-        return manager.queries.provider_actions(status=status)
-
-    @app.get("/api/provider-scores")
-    def provider_scores(role: str | None = None) -> list[dict[str, object]]:
-        return manager.provider_scores(role=role)
-
-    @app.get("/api/learning/provider")
-    def provider_learning(role: str | None = None) -> list[dict[str, object]]:
-        return manager.provider_learning(role=role)
-
-    @app.get("/api/parallel-conflicts")
-    def parallel_conflicts(status: str | None = None) -> list[dict[str, object]]:
-        return manager.parallel_conflicts(status=status)
-
-    @app.get("/api/semantic-merge-reviews")
-    def semantic_merge_reviews() -> list[dict[str, object]]:
-        return manager.semantic_merge_reviews()
-
-    @app.get("/api/multi-repo/orchestrations")
-    def multi_repo_orchestrations(status: str | None = None) -> list[dict[str, object]]:
-        return manager.multi_repo_orchestrations(status=status)
-
-    @app.post("/api/multi-repo/plan")
-    def multi_repo_plan(request: MultiRepoPlanRequest) -> dict[str, object]:
-        workspace = Path(request.workspace or Path.cwd()).resolve()
-        return manager.commands.plan_multi_repo(
-            workspace=workspace,
-            repos=[Path(repo) for repo in request.repos],
-            task=request.task,
-            mode=request.mode,
-        )
-
-    @app.post("/api/feedback")
-    def feedback(request: FeedbackRequest) -> dict[str, object]:
-        workspace = _feedback_workspace(request)
-        return manager.ingest_feedback(
-            kind=request.kind,
-            source=request.source,
-            content=request.content,
-            workspace=workspace,
-            run_id=request.run_id,
-            severity=request.severity,
-            provider=request.provider,
-            payload=request.payload,
-            auto_submit=request.auto_submit,
-        )
-
-    def _feedback_workspace(request: FeedbackRequest) -> Path:
-        if request.workspace:
-            return Path(request.workspace).resolve()
-        if request.run_id:
-            try:
-                run = manager.get_run(request.run_id)
-                return Path(str(run["workspace"])).resolve()
-            except (KeyError, FileNotFoundError):
-                pass
-        return Path.cwd().resolve()
-
-    @app.get("/api/ecosystem")
-    def ecosystem() -> dict[str, object]:
-        return manager.ecosystem_state()
-
-    @app.get("/api/tasks/{task_id}/provider-actions")
-    def task_provider_actions(task_id: str, status: str | None = None) -> list[dict[str, object]]:
-        try:
-            return manager.queries.provider_actions(status=status, task_id=task_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.get("/api/tasks/{task_id}/parallel-conflicts")
-    def task_parallel_conflicts(task_id: str, status: str | None = None) -> list[dict[str, object]]:
-        try:
-            return manager.parallel_conflicts(status=status, task_id=task_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.get("/api/tasks/{task_id}/semantic-merge-reviews")
-    def task_semantic_merge_reviews(task_id: str) -> list[dict[str, object]]:
-        try:
-            return manager.semantic_merge_reviews(task_id=task_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.get("/api/memory/contradictions")
-    def memory_contradictions(workspace: str | None = None, status: str | None = None) -> list[dict[str, object]]:
-        with MemoryStore(Path(workspace or Path.cwd()).resolve()) as store:
-            if status is None:
-                store.detect_contradictions()
-            return store.list_contradictions(status=status)
-
-    @app.get("/api/memory/inbox")
-    def memory_inbox(workspace: str | None = None, limit: int = 50) -> dict[str, object]:
-        with MemoryStore(Path(workspace or Path.cwd()).resolve()) as store:
-            return store.inbox(limit=limit)
-
-    @app.post("/api/memory/{memory_id}/promote")
-    def memory_promote(memory_id: str, workspace: str | None = None, layer: str = "project", scope_id: str | None = None) -> dict[str, object]:
-        try:
-            with MemoryStore(Path(workspace or Path.cwd()).resolve()) as store:
-                return store.promote(memory_id, layer=layer, scope_id=scope_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.post("/api/memory/quarantine-auto")
-    def memory_quarantine_auto(workspace: str | None = None) -> list[dict[str, object]]:
-        with MemoryStore(Path(workspace or Path.cwd()).resolve()) as store:
-            store.detect_contradictions()
-            return store.auto_quarantine_contradictions()
-
-    @app.post("/api/provider-actions/{action_id}/handled")
-    def provider_action_handled(action_id: str, request: ProviderActionResponseRequest | None = None) -> dict[str, object]:
-        try:
-            if request is not None:
-                return manager.commands.provider_response(action_id, request.response_payload())
-            return manager.commands.provider_action(action_id, ProviderActionStatus.HANDLED)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.post("/api/provider-actions/{action_id}/response")
-    def provider_action_response(action_id: str, request: ProviderActionResponseRequest) -> dict[str, object]:
-        try:
-            return manager.commands.provider_response(action_id, request.response_payload())
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.post("/api/tasks/{task_id}/actions/{action_id}/handled-and-continue")
-    def provider_action_handled_and_continue(task_id: str, action_id: str, request: ProviderActionResponseRequest | None = None) -> dict[str, object]:
-        try:
-            handled = (
-                manager.commands.provider_response(action_id, request.response_payload())
-                if request is not None and (request.response is not None or request.choice is not None or request.text is not None)
-                else manager.commands.provider_action(action_id, ProviderActionStatus.HANDLED)
-            )
-            continued = manager.commands.continue_task(task_id, max_cost_usd=(request.max_cost_usd if request else 0.5))
-            return {
-                "task_id": task_id,
-                "run_id": task_id,
-                "action": handled,
-                "continue": continued,
-                "status": continued.get("status"),
-            }
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.post("/api/tasks/{task_id}/actions/{action_id}/respond-and-continue")
-    def provider_action_respond_and_continue(task_id: str, action_id: str, request: ProviderActionResponseRequest) -> dict[str, object]:
-        try:
-            handled = manager.commands.provider_response(action_id, request.response_payload())
-            continued = manager.commands.continue_task(task_id, max_cost_usd=request.max_cost_usd)
-            return {
-                "task_id": task_id,
-                "run_id": task_id,
-                "action": handled,
-                "continue": continued,
-                "status": continued.get("status"),
-            }
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.post("/api/provider-actions/{action_id}/dismiss")
-    def provider_action_dismiss(action_id: str) -> dict[str, object]:
-        try:
-            return manager.commands.provider_action(action_id, ProviderActionStatus.DISMISSED)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.get("/api/approvals")
-    def approvals(status: str | None = None) -> list[dict[str, object]]:
-        return manager.queries.approvals(status=status)
-
-    @app.post("/api/approvals/{approval_id}/approve")
-    def approve(approval_id: str) -> dict[str, object]:
-        try:
-            return manager.commands.approve(approval_id, ApprovalStatus.APPROVED)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.post("/api/approvals/{approval_id}/deny")
-    def deny(approval_id: str) -> dict[str, object]:
-        try:
-            return manager.commands.approve(approval_id, ApprovalStatus.DENIED)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.post("/api/approvals/{approval_id}/feedback")
-    def approval_feedback(approval_id: str, request: ApprovalFeedbackRequest) -> dict[str, object]:
-        try:
-            return manager.commands.planning_feedback(approval_id, request.feedback)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    @app.post("/api/approvals/{approval_id}/feedback-and-continue")
-    def approval_feedback_and_continue(approval_id: str, request: ApprovalFeedbackRequest) -> dict[str, object]:
-        try:
-            feedback = manager.commands.planning_feedback(approval_id, request.feedback)
-            continued = manager.commands.continue_task(str(feedback.get("run_id")), max_cost_usd=request.max_cost_usd)
-            return {
-                "approval": feedback,
-                "continue": continued,
-                "status": continued.get("status"),
-            }
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    async def _events(websocket: WebSocket) -> None:
-        if enforce_auth:
-            origin = websocket.headers.get("origin")
-            if origin:
-                try:
-                    hostname = (urlsplit(origin).hostname or "").lower()
-                except ValueError:
-                    hostname = ""
-                if hostname not in {"127.0.0.1", "localhost", "::1", "testserver"}:
-                    await websocket.close(code=1008)
-                    return
-            if not request_is_authenticated(auth, headers=websocket.headers, cookies=websocket.cookies):
-                await websocket.close(code=1008)
-                return
-        await websocket.accept()
-        queue = await manager.subscribe()
-        try:
-            while True:
-                await websocket.send_json(await queue.get())
-        except WebSocketDisconnect:
-            pass
-        finally:
-            manager.unsubscribe(queue)
-
-    app.websocket("/events")(_events)
-    app.websocket("/api/events")(_events)
-    return app
-
-
-def _require_local_origin(request: Request) -> None:
-    origin = request.headers.get("origin")
-    if not origin:
-        return
-    try:
-        hostname = (urlsplit(origin).hostname or "").lower()
-    except ValueError as exc:
-        raise HTTPException(status_code=403, detail="invalid Origin") from exc
-    if hostname not in {"127.0.0.1", "localhost", "::1", "testserver"}:
-        raise HTTPException(status_code=403, detail="storage API requires a local Origin")
-
-
-def _auth_landing_html() -> str:
-    return """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>muxdev local authorization</title></head><body><main><h1>Local authorization required</h1><p>Run <code>muxdev dashboard</code> to create a one-time browser session. No task data is exposed on this page.</p></main></body></html>"""
-
-
-def _provider_health_payload() -> dict[str, object]:
-    return build_provider_health([probe.to_dict() for probe in detect_providers()])
-
-
-def _deferred_provider_health_payload() -> dict[str, object]:
-    return {"ready": [], "partial": [], "unavailable": [], "total": 0, "providers": [], "deferred": True}
-
-
-def _memory_governance_payload(workspace: Path) -> dict[str, object]:
-    try:
-        with MemoryStore(workspace) as store:
-            inbox = store.inbox(limit=8)
-            status = store.status()
-    except Exception as exc:  # pragma: no cover - dashboard should tolerate memory DB migration issues
-        return {"status": "blocked", "summary": f"memory unavailable: {exc}", "counts": {}, "path": "", "inbox": {}}
-    counts = {key: len(value) for key, value in inbox.items() if isinstance(value, list)}
-    pending_contradictions = counts.get("contradictions", 0)
-    promotable = counts.get("promotable", 0)
-    proposed = counts.get("proposed", 0)
-    memory_status = "blocked" if pending_contradictions else ("watch" if promotable or proposed else "ready")
-    return {
-        "status": memory_status,
-        "summary": f"{proposed} proposed; {promotable} promotable; {pending_contradictions} contradiction(s)",
-        "counts": counts,
-        "path": status.get("path") or "",
-        "inbox": inbox,
-    }
-
-
-def _find_dashboard_task(overview: dict[str, object], task_id: str) -> dict[str, object] | None:
-    projects = overview.get("projects", [])
-    for project in projects if isinstance(projects, list) else []:
-        if not isinstance(project, dict):
-            continue
-        workflows = project.get("workflows", [])
-        for workflow in workflows if isinstance(workflows, list) else []:
-            if not isinstance(workflow, dict):
-                continue
-            role_groups = workflow.get("role_groups", [])
-            for group in role_groups if isinstance(role_groups, list) else []:
-                if not isinstance(group, dict):
-                    continue
-                tasks = group.get("tasks", [])
-                for task in tasks if isinstance(tasks, list) else []:
-                    if isinstance(task, dict) and str(task.get("task_id") or task.get("run_id") or "") == task_id:
-                        return task
-    return None
-
-
-def render_live_dashboard_html(task_id: str | None = None, lang: str | None = None, *, nonce: str | None = None) -> str:
-    """Render the daemon-backed live dashboard."""
-    return render_workbench_dashboard_html(task_id=task_id, lang=lang, nonce=nonce)
+def _dashboard_html() -> str:
+    return """<!doctype html><html><head><meta charset='utf-8'><title>muxdev</title>
+<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;color:#17202a}table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid #ddd;text-align:left}.PASS,.completed{color:#16794b}.BLOCKED,.blocked{color:#b42318}code{font-size:12px}</style></head>
+<body><h1>muxdev 可信交付</h1><p>任务、人工动作、门禁和四维证据质量。</p><table><thead><tr><th>Run</th><th>Workflow</th><th>Profile</th><th>Status</th><th>Gate</th><th>Score</th></tr></thead><tbody id='runs'></tbody></table>
+<script>fetch('/runs').then(r=>r.json()).then(async runs=>{for(const x of runs){let gate='—',score='—';try{const e=await fetch(`/runs/${x.run_id}/evidence`).then(r=>r.json());gate=e.decision.status;const s=e.decision.scorecard;score=`C ${s.completeness.numerator}/${s.completeness.denominator} · R ${s.reproducibility.numerator}/${s.reproducibility.denominator} · I ${s.integrity.numerator}/${s.integrity.denominator} · D ${s.independence.numerator}/${s.independence.denominator}`;}catch{}document.querySelector('#runs').insertAdjacentHTML('beforeend',`<tr><td><code>${x.run_id}</code></td><td>${x.workflow}</td><td>${x.profile}</td><td class='${x.status}'>${x.status}</td><td class='${gate}'>${gate}</td><td>${score}</td></tr>`);}})</script></body></html>"""

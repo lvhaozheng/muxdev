@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
-
-from .evidence import ArtifactDescriptor, EvidenceBundle
-
+from typing import Mapping
 
 @dataclass(frozen=True)
 class UsageRecord:
@@ -28,7 +25,6 @@ class StageExecutionInput:
     provider: str
     policy: Mapping[str, object]
     skills: tuple[Mapping[str, object], ...] = ()
-    session_dir: Path | None = None
     attempt: int = 1
 
     @classmethod
@@ -66,16 +62,12 @@ class StageExecutionResult:
     tokens: int = 0
     cost_usd: float = 0.0
     returncode: int = 0
-    evidence: EvidenceBundle | None = None
-    provider_actions: list[dict[str, Any]] = field(default_factory=list)
-    harness_events: tuple[Any, ...] = ()
-    transcript_path: str | None = None
-    chunks_path: str | None = None
     stdout_hash: str | None = None
     stderr_hash: str | None = None
     stdout_bytes: int = 0
     stderr_bytes: int = 0
-    artifacts: tuple[ArtifactDescriptor, ...] = ()
+    output_refs: tuple[str, ...] = ()
+    interaction_requests: tuple[Mapping[str, object], ...] = ()
 
     @property
     def usage(self) -> UsageRecord:

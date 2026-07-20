@@ -9,7 +9,6 @@ from typing import Any
 
 from ...models import utc_now
 from ...storage.contracts import sha256_file
-from ...storage.memory import MemoryStore
 from .discovery import scan_skills
 from .model import SkillInfo
 
@@ -17,7 +16,7 @@ from .model import SkillInfo
 LOCK_VERSION = "muxdev.skill_lock.v2"
 
 
-def write_skill_lock(workspace: Path, *, promote_memory: bool = True) -> dict[str, Any]:
+def write_skill_lock(workspace: Path) -> dict[str, Any]:
     """Write `.muxdev/skill-lock.json` with directory-level hashes."""
     rows = [_lock_row(skill) for skill in scan_skills(workspace, include_disabled=True)]
     payload = {
@@ -28,29 +27,7 @@ def write_skill_lock(workspace: Path, *, promote_memory: bool = True) -> dict[st
     path = workspace / ".muxdev" / "skill-lock.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    memories: list[dict[str, object]] = []
-    if promote_memory:
-        with MemoryStore(workspace) as store:
-            for row in payload["skills"]:
-                tree_hash = str(row.get("hashes", {}).get("tree", ""))
-                memories.append(
-                    store.propose_claim(
-                        claim=f"Skill {row['name']} {row.get('version') or ''} is proposed for roles: {', '.join(row['compatible_roles']) or 'any'}",
-                        scope="project",
-                        kind="skill_memory",
-                        role="any",
-                        confidence=0.45,
-                        evidence=[
-                            {
-                                "kind": "skill_lock",
-                                "path": str(path),
-                                "tree_hash": tree_hash,
-                                "summary": f"skill lock for {row['name']}",
-                            }
-                        ],
-                    )
-                )
-    return {"path": str(path), "skills": payload["skills"], "memory_proposals": memories}
+    return {"path": str(path), "skills": payload["skills"]}
 
 
 def verify_skill_lock(workspace: Path, *, name: str | None = None) -> dict[str, Any]:
@@ -114,12 +91,9 @@ def _lock_row(skill: SkillInfo) -> dict[str, Any]:
         "skill_file": skill.skill_file,
         "source": {"type": skill.source, "path": skill.source_path or skill.path},
         "hashes": hashes,
-        "skill_hash": hashes["tree"],
-        "compatible_roles": list(skill.roles),
         "roles": list(skill.roles),
         "permissions": skill.permissions.to_dict(),
-        "trust": {"state": skill.trust},
-        "trust_state": skill.trust,
+        "trust": skill.trust,
         "disabled": skill.disabled,
         "validation": {
             "valid": not skill.validation_errors,

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import re
+import tomllib
 from pathlib import Path
 
-from .discovery import load_skills_config, scan_all_skills, scan_skills, skill_from_file
+from .discovery import scan_skills, skill_from_file
+from .parser import parse_skill_document
 
 
 def skill_show(workspace: Path, name: str) -> dict[str, object]:
@@ -44,32 +46,41 @@ def validate_skill_path(path: Path, *, strict: bool = False) -> dict[str, object
                 errors.append("description must be <= 1024 chars")
             if skill_file.parent.name != info.name:
                 errors.append("parent dir must match skill name")
+            meta, _ = parse_skill_document(skill_file)
+            unexpected = sorted(set(meta) - {"name", "description"})
+            if unexpected:
+                errors.append("SKILL.md frontmatter supports only name and description: " + ", ".join(unexpected))
         if not info.description:
             warnings.append("description is required for automatic activation")
-    return {"valid": not errors, "errors": errors, "warnings": warnings, "path": str(skill_file)}
+    return {
+        "valid": not errors,
+        "errors": errors,
+        "warnings": warnings,
+        "migration_suggestions": _legacy_migration_suggestions(skill_file),
+        "path": str(skill_file),
+    }
 
 
-def skill_doctor(workspace: Path) -> dict[str, object]:
-    all_skills = scan_all_skills(workspace, include_disabled=True)
-    names: dict[str, list[object]] = {}
-    warnings: list[str] = []
-    errors: list[str] = []
-    for skill in all_skills:
-        names.setdefault(skill.name, []).append(skill)
-        if not Path(skill.skill_file).exists():
-            errors.append(f"missing SKILL.md for {skill.name}: {skill.skill_file}")
-        errors.extend(f"{skill.name}: {message}" for message in skill.validation_errors)
-        warnings.extend(f"{skill.name}: {message}" for message in skill.validation_warnings)
-        if skill.permissions.shell and skill.trust == "untrusted":
-            errors.append(f"script requires shell but permission denied: {skill.name}")
-    for name, rows in names.items():
-        if len(rows) > 1:
-            warnings.append(f"duplicate skill name uses highest priority: {name}")
-    config = load_skills_config(workspace)
-    available = {skill.name for skill in all_skills}
-    for role, values in config.get("bind", {}).items():
-        if isinstance(values, list):
-            for value in values:
-                if value not in available:
-                    warnings.append(f"binding points to missing skill: {role}={value}")
-    return {"valid": not errors, "errors": errors, "warnings": warnings, "skills": [skill.to_dict() for skill in all_skills]}
+def _legacy_migration_suggestions(skill_file: Path) -> list[dict[str, object]]:
+    suggestions: list[dict[str, object]] = []
+    policy_path = skill_file.parent / "muxdev.skill.toml"
+    if policy_path.is_file():
+        try:
+            policy = tomllib.loads(policy_path.read_text(encoding="utf-8"))
+        except tomllib.TOMLDecodeError:
+            policy = {}
+        delivery = policy.get("delivery_gate") if isinstance(policy, dict) else None
+        if isinstance(delivery, dict):
+            suggestions.append({
+                "source": "muxdev.skill.toml:[delivery_gate]",
+                "target": "evidence-policy.yaml:requirements",
+                "legacy_keys": sorted(delivery),
+                "automatic": False,
+            })
+    if skill_file.is_file() and "## Delivery Standard" in skill_file.read_text(encoding="utf-8", errors="replace"):
+        suggestions.append({
+            "source": "SKILL.md:Delivery Standard",
+            "target": "evidence-policy.yaml:requirements",
+            "automatic": False,
+        })
+    return suggestions

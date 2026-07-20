@@ -1,21 +1,22 @@
-"""Repository-local pytest infrastructure."""
+from __future__ import annotations
 
 from pathlib import Path
+import shutil
+from uuid import uuid4
 
 import pytest
 
 
-def pytest_sessionstart() -> None:
-    # Pre-creating the target avoids pytest's cross-volume atomic cache rename
-    # fallback on locked-down Windows hosts.
-    Path(".test_workspaces/.pytest_cache").mkdir(parents=True, exist_ok=True)
-
-
-@pytest.fixture(autouse=True)
-def _close_daemon_workers_after_each_test():
-    """Keep one TestClient from polluting later integration cases."""
-    yield
-    from muxdev.daemon.tasks import TaskManager
-
-    for manager in TaskManager.live_instances():
-        assert manager.close(timeout=2.0) == [], "daemon test leaked a live Worker"
+@pytest.fixture()
+def workspace() -> Path:
+    path = Path(".test_workspaces") / f"v3_{uuid4().hex}"
+    path.mkdir(parents=True)
+    try:
+        yield path
+    finally:
+        for item in path.rglob("*"):
+            try:
+                item.chmod(0o700 if item.is_dir() else 0o600)
+            except OSError:
+                pass
+        shutil.rmtree(path, ignore_errors=True)

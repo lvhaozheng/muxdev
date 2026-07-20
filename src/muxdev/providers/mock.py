@@ -1,155 +1,76 @@
-"""Deterministic offline provider used for tests and safe demos."""
+"""Small deterministic Provider used for offline control-plane tests."""
 
 from __future__ import annotations
 
 import json
-from ..domain import StageExecutionInput, StageExecutionResult
-from ..models import PlanArtifact, ReviewResult, TestResult
+import sys
+
+from pydantic import BaseModel
+
 from ..core.redaction import redact
-
-
-def _mock_design_payload(task: str, *, summary: str) -> dict[str, object]:
-    return {
-        "summary": summary,
-        "design_doc": {
-            "problem_statement": f"Create a complete design for: {task}",
-            "scope": [
-                "Produce a single user-facing design document.",
-                "Keep the workflow design-only; do not implement code in this stage.",
-            ],
-            "requirements": [
-                "The reader can understand the goal, flow, states, and failure conditions without reading source code.",
-                "The design gives enough implementation detail for a lightweight browser game or app.",
-            ],
-            "constraints": ["Browser-first experience", "Small reversible scope", "No production data migration"],
-            "non_goals": ["No implementation files are created by the design workflow."],
-            "user_preferences": {
-                "audience": "Casual browser users",
-                "platform": "Desktop and mobile web browsers",
-                "style": "Clear, lightweight, and easy to scan",
-            },
-            "audience": "Casual browser users",
-            "platform": "Web browser",
-            "core_loop": ["Start", "Interact with the main board", "Receive immediate feedback", "Restart or continue"],
-            "controls": {"keyboard": "Primary keyboard controls where relevant", "mobile": "Touch-friendly controls"},
-            "ui": ["Main play surface", "Current score or status", "Primary action buttons", "Mobile controls"],
-            "states": ["start", "running", "paused", "completed", "failed"],
-            "rules": ["Inputs update state on each tick", "Invalid actions are ignored", "End conditions are visible"],
-            "scoring": "Expose score or progress when the task has game mechanics.",
-            "acceptance_criteria": [
-                "A reader can identify the target users, platform, and scope.",
-                "A reader can follow the core interaction loop and state transitions.",
-                "A downstream implementer can derive UI, rules, data, and test cases from the document.",
-            ],
-            "test_strategy": [
-                "Inspect the design document for all required sections.",
-                "Create future smoke tests for start, interaction, pause, restart, and end-state behavior.",
-                "Check desktop and mobile control paths during implementation.",
-            ],
-            "proposed_design": {
-                "approach": "Mock design output uses a small state-machine-oriented browser design.",
-                "modules": ["StateModel", "Renderer", "InputController", "RulesEngine"],
-            },
-            "state_model": {"states": ["start", "running", "paused", "completed", "failed"]},
-            "data_flow": ["User input", "State transition", "Rules evaluation", "UI render", "Feedback"],
-            "implementation_sequence": [
-                "Create the play surface and status UI.",
-                "Implement state transitions and input handling.",
-                "Add scoring/progress and end-state handling.",
-                "Verify keyboard, touch, restart, and responsive behavior.",
-            ],
-            "risks_and_mitigations": [
-                "Mobile controls may feel cramped; reserve stable button areas and verify on a narrow viewport.",
-                "State transitions can drift; keep them explicit and test each transition.",
-            ],
-            "open_questions": ["Confirm final visual theme and exact difficulty tuning before implementation."],
-        },
-    }
+from ..domain import StageExecutionInput, StageExecutionResult
+from ..models import ChangeResult, PlanResult, ReviewResult, TestResult
 
 
 class MockProvider:
     id = "mock"
 
     def execute(self, input: StageExecutionInput) -> StageExecutionResult:
-        stage_id, task, worktree = input.stage_id, input.task, input.worktree
-        safe_task = redact(task)
-        if stage_id == "direct":
-            target = worktree / "muxdev_mock_direct.txt"
-            target.write_text(f"Mock direct CLI result for task: {safe_task}\n", encoding="utf-8")
-            content = "# Direct CLI Result\n\nmock direct CLI completed the task in one pass.\n"
-            return StageExecutionResult("direct_output.md", content, "mock direct CLI completed", stage_id, self.id, tokens=70, cost_usd=0.005)
-        if stage_id == "judge":
-            payload = {
-                "score": 0.82,
-                "pass": True,
-                "task_completion": 0.8,
-                "answer_quality": 0.8,
-                "groundedness": 0.75,
-                "safety": 0.9,
-                "process_quality": 0.8,
-                "reasons": ["mock judge accepted the run"],
-                "risks": [],
-            }
-            return StageExecutionResult("validation/judge_mock.json", json.dumps(payload, ensure_ascii=False, indent=2), "mock judge completed", stage_id, self.id, tokens=40, cost_usd=0.002)
-        if stage_id in {"design", "plan", "quick_plan", "scaffold_plan"}:
-            artifact = PlanArtifact(summary=f"Plan for: {safe_task}", steps=["inspect", "implement", "test", "review"])
-            content = "# Plan\n\n" + artifact.summary + "\n\n```json\n" + artifact.model_dump_json(indent=2) + "\n```\n"
-            return StageExecutionResult(f"{stage_id}.md", content, artifact.summary, stage_id, self.id, tokens=100, cost_usd=0.01)
-        if stage_id in {"design_brief", "design_plan"}:
-            payload = _mock_design_payload(safe_task, summary="Mock design plan")
-            content = "# Design Plan\n\nMock design plan\n\n```json\n" + json.dumps(payload, ensure_ascii=False, indent=2) + "\n```\n"
-            return StageExecutionResult(f"design/{stage_id}.md", content, "Mock design plan", stage_id, self.id, tokens=100, cost_usd=0.01)
-        if stage_id == "plan_revise":
-            artifact = PlanArtifact(summary=f"Revised plan for: {safe_task}", steps=["adjust plan from feedback", "review", "implement", "verify"])
-            content = "# Revised Plan\n\n" + artifact.summary + "\n\n```json\n" + artifact.model_dump_json(indent=2) + "\n```\n"
-            return StageExecutionResult("plan_revise.md", content, artifact.summary, stage_id, self.id, tokens=100, cost_usd=0.01)
-        if stage_id in {"implement", "code", "scaffold", "refactor"}:
-            target = worktree / "muxdev_mock_change.txt"
-            target.write_text(f"Mock implementation for task: {safe_task}\n", encoding="utf-8")
-            return StageExecutionResult(f"session/{stage_id}.log", "mock implementer wrote muxdev_mock_change.txt\n", "mock implementation completed", stage_id, self.id, tokens=100, cost_usd=0.01)
-        if stage_id in {"docs_update", "docs_fix"}:
-            target = worktree / "docs" / "muxdev_mock_docs.md"
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(f"# muxdev mock docs\n\nMock documentation update for task: {safe_task}\n", encoding="utf-8")
-            content = f"# {stage_id.replace('_', ' ').title()}\n\nUpdated docs/muxdev_mock_docs.md for task: {safe_task}\n"
-            return StageExecutionResult(f"docs/{stage_id}.md", content, f"mock {stage_id} completed", stage_id, self.id, tokens=100, cost_usd=0.01)
-        if stage_id in {"test", "targeted_test", "smoke_check", "run_smoke"}:
-            result = TestResult(passed=True, command="pytest", exit_code=0, summary=f"mock {stage_id} passed")
-            content = "mock test log\n" + result.model_dump_json(indent=2) + "\n"
-            return StageExecutionResult(f"{stage_id}.log", content, result.summary, stage_id, self.id, tokens=100, cost_usd=0.01)
-        if stage_id in {"review", "plan_review", "light_review", "review_test_result", "docs_review", "final_design_review"}:
-            result = ReviewResult(has_blockers=False, blockers=[])
-            content = "# Review\n\nNo blockers.\n\n```json\n" + result.model_dump_json(indent=2) + "\n```\n"
-            return StageExecutionResult(f"{stage_id}.md", content, "no blockers", stage_id, self.id, tokens=100, cost_usd=0.01)
-        if stage_id == "design_review":
-            result = ReviewResult(has_blockers=False, blockers=[])
-            content = "# Design Review\n\nNo blockers.\n\n```json\n" + result.model_dump_json(indent=2) + "\n```\n"
-            return StageExecutionResult("design/design_review.md", content, "design review passed", stage_id, self.id, tokens=100, cost_usd=0.01)
-        if stage_id == "design_revise":
-            payload = _mock_design_payload(safe_task, summary="Mock revised design output")
-            content = "# Revised Design\n\nMock revised design output\n\n```json\n" + json.dumps(payload, ensure_ascii=False, indent=2) + "\n```\n"
-            return StageExecutionResult("design/design_revise.md", content, "mock design revision completed", stage_id, self.id, tokens=100, cost_usd=0.01)
-        if stage_id == "fix":
-            return StageExecutionResult("session/fix.log", "no fix needed\n", "fix skipped", stage_id, self.id, tokens=100, cost_usd=0.01)
-        if stage_id in {
-            "task_intake",
-            "project_brief",
-            "problem_statement",
-            "requirements",
-            "architecture_options",
-            "decision_record",
-            "system_design",
-            "api_and_data_model",
-            "risk_and_threat_model",
-            "test_strategy",
-            "implementation_roadmap",
-            "design_pack",
-            "review_summary",
-            "handoff_summary",
-            "memory_proposals",
-            "impact_check",
-        }:
-            title = stage_id.replace("_", " ").title()
-            content = f"# {title}\n\nMock design output for task: {safe_task}\n"
-            return StageExecutionResult(f"design/{stage_id}.md", content, f"mock {stage_id} completed", stage_id, self.id, tokens=100, cost_usd=0.01)
-        return StageExecutionResult(f"{stage_id}.md", json.dumps({"stage": stage_id}), f"mock {stage_id} completed", stage_id, self.id, tokens=100, cost_usd=0.01)
+        task = redact(input.task)
+        if input.stage_id in {"plan", "test_plan", "design", "revise"}:
+            result = PlanResult(
+                summary=f"Plan for: {task}",
+                steps=["inspect", "change", "verify", "review"],
+                risks=["Mock output proves orchestration behavior, not Provider quality."],
+            )
+            return self._result(input, result, "plan.json")
+        if input.stage_id in {"implement", "fix"}:
+            target = input.worktree / "muxdev_mock_change.txt"
+            target.write_text(f"Mock implementation for task: {task}\n", encoding="utf-8")
+            result = ChangeResult(
+                summary="mock implementation completed",
+                affected_paths=[target.name],
+                suggested_verification=["runtime mock check"],
+            )
+            return self._result(input, result, "change.json")
+        if input.stage_id == "test":
+            result = TestResult(
+                checks=[{
+                    "id": "mock-runtime-check",
+                    "criteria_ids": ["mock-acceptance"],
+                    "argv": [sys.executable, "-c", "print('muxdev mock check')"],
+                    "status": "passed",
+                    "exit_code": 0,
+                    "summary": "runtime-reproducible mock check",
+                }],
+                criteria_covered=["mock-acceptance"],
+            )
+            return self._result(input, result, "test.json")
+        if input.stage_id in {"review", "security_review"}:
+            result = ReviewResult(
+                target_subject=str(input.context.get("subject_digest") or "runtime-bound"),
+                findings=[],
+                residual_risk="Mock review is simulation-only.",
+            )
+            return self._result(input, result, "review.json")
+        return StageExecutionResult(
+            artifact_name="unsupported.json",
+            content=json.dumps({"error": f"unsupported mock stage: {input.stage_id}"}),
+            summary="unsupported mock stage",
+            stage_id=input.stage_id,
+            provider=self.id,
+            status="failed",
+            returncode=2,
+        )
+
+    def _result(self, input: StageExecutionInput, result: BaseModel, artifact_name: str) -> StageExecutionResult:
+        content = result.model_dump_json(indent=2)
+        return StageExecutionResult(
+            artifact_name=artifact_name,
+            content=content,
+            summary=str(getattr(result, "summary", input.stage_id)),
+            stage_id=input.stage_id,
+            provider=self.id,
+            tokens=100,
+            cost_usd=0.01,
+        )

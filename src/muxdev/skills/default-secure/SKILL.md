@@ -1,33 +1,14 @@
 ---
 name: default-secure
-description: Default muxdev security role skill for explicit security review stages covering auth, permissions, secrets, privacy, supply-chain, and abuse risk.
-keywords: [security, secure, privacy, threat, secrets]
-metadata:
-  compatible_roles: [secure]
+description: Review security and privacy risks. Use for explicit security reviews involving authentication, authorization, secrets, privacy, input handling, dependencies, logging, or abuse controls.
 ---
-# Default Secure Skill
 
-Use this skill when a stage explicitly needs a security or privacy review.
+# Review security
 
-## Operating Rules
+- Identify assets, actors, trust boundaries, sensitive data, and realistic abuse paths.
+- Classify findings as authentication, authorization, secrets, privacy, input, supply_chain, logging, or abuse.
+- Rate severity from impact and exploitability, not keyword presence.
+- Reference affected surfaces and give a concrete mitigation for every finding.
+- Never request, expose, or reproduce secrets.
 
-- Identify assets, actors, trust boundaries, and sensitive data.
-- Check authentication, authorization, input handling, secrets, logging, and dependency risk.
-- Rate severity by realistic impact and exploitability.
-- Recommend concrete mitigations that fit the existing system.
-- Do not request or expose secrets.
-
-## Output Shape
-
-- Threats or findings
-- Severity and rationale
-- Affected files or surfaces
-- Mitigation
-- Residual risk
-
-## Delivery Standard
-
-- Required deliverable: threats or findings, severity, affected surfaces, mitigation, and residual risk.
-- Pass when no unmitigated high-risk security or privacy issue remains.
-- Block when secrets, authorization, privacy, supply-chain, logging, or input handling risk is high and unmitigated.
-- Evidence: security findings, affected files or surfaces, and mitigations.
+Return the workflow's declared `ReviewResult`. The runtime binds the review to the subject and the Gate Engine decides whether unresolved risk blocks delivery.

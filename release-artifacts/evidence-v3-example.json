@@ -1,0 +1,105 @@
+{
+  "examples": [
+    {
+      "decision": {
+        "blockers": [],
+        "policy_hash": "sha256:example-pass-policy",
+        "requirements": [
+          {
+            "reason": "Runtime captured exit code 0.",
+            "record_ids": [
+              "ev_check"
+            ],
+            "requirement_id": "deterministic_check",
+            "status": "satisfied"
+          }
+        ],
+        "scorecard": {
+          "completeness": {
+            "denominator": 4,
+            "failed_requirements": [],
+            "numerator": 4,
+            "percent": 100.0
+          },
+          "independence": {
+            "denominator": 1,
+            "failed_requirements": [],
+            "numerator": 1,
+            "percent": 100.0
+          },
+          "integrity": {
+            "denominator": 4,
+            "failed_requirements": [],
+            "numerator": 4,
+            "percent": 100.0
+          },
+          "overall": 100.0,
+          "reproducibility": {
+            "denominator": 1,
+            "failed_requirements": [],
+            "numerator": 1,
+            "percent": 100.0
+          }
+        },
+        "status": "PASS"
+      },
+      "name": "verified-pass"
+    },
+    {
+      "decision": {
+        "blockers": [
+          {
+            "code": "requirement_missing",
+            "reason": "Required human approval is missing.",
+            "record_ids": [],
+            "remediation": "Request an explicit approval bound to the current subject.",
+            "requirement_id": "human_approval"
+          }
+        ],
+        "policy_hash": "sha256:example-blocked-policy",
+        "requirements": [
+          {
+            "reason": "Required human approval is missing.",
+            "record_ids": [],
+            "remediation": "Request an explicit approval bound to the current subject.",
+            "requirement_id": "human_approval",
+            "status": "missing"
+          }
+        ],
+        "scorecard": {
+          "completeness": {
+            "denominator": 5,
+            "failed_requirements": [
+              "human_approval"
+            ],
+            "numerator": 4,
+            "percent": 80.0
+          },
+          "independence": {
+            "denominator": 1,
+            "failed_requirements": [],
+            "numerator": 1,
+            "percent": 100.0
+          },
+          "integrity": {
+            "denominator": 4,
+            "failed_requirements": [],
+            "numerator": 4,
+            "percent": 100.0
+          },
+          "overall": 95.0,
+          "reproducibility": {
+            "denominator": 1,
+            "failed_requirements": [],
+            "numerator": 1,
+            "percent": 100.0
+          }
+        },
+        "status": "BLOCKED"
+      },
+      "name": "high-score-but-blocked"
+    }
+  ],
+  "note": "Scores explain evidence quality and never override a hard requirement.",
+  "schema": "muxdev.evidence-v3-examples.v1"
+}

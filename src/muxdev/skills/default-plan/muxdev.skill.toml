@@ -1,8 +1,8 @@
-version = 1
+version = 2
 
 [activation]
 roles = ["plan", "architect"]
-stages = ["plan", "quick_plan", "scaffold_plan", "plan_revise"]
+stages = ["plan", "design", "revise"]
 auto = true
 
 [permissions]

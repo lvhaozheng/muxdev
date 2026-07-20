@@ -1,0 +1,45 @@
+evidence_policies:
+  requirements:
+    plan_artifact:
+      description: A non-empty plan or design artifact is bound to its producing stage subject.
+      accepted_kinds: [artifact]
+      subject_selector: any
+    change_artifact:
+      description: The delivered change or document is content-addressed.
+      accepted_kinds: [artifact]
+    deterministic_check:
+      description: Relevant verification completes through the runtime command wrapper.
+      accepted_kinds: [check]
+      require_reproducible: true
+    review:
+      description: The current subject is reviewed without unresolved high-severity findings.
+      accepted_kinds: [review]
+    independent_review:
+      description: The current subject is reviewed by an identity different from the executor.
+      accepted_kinds: [review]
+      require_independent: true
+    human_approval:
+      description: A human explicitly approves the declared workflow checkpoint.
+      accepted_kinds: [interaction]
+      subject_selector: any
+    runtime_health:
+      description: Runtime execution completes without an unresolved policy or execution failure.
+      accepted_kinds: [runtime]
+      subject_selector: any
+  policies:
+    change:
+      lite: [change_artifact, deterministic_check, review, runtime_health]
+      standard: [plan_artifact, change_artifact, deterministic_check, independent_review, runtime_health]
+      strict: [plan_artifact, change_artifact, deterministic_check, independent_review, human_approval, runtime_health]
+    design:
+      lite: [plan_artifact, review, runtime_health]
+      standard: [plan_artifact, independent_review, runtime_health]
+      strict: [plan_artifact, independent_review, human_approval, runtime_health]
+    review:
+      lite: [review, runtime_health]
+      standard: [independent_review, runtime_health]
+      strict: [independent_review, human_approval, runtime_health]
+    test:
+      lite: [deterministic_check, review, runtime_health]
+      standard: [plan_artifact, deterministic_check, independent_review, runtime_health]
+      strict: [plan_artifact, deterministic_check, independent_review, human_approval, runtime_health]

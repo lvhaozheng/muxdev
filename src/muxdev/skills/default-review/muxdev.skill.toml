@@ -1,8 +1,8 @@
-version = 1
+version = 2
 
 [activation]
-roles = ["review", "reviewer"]
-stages = ["plan_review", "design_review", "light_review", "impact_check", "review", "review_test_result", "docs_review", "final_design_review"]
+roles = ["review"]
+stages = ["review"]
 auto = true
 
 [permissions]

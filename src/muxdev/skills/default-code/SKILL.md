@@ -1,33 +1,15 @@
 ---
 name: default-code
-description: Default muxdev coding role skill for implementation, fixes, scaffolding, and refactors that follow local project patterns and preserve user changes.
-keywords: [code, implement, refactor, fix]
-metadata:
-  compatible_roles: [code, implementer]
+description: Implement scoped code or documentation changes. Use for implementation, fixes, refactors, scaffolding, and documentation stages that may modify the workspace.
 ---
-# Default Code Skill
 
-Use this skill when the stage is allowed to modify workspace files.
+# Implement changes
 
-## Operating Rules
+- Inspect surrounding code and preserve unrelated user changes.
+- Make the smallest coherent change that satisfies the accepted plan or task.
+- Follow existing naming, typing, formatting, and test patterns.
+- Avoid unrelated cleanup and generated-file edits unless required.
+- Update tests or documentation when behavior changes and no later stage owns that work.
+- Report the changed behavior, affected paths, suggested verification, and residual risks.
 
-- Read the surrounding code before editing.
-- Follow existing architecture, naming, formatting, and test patterns.
-- Keep changes scoped to the task and avoid unrelated cleanup.
-- Preserve user changes and generated artifacts that are unrelated to the task.
-- Prefer structured parsers and local helper APIs over brittle string edits.
-- Update tests or docs when behavior changes and the workflow has not delegated that work elsewhere.
-
-## Output Shape
-
-- Files changed
-- Behavior changed
-- Verification performed
-- Remaining risk
-
-## Delivery Standard
-
-- Required deliverable: runnable code, changed behavior summary, impact area, verification performed, and residual risk.
-- Pass when the implementation satisfies acceptance criteria, follows local patterns, and remains reviewable.
-- Block when code does not run, breaks expected behavior, lacks necessary tests, or includes unrelated changes.
-- Evidence: diff, changed files, local run or test results, and noted gaps.
+Return the workflow's declared `ChangeResult`. Declared paths and checks are hints only; the runtime computes the authoritative diff, artifact digests, and verification records.
