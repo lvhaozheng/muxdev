@@ -14,6 +14,7 @@ from . import utc_now
 EvidenceKind = Literal["artifact", "check", "review", "interaction", "runtime"]
 RequirementStatus = Literal["satisfied", "missing", "failed", "not_applicable"]
 GateStatus = Literal["PASS", "BLOCKED", "WAITING_HUMAN"]
+RecoveryStatus = Literal["not_needed", "recovering", "recovered", "needs_action", "exhausted"]
 
 
 def canonical_hash(value: object) -> str:
@@ -179,6 +180,55 @@ class GateDecision(BaseModel):
     evaluated_at: str = Field(default_factory=utc_now)
 
 
+class FailureDiagnosis(BaseModel):
+    code: str
+    kind: Literal[
+        "output_contract",
+        "test_failure",
+        "review_blocker",
+        "provider_timeout",
+        "provider_failure",
+        "environment",
+        "independent_reviewer",
+        "policy",
+        "unknown",
+    ] = "unknown"
+    stage_id: str | None = None
+    summary: str
+    details: list[str] = Field(default_factory=list)
+    consequences: list[str] = Field(default_factory=list)
+
+
+class RecoveryAttempt(BaseModel):
+    action: Literal["fix-output", "retry", "switch-provider", "repair"]
+    stage_id: str | None = None
+    provider: str | None = None
+    status: Literal["started", "succeeded", "failed", "skipped"]
+    failure_kind: str | None = None
+    feedback_summary: list[str] = Field(default_factory=list)
+
+
+class RecoveryAction(BaseModel):
+    action: Literal[
+        "auto", "fix-output", "retry", "switch-provider", "configure-reviewer", "rerun-lite", "inspect"
+    ]
+    label: str
+    description: str
+    command: str
+    requires_confirmation: bool = False
+
+
+class RecoverySummary(BaseModel):
+    status: RecoveryStatus = "not_needed"
+    max_actions: int = 2
+    actions_used: int = 0
+    primary_failure: FailureDiagnosis | None = None
+    attempts: list[RecoveryAttempt] = Field(default_factory=list)
+    next_actions: list[RecoveryAction] = Field(default_factory=list)
+    workspace_safe: bool = True
+    workspace_message: str = "All recovery work stayed inside the isolated run worktree."
+
+
 class EvidenceReport(BaseModel):
     contract_version: Literal["muxdev.evidence.v3"] = "muxdev.evidence.v3"
     run_id: str
@@ -189,4 +239,6 @@ class EvidenceReport(BaseModel):
     integrity: dict[str, Any]
     routing: dict[str, Any] = Field(default_factory=dict)
     reviewer: dict[str, Any] = Field(default_factory=dict)
+    harness: dict[str, Any] = Field(default_factory=dict)
+    recovery: RecoverySummary | None = None
     generated_at: str = Field(default_factory=utc_now)

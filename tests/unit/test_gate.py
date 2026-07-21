@@ -61,3 +61,101 @@ def test_failed_check_and_self_review_are_hard_blockers() -> None:
     decision = evaluate_gate(policy, records)
     assert decision.status == "BLOCKED"
     assert {item.requirement_id for item in decision.blockers} == {"check", "review"}
+
+
+def test_successful_stage_retry_supersedes_prior_runtime_failure() -> None:
+    policy = EvidencePolicy(policy_id="p", requirements=[requirement("health", "runtime")])
+    failed = RuntimeEvidence(
+        record_id="failed",
+        run_id="r",
+        stage_id="implement",
+        requirement_id="health",
+        subject_digest=SUBJECT,
+        producer="runtime",
+        event_type="policy_or_execution_failure",
+        status="failed",
+    )
+    completed = failed.model_copy(update={
+        "record_id": "completed",
+        "event_type": "stage_completed",
+        "status": "passed",
+    })
+
+    decision = evaluate_gate(policy, [failed, completed])
+
+    assert decision.status == "PASS"
+    assert decision.requirements[0].record_ids == ["completed"]
+
+
+def test_runtime_failure_remains_until_the_same_stage_recovers() -> None:
+    policy = EvidencePolicy(policy_id="p", requirements=[requirement("health", "runtime")])
+    failed = RuntimeEvidence(
+        record_id="failed",
+        run_id="r",
+        stage_id="implement",
+        requirement_id="health",
+        subject_digest=SUBJECT,
+        producer="runtime",
+        event_type="policy_or_execution_failure",
+        status="failed",
+    )
+    other_stage_completed = failed.model_copy(update={
+        "record_id": "review-completed",
+        "stage_id": "review",
+        "event_type": "stage_completed",
+        "status": "passed",
+    })
+
+    decision = evaluate_gate(policy, [failed, other_stage_completed])
+
+    assert decision.status == "BLOCKED"
+    assert decision.blockers[0].record_ids == ["failed", "review-completed"]
+
+
+def test_latest_check_for_the_same_command_supersedes_a_failed_attempt() -> None:
+    policy = EvidencePolicy(policy_id="p", requirements=[requirement("check", "check")])
+    failed = CheckEvidence(
+        record_id="failed",
+        run_id="r",
+        stage_id="test",
+        requirement_id="check",
+        subject_digest=SUBJECT,
+        producer="runtime",
+        argv=["pytest", "-q"],
+        cwd=".",
+        cwd_digest="sha256:cwd",
+        exit_code=1,
+    )
+    passed = failed.model_copy(update={"record_id": "passed", "exit_code": 0})
+
+    decision = evaluate_gate(policy, [failed, passed])
+
+    assert decision.status == "PASS"
+    assert decision.requirements[0].record_ids == ["passed"]
+
+
+def test_latest_review_supersedes_prior_findings_for_the_same_reviewer() -> None:
+    policy = EvidencePolicy(policy_id="p", requirements=[requirement("review", "review")])
+    blocked = ReviewEvidence(
+        record_id="blocked",
+        run_id="r",
+        stage_id="review",
+        requirement_id="review",
+        subject_digest=SUBJECT,
+        producer="runtime",
+        target_digest=SUBJECT,
+        reviewer="reviewer",
+        independent=True,
+        findings=[{
+            "finding_id": "f1",
+            "severity": "high",
+            "message": "bug",
+            "remediation": "fix it",
+        }],
+    )
+    passed = blocked.model_copy(update={"record_id": "passed", "findings": []})
+
+    decision = evaluate_gate(policy, [blocked, passed])
+
+    assert decision.status == "PASS"
+    assert decision.requirements[0].record_ids == ["passed"]

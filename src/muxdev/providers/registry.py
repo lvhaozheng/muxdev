@@ -12,6 +12,7 @@ import shutil
 import subprocess
 from dataclasses import asdict, dataclass
 from enum import StrEnum
+from pathlib import Path
 from typing import Callable, Iterable
 
 from ..config.loader import load_config
@@ -132,29 +133,38 @@ def _build_invocation(command: str, args: tuple[str, ...]) -> list[str]:
 
 def detect_providers(
     *,
+    workspace: Path | None = None,
     which: Which = shutil.which,
     runner: Runner = default_runner,
 ) -> list[ProviderProbe]:
     """Probe every configured provider and preserve config order."""
-    return [probe_provider(definition.provider, which=which, runner=runner) for definition in provider_definitions()]
+    return [
+        probe_provider(definition.provider, workspace=workspace, which=which, runner=runner)
+        for definition in provider_definitions(workspace)
+    ]
 
 
 def probe_provider(
     provider: str,
     *,
+    workspace: Path | None = None,
     which: Which = shutil.which,
     runner: Runner = default_runner,
 ) -> ProviderProbe:
     """Probe a single provider by combining config metadata and CLI help text."""
-    definition = get_provider_definition(provider)
+    definition = get_provider_definition(provider, workspace)
     if definition.provider == "mock":
-        return _mock_probe()
+        return _mock_probe(workspace)
 
     command = _resolve_command(definition.commands, which)
     if command is None:
         return _unavailable_probe(definition)
 
-    probe_kind = _provider_config(definition.provider).get("probe", "generic")
+    provider_config = _provider_config(definition.provider, workspace)
+    runtime = provider_config.get("runtime") if isinstance(provider_config.get("runtime"), dict) else {}
+    if runtime.get("kind") == "acp":
+        return _acp_probe(definition, command)
+    probe_kind = provider_config.get("probe", "generic")
     if probe_kind == "codex":
         return _probe_codex(definition, command, runner)
 
@@ -178,18 +188,18 @@ def probe_provider(
     )
 
 
-def get_provider_definition(provider: str) -> ProviderDefinition:
+def get_provider_definition(provider: str, workspace: Path | None = None) -> ProviderDefinition:
     normalized = provider.lower()
-    for definition in provider_definitions():
+    for definition in provider_definitions(workspace):
         if definition.provider == normalized:
             return definition
-    known = ", ".join(definition.provider for definition in provider_definitions())
+    known = ", ".join(definition.provider for definition in provider_definitions(workspace))
     raise ValueError(f"unknown provider '{provider}'. Known providers: {known}")
 
 
-def provider_definitions() -> tuple[ProviderDefinition, ...]:
+def provider_definitions(workspace: Path | None = None) -> tuple[ProviderDefinition, ...]:
     """Build provider definitions dynamically from merged configuration."""
-    providers = load_config().get("providers", {})
+    providers = load_config(workspace).get("providers", {})
     definitions: list[ProviderDefinition] = []
     for name, data in providers.items():
         definitions.append(
@@ -203,7 +213,7 @@ def provider_definitions() -> tuple[ProviderDefinition, ...]:
     return tuple(definitions)
 
 
-def _mock_probe() -> ProviderProbe:
+def _mock_probe(workspace: Path | None = None) -> ProviderProbe:
     return ProviderProbe(
         provider="mock",
         mode="builtin",
@@ -217,7 +227,11 @@ def _mock_probe() -> ProviderProbe:
         skill=CapabilityState.SUPPORTED,
         attach=CapabilityState.SUPPORTED,
         status=ProviderStatus.READY,
-        notes=str(_provider_config("mock").get("notes", "built-in deterministic provider for workflow and matrix tests")),
+        notes=str(
+            _provider_config("mock", workspace).get(
+                "notes", "built-in deterministic provider for workflow and matrix tests"
+            )
+        ),
         trust_tier="managed",
     )
 
@@ -237,6 +251,26 @@ def _unavailable_probe(definition: ProviderDefinition) -> ProviderProbe:
         attach=CapabilityState.NOT_INSTALLED,
         status=ProviderStatus.UNAVAILABLE,
         notes=f"command not found ({definition.status_hint})",
+    )
+
+
+def _acp_probe(definition: ProviderDefinition, command: str) -> ProviderProbe:
+    """Avoid sending CLI help flags into a stdio protocol process."""
+    return ProviderProbe(
+        provider=definition.provider,
+        mode=definition.mode,
+        command=command,
+        installed=True,
+        version=None,
+        headless=CapabilityState.SUPPORTED,
+        pty=CapabilityState.UNKNOWN,
+        json=CapabilityState.SUPPORTED,
+        approval=CapabilityState.SUPPORTED,
+        skill=CapabilityState.UNKNOWN,
+        attach=CapabilityState.UNKNOWN,
+        status=ProviderStatus.PARTIAL,
+        notes="ACP configuration detected; protocol behavior requires live certification",
+        trust_tier="managed",
     )
 
 
@@ -310,8 +344,8 @@ def _extract_version(text: str) -> str | None:
     return None
 
 
-def _provider_config(provider: str) -> dict[str, object]:
-    data = load_config().get("providers", {}).get(provider, {})
+def _provider_config(provider: str, workspace: Path | None = None) -> dict[str, object]:
+    data = load_config(workspace).get("providers", {}).get(provider, {})
     return data if isinstance(data, dict) else {}
 
 

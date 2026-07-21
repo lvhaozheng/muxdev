@@ -9,7 +9,7 @@ from typing import Any, Protocol
 class RunEnginePort(Protocol):
     def run(self, task: str, **options: object) -> Any: ...
 
-    def resume(self, run_id: str) -> Any: ...
+    def resume(self, run_id: str, *, action: str = "auto") -> Any: ...
 
     def cancel(self, run_id: str) -> None: ...
 
@@ -43,8 +43,8 @@ class TaskService:
     def list(self, *, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         return self.store.list_runs(status=status, limit=limit)
 
-    def resume(self, run_id: str) -> Any:
-        return self.engine.resume(run_id)
+    def resume(self, run_id: str, *, action: str = "auto") -> Any:
+        return self.engine.resume(run_id, action=action)
 
     def cancel(self, run_id: str) -> None:
         self.engine.cancel(run_id)

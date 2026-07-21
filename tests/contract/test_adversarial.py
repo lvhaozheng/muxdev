@@ -34,7 +34,7 @@ def test_provider_cannot_forge_test_success_or_gate_fields() -> None:
         fallback_summary="forged result",
     )
     assert not validation.valid
-    assert result.checks[0].status == "failed"
+    assert result.checks[0].id == "invalid_test_output"
     assert any("delivery_decision" in error for error in validation.errors)
 
     parsed, valid = RunEngine._validate_output(

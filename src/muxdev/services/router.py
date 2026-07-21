@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from ..config.loader import load_config
-from ..providers import CapabilityState, probe_provider
+from ..providers import CapabilityState, certification_matches, probe_provider
+from ..providers.capabilities import provider_capabilities
 from ..storage.control import ControlStore
 
 
@@ -57,11 +58,24 @@ class ProviderRouter:
         preferred: str | None,
         profile: str,
         max_cost_usd: float,
+        roles: Sequence[str] = (),
+        role_providers: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
-        candidates = self._candidates(preferred=preferred, max_cost_usd=max_cost_usd)
+        overrides = dict(role_providers or {})
+        candidates = self._candidates(
+            preferred=preferred,
+            additional=tuple(overrides.values()),
+            profile=profile,
+            max_cost_usd=max_cost_usd,
+        )
         eligible = [item for item in candidates if item.eligible]
-        if preferred:
-            main = next((item for item in eligible if item.provider == preferred), None)
+        candidates_by_name = {item.provider: item for item in candidates}
+        eligible_by_name = {item.provider: item for item in eligible}
+        implementation_provider = overrides.get("code") or preferred
+        if implementation_provider:
+            main = next(
+                (item for item in eligible if item.provider == implementation_provider), None
+            )
         else:
             main = max(eligible, key=lambda item: (item.score, item.provider), default=None)
         reviewer = None
@@ -71,13 +85,54 @@ class ProviderRouter:
                 key=lambda item: (item.score, item.provider),
                 default=None,
             )
+        role_errors: list[str] = []
+        role_assignments: dict[str, str] = {}
+        for role in dict.fromkeys(roles):
+            requested = overrides.get(role)
+            if requested:
+                if requested not in eligible_by_name:
+                    candidate = candidates_by_name.get(requested)
+                    reasons = ", ".join(candidate.reasons) if candidate else "not configured"
+                    role_errors.append(
+                        f"{role} Provider '{requested}' is not eligible: {reasons}"
+                    )
+                    continue
+                if (
+                    profile in {"standard", "strict"}
+                    and role in {"review", "secure"}
+                    and main
+                    and requested == main.provider
+                ):
+                    role_errors.append(
+                        f"{role} Provider must be independent from executor '{main.provider}'"
+                    )
+                    continue
+                role_assignments[role] = requested
+            elif role in {"review", "secure"} and reviewer:
+                role_assignments[role] = reviewer.provider
+            elif main:
+                role_assignments[role] = main.provider
+        resolved_reviewer = role_assignments.get("review") or (
+            reviewer.provider if reviewer else None
+        )
         payload = {
             "main_provider": main.provider if main else None,
-            "reviewer_provider": reviewer.provider if reviewer else None,
+            "reviewer_provider": resolved_reviewer,
             "profile": profile,
             "reason": "capability_and_history" if main else "no_eligible_provider",
             "candidates": [item.to_dict() for item in candidates],
+            "warnings": [],
+            "role_assignments": role_assignments,
+            "role_errors": role_errors,
         }
+        if main and main.provider not in {"mock", "replay"}:
+            certification = self.store.latest_certification(main.provider)
+            if (
+                not certification
+                or certification.get("status") != "live_verified"
+                or not certification_matches(self.store.workspace, main.provider, certification)
+            ):
+                payload["warnings"].append("selected provider is not fingerprint-matched live-certified")
         payload["decision_id"] = self.store.record_routing(run_id, payload)
         return payload
 
@@ -107,30 +162,55 @@ class ProviderRouter:
             grouped.setdefault(str(row["provider"]), []).append(row)
         return {provider: self._history(provider, rows) for provider, rows in sorted(grouped.items())}
 
-    def _candidates(self, *, preferred: str | None, max_cost_usd: float) -> list[RoutedProvider]:
+    def _candidates(
+        self,
+        *,
+        preferred: str | None,
+        additional: Sequence[str] = (),
+        profile: str,
+        max_cost_usd: float,
+    ) -> list[RoutedProvider]:
         configured = load_config(self.store.workspace).get("providers", {})
         provider_ids = sorted(str(item) for item in configured) if isinstance(configured, Mapping) else []
-        if preferred and preferred not in provider_ids:
-            provider_ids.append(preferred)
-        return [self._candidate(provider, max_cost_usd=max_cost_usd) for provider in provider_ids]
+        for provider in (preferred, *additional):
+            if provider and provider not in provider_ids:
+                provider_ids.append(provider)
+        return [self._candidate(provider, profile=profile, max_cost_usd=max_cost_usd) for provider in provider_ids]
 
-    def _candidate(self, provider: str, *, max_cost_usd: float) -> RoutedProvider:
+    def _candidate(self, provider: str, *, profile: str, max_cost_usd: float) -> RoutedProvider:
         reasons: list[str] = []
+        certification = self.store.latest_certification(provider)
+        live_certified = bool(
+            provider in {"mock", "replay"}
+            or (
+                certification
+                and certification.get("status") == "live_verified"
+                and certification_matches(self.store.workspace, provider, certification)
+            )
+        )
+        capabilities: dict[str, object] = {}
         try:
-            probe = probe_provider(provider)
+            capabilities = provider_capabilities(self.store.workspace, provider)
+        except ValueError:
+            reasons.append("provider_capabilities_unavailable")
+        try:
+            probe = probe_provider(provider, workspace=self.store.workspace)
             if not probe.installed:
                 reasons.append("unavailable_or_not_authenticated")
-            if probe.headless != CapabilityState.SUPPORTED:
+            if not live_certified and capabilities.get("protocol") != "acp" and probe.headless != CapabilityState.SUPPORTED:
                 reasons.append("headless_execution_not_verified")
-            if probe.json != CapabilityState.SUPPORTED:
+            if not live_certified and capabilities.get("protocol") != "acp" and probe.json != CapabilityState.SUPPORTED:
                 reasons.append("structured_output_not_verified")
         except (OSError, ValueError) as exc:
             reasons.append(f"unavailable:{type(exc).__name__}")
-        certification = self.store.latest_certification(provider)
-        if provider not in {"mock", "replay"} and (
-            not certification or certification.get("status") not in {"offline_verified", "live_verified"}
-        ):
-            reasons.append("uncertified")
+        if provider not in {"mock", "replay"} and profile in {"standard", "strict"}:
+            if not capabilities.get("isolated_config"):
+                reasons.append("isolated_provider_config_required")
+        if provider not in {"mock", "replay"} and profile in {"standard", "strict"}:
+            if not certification or certification.get("status") != "live_verified":
+                reasons.append("live_certification_required")
+            elif not live_certified:
+                reasons.append("certification_fingerprint_mismatch")
         history = self._history(provider, self.store.outcomes(provider))
         if float(history["cost_p90"]) > max_cost_usd:
             reasons.append("cost_limit")

@@ -1,8 +1,9 @@
-"""The intentionally small muxdev command surface (29 leaf commands)."""
+"""The intentionally small muxdev command surface (30 leaf commands)."""
 
 from __future__ import annotations
 
 import json
+import secrets
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated
@@ -10,10 +11,10 @@ from typing import Annotated
 import typer
 from rich.console import Console
 
-from ..api import create_app
+from ..api import create_app, serve_stdio
 from ..application import TaskService
 from ..config.loader import load_config
-from ..providers import detect_providers, probe_provider
+from ..providers import certify_provider, detect_providers, probe_provider
 from ..runtime import RunEngine
 from ..services.dsse import export_dsse
 from ..services.evidence_verify import verify_evidence_report
@@ -36,12 +37,14 @@ provider_app = typer.Typer(no_args_is_help=True)
 skill_app = typer.Typer(no_args_is_help=True)
 config_app = typer.Typer(no_args_is_help=True)
 migrate_app = typer.Typer(no_args_is_help=True)
+mcp_app = typer.Typer(no_args_is_help=True)
 app.add_typer(evidence_app, name="evidence")
 app.add_typer(route_app, name="route")
 app.add_typer(provider_app, name="provider")
 app.add_typer(skill_app, name="skill")
 app.add_typer(config_app, name="config")
 app.add_typer(migrate_app, name="migrate")
+app.add_typer(mcp_app, name="mcp")
 console = Console()
 Workspace = Annotated[Path, typer.Option("--workspace", "-w", resolve_path=True)]
 
@@ -113,9 +116,15 @@ def show(run_id: str, workspace: Workspace = Path.cwd()) -> None:
 
 
 @app.command("resume")
-def resume(run_id: str, workspace: Workspace = Path.cwd()) -> None:
+def resume(
+    run_id: str,
+    workspace: Workspace = Path.cwd(),
+    action: Annotated[str, typer.Option("--action")] = "auto",
+) -> None:
+    if action not in {"auto", "fix-output", "retry", "switch-provider"}:
+        raise typer.BadParameter("action must be auto, fix-output, retry, or switch-provider")
     with _tasks(workspace) as tasks:
-        result = tasks.resume(run_id)
+        result = tasks.resume(run_id, action=action)
     _print({"run_id": result.run_id, "status": str(result.status), "evidence": str(result.report_path)})
 
 
@@ -194,29 +203,30 @@ def route_benchmark(workspace: Workspace = Path.cwd()) -> None:
 
 
 @provider_app.command("list")
-def provider_list() -> None:
-    _print([item.to_dict() for item in detect_providers()])
+def provider_list(workspace: Workspace = Path.cwd()) -> None:
+    _print([item.to_dict() for item in detect_providers(workspace=workspace)])
 
 
 @provider_app.command("show")
-def provider_show(name: str) -> None:
-    _print(probe_provider(name).to_dict())
+def provider_show(name: str, workspace: Workspace = Path.cwd()) -> None:
+    _print(probe_provider(name, workspace=workspace).to_dict())
 
 
 @provider_app.command("doctor")
-def provider_doctor(name: str | None = None) -> None:
-    probes = [probe_provider(name)] if name else detect_providers()
+def provider_doctor(name: str | None = None, workspace: Workspace = Path.cwd()) -> None:
+    probes = [probe_provider(name, workspace=workspace)] if name else detect_providers(workspace=workspace)
     _print({"healthy": all(item.installed for item in probes), "providers": [item.to_dict() for item in probes]})
 
 
 @provider_app.command("certify")
 def provider_certify(name: str, workspace: Workspace = Path.cwd(), live: bool = False) -> None:
-    probe = probe_provider(name)
-    status = "live_verified" if live and probe.installed else "offline_verified" if probe.installed else "failed"
-    payload = {"probe": probe.to_dict(), "live": live, "scope": "capability_and_authentication_only"}
+    payload = certify_provider(workspace, name, live=live)
+    status = str(payload["status"])
     with _store(workspace) as store:
         certification_id = store.record_certification(name, status=status, payload=payload)
-    _print({"certification_id": certification_id, "provider": name, "status": status, **payload})
+    _print({"certification_id": certification_id, **payload})
+    if status == "failed":
+        raise typer.Exit(1)
 
 
 @skill_app.command("list")
@@ -283,11 +293,21 @@ def migrate_run(workspace: Workspace = Path.cwd()) -> None:
     _print(migrate_workspace(workspace))
 
 
+@mcp_app.command("serve")
+def mcp_serve(
+    workspace: Workspace = Path.cwd(),
+    transport: Annotated[str, typer.Option("--transport")] = "stdio",
+) -> None:
+    if transport != "stdio":
+        raise typer.BadParameter("muxdev Trusted Harness v1 only supports MCP stdio")
+    serve_stdio(workspace)
+
+
 @app.command("doctor")
 def doctor(workspace: Workspace = Path.cwd()) -> None:
     with _store(workspace) as store:
         tables = store.table_names()
-        result = {"healthy": len(tables) == 12, "database": str(store.path), "tables": list(tables)}
+        result = {"healthy": len(tables) == 18, "database": str(store.path), "tables": list(tables)}
     _print(result)
     if not result["healthy"]:
         raise typer.Exit(1)
@@ -298,10 +318,28 @@ def serve(
     workspace: Workspace = Path.cwd(),
     host: str = "127.0.0.1",
     port: int = 8765,
+    allow_remote: Annotated[bool, typer.Option("--allow-remote")] = False,
+    trusted_origin: Annotated[list[str] | None, typer.Option("--trusted-origin")] = None,
 ) -> None:
     import uvicorn
 
-    uvicorn.run(create_app(workspace), host=host, port=port)
+    loopback = host in {"127.0.0.1", "localhost", "::1"}
+    if not loopback and not allow_remote:
+        raise typer.BadParameter("non-loopback Web binding requires --allow-remote")
+    pairing_code = secrets.token_urlsafe(8) if allow_remote else None
+    if pairing_code:
+        console.print("Remote Web access is protected. Pair a browser with this one-time code:")
+        console.print(f"[bold]{pairing_code}[/bold]")
+    uvicorn.run(
+        create_app(
+            workspace,
+            require_auth=allow_remote,
+            pairing_code=pairing_code,
+            trusted_origins=tuple(trusted_origin or ()),
+        ),
+        host=host,
+        port=port,
+    )
 
 
 if __name__ == "__main__":

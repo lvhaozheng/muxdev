@@ -46,3 +46,22 @@ flowchart LR
   SC --> REP
   REP --> DSSE["optional attestation.dsse.json"]
 ```
+
+## Bounded Supervisor fan-out and context
+
+```mermaid
+flowchart LR
+  T["Task + frozen Policy"] --> P["Plan"]
+  P --> I["Implement"]
+  I --> X["Runtime test replay"]
+  X --> R["Read-only review"]
+  X --> S["Read-only security review"]
+  R --> G["Deterministic Gate"]
+  S --> G
+  V["Verified PASS memory"] --> C["Budgeted Context Pack"]
+  M["AST repo map"] --> C
+  C --> P
+  C --> I
+  C --> R
+  C --> S
+```

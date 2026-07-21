@@ -35,7 +35,7 @@ class WorktreeManager:
 
     def prepare(self, run_id: str, run_dir: Path) -> WorktreeResult:
         """Prepare a run worktree using Git when possible, else fallback copies."""
-        if self._is_git_repo(self.workspace):
+        if self._is_git_repo(self.workspace) and not self._is_dirty(self.workspace):
             worktree_path = (self.worktrees_root or path_config(self.workspace, "worktrees")) / run_id
             worktree_path.parent.mkdir(parents=True, exist_ok=True)
             if worktree_path.exists():
@@ -70,6 +70,39 @@ class WorktreeManager:
         return WorktreeResult(worktree_path, "workspace_copy", "workspace is not a git repository root; copied workspace")
 
     @staticmethod
+    def checkpoint(path: Path, message: str) -> bool:
+        """Commit the isolated worktree so an accepted delivery becomes its next baseline."""
+        add = WorktreeManager._run_git(path, ["add", "--all"])
+        if add.returncode != 0:
+            return False
+        status = WorktreeManager._run_git(path, ["status", "--porcelain"])
+        if status.returncode != 0:
+            return False
+        if not status.stdout.strip():
+            return True
+        result = WorktreeManager._run_git(
+            path,
+            [
+                "-c", "user.name=muxdev",
+                "-c", "user.email=muxdev@example.invalid",
+                "commit", "-m", message, "--no-gpg-sign",
+            ],
+        )
+        return result.returncode == 0
+
+    @staticmethod
+    def _is_dirty(path: Path) -> bool:
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=path,
+            capture_output=True,
+            text=True,
+            check=False,
+            **hidden_subprocess_kwargs(),
+        )
+        return result.returncode != 0 or bool(result.stdout.strip())
+
+    @staticmethod
     def _is_git_repo(path: Path) -> bool:
         result = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
@@ -93,7 +126,10 @@ class WorktreeManager:
             targets.append(self.worktrees_root.resolve())
 
         def ignore(directory: str, names: list[str]) -> set[str]:
-            ignored = {".git", ".muxdev", ".pytest_cache", ".test_workspaces", "__pycache__"}
+            ignored = {
+                ".git", ".muxdev", ".pytest_cache", ".test_workspaces",
+                "__pycache__", "node_modules", ".venv", "venv",
+            }
             current = Path(directory).resolve()
             for name in names:
                 if name.startswith("pytest-cache-files-"):

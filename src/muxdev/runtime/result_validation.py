@@ -7,7 +7,14 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from ..models import ReviewFinding, ReviewResult, TestCheck, TestResult
+from ..models import (
+    ChangeResult,
+    PlanResult,
+    ReviewFinding,
+    ReviewResult,
+    TestResult,
+    VerificationSuggestion,
+)
 
 
 @dataclass(frozen=True)
@@ -19,6 +26,52 @@ class ContractValidation:
 
 
 FORBIDDEN_DECISION_FIELDS = {"delivery_decision", "confidence", "evidence", "missing_evidence"}
+
+
+def validate_stage_output(schema: str | None, content: str) -> tuple[dict[str, Any], ContractValidation]:
+    """Validate every model-produced stage contract without discarding diagnostics."""
+    payload = extract_json(content)
+    forbidden = sorted(FORBIDDEN_DECISION_FIELDS & set(payload or {}))
+    if forbidden:
+        errors = tuple(f"provider-controlled decision field is forbidden: {field}" for field in forbidden)
+        return {}, ContractValidation(schema or "JSON object", False, errors, payload)
+    if schema == "TestResult":
+        result, validation = validate_test_result(
+            payload, fallback_summary="Runtime did not receive a valid TestResult."
+        )
+        return result.model_dump(mode="json"), validation
+    if schema == "ReviewResult":
+        result, validation = validate_review_result(payload)
+        return result.model_dump(mode="json"), validation
+    if schema in {"PlanResult", "ChangeResult"}:
+        model = PlanResult if schema == "PlanResult" else ChangeResult
+        if payload is None:
+            return {}, ContractValidation(schema, False, ("missing JSON object",), None)
+        try:
+            result = model.model_validate(payload)
+        except ValidationError as exc:
+            errors = tuple(_pydantic_errors(exc))
+            return {}, ContractValidation(schema, False, errors, payload)
+        return result.model_dump(mode="json"), ContractValidation(schema, True, (), payload)
+    if payload is None and schema:
+        return {}, ContractValidation(schema, False, ("missing JSON object",), None)
+    return payload or {}, ContractValidation(schema or "JSON object", True, (), payload)
+
+
+def extract_json(content: str) -> dict[str, Any] | None:
+    import json
+
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(content):
+        if char != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(content[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
 
 
 def validate_test_result(parsed: dict[str, Any] | None, *, fallback_summary: str) -> tuple[TestResult, ContractValidation]:
@@ -35,9 +88,8 @@ def validate_test_result(parsed: dict[str, Any] | None, *, fallback_summary: str
     summary = "; ".join(errors) or "invalid TestResult"
     fallback = TestResult(
         checks=[
-            TestCheck(
-                id="invalid_test_output", status="failed", exit_code=-1,
-                summary=f"{summary}. Provider summary: {fallback_summary}",
+            VerificationSuggestion(
+                id="invalid_test_output", summary=f"{summary}. Provider summary: {fallback_summary}"
             )
         ]
     )
@@ -69,3 +121,11 @@ def _base_errors(parsed: dict[str, Any] | None, *, required: set[str], forbidden
     errors = [f"missing required field: {field}" for field in sorted(required - set(parsed))]
     errors.extend(f"provider-controlled decision field is forbidden: {field}" for field in sorted(forbidden & set(parsed)))
     return errors
+
+
+def _pydantic_errors(exc: ValidationError) -> list[str]:
+    errors: list[str] = []
+    for item in exc.errors(include_url=False):
+        location = ".".join(str(part) for part in item.get("loc", ())) or "root"
+        errors.append(f"{location}: {item.get('msg', 'invalid value')}")
+    return errors or [str(exc)]

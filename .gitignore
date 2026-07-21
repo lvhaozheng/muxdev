@@ -22,3 +22,7 @@ release-artifacts/*
 !release-artifacts/interview-narratives.md
 !release-artifacts/resume-bullets.md
 !release-artifacts/verification-report.md
+!release-artifacts/interview-qa-cn.md
+!release-artifacts/login-evidence-example.json
+!release-artifacts/muxdev-teaching-playbook-cn.md
+!release-artifacts/muxdev-interview-drill-bank-cn.md

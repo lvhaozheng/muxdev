@@ -1,8 +1,9 @@
-"""Compact SQLite fact store for the trusted-delivery control plane.
+"""SQLite facts for trusted Runs plus durable Conversation projections.
 
-The schema deliberately contains twelve tables.  Flexible facts live in typed
-JSON payloads; new product features therefore do not imply new projection
-tables.  Legacy v7 blackboards are imported as immutable events and artifacts.
+Run evidence remains append-only and hash chained. Conversation, delivery and
+personal-device projections add the long-running Web lifecycle without turning
+chat messages into trusted evidence. Legacy v7 blackboards are imported as
+immutable events and artifacts.
 """
 
 from __future__ import annotations
@@ -18,8 +19,14 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 from uuid import uuid4
 
+from .conversation import (
+    CONVERSATION_SCHEMA_STATEMENTS,
+    CONVERSATION_TABLES,
+    ConversationStoreMixin,
+)
 
-SCHEMA_VERSION = 8
+
+SCHEMA_VERSION = 9
 CORE_TABLES = (
     "schema_migrations",
     "runs",
@@ -33,7 +40,7 @@ CORE_TABLES = (
     "routing_decisions",
     "attestations",
     "skill_locks",
-)
+) + CONVERSATION_TABLES
 
 
 def utc_now() -> str:
@@ -57,7 +64,7 @@ def _decode_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return result
 
 
-class ControlStore:
+class ControlStore(ConversationStoreMixin):
     """Explicit repository over the compact control-plane schema."""
 
     def __init__(self, workspace: Path | str, *, database: Path | None = None) -> None:
@@ -150,6 +157,26 @@ class ControlStore:
         )
         self.connection.commit()
         self.append_event(run_id, "run.status_changed", {"status": status, "current_stage": current_stage})
+
+    def freeze_run_policy(self, run_id: str, snapshot: Mapping[str, object], snapshot_hash: str) -> None:
+        """Attach the policy snapshot exactly once, before execution begins."""
+        run = self.get_run(run_id)
+        if not run:
+            raise FileNotFoundError(run_id)
+        if run.get("status") != "created":
+            raise RuntimeError("run policy can only be frozen while the run is created")
+        metadata = run.get("metadata") if isinstance(run.get("metadata"), dict) else {}
+        if metadata.get("policy_snapshot"):
+            raise RuntimeError("run policy snapshot is already frozen")
+        frozen = dict(metadata)
+        frozen["policy_snapshot"] = dict(snapshot)
+        frozen["policy_snapshot_hash"] = snapshot_hash
+        self.connection.execute(
+            "UPDATE runs SET metadata = ?, updated_at = ? WHERE run_id = ?",
+            (_json(frozen), utc_now(), run_id),
+        )
+        self.connection.commit()
+        self.append_event(run_id, "run.policy_frozen", {"snapshot_hash": snapshot_hash})
 
     def cancel_run(self, run_id: str) -> None:
         self.update_run(run_id, status="aborted")
@@ -254,6 +281,13 @@ class ControlStore:
             (event_id, run_id, stage_id, event_type, sequence, created_at, _json(payload), previous_hash, event_hash),
         )
         self.connection.commit()
+        self.project_run_event(
+            run_id,
+            {
+                **fact,
+                "event_hash": event_hash,
+            },
+        )
         return event_id
 
     def events(self, run_id: str, *, after: int = 0) -> list[dict[str, Any]]:
@@ -318,6 +352,7 @@ class ControlStore:
         requirement_id: str,
         prompt: str,
         stage_id: str | None = None,
+        details: Mapping[str, object] | None = None,
     ) -> str:
         interaction_id = f"int_{uuid4().hex}"
         now = utc_now()
@@ -328,14 +363,33 @@ class ControlStore:
             (interaction_id, run_id, stage_id, kind, requirement_id, prompt, now),
         )
         self.connection.commit()
-        self.append_event(run_id, "interaction.requested", {"interaction_id": interaction_id, "kind": kind})
+        self.append_event(
+            run_id,
+            "interaction.requested",
+            {
+                "interaction_id": interaction_id,
+                "kind": kind,
+                "requirement_id": requirement_id,
+                "question": prompt,
+                **dict(details or {}),
+            },
+            stage_id=stage_id,
+        )
         return interaction_id
 
-    def respond(self, interaction_id: str, *, status: str, response: str | None = None) -> dict[str, Any]:
+    def respond(
+        self,
+        interaction_id: str,
+        *,
+        status: str,
+        response: str | None = None,
+        details: Mapping[str, object] | None = None,
+    ) -> dict[str, Any]:
         if status not in {"approved", "rejected", "responded"}:
             raise ValueError("interaction status must be approved, rejected, or responded")
-        self.connection.execute(
-            "UPDATE interactions SET status = ?, response = ?, responded_at = ? WHERE interaction_id = ?",
+        cursor = self.connection.execute(
+            """UPDATE interactions SET status = ?, response = ?, responded_at = ?
+               WHERE interaction_id = ? AND status = 'pending'""",
             (status, response, utc_now(), interaction_id),
         )
         self.connection.commit()
@@ -345,7 +399,14 @@ class ControlStore:
         result = _decode_row(row)
         if result is None:
             raise KeyError(interaction_id)
-        self.append_event(str(result["run_id"]), "interaction.responded", {"interaction_id": interaction_id, "status": status})
+        if cursor.rowcount != 1:
+            raise RuntimeError("interaction has already been answered")
+        self.append_event(
+            str(result["run_id"]),
+            "interaction.responded",
+            {"interaction_id": interaction_id, "status": status, **dict(details or {})},
+            stage_id=str(result.get("stage_id") or "") or None,
+        )
         return result
 
     def interactions(self, run_id: str, *, pending_only: bool = False) -> list[dict[str, Any]]:
@@ -353,7 +414,16 @@ class ControlStore:
         if pending_only:
             sql += " AND status = 'pending'"
         sql += " ORDER BY created_at"
-        return [_decode_row(row) or {} for row in self.connection.execute(sql, (run_id,)).fetchall()]
+        rows = [_decode_row(row) or {} for row in self.connection.execute(sql, (run_id,)).fetchall()]
+        requested = {
+            str(event["payload"].get("interaction_id")): event["payload"]
+            for event in self.events(run_id)
+            if event["type"] == "interaction.requested"
+            and isinstance(event.get("payload"), dict)
+        }
+        for row in rows:
+            row.update(requested.get(str(row.get("interaction_id") or ""), {}))
+        return rows
 
     def record_routing(self, run_id: str, payload: Mapping[str, object]) -> str:
         decision_id = f"route_{uuid4().hex}"
@@ -486,7 +556,7 @@ def _schema_statements() -> tuple[str, ...]:
           lock_id TEXT PRIMARY KEY, skill_name TEXT NOT NULL, version TEXT NOT NULL, digest TEXT NOT NULL,
           created_at TEXT NOT NULL, payload TEXT NOT NULL, UNIQUE(skill_name, version)
         )""",
-    )
+    ) + CONVERSATION_SCHEMA_STATEMENTS
 
 
 def compact_database_status(workspace: Path | str) -> dict[str, object]:

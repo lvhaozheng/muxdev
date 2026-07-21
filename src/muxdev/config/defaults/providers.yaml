@@ -23,7 +23,29 @@ providers:
         - --skip-git-repo-check
         - --sandbox
         - workspace-write
+      resume_command:
+        - codex
+        - --ask-for-approval
+        - never
+        - --sandbox
+        - workspace-write
+        - exec
+        - resume
+        - --json
+        - --skip-git-repo-check
+        - "{session_id}"
+        - "-"
       prompt_transport: stdin
+      resume_prompt_transport: stdin
+  codex-acp:
+    mode: local ACP
+    commands: [codex-acp]
+    status_hint: P0
+    probe: generic
+    runtime:
+      kind: acp
+      command: [codex-acp]
+      timeout: 300
   claude-code:
     mode: local CLI
     commands: [claude, claude-code]
@@ -32,6 +54,9 @@ providers:
     runtime:
       kind: headless_cli
       command: [claude, -p, "{prompt}", --output-format, stream-json, --verbose]
+      prompt_transport: argument
+      resume_command: [claude, --resume, "{session_id}", -p, "{prompt}", --output-format, stream-json, --verbose]
+      resume_prompt_transport: argument
   qwen:
     mode: local CLI
     commands: [qwen]
@@ -39,7 +64,8 @@ providers:
     probe: generic
     runtime:
       kind: headless_cli
-      command: [qwen, --bare, --sandbox, --approval-mode, auto, --output-format, stream-json, --max-tool-calls, "40", -p]
+      command: [qwen, --bare, --sandbox, --approval-mode, auto, --output-format, stream-json, --max-tool-calls, "40", -p, "{prompt}"]
+      prompt_transport: argument
   kimi:
     mode: local CLI
     commands: [kimi]
@@ -48,6 +74,7 @@ providers:
     runtime:
       kind: headless_cli
       command: [kimi]
+      prompt_transport: stdin
   trae:
     mode: IDE/shell
     commands: [trae]
@@ -56,6 +83,7 @@ providers:
     runtime:
       kind: headless_cli
       command: [trae]
+      prompt_transport: stdin
   antigravity:
     mode: beta
     commands: [antigravity]
@@ -64,3 +92,4 @@ providers:
     runtime:
       kind: headless_cli
       command: [antigravity]
+      prompt_transport: stdin

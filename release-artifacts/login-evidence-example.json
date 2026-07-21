@@ -1,0 +1,393 @@
+{
+  "contract_version": "muxdev.evidence.v3",
+  "run_id": "run_login_demo_001",
+  "subject": {
+    "name": "login-api-change",
+    "digest": "sha256:ec27763f44967c88c483ced5a965b298a4be5ce83cfe693ab627a70bf5087e3e",
+    "simulated": true,
+    "artifacts": [
+      {
+        "name": "diff.patch",
+        "digest": "sha256:bead65ae201894eb47612e80a7802ad8229d1eb210e7d31c79603efcf98ae739"
+      }
+    ]
+  },
+  "policy": {
+    "policy_id": "muxdev.change.strict.login-demo",
+    "version": 3,
+    "requirements": [
+      {
+        "id": "plan_artifact",
+        "description": "A structured login implementation plan exists.",
+        "required": true,
+        "accepted_kinds": [
+          "artifact"
+        ],
+        "subject_selector": "any",
+        "require_reproducible": false,
+        "require_integrity": true,
+        "require_independent": false
+      },
+      {
+        "id": "change_artifact",
+        "description": "The login diff is content-addressed.",
+        "required": true,
+        "accepted_kinds": [
+          "artifact"
+        ],
+        "subject_selector": "run",
+        "require_reproducible": false,
+        "require_integrity": true,
+        "require_independent": false
+      },
+      {
+        "id": "deterministic_check",
+        "description": "Login tests are replayed by muxdev Runtime.",
+        "required": true,
+        "accepted_kinds": [
+          "check"
+        ],
+        "subject_selector": "run",
+        "require_reproducible": true,
+        "require_integrity": true,
+        "require_independent": false
+      },
+      {
+        "id": "independent_review",
+        "description": "A different provider reviews the final login subject.",
+        "required": true,
+        "accepted_kinds": [
+          "review"
+        ],
+        "subject_selector": "run",
+        "require_reproducible": false,
+        "require_integrity": true,
+        "require_independent": true
+      },
+      {
+        "id": "security_review",
+        "description": "A security worker reviews authentication risks.",
+        "required": true,
+        "accepted_kinds": [
+          "review"
+        ],
+        "subject_selector": "run",
+        "require_reproducible": false,
+        "require_integrity": true,
+        "require_independent": true
+      },
+      {
+        "id": "human_approval",
+        "description": "A human approves the strict delivery.",
+        "required": true,
+        "accepted_kinds": [
+          "interaction"
+        ],
+        "subject_selector": "any",
+        "require_reproducible": false,
+        "require_integrity": true,
+        "require_independent": false
+      },
+      {
+        "id": "runtime_health",
+        "description": "The runtime completes without unresolved failures.",
+        "required": true,
+        "accepted_kinds": [
+          "runtime"
+        ],
+        "subject_selector": "any",
+        "require_reproducible": false,
+        "require_integrity": true,
+        "require_independent": false
+      }
+    ],
+    "policy_hash": "sha256:6e9d9b3561edfe588787d5b069d1b4431f19762bd697536d2f723bcb14c1c8a4"
+  },
+  "records": [
+    {
+      "record_id": "ev_plan_login_001",
+      "run_id": "run_login_demo_001",
+      "stage_id": "plan",
+      "requirement_id": "plan_artifact",
+      "kind": "artifact",
+      "subject_digest": "sha256:ec27763f44967c88c483ced5a965b298a4be5ce83cfe693ab627a70bf5087e3e",
+      "producer": "muxdev.runtime",
+      "created_at": "2026-07-20T10:30:00+08:00",
+      "schema_version": 3,
+      "integrity_valid": true,
+      "path": "artifacts/plan/plan.json",
+      "digest": "sha256:db61b2fcc4486da7f98ad559617765beafa9c2bfc135cb440b7d33883ba3d013",
+      "size": 1842,
+      "media_type": "application/json"
+    },
+    {
+      "record_id": "ev_diff_login_001",
+      "run_id": "run_login_demo_001",
+      "stage_id": null,
+      "requirement_id": "change_artifact",
+      "kind": "artifact",
+      "subject_digest": "sha256:ec27763f44967c88c483ced5a965b298a4be5ce83cfe693ab627a70bf5087e3e",
+      "producer": "muxdev.runtime",
+      "created_at": "2026-07-20T10:30:00+08:00",
+      "schema_version": 3,
+      "integrity_valid": true,
+      "path": "diff.patch",
+      "digest": "sha256:bead65ae201894eb47612e80a7802ad8229d1eb210e7d31c79603efcf98ae739",
+      "size": 4268,
+      "media_type": "text/x-diff"
+    },
+    {
+      "record_id": "ev_check_login_success",
+      "run_id": "run_login_demo_001",
+      "stage_id": "test",
+      "requirement_id": "deterministic_check",
+      "kind": "check",
+      "subject_digest": "sha256:ec27763f44967c88c483ced5a965b298a4be5ce83cfe693ab627a70bf5087e3e",
+      "producer": "muxdev.runtime.command",
+      "created_at": "2026-07-20T10:30:00+08:00",
+      "schema_version": 3,
+      "integrity_valid": true,
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "tests/test_auth.py::test_login_success",
+        "-q"
+      ],
+      "cwd": ".",
+      "cwd_digest": "sha256:db00c463e8c24aa9330e9f1e4d349f74ee1ebea837ef231e41733e80d11ea31a",
+      "exit_code": 0,
+      "declared_exit_code": 0,
+      "declared_status": "passed",
+      "duration_ms": 842,
+      "stdout_digest": "sha256:e99de527c497c073fc9c7b8f3fe62cb07cbdea58572ab6c801fd5ed039809bf2",
+      "stderr_digest": "sha256:12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+      "stdout_summary": "1 passed in 0.42s",
+      "stderr_summary": "",
+      "summary": "Valid credentials return a signed access token.",
+      "reproducible": true
+    },
+    {
+      "record_id": "ev_check_login_failure",
+      "run_id": "run_login_demo_001",
+      "stage_id": "test",
+      "requirement_id": "deterministic_check",
+      "kind": "check",
+      "subject_digest": "sha256:ec27763f44967c88c483ced5a965b298a4be5ce83cfe693ab627a70bf5087e3e",
+      "producer": "muxdev.runtime.command",
+      "created_at": "2026-07-20T10:30:00+08:00",
+      "schema_version": 3,
+      "integrity_valid": true,
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "tests/test_auth.py::test_login_wrong_password",
+        "-q"
+      ],
+      "cwd": ".",
+      "cwd_digest": "sha256:db00c463e8c24aa9330e9f1e4d349f74ee1ebea837ef231e41733e80d11ea31a",
+      "exit_code": 0,
+      "declared_exit_code": 0,
+      "declared_status": "passed",
+      "duration_ms": 799,
+      "stdout_digest": "sha256:07794e041b8d7f6f5f832fc3757d60ce5122bad0d71633c63b2a56ecaed5a433",
+      "stderr_digest": "sha256:12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+      "stdout_summary": "1 passed in 0.39s",
+      "stderr_summary": "",
+      "summary": "Wrong passwords return the same generic 401 response.",
+      "reproducible": true
+    },
+    {
+      "record_id": "ev_review_login_001",
+      "run_id": "run_login_demo_001",
+      "stage_id": "review",
+      "requirement_id": "independent_review",
+      "kind": "review",
+      "subject_digest": "sha256:ec27763f44967c88c483ced5a965b298a4be5ce83cfe693ab627a70bf5087e3e",
+      "producer": "muxdev.runtime.review",
+      "created_at": "2026-07-20T10:30:00+08:00",
+      "schema_version": 3,
+      "integrity_valid": true,
+      "target_digest": "sha256:ec27763f44967c88c483ced5a965b298a4be5ce83cfe693ab627a70bf5087e3e",
+      "reviewer": "claude-code",
+      "executor": "codex",
+      "independent": true,
+      "findings": [],
+      "residual_risk": "Refresh-token rotation is outside this change."
+    },
+    {
+      "record_id": "ev_security_login_001",
+      "run_id": "run_login_demo_001",
+      "stage_id": "security_review",
+      "requirement_id": "security_review",
+      "kind": "review",
+      "subject_digest": "sha256:ec27763f44967c88c483ced5a965b298a4be5ce83cfe693ab627a70bf5087e3e",
+      "producer": "muxdev.runtime.review",
+      "created_at": "2026-07-20T10:30:00+08:00",
+      "schema_version": 3,
+      "integrity_valid": true,
+      "target_digest": "sha256:ec27763f44967c88c483ced5a965b298a4be5ce83cfe693ab627a70bf5087e3e",
+      "reviewer": "qwen",
+      "executor": "codex",
+      "independent": true,
+      "findings": [],
+      "residual_risk": "Production rate-limit tuning requires traffic data."
+    },
+    {
+      "record_id": "ev_approval_login_001",
+      "run_id": "run_login_demo_001",
+      "stage_id": "approve_plan",
+      "requirement_id": "human_approval",
+      "kind": "interaction",
+      "subject_digest": "sha256:ec27763f44967c88c483ced5a965b298a4be5ce83cfe693ab627a70bf5087e3e",
+      "producer": "muxdev.runtime.interaction",
+      "created_at": "2026-07-20T10:30:00+08:00",
+      "schema_version": 3,
+      "integrity_valid": true,
+      "interaction_type": "approval",
+      "decision": "approved",
+      "actor": "developer"
+    },
+    {
+      "record_id": "ev_runtime_login_001",
+      "run_id": "run_login_demo_001",
+      "stage_id": "finalize",
+      "requirement_id": "runtime_health",
+      "kind": "runtime",
+      "subject_digest": "sha256:ec27763f44967c88c483ced5a965b298a4be5ce83cfe693ab627a70bf5087e3e",
+      "producer": "muxdev.runtime",
+      "created_at": "2026-07-20T10:30:00+08:00",
+      "schema_version": 3,
+      "integrity_valid": true,
+      "event_type": "run_health",
+      "status": "passed",
+      "details": {
+        "context_pack_digest": "sha256:a820623dce3595a00ec69a6046ef339e84de427c733300e0535be8710163bb54",
+        "fanout": [
+          "review",
+          "security_review"
+        ],
+        "read_only_subject_unchanged": true
+      }
+    }
+  ],
+  "decision": {
+    "status": "PASS",
+    "policy_hash": "sha256:6e9d9b3561edfe588787d5b069d1b4431f19762bd697536d2f723bcb14c1c8a4",
+    "requirements": [
+      {
+        "requirement_id": "plan_artifact",
+        "status": "satisfied",
+        "record_ids": [
+          "ev_plan_login_001"
+        ],
+        "reason": "Requirement is satisfied by verified evidence.",
+        "remediation": null
+      },
+      {
+        "requirement_id": "change_artifact",
+        "status": "satisfied",
+        "record_ids": [
+          "ev_diff_login_001"
+        ],
+        "reason": "Requirement is satisfied by verified evidence.",
+        "remediation": null
+      },
+      {
+        "requirement_id": "deterministic_check",
+        "status": "satisfied",
+        "record_ids": [
+          "ev_check_login_success",
+          "ev_check_login_failure"
+        ],
+        "reason": "Requirement is satisfied by verified evidence.",
+        "remediation": null
+      },
+      {
+        "requirement_id": "independent_review",
+        "status": "satisfied",
+        "record_ids": [
+          "ev_review_login_001"
+        ],
+        "reason": "Requirement is satisfied by verified evidence.",
+        "remediation": null
+      },
+      {
+        "requirement_id": "security_review",
+        "status": "satisfied",
+        "record_ids": [
+          "ev_security_login_001"
+        ],
+        "reason": "Requirement is satisfied by verified evidence.",
+        "remediation": null
+      },
+      {
+        "requirement_id": "human_approval",
+        "status": "satisfied",
+        "record_ids": [
+          "ev_approval_login_001"
+        ],
+        "reason": "Requirement is satisfied by verified evidence.",
+        "remediation": null
+      },
+      {
+        "requirement_id": "runtime_health",
+        "status": "satisfied",
+        "record_ids": [
+          "ev_runtime_login_001"
+        ],
+        "reason": "Requirement is satisfied by verified evidence.",
+        "remediation": null
+      }
+    ],
+    "blockers": [],
+    "scorecard": {
+      "completeness": {
+        "numerator": 7,
+        "denominator": 7,
+        "percent": 100.0,
+        "failed_requirements": []
+      },
+      "reproducibility": {
+        "numerator": 2,
+        "denominator": 2,
+        "percent": 100.0,
+        "failed_requirements": []
+      },
+      "integrity": {
+        "numerator": 8,
+        "denominator": 8,
+        "percent": 100.0,
+        "failed_requirements": []
+      },
+      "independence": {
+        "numerator": 2,
+        "denominator": 2,
+        "percent": 100.0,
+        "failed_requirements": []
+      },
+      "overall": 100.0
+    },
+    "evaluated_at": "2026-07-20T10:30:00+08:00"
+  },
+  "integrity": {
+    "valid": true,
+    "event_chain_errors": [],
+    "event_chain_sequence": 18,
+    "event_chain_head": "sha256:c6b686809c95ae35d276f50e48ea08cf4531ceb1fbd6705bee6e73f2329dc778",
+    "records_hash": "sha256:6da8e6c7da8aeb3e73c27619505b6fd0b18c58bd7135fbfd1561ac493e4ef245"
+  },
+  "routing": {
+    "main_provider": "codex",
+    "reviewer_provider": "claude-code",
+    "security_provider": "qwen",
+    "reason": "capability_and_verified_history"
+  },
+  "reviewer": {
+    "executor": "codex",
+    "reviewer": "claude-code",
+    "security_reviewer": "qwen"
+  },
+  "generated_at": "2026-07-20T10:30:00+08:00"
+}

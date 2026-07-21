@@ -24,11 +24,15 @@ workflows:
         deps: [implement]
         read_only: true
         allow_shell: true
+        verification_commands:
+          - id: diff-integrity
+            argv: [git, diff, --check, --, .]
+            timeout_seconds: 60
         output_schema: TestResult
       - id: review
         role: review
         default_skills: ["review=default-review"]
-        deps: [test, security_review]
+        deps: [test]
         read_only: true
         output_schema: ReviewResult
       - id: security_review
@@ -106,6 +110,10 @@ workflows:
         deps: [approve_plan]
         read_only: true
         allow_shell: true
+        verification_commands:
+          - id: diff-integrity
+            argv: [git, diff, --check, --, .]
+            timeout_seconds: 60
         output_schema: TestResult
       - id: review
         role: review

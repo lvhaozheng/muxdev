@@ -25,7 +25,7 @@ def evaluate_gate(
     *,
     subject_digest: str | None = None,
 ) -> GateDecision:
-    evidence = _latest_interactions(list(records))
+    evidence = _effective_records(list(records))
     evaluations: list[RequirementEvaluation] = []
     blockers: list[GateBlocker] = []
     waiting = False
@@ -74,16 +74,31 @@ def evaluate_gate(
     )
 
 
-def _latest_interactions(records: list[AnyEvidenceRecord]) -> list[AnyEvidenceRecord]:
-    """An append-only interaction stream is evaluated by its latest state."""
-    latest: dict[tuple[str, str | None], InteractionEvidence] = {}
+def _effective_records(records: list[AnyEvidenceRecord]) -> list[AnyEvidenceRecord]:
+    """Evaluate mutable state projections without discarding the audit history."""
+    latest_runtime: dict[tuple[str, str | None], RuntimeEvidence] = {}
+    latest_interaction: dict[tuple[str, str | None], InteractionEvidence] = {}
+    latest_check: dict[tuple[str, str | None, tuple[str, ...], str], CheckEvidence] = {}
+    latest_review: dict[tuple[str, str | None, str], ReviewEvidence] = {}
     other: list[AnyEvidenceRecord] = []
     for record in records:
-        if isinstance(record, InteractionEvidence):
-            latest[(record.requirement_id, record.stage_id)] = record
+        if isinstance(record, RuntimeEvidence):
+            latest_runtime[(record.requirement_id, record.stage_id)] = record
+        elif isinstance(record, InteractionEvidence):
+            latest_interaction[(record.requirement_id, record.stage_id)] = record
+        elif isinstance(record, CheckEvidence):
+            latest_check[(record.requirement_id, record.stage_id, tuple(record.argv), record.cwd)] = record
+        elif isinstance(record, ReviewEvidence):
+            latest_review[(record.requirement_id, record.stage_id, record.reviewer)] = record
         else:
             other.append(record)
-    return [*other, *latest.values()]
+    return [
+        *other,
+        *latest_runtime.values(),
+        *latest_interaction.values(),
+        *latest_check.values(),
+        *latest_review.values(),
+    ]
 
 
 def _subject_records(

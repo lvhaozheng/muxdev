@@ -60,6 +60,22 @@ jobs:
           path: .test_workspaces/test-logs/*.log
           if-no-files-found: warn
 
+  interop:
+    name: interop / MCP-ACP / ubuntu / py3.12
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package with protocol adapters
+        run: python -m pip install -e ".[test,interop]"
+      - name: Run MCP, ACP and trusted harness tests
+        run: >-
+          python -m pytest -q
+          tests/integration/test_interfaces.py
+          tests/unit/test_trusted_harness.py
+
   release:
     name: release / replay-security-package / py3.12
     runs-on: ubuntu-latest

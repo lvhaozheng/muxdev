@@ -1,30 +1,45 @@
 # muxdev verification report
 
-Measured on Windows with Python 3.13 after the compact refactor.
+Measured on Windows with Python 3.13 after the bounded Supervisor/Context optimization.
 
-| Layer | Result | Time |
+| Verification | Result | Measured time |
 |---|---:|---:|
-| Quick product verification | passed | 12.03s |
-| Unit + contract | 14 passed | 2.63s |
-| Integration | 7 passed | 66.26s |
-| Migration | 2 passed | 0.04s |
-| Release | 2 passed | 7.72s |
-| Ruff | passed | 2.2s |
-| Compileall | passed | 2.2s |
-| Documentation links/layout | passed | 2.2s |
+| Full Pytest suite (workspace sandbox) | 40 passed, 4 platform/sandbox skips | 66.27s |
+| Official MCP + ACP stdio conformance outside the Windows pipe sandbox | 3 passed | 8.11s |
+| Ruff over `src/muxdev`, `scripts`, and `tests` | passed | <2s combined check run |
+| Python bytecode compilation | passed | <2s combined check run |
+| Documentation links/layout | passed | <2s combined check run |
+| Git whitespace validation | passed | <2s combined check run |
 
-The quick suite is below the 45-second target. Integration is executed separately and reports per-test duration:
+## Current architecture facts
 
-| Integration case | Time |
+| Metric | Value |
 |---|---:|
-| strict pause → policy mutation → approve → resume | 16.05s |
-| lite PASS plus artifact tamper detection | 15.60s |
-| standard Profile independent-review block | 12.57s |
-| forged TestResult versus Runtime exit code | 11.33s |
-| event-chain tamper detection | 9.97s |
-| HTTP/MCP read surfaces | 0.02s |
-| fixed interface budgets | 0.01s |
+| Production Python logical lines | 7,042 |
+| Production Python files | 63 |
+| Largest production file | 996 lines |
+| Functions over 120 lines | 0 |
+| Layer cycles | 0 |
+| Reverse four-layer dependency violations | 0 |
+| CLI / HTTP / MCP surfaces | 30 / 18 / 8 |
+| SQLite core tables | 12 |
 
-Coverage includes normal PASS, high-score BLOCKED, missing/pending/rejected interaction behavior, self-review, wrong review subject, Provider-controlled gate fields, forged test success, runtime exit-code contradiction, artifact tampering, event-chain verification, Skill permission escalation, legacy Skill gate migration warnings, DSSE signing/verification, v7 migration, rollback, and idempotent restart.
+## Behavior covered
 
-The host Conda environment emits a `requests` dependency compatibility warning. muxdev does not depend on or import `requests`; Ruff, compilation, and all test layers still pass.
+- Normal lite `PASS`, artifact tamper detection, and event-chain tamper detection.
+- Standard self-review block and strict pause → frozen Policy → approve → resume.
+- Strict ordinary/security review fan-out events and separate `security_review` Requirement.
+- Provider-forged test success and argv are ignored; only frozen policy-owned VerificationCommands produce ExecutedCheck evidence.
+- Read-only Reviewer write violation detected from the changed Subject and never applied to the main workspace.
+- A Runtime verification command that exits zero but modifies the Subject is marked integrity-invalid and never applied.
+- Explicit stdin versus argument Prompt transport and Provider-specific Codex/Claude JSONL normalization.
+- Deterministic DAG Frontier grouping for ordinary/security Review.
+- Budgeted Context Pack with upstream structured facts.
+- Evidence-grounded Memory promotion only for reports that still verify as `PASS`; a tampered report is excluded.
+- Skill permission escalation, legacy Skill gate migration warnings, Skill lock drift, DSSE binding, v7 migration, rollback on failed migration, HTTP/MCP read surfaces, and public interface budgets.
+- Immutable RunPolicySnapshot resume behavior, exact read-only MCP grants, Secret minimization, Provider fingerprint invalidation, ProcessSupervisor timeout cleanup, and conflict-atomic ChangeSets with whole-file payload artifacts.
+- Official Control MCP input/output Schema, ACP initialize/session/streaming, in-Grant permission, protocol cancel, and ACP-to-MCP read-only fixture transfer.
+- The simulated login report is Pydantic-valid Evidence v3 with a reproducible `PASS` decision and eight typed records.
+- The Chinese teaching pack verifier confirms 130 unique interview question families across 13 domains, complete Q1-Q22 coverage, the simulated login evidence, four mandatory honesty boundaries, and every referenced core code symbol.
+
+The host Conda environment emits a `requests` dependency compatibility warning. muxdev does not depend on or import `requests`; Ruff, compilation, and all test layers pass despite that unrelated host warning. A real external ACP Agent is not installed on this host, so release-grade live certification remains an explicit pre-release gate rather than a claimed result.

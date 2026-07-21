@@ -3,12 +3,12 @@
     "builtin_skills": 5,
     "functions_over_120_lines": 0,
     "http_routes": 18,
-    "largest_file_lines": 586,
+    "largest_file_lines": 996,
     "layer_cycles": 0,
-    "logical_lines": 4328,
-    "python_files": 52,
+    "logical_lines": 7042,
+    "python_files": 63,
     "sqlite_tables": 12,
-    "typer_commands": 29,
+    "typer_commands": 30,
     "workflows": 4
   },
   "before": {
@@ -37,28 +37,28 @@
       "reduction_percent": 81.8
     },
     "largest_file_lines": {
-      "absolute": -3061,
-      "reduction_percent": 83.9
+      "absolute": -2651,
+      "reduction_percent": 72.7
     },
     "layer_cycles": {
       "absolute": -1,
       "reduction_percent": 100.0
     },
     "logical_lines": {
-      "absolute": -34605,
-      "reduction_percent": 88.9
+      "absolute": -31891,
+      "reduction_percent": 81.9
     },
     "python_files": {
-      "absolute": -114,
-      "reduction_percent": 68.7
+      "absolute": -103,
+      "reduction_percent": 62.0
     },
     "sqlite_tables": {
       "absolute": -42,
       "reduction_percent": 77.8
     },
     "typer_commands": {
-      "absolute": -130,
-      "reduction_percent": 81.8
+      "absolute": -129,
+      "reduction_percent": 81.1
     },
     "workflows": {
       "absolute": -7,
@@ -102,47 +102,47 @@
     },
     "reverse_dependency_violations": []
   },
-  "generated_at": "2026-07-19T17:41:22.009423+00:00",
+  "generated_at": "2026-07-20T16:08:02.348644+00:00",
   "largest_files": [
     {
       "file": "src/muxdev/runtime/engine.py",
-      "lines": 586
+      "lines": 996
     },
     {
       "file": "src/muxdev/storage/control.py",
-      "lines": 563
+      "lines": 582
+    },
+    {
+      "file": "src/muxdev/providers/acp.py",
+      "lines": 310
+    },
+    {
+      "file": "src/muxdev/runtime/workspace.py",
+      "lines": 302
     },
     {
       "file": "src/muxdev/providers/registry.py",
-      "lines": 262
+      "lines": 294
+    },
+    {
+      "file": "src/muxdev/runtime/policy_snapshot.py",
+      "lines": 260
     },
     {
       "file": "src/muxdev/cli/main.py",
-      "lines": 231
+      "lines": 242
     },
     {
-      "file": "src/muxdev/runtime/worktree.py",
-      "lines": 176
+      "file": "src/muxdev/core/processes.py",
+      "lines": 235
     },
     {
-      "file": "src/muxdev/services/skills/discovery.py",
-      "lines": 175
+      "file": "src/muxdev/providers/certification.py",
+      "lines": 235
     },
     {
-      "file": "src/muxdev/api/web.py",
-      "lines": 164
-    },
-    {
-      "file": "src/muxdev/services/gate.py",
-      "lines": 161
-    },
-    {
-      "file": "src/muxdev/services/router.py",
-      "lines": 158
-    },
-    {
-      "file": "src/muxdev/models/evidence.py",
-      "lines": 150
+      "file": "src/muxdev/providers/adapters.py",
+      "lines": 225
     }
   ],
   "schema": "muxdev.architecture_metrics.v1",
@@ -158,7 +158,7 @@
     "delivery_standard_sections": 0,
     "http_routes": 18,
     "sqlite_tables": 12,
-    "typer_commands": 29,
+    "typer_commands": 30,
     "workflow_names": [
       "change",
       "design",

@@ -8,6 +8,17 @@ from ..config.loader import load_config
 from ..models import WorkflowDefinition
 
 
+AGENT_ROLES = frozenset({
+    "plan",
+    "code",
+    "test",
+    "review",
+    "secure",
+    "architect",
+    "test_strategy",
+})
+
+
 def load_workflow(name: str) -> WorkflowDefinition:
     """Load one of change, design, review, or test."""
     workflows = load_config().get("workflows", {})
@@ -29,8 +40,33 @@ def validate_dag(workflow: WorkflowDefinition) -> None:
     ordered_stage_ids(workflow)
 
 
+def validate_role_providers(
+    workflow: WorkflowDefinition,
+    role_providers: dict[str, str],
+) -> dict[str, str]:
+    """Validate and normalize explicit Agent-role Provider assignments."""
+    workflow_roles = {stage.role for stage in workflow.stages if stage.role}
+    unknown = sorted(set(role_providers) - AGENT_ROLES)
+    unavailable = sorted(set(role_providers) - workflow_roles)
+    empty = sorted(role for role, provider in role_providers.items() if not str(provider).strip())
+    if unknown:
+        raise ValueError(f"unknown Agent roles: {', '.join(unknown)}")
+    if unavailable:
+        raise ValueError(
+            f"roles are not used by workflow {workflow.name}: {', '.join(unavailable)}"
+        )
+    if empty:
+        raise ValueError(f"role Provider cannot be empty: {', '.join(empty)}")
+    return {role: str(provider).strip() for role, provider in role_providers.items()}
+
+
 def ordered_stage_ids(workflow: WorkflowDefinition) -> list[str]:
     """Return a deterministic topological order for serial execution."""
+    return [stage_id for wave in execution_waves(workflow) for stage_id in wave]
+
+
+def execution_waves(workflow: WorkflowDefinition) -> list[list[str]]:
+    """Return deterministic DAG frontiers suitable for bounded fan-out."""
     indegree = {stage.id: 0 for stage in workflow.stages}
     graph: dict[str, list[str]] = defaultdict(list)
     for stage in workflow.stages:
@@ -38,17 +74,20 @@ def ordered_stage_ids(workflow: WorkflowDefinition) -> list[str]:
             graph[dep].append(stage.id)
             indegree[stage.id] += 1
     queue = deque([stage.id for stage in workflow.stages if indegree[stage.id] == 0])
-    ordered: list[str] = []
+    waves: list[list[str]] = []
+    visited = 0
     while queue:
-        stage_id = queue.popleft()
-        ordered.append(stage_id)
-        for child in graph[stage_id]:
-            indegree[child] -= 1
-            if indegree[child] == 0:
-                queue.append(child)
-    if len(ordered) != len(workflow.stages):
+        wave = [queue.popleft() for _ in range(len(queue))]
+        waves.append(wave)
+        visited += len(wave)
+        for stage_id in wave:
+            for child in graph[stage_id]:
+                indegree[child] -= 1
+                if indegree[child] == 0:
+                    queue.append(child)
+    if visited != len(workflow.stages):
         raise ValueError(f"workflow {workflow.name} contains a cycle")
-    return ordered
+    return waves
 
 
 def should_run_when(expression: str | None, context: dict[str, object]) -> bool:

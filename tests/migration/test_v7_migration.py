@@ -19,7 +19,7 @@ def test_v7_import_is_atomic_and_legacy_evidence_is_not_rescored(workspace: Path
     assert result["migrated"] is True
     assert Path(str(result["backup"])).is_dir()
     with ControlStore(workspace) as store:
-        assert len(store.table_names()) == 12
+        assert len(store.table_names()) == 18
         events = [event for run in store.list_runs() for event in store.events(str(run["run_id"]))]
         assert any(event["type"] == "legacy_evidence" and event["payload"]["rescored"] is False for event in events)
     assert migrate_workspace(workspace)["migrated"] is False

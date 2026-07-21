@@ -18,6 +18,10 @@ evidence_policies:
       description: The current subject is reviewed by an identity different from the executor.
       accepted_kinds: [review]
       require_independent: true
+    security_review:
+      description: The current subject receives an independent security-focused review without unresolved high findings.
+      accepted_kinds: [review]
+      require_independent: true
     human_approval:
       description: A human explicitly approves the declared workflow checkpoint.
       accepted_kinds: [interaction]
@@ -30,7 +34,7 @@ evidence_policies:
     change:
       lite: [change_artifact, deterministic_check, review, runtime_health]
       standard: [plan_artifact, change_artifact, deterministic_check, independent_review, runtime_health]
-      strict: [plan_artifact, change_artifact, deterministic_check, independent_review, human_approval, runtime_health]
+      strict: [plan_artifact, change_artifact, deterministic_check, independent_review, security_review, human_approval, runtime_health]
     design:
       lite: [plan_artifact, review, runtime_health]
       standard: [plan_artifact, independent_review, runtime_health]

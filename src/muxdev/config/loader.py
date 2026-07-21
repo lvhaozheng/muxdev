@@ -22,6 +22,7 @@ DEFAULT_CONFIG_FILES = (
 
 KNOWN_SECTIONS = {
     "evidence_policies",
+    "mcp_servers",
     "paths",
     "providers",
     "workflows",
@@ -110,6 +111,15 @@ def validate_config(config: dict[str, Any] | None = None) -> dict[str, object]:
     for name, workflow in _mapping_items(config.get("workflows", {})):
         if "stages" not in workflow:
             errors.append(f"workflow {name} is missing stages")
+    for name, definition in _mapping_items(config.get("mcp_servers", {})):
+        if str(definition.get("transport") or "stdio") != "stdio":
+            errors.append(f"MCP server {name} must use stdio in v1")
+        if not definition.get("command"):
+            errors.append(f"MCP server {name} is missing command")
+        tools = definition.get("tools") if isinstance(definition.get("tools"), dict) else {}
+        for tool_name, tool in _mapping_items(tools):
+            if str(tool.get("effect") or "") != "read":
+                errors.append(f"MCP tool {name}/{tool_name} must have effect read in v1")
     return {"valid": not errors, "errors": errors, "warnings": warnings}
 
 
