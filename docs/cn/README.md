@@ -1,50 +1,103 @@
-# muxdev 中文参考
+# muxdev 中文设计与运维指南
 
-muxdev 的产品定义是“AI Agent 可信交付控制面”，不是通用多 Agent 平台。
+## 1. 设计理念
 
-## 执行模型
+muxdev 是 Coding CLI 的薄控制面，不是 Agent SDK wrapper。它不重建 Codex 或 Claude Code 的记忆、工具协议、Skill、MCP、Plan Mode 和审批；它只管理 CLI 进程之外必须由产品负责的事实：Conversation、PTY、Assignment、权限、工作树、合并、Evidence、交付候选与接受后写回。
 
-四个工作流为 `change / design / review / test`。Profile 只改变必需阶段、Evidence Requirement、独立/安全评审、人工确认、签名、超时、重试和成本上限；不会动态生成工作流。
+角色提示只影响行为，不是安全边界。argv/env 白名单、Assignment 范围、worktree 隔离、确定性检查和交付 Gate 由 Runtime 强制执行。
 
-一次运行由 `TaskService` 管理生命周期，`RunEngine` 持久化 Job、Stage 和 typed append-only event。固定 DAG 按确定性 Frontier 执行；严格变更工作流会把普通/安全 Review 作为同一 Subject 上的只读 Worker 并行执行并按固定顺序归并。已完成阶段不会在恢复时重复执行；无法证明安全重放的外部 Provider 阶段会被阻断并要求协调。每个 Run 最多使用两次安全恢复动作，下一轮模型会收到上一轮的契约错误、失败检查、Review blocker 或 Provider 终止信息；仅输出契约错误时优先保留代码并执行只读 JSON 纠正。
+## 2. Agent、Conversation、Assignment
 
-Conversation 默认使用固定角色团队：规划、实现、测试、评审，Strict 增加安全评审。`provider` 表示主要实现 Agent，`role_providers` 可覆盖当前 Workflow 使用的角色；每个 Stage/Attempt 都有独立 Worker 身份，只有可写实现角色允许跨修订续接。Standard/Strict 的 Reviewer 必须与实现 Provider 不同。系统不会动态生成子任务或并行写入：写阶段始终串行，同一冻结 Subject 上的只读阶段最多 4 个并行。
+- `CliAdapterDefinition` 描述完整 CLI 的启动 argv、恢复 argv、工作目录和模型参数、环境变量白名单、PTY/resize/resume 能力与 session ID 发现方式。
+- `AgentDefinition` 描述显示名、CLI、模型、角色提示、能力标签、编排资格、最大并发和默认权限。
+- `Conversation` 是用户可见的长期协作容器，拥有模式、主 Agent、编排者、活动计划、集成工作树和 DeliveryContract。
+- `Assignment` 是最小派发和交付单位，固定状态从 `proposed` 到 `completed/blocked/failed/cancelled`。
+- `AgentSession` 为 Agent/Assignment 管理独立 CLI 进程、终端、原生 session ID、transcript、写入租约和恢复方式。
 
-阶段 Agent 可以把不明确需求作为结构化选项题发送到 Conversation，并允许自由输入。低风险问题在 60 秒未回复时采用明确标出的推荐项并重跑当前阶段；权限、删除、凭据、网络、门禁和交付接受等高风险问题必须显式确认。Conversation API 同时返回 `interactions`、基于完成阶段的 `progress` 和逐阶段 `stage_deliveries`。Dashboard 右侧把标准、产物、Artifact、Evidence 分开显示；修订阶段标准会创建新 Contract、标记受影响的下游 Stage，绝不修改原 Run 的冻结策略或 Evidence。
+Agent 只收到冻结任务契约、自己的简报、依赖节点产物和定向消息，不会自动获得完整 Conversation transcript。派发、回报、提问、合并和交付会投影到共享时间线。
 
-Provider 失败会区分超时、临时网络/限流、认证、权限/沙箱、命令配置、进程异常和未知退出。只有临时类与未知退出会安全重试；只有冻结策略中存在合格备用 Provider 时才返回 `switch-provider`。Conversation API 的 `team` 与 `recovery` 投影、SSE Worker 事件和 Dashboard 失败卡会显示 Agent、阶段、退出码、脱敏详情、尝试历史、剩余额度、工作区状态和服务端允许的下一步。后台异常不会再停留在不明状态，而会写入 `run.failed_to_start` 或 `recovery.failed` 并回到 `needs_user`。
+## 3. 直接模式与编排模式
 
-每个 Stage 接收统一 `StageExecutionInput`。Provider Codec 负责不同 CLI 的 Prompt 传输和 JSONL 输出协议。下游 Stage 通过预算化 Context Pack 获取前序结构化事实、Repo Map 和 Verified PASS 历史；检索 Memory 不具备 Policy 权限。
+`direct` 是默认路径：主 Agent 使用 Conversation 集成工作树端到端工作。Standard 完成后按需启动独立 Reviewer；Strict 再增加 Security Reviewer 和人工确认。
 
-## Evidence 与门禁
+`orchestrated` 必须显式选择具备 `orchestrate` 能力的 Agent。编排者提交 `muxdev.orchestration-plan.v1`：
 
-EvidencePolicy 是唯一规则源，五种记录为 Artifact、Check、Review、Interaction 和 Runtime。TestResult 中的 argv 仅是 `VerificationSuggestion`，Runtime 只执行 Workflow/项目策略拥有且已冻结的 argv 数组，并通过 `ExecutedCheck` 生成 CheckEvidence；Provider 的 `passed`、exit code、confidence、Evidence 或 delivery decision 均不能决定 Gate。
-
-Gate 的每个失败项都包含稳定 `requirement_id`、原因、Evidence 引用和修复建议。四维 Scorecard 展示分子、分母和失败 Requirement；分母为零显示 N/A。分数只解释质量，因此高分运行仍可能因缺少批准而 BLOCKED。
-
-运行只产生 `evidence-report.json`。`muxdev evidence export <run-id>` 可额外生成 DSSE Envelope，绑定报告摘要但不复制业务事实。
-
-## 常用命令
-
-```powershell
-muxdev init
-muxdev run "task" --workflow change --profile lite --provider mock
-muxdev show <run-id>
-muxdev resume <run-id> --action auto  # 也可用 fix-output / retry / switch-provider
-muxdev approve <interaction-id>
-muxdev evidence show <run-id>
-muxdev evidence verify <run-id>
-muxdev route explain <run-id>
-muxdev skill verify default-test
-muxdev provider certify codex-acp --live
-muxdev mcp serve --transport stdio
-muxdev migrate status
+```json
+{
+  "schema_version": "muxdev.orchestration-plan.v1",
+  "summary": "implementation and review",
+  "max_parallel": 4,
+  "nodes": [{
+    "id": "implementation",
+    "title": "Implement feature",
+    "brief": "bounded task brief",
+    "agent_id": "codex",
+    "role": "implementer",
+    "dependencies": [],
+    "work_mode": "write",
+    "deliverables": ["source changes"],
+    "completion": ["acceptance tests pass"],
+    "proof": ["ChangeSet and Runtime check"]
+  }]
+}
 ```
 
-每个 Run 会冻结 Workflow、Provider fingerprint、Skill 锁、CapabilityGrant、MCP 工具和工作区 Manifest。项目级 Skill 只能请求 Grant 子集，不能扩大权限或改变 EvidencePolicy。MCP 只负责向外暴露控制面、向内投影当前 Stage 的精确只读工具；普通工具调用仍由 Coding CLI/ACP Agent 原生完成。ACP 每个 Stage 使用一个本地 Session，权限越界立即拒绝。旧 `[delivery_gate]` 和 `## Delivery Standard` 仅产生迁移警告；生产门禁必须迁移到 `evidence-policy.yaml`。
+Runtime 校验无环依赖、Agent、能力、并发、范围和三段式标准后展示 DAG。用户确认一次即冻结计划。确认后允许在原目标、范围、预算、权限、并发和标准内拆分、重试、重派与调整依赖；扩大边界必须重新确认。
 
-## 教学与面试材料
+## 4. 工作树、合并和恢复
 
-- [项目教学与面试答辩规范](../../release-artifacts/muxdev-teaching-playbook-cn.md)：导师授课规则、10 单元课程、真实难点矩阵、评分与毕业门禁。
-- [130 个面试问题族](../../release-artifacts/muxdev-interview-drill-bank-cn.md)：覆盖产品、架构、Provider、DAG、Evidence、安全、Memory、恢复、路由、测试、选型、行为面试与登录场景。
-- [Q1-Q22 深度答辩](../../release-artifacts/interview-qa-cn.md)：零基础长答案和代码示例。
+每个并行写 Assignment 从依赖已完成的集成状态创建子 worktree。完成后生成内容寻址 ChangeSet。合并顺序为拓扑顺序，其次稳定 Assignment ID；触碰文件的当前 hash 与节点基线不一致时拒绝覆盖，并创建冲突解决 Assignment。
+
+每个 Assignment 最多使用两次安全恢复额度。超过额度后转为 `blocked`。所有子 Agent 都不能直接写回用户项目。
+
+daemon 重启后：tmux 直接 reattach；普通 PTY 使用 CLI 原生 session ID；不支持 resume 的 CLI 会用任务简报、依赖产物和 transcript 摘要启动新会话，并标记 `rebuilt_context`。
+
+## 5. Web 终端和远程安全
+
+Dashboard 使用本地打包的 xterm.js 与 fit addon，不依赖 CDN。WebSocket JSON 帧：
+
+- 客户端：`attach`、`input`、`resize`、`release_write`；
+- 服务端：`output`、`status`、`lease`、`error`。
+
+终端 transcript 是带序号的本地 JSONL，权限尽量限制为所有者读写。一个 Session 只有一个有效写入租约，其他设备只读。输出断线重放使用 `after_seq`，输入帧限制 64 KiB，并有滑动窗口限流。
+
+远程模式必须启用 HTTPS 反向代理或 VPN，并完成一次性设备配对。WebSocket 不依赖 HTTP 中间件，自己校验 Cookie、Origin、Session、帧大小和速率。
+
+## 6. 三段式团队交付标准
+
+`muxdev.delivery-standard.v2` 的每一项都包含：
+
+- `deliverable`：需要交付的内容；
+- `completion`：可判定的完成条件；
+- `proof`：可信证明方式；
+- 可选 `assignment_id`；
+- `verifier`：`runtime_check`、`agent_review`、`artifact` 或 `human_acceptance`。
+
+内置基线不可删除或降级。Runtime check 只能引用 Workflow 中冻结的 argv 命令；Agent review 必须绑定 Reviewer 身份和当前 Subject；artifact 必须内容寻址；人工接受必须是结构化事件。
+
+标准修改会生成新 Contract、记录受影响 Assignment 并使旧 Candidate 失效。已接受的 Candidate、Contract 和 Evidence 不会被改写。
+
+## 7. Agent 配置与排错
+
+```powershell
+muxdev agent list
+muxdev agent show codex
+muxdev agent doctor codex
+muxdev doctor
+```
+
+常见降级：
+
+- `executable not found`：在本机安装 CLI，或在项目配置中禁用该 Agent。
+- `pipe` 后端：系统没有可用 PTY；Agent 仍可 headless 工作，但 resize 和交互能力会显示不可用。
+- `resumable`：daemon 已重启，使用终端重新附着即可触发原生恢复或上下文重建。
+- `merge_conflict`：集成文件偏离节点基线，必须完成 Runtime 创建的冲突解决 Assignment。
+- `delivery.blocked`：缺少独立 Reviewer、检查失败、Evidence 不完整或标准未满足；查看 Candidate Evidence 的 blocker。
+
+## 8. 迁移与兼容
+
+schema v9 打开时自动增加 v10 列和四张协作表；旧记录标记为 `legacy_pipeline`。`/api/v1`、`/runs`、ACP/MCP、headless Provider 与固定四工作流不删除，但新 Dashboard 默认使用 `/api/v2`。
+
+## 9. 与 botmux 的关系
+
+muxdev 参考 botmux 的薄编排和 CLI 进程思路，不复制代码。botmux 的飞书话题和群成员路由，在这里由本地 Conversation、Assignment、AgentSession 与共享时间线取代。muxdev 额外提供隔离 worktree 的 fail-closed 合并、Evidence v3、三段式交付标准和接受后冲突安全写回。

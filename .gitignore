@@ -12,6 +12,7 @@ src/*.egg-info/
 pytest-cache-files-*/
 build/
 dist/
+node_modules/
 release-artifacts/*
 !release-artifacts/architecture-metrics.json
 !release-artifacts/simplification-report.md

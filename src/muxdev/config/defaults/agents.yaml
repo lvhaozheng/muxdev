@@ -1,0 +1,80 @@
+cli_adapters:
+  mock:
+    cli_id: mock
+    command: [python, -m, muxdev.runtime.mock_cli]
+    env_allowlist: []
+    supports_pty: true
+    supports_resize: true
+    supports_resume: false
+  codex:
+    cli_id: codex
+    command: [codex, --no-alt-screen]
+    resume_command: [codex, --no-alt-screen, resume, "{native_session_id}"]
+    working_directory_arg: -C
+    model_arg: --model
+    env_allowlist: [OPENAI_API_KEY, OPENAI_BASE_URL]
+    supports_pty: true
+    supports_resize: true
+    supports_resume: true
+    native_session_id_pattern: '(?i)(?:session(?: id)?|resume)[:= ]+([0-9a-f-]{20,})'
+    prefer_tmux: true
+  claude-code:
+    cli_id: claude-code
+    command: [claude]
+    resume_command: [claude, --resume, "{native_session_id}"]
+    model_arg: --model
+    env_allowlist: [ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL]
+    supports_pty: true
+    supports_resize: true
+    supports_resume: true
+    prefer_tmux: true
+
+agents:
+  mock:
+    agent_id: mock
+    display_name: Mock Agent
+    cli_id: mock
+    role_prompt: Deterministic local agent for tests and offline demonstrations.
+    capability_tags: [code, terminal]
+    max_concurrency: 4
+    default_permissions: workspace-write
+    enabled: true
+  mock-review:
+    agent_id: mock-review
+    display_name: Mock Reviewer
+    cli_id: mock
+    role_prompt: Independently review completed changes against the frozen delivery contract.
+    capability_tags: [review, security-review, terminal]
+    max_concurrency: 4
+    default_permissions: read
+    enabled: true
+  mock-orchestrator:
+    agent_id: mock-orchestrator
+    display_name: Mock Orchestrator
+    cli_id: mock
+    role_prompt: Propose and coordinate deterministic test plans.
+    capability_tags: [code, review, security-review, orchestrate, terminal]
+    can_orchestrate: true
+    max_concurrency: 4
+    default_permissions: workspace-write
+    enabled: true
+  codex:
+    agent_id: codex
+    display_name: Codex
+    cli_id: codex
+    role_prompt: Own the assignment end to end and report only verifiable deliverables.
+    capability_tags: [code, review, security-review, orchestrate, terminal, resume]
+    can_orchestrate: true
+    max_concurrency: 4
+    default_permissions: workspace-write
+    enabled: true
+  claude-code:
+    agent_id: claude-code
+    display_name: Claude Code
+    cli_id: claude-code
+    role_prompt: Own the assignment end to end and report only verifiable deliverables.
+    capability_tags: [code, review, orchestrate, terminal, resume]
+    can_orchestrate: true
+    max_concurrency: 4
+    default_permissions: workspace-write
+    enabled: true

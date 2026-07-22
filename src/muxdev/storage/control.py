@@ -24,9 +24,14 @@ from .conversation import (
     CONVERSATION_TABLES,
     ConversationStoreMixin,
 )
+from .collaboration import (
+    COLLABORATION_SCHEMA_STATEMENTS,
+    COLLABORATION_TABLES,
+    CollaborationStoreMixin,
+)
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 CORE_TABLES = (
     "schema_migrations",
     "runs",
@@ -40,7 +45,7 @@ CORE_TABLES = (
     "routing_decisions",
     "attestations",
     "skill_locks",
-) + CONVERSATION_TABLES
+) + CONVERSATION_TABLES + COLLABORATION_TABLES
 
 
 def utc_now() -> str:
@@ -64,7 +69,7 @@ def _decode_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return result
 
 
-class ControlStore(ConversationStoreMixin):
+class ControlStore(CollaborationStoreMixin, ConversationStoreMixin):
     """Explicit repository over the compact control-plane schema."""
 
     def __init__(self, workspace: Path | str, *, database: Path | None = None) -> None:
@@ -102,10 +107,31 @@ class ControlStore(ConversationStoreMixin):
         with self.transaction() as conn:
             for statement in statements:
                 conn.execute(statement)
+            self._ensure_schema_v10(conn)
             conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations(version, applied_at, checksum) VALUES (?, ?, ?)",
                 (SCHEMA_VERSION, utc_now(), _schema_checksum(statements)),
             )
+
+    @staticmethod
+    def _ensure_schema_v10(conn: sqlite3.Connection) -> None:
+        """Add v10 Conversation columns without rewriting existing v9 databases."""
+        columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(conversations)").fetchall()
+        }
+        additions = {
+            "mode": "TEXT NOT NULL DEFAULT 'legacy_pipeline'",
+            "primary_agent_id": "TEXT",
+            "orchestrator_agent_id": "TEXT",
+            "active_plan_id": "TEXT",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                conn.execute(f"ALTER TABLE conversations ADD COLUMN {name} {definition}")
+        conn.execute(
+            "UPDATE conversations SET mode = 'legacy_pipeline' WHERE mode IS NULL OR mode = ''"
+        )
 
     def table_names(self) -> tuple[str, ...]:
         rows = self.connection.execute(
@@ -556,7 +582,7 @@ def _schema_statements() -> tuple[str, ...]:
           lock_id TEXT PRIMARY KEY, skill_name TEXT NOT NULL, version TEXT NOT NULL, digest TEXT NOT NULL,
           created_at TEXT NOT NULL, payload TEXT NOT NULL, UNIQUE(skill_name, version)
         )""",
-    ) + CONVERSATION_SCHEMA_STATEMENTS
+    ) + CONVERSATION_SCHEMA_STATEMENTS + COLLABORATION_SCHEMA_STATEMENTS
 
 
 def compact_database_status(workspace: Path | str) -> dict[str, object]:

@@ -1,30 +1,65 @@
-# muxdev English reference
+# muxdev architecture and operations
 
-muxdev is a local-first trusted-delivery control plane for AI agents, not a general multi-agent platform.
+## Philosophy
 
-It exposes four workflows (`change`, `design`, `review`, `test`), three Profiles (`lite`, `standard`, `strict`), five built-in Skills, one Provider execution method, and one deterministic EvidencePolicy/Gate Engine. TaskService owns lifecycle use cases; RunEngine owns durable stage execution and recovery. Strict changes fan ordinary and security review out over one frozen read-only subject and commit their results in deterministic order.
+muxdev is a thin control plane for complete coding CLIs, not an Agent SDK wrapper. Codex, Claude Code, and similar tools keep ownership of their memory, tools, Skills, MCP integrations, plan mode, and approval protocol. muxdev owns the surrounding facts that require a trusted runtime: Conversations, PTYs, dispatch, isolated worktrees, deterministic merges, Evidence, delivery contracts, and conflict-safe write-back after user acceptance.
 
-Provider output is a claim. Provider-suggested commands are never executed: only frozen Workflow/project `VerificationCommand` argv arrays can produce an `ExecutedCheck` and trusted exit code. The runtime also derives facts from conflict-safe ChangeSets, subject-bound reviews, runtime-confirmed reviewer identity, human interactions, and a hash-chained event log. Hard gates produce `PASS`, `BLOCKED`, or `WAITING_HUMAN`.
+Role prompts guide behavior but are not security boundaries. argv-only adapters, environment allowlists, assignment scope, worktree isolation, deterministic checks, and delivery gates are enforced by the Runtime.
+
+## Execution modes
+
+- `direct` is the default. One primary Agent owns the task end to end. Standard starts an independent Reviewer only when delivery is ready; Strict also requires a Security Reviewer and explicit human confirmation.
+- `orchestrated` is opt-in. An Agent with the `orchestrate` capability proposes a validated DAG. The user approves the assignment once, after which up to four ready nodes execute in parallel within the frozen boundaries.
+- `legacy_pipeline` preserves the fixed workflows, headless Providers, ACP/MCP, `/api/v1`, and `/runs`.
+
+Agents share a Conversation timeline but have isolated CLI contexts, terminals, and worktrees. A normal message targets the primary Agent. `@agent`, `consult`, or `write` explicitly creates cross-Agent collaboration. Agents receive the frozen contract, their own brief, dependency outputs, and directed messages—not the complete transcript by default.
+
+## Worktrees and merging
+
+Every parallel write Assignment uses a child worktree. Completion produces a content-addressed ChangeSet. The Runtime merges by topological order and then stable Assignment ID. If a touched path has drifted from the node baseline, the merge fails closed and a conflict-resolution Assignment is created. Each Assignment has at most two safe recovery attempts.
+
+Only the integrated Conversation worktree can become a Delivery Candidate. Sub-agents never write directly into the user's project.
+
+## Persistent Web terminals
+
+Windows prefers ConPTY through `pywinpty`; Unix uses POSIX PTYs and can reattach tmux sessions. Other CLIs fall back to the existing headless mode with explicit capability reporting.
+
+Each terminal stores a sequence-numbered local JSONL transcript. A browser attaches with `after_seq` for replay. Only one device has a write lease; takeover is explicit. The Dashboard ships local xterm.js and fit-addon assets and provides mobile Esc, Ctrl+C, Tab, arrow, and keyboard-collapse controls.
+
+Remote mode requires a self-managed HTTPS reverse proxy or VPN plus device pairing. WebSockets independently validate the device cookie, Origin, Session ownership, frame size, and rate limits. muxdev provides no cloud relay.
+
+## Trusted delivery
+
+`muxdev.delivery-standard.v2` defines every custom requirement as:
+
+- `deliverable`: what will be delivered;
+- `completion`: the deterministic completion condition;
+- `proof`: the required proof;
+- optional `assignment_id` binding;
+- a verifier restricted to `runtime_check`, `agent_review`, `artifact`, or `human_acceptance`.
+
+Runtime checks can only reference frozen argv commands. User text cannot introduce arbitrary shell commands. Changing the standard creates a new DeliveryContract and invalidates prior candidates; accepted deliveries remain immutable.
+
+After all Assignments merge, the Runtime runs deterministic checks and independent reviews against the integrated subject, emits Evidence v3, and creates a candidate only when the gate passes. Acceptance re-verifies the Evidence chain, contract version, and workspace summary before applying the ChangeSet to the user's project.
+
+## Configuration and diagnostics
+
+Configuration precedence remains built-in, user, project `.muxdev/config.yaml`, then `MUXDEV_CONFIG`.
 
 ```powershell
-python -m pip install -e ".[test]"
-muxdev init
-muxdev run "add a deterministic marker" --workflow change --profile lite --provider mock
-muxdev evidence verify <run-id>
+muxdev agent list
+muxdev agent show codex
+muxdev agent doctor
+muxdev doctor
+muxdev serve
 ```
 
-Each run produces one `evidence-report.json`. Explicit export can add an `attestation.dsse.json` that binds the report digest without duplicating its facts. Project Skills remain prompt guidance only; project gate rules belong in `evidence-policy.yaml`.
+CLI adapter commands are argv arrays, never shell strings. The Web UI can select and inspect Agents but cannot edit executable paths or secret environment configuration.
 
-Recovery is bounded to two actions per run. Every model retry receives the previous attempt's structured validation errors, failed runtime checks, review blockers, or provider termination details. When code changes are present but only the structured response is invalid, muxdev freezes the isolated worktree and performs a read-only output correction before considering a full rollback and rerun. The Dashboard and Evidence Report expose the primary cause, attempted repairs, workspace safety, and an exact next command. Existing resume surfaces accept `auto`, `fix-output`, `retry`, and `switch-provider` actions.
+## Migration and compatibility
 
-Each Conversation resolves a fixed role team: planning, implementation, testing, and review, plus security review in Strict. `provider` names the primary implementation agent; optional `role_providers` overrides roles used by the selected workflow. Every Stage/Attempt has an independent worker identity, and only the writable implementation role may resume its session across revisions. Standard/Strict reviewers must use a Provider different from the implementer. This remains a trusted fixed DAG rather than an arbitrary agent swarm: writes are serial, while ready read-only stages on one frozen subject fan out to at most four workers and fan in deterministically.
+Opening a v9 database performs an additive v10 migration and marks existing Conversations as `legacy_pipeline`. v10 adds `agent_sessions`, `orchestration_plans`, `assignments`, and `assignment_dependencies`. Existing v1 APIs, fixed workflows, ACP/MCP, headless Providers, and Evidence reports remain available.
 
-Stage agents may raise structured clarification questions with two to four choices, a recommended choice, and optional free-form input. A low-risk, non-blocking question selects the disclosed recommendation after 60 seconds and reruns the current stage. Permission expansion, deletion or overwrite, credentials, network access, gate changes, and delivery acceptance never receive a timeout approval. The Conversation API exposes `interactions`, stage-completion `progress`, and per-stage `stage_deliveries`; the Dashboard separates standards, outputs, artifacts, and Evidence. Editing a stage standard creates a new Contract and records downstream impact without mutating a frozen Run or existing Evidence.
+## Relation to botmux
 
-Non-zero Provider exits are classified as timeout, transient network/rate limiting, authentication, permission/sandbox, command configuration, process failure, or unknown failure. Only transient and unknown failures are retried automatically, and `switch-provider` is returned only when the frozen route contains a qualified fallback. Conversation `team`/`recovery` projections and SSE worker events expose the stage, Provider, exit code, redacted detail, attempts, remaining budget, workspace safety, and server-authorized next actions. Background start and recovery failures always return the Conversation to `needs_user` with a `run.failed_to_start` or `recovery.failed` event.
-
-The optional `interop` extra adds the official MCP and ACP SDKs. `muxdev mcp serve --transport stdio` exposes the existing eight TaskService-backed control tools. Internally muxdev projects only the current Stage's exact read-only MCP tools into an isolated CLI/ACP configuration; the coding agent remains the native MCP client. ACP uses one local process and session per Stage, with permission requests checked against the frozen CapabilityGrant.
-
-Provider protocol codecs keep semantic stage input uniform while preserving stdin/argument prompt transport and JSONL differences. Each worker receives a budgeted Context Pack of upstream typed facts, an AST repository map, and BM25-ranked history derived only from prior reports that still verify as `PASS`; retrieved memory never changes gate authority.
-
-See the [measured simplification report](../../release-artifacts/simplification-report.md), [architecture diagrams](../../release-artifacts/architecture-diagrams.md), [open-source research record](../../release-artifacts/open-source-research.md), and [Evidence v3 examples](../../release-artifacts/evidence-v3-example.json).
+muxdev takes inspiration from botmux's thin orchestration, explicit multi-bot dispatch, and CLI process model. It does not copy botmux code and has no Feishu dependency. Local Conversations, Assignments, and AgentSessions replace chat topics; isolated worktree merging, Evidence, delivery standards, and acceptance-time write-back are muxdev's primary additions.

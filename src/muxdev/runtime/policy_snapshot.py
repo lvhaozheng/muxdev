@@ -29,6 +29,7 @@ def freeze_policy_snapshot(
     role_providers: Mapping[str, str],
     workspace_snapshot: WorkspaceSnapshot,
     run_dir: Path,
+    delivery_standard: Mapping[str, object] | None = None,
 ) -> RunPolicySnapshot:
     config = load_config(workspace)
     _reject_inline_secret_config(config)
@@ -98,6 +99,7 @@ def freeze_policy_snapshot(
         provider_request=provider_request,
         provider_route=dict(route),
         workflow_definition=workflow.model_dump(mode="json"),
+        delivery_standard=dict(delivery_standard or {}),
         workspace_manifest=workspace_snapshot.to_dict(),
         stage_capabilities=stage_capabilities,
         stage_skills=stage_skills,
@@ -145,6 +147,7 @@ def freeze_preflight_failure(
     route: Mapping[str, object],
     workspace_snapshot: WorkspaceSnapshot,
     run_dir: Path,
+    delivery_standard: Mapping[str, object] | None = None,
 ) -> RunPolicySnapshot:
     """Freeze enough immutable context to report a fail-closed preflight result."""
     snapshot = RunPolicySnapshot(
@@ -156,6 +159,7 @@ def freeze_preflight_failure(
         provider_request=provider_request,
         provider_route=dict(route),
         workflow_definition=workflow.model_dump(mode="json"),
+        delivery_standard=dict(delivery_standard or {}),
         workspace_manifest=workspace_snapshot.to_dict(),
         secret_names=sorted({name for stage in workflow.stages for name in stage.allowed_secrets}),
     )

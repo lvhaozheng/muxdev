@@ -16,11 +16,14 @@ import yaml
 DEFAULT_CONFIG_FILES = (
     "paths.yaml",
     "providers.yaml",
+    "agents.yaml",
     "workflows.yaml",
     "evidence_policies.yaml",
 )
 
 KNOWN_SECTIONS = {
+    "agents",
+    "cli_adapters",
     "evidence_policies",
     "mcp_servers",
     "paths",
@@ -111,6 +114,23 @@ def validate_config(config: dict[str, Any] | None = None) -> dict[str, object]:
     for name, workflow in _mapping_items(config.get("workflows", {})):
         if "stages" not in workflow:
             errors.append(f"workflow {name} is missing stages")
+    cli_adapters = config.get("cli_adapters", {})
+    for name, definition in _mapping_items(cli_adapters):
+        try:
+            from muxdev.models import CliAdapterDefinition
+
+            CliAdapterDefinition.model_validate({"cli_id": name, **definition})
+        except (TypeError, ValueError) as exc:
+            errors.append(f"CLI adapter {name} is invalid: {exc}")
+    for name, definition in _mapping_items(config.get("agents", {})):
+        try:
+            from muxdev.models import AgentDefinition
+
+            agent = AgentDefinition.model_validate({"agent_id": name, **definition})
+            if agent.cli_id not in cli_adapters:
+                errors.append(f"agent {name} references unknown CLI adapter {agent.cli_id}")
+        except (TypeError, ValueError) as exc:
+            errors.append(f"agent {name} is invalid: {exc}")
     for name, definition in _mapping_items(config.get("mcp_servers", {})):
         if str(definition.get("transport") or "stdio") != "stdio":
             errors.append(f"MCP server {name} must use stdio in v1")

@@ -7,6 +7,7 @@ from typing import Any, Mapping
 
 from ..services.evidence_policy import load_evidence_policy
 from ..workflows import load_workflow, validate_role_providers
+from .delivery_standards import bind_standard_checks, extend_evidence_policy
 from .run_setup import build_run_metadata, validate_run_options
 
 
@@ -57,6 +58,12 @@ class RunReservationMixin:
         policy = load_evidence_policy(
             self.workspace, workflow=workflow_name, profile=profile
         )
+        delivery_standard = (
+            delivery_context.get("delivery_standard")
+            if isinstance(delivery_context.get("delivery_standard"), Mapping) else {}
+        )
+        policy = extend_evidence_policy(policy, delivery_standard)
+        workflow = bind_standard_checks(workflow, delivery_standard)
         limit = min(max_cost_usd, _PROFILE_COST_LIMITS[profile])
         run_dir = self._run_dir(run_id)
         metadata = build_run_metadata(
@@ -112,6 +119,8 @@ class RunReservationMixin:
                 profile=profile,
                 provider=provider,
                 worktree=worktree,
+                policy=policy,
+                delivery_context=delivery_context,
             )
             return
         self.store.create_run(
@@ -142,6 +151,8 @@ class RunReservationMixin:
         profile: str,
         provider: str,
         worktree: Path,
+        policy: Any,
+        delivery_context: Mapping[str, object] | None,
     ) -> None:
         metadata = run.get("metadata") if isinstance(run.get("metadata"), Mapping) else {}
         expected = {
@@ -159,6 +170,14 @@ class RunReservationMixin:
             raise RuntimeError("existing Run was not reserved for Conversation startup")
         if Path(str(metadata.get("worktree") or "")).resolve() != worktree.resolve():
             raise RuntimeError("reserved Run worktree does not match the execution request")
+        if str(run.get("policy_hash") or "") != str(policy.policy_hash):
+            raise RuntimeError("reserved Run delivery standard does not match the execution request")
+        frozen_context = metadata.get("delivery_context")
+        frozen_delivery_context = (
+            dict(frozen_context) if isinstance(frozen_context, Mapping) else {}
+        )
+        if frozen_delivery_context != dict(delivery_context or {}):
+            raise RuntimeError("reserved Run delivery context does not match the execution request")
 
 
 __all__ = ["RunReservationMixin"]

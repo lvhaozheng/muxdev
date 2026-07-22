@@ -47,10 +47,21 @@ class MockProvider:
             )
             return self._result(input, result, "test.json")
         if input.stage_id in {"review", "security_review"}:
+            standards = input.context.get("review_standards")
+            review_standards = standards if isinstance(standards, list) else []
             result = ReviewResult(
                 target_subject=str(input.context.get("subject_digest") or "runtime-bound"),
                 findings=[],
                 residual_risk="Mock review is simulation-only.",
+                standard_assessments=[
+                    {
+                        "standard_id": str(item.get("id") or ""),
+                        "status": "satisfied",
+                        "note": "Mock reviewer assessed the frozen conversation standard.",
+                    }
+                    for item in review_standards
+                    if isinstance(item, dict) and item.get("id")
+                ],
             )
             return self._result(input, result, "review.json")
         return StageExecutionResult(

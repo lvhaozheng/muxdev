@@ -27,6 +27,7 @@ dependencies = [
   "fastapi>=0.110",
   "uvicorn>=0.27",
   "cryptography>=43",
+  "pywinpty>=3; platform_system == 'Windows'",
 ]
 
 [project.optional-dependencies]
@@ -63,6 +64,7 @@ version = {attr = "muxdev._version.__version__"}
 [tool.setuptools.package-data]
 "muxdev.config.defaults" = ["*.yaml"]
 "muxdev.skills" = ["*/SKILL.md", "*/muxdev.skill.toml"]
+"muxdev.api" = ["static/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

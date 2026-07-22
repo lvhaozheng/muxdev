@@ -24,6 +24,7 @@ from ..models.evidence import (
 from ..services.evidence_policy import load_evidence_policy
 from ..services.gate import evaluate_gate
 from .changeset_artifacts import store_changeset_payloads
+from .delivery_standards import custom_items, standard_requirement_id
 from .policy_snapshot import build_harness_summary, load_policy_snapshot
 from .recovery import build_recovery_summary
 from .workspace import (
@@ -94,6 +95,7 @@ class RunFinalizationMixin:
                 subject_digest=subject_digest, producer="muxdev.runtime",
                 event_type="run_health", status="passed", details={},
             ))
+        self._record_delivery_standard_evidence(run_id, subject_digest)
         records = self._records(run_id)
         decision = evaluate_gate(self._policy(run_id), records, subject_digest=subject_digest)
         current_run = self.store.get_run(run_id) or {}
@@ -332,7 +334,162 @@ class RunFinalizationMixin:
         ]
 
     def _has_runtime_evidence(self, run_id: str) -> bool:
-        return any(item.kind == "runtime" for item in self._records(run_id))
+        return any(
+            item.kind == "runtime" and item.requirement_id == "runtime_health"
+            for item in self._records(run_id)
+        )
+
+    def _record_delivery_standard_evidence(
+        self,
+        run_id: str,
+        subject_digest: str,
+    ) -> None:
+        """Turn constrained review/check observations into per-rule Runtime facts."""
+        snapshot = self._policy_snapshot(run_id)
+        items = custom_items(snapshot.delivery_standard)
+        if not items:
+            return
+        records = self._records(run_id)
+        for item in items:
+            standard_id = str(item["id"])
+            verifier = item.get("verifier") if isinstance(item.get("verifier"), dict) else {}
+            verifier_type = str(verifier.get("type") or "agent_review")
+            if verifier_type in {"check", "runtime_check"}:
+                status, message, record_ids = self._assess_check_standard(
+                    records, standard_id, subject_digest
+                )
+            elif verifier_type == "artifact":
+                status, message, record_ids = self._assess_artifact_standard(
+                    records, subject_digest
+                )
+            elif verifier_type == "human_acceptance":
+                status, message, record_ids = self._assess_human_standard(
+                    records, subject_digest
+                )
+            else:
+                status, message, record_ids = self._assess_review_standard(
+                    records,
+                    standard_id,
+                    subject_digest,
+                    security=str(item.get("stage_id") or "") == "security_review",
+                    require_independent=snapshot.profile in {"standard", "strict"},
+                )
+            self._append_evidence(RuntimeEvidence(
+                record_id=_record_id(),
+                run_id=run_id,
+                stage_id=str(item.get("stage_id") or "") or None,
+                requirement_id=standard_requirement_id(standard_id),
+                subject_digest=subject_digest,
+                producer="muxdev.runtime.delivery-standard",
+                event_type="delivery_standard_assessment",
+                status=status,
+                details={
+                    "standard_id": standard_id,
+                    "standard_text": str(item.get("completion") or item.get("text") or ""),
+                    "deliverable": str(item.get("deliverable") or item.get("text") or ""),
+                    "proof": str(item.get("proof") or item.get("text") or ""),
+                    "message": message,
+                    "source_record_ids": record_ids,
+                },
+            ))
+
+    @staticmethod
+    def _assess_artifact_standard(
+        records: list[AnyEvidenceRecord],
+        subject_digest: str,
+    ) -> tuple[str, str, list[str]]:
+        artifacts = [
+            item for item in records
+            if isinstance(item, ArtifactEvidence)
+            and item.subject_digest == subject_digest
+            and item.integrity_valid
+            and str(item.digest).startswith("sha256:")
+        ]
+        if not artifacts:
+            return "pending", "内容寻址产物尚未生成。", []
+        artifact = artifacts[-1]
+        return "passed", "内容寻址产物存在且完整性有效。", [artifact.record_id]
+
+    @staticmethod
+    def _assess_human_standard(
+        records: list[AnyEvidenceRecord],
+        subject_digest: str,
+    ) -> tuple[str, str, list[str]]:
+        approvals = [
+            item for item in records
+            if isinstance(item, InteractionEvidence)
+            and item.subject_digest == subject_digest
+            and item.interaction_type == "approval"
+        ]
+        if not approvals:
+            return "pending", "尚未获得人工接受。", []
+        approval = approvals[-1]
+        if approval.decision != "approved" or not approval.integrity_valid:
+            return "failed", "人工接受未批准或完整性无效。", [approval.record_id]
+        return "passed", "人工接受已批准。", [approval.record_id]
+
+    @staticmethod
+    def _assess_check_standard(
+        records: list[AnyEvidenceRecord],
+        standard_id: str,
+        subject_digest: str,
+    ) -> tuple[str, str, list[str]]:
+        checks = [
+            item for item in records
+            if isinstance(item, CheckEvidence)
+            and standard_id in item.criteria_ids
+            and item.subject_digest == subject_digest
+        ]
+        if not checks:
+            return "pending", "绑定的运行检查尚未产生覆盖证据。", []
+        check = checks[-1]
+        if not check.integrity_valid or not check.reproducible:
+            return "failed", "绑定检查的完整性或可复现性无效。", [check.record_id]
+        if not check.passed:
+            return "failed", "绑定的运行检查未通过。", [check.record_id]
+        return "passed", "绑定的运行检查已通过并覆盖此标准。", [check.record_id]
+
+    @staticmethod
+    def _assess_review_standard(
+        records: list[AnyEvidenceRecord],
+        standard_id: str,
+        subject_digest: str,
+        *,
+        security: bool,
+        require_independent: bool,
+    ) -> tuple[str, str, list[str]]:
+        stage_id = "security_review" if security else "review"
+        reviews = [
+            item for item in records
+            if isinstance(item, ReviewEvidence)
+            and item.stage_id == stage_id
+            and item.subject_digest == subject_digest
+            and item.target_digest == subject_digest
+        ]
+        if not reviews:
+            return "pending", "负责此标准的评审尚未完成。", []
+        review = reviews[-1]
+        if not review.integrity_valid:
+            return "failed", "评审证据完整性无效。", [review.record_id]
+        if require_independent and not review.independent:
+            return "failed", "此 Profile 要求独立 Reviewer。", [review.record_id]
+        assessment = next(
+            (
+                item for item in reversed(review.standard_assessments)
+                if item.standard_id == standard_id
+            ),
+            None,
+        )
+        if assessment is None:
+            return "pending", "Reviewer 未逐项确认此标准。", [review.record_id]
+        if assessment.status != "satisfied":
+            return "failed", assessment.note or "Reviewer 判定此标准未满足。", [review.record_id]
+        if any(
+            finding.severity == "high" and not finding.resolved
+            for finding in review.findings
+        ):
+            return "failed", "评审仍有未解决的高风险问题。", [review.record_id]
+        return "passed", assessment.note or "Reviewer 已确认此标准满足。", [review.record_id]
 
     def _has_failed_checks(self, run_id: str, worktree: Path) -> bool:
         subject = self._subject_digest(worktree)

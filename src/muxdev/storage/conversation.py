@@ -24,7 +24,9 @@ CONVERSATION_SCHEMA_STATEMENTS = (
     """CREATE TABLE IF NOT EXISTS conversations(
       conversation_id TEXT PRIMARY KEY, title TEXT NOT NULL, goal TEXT NOT NULL,
       status TEXT NOT NULL, workspace TEXT NOT NULL, active_contract_id TEXT,
-      active_run_id TEXT, active_candidate_id TEXT, created_at TEXT NOT NULL,
+      active_run_id TEXT, active_candidate_id TEXT,
+      mode TEXT NOT NULL DEFAULT 'legacy_pipeline', primary_agent_id TEXT,
+      orchestrator_agent_id TEXT, active_plan_id TEXT, created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL, metadata TEXT NOT NULL
     )""",
     """CREATE TABLE IF NOT EXISTS conversation_events(
@@ -102,14 +104,21 @@ class ConversationStoreMixin:
         goal: str,
         status: str,
         metadata: Mapping[str, object],
+        mode: str = "legacy_pipeline",
+        primary_agent_id: str | None = None,
+        orchestrator_agent_id: str | None = None,
     ) -> dict[str, Any]:
         now = _now()
         self.connection.execute(
             """INSERT INTO conversations(
               conversation_id, title, goal, status, workspace, active_contract_id,
-              active_run_id, active_candidate_id, created_at, updated_at, metadata
-            ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?)""",
-            (conversation_id, title, goal, status, str(self.workspace), now, now, _json(metadata)),
+              active_run_id, active_candidate_id, mode, primary_agent_id,
+              orchestrator_agent_id, active_plan_id, created_at, updated_at, metadata
+            ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, NULL, ?, ?, ?)""",
+            (
+                conversation_id, title, goal, status, str(self.workspace), mode,
+                primary_agent_id, orchestrator_agent_id, now, now, _json(metadata),
+            ),
         )
         self.connection.commit()
         return self.get_conversation(conversation_id) or {}
@@ -138,6 +147,10 @@ class ConversationStoreMixin:
         active_contract_id: str | None = None,
         active_run_id: str | None = None,
         active_candidate_id: str | None = None,
+        mode: str | None = None,
+        primary_agent_id: str | None = None,
+        orchestrator_agent_id: str | None = None,
+        active_plan_id: str | None = None,
         metadata: Mapping[str, object] | None = None,
     ) -> dict[str, Any]:
         current = self.get_conversation(conversation_id)
@@ -148,12 +161,18 @@ class ConversationStoreMixin:
             merged.update(metadata)
         self.connection.execute(
             """UPDATE conversations SET status = ?, active_contract_id = ?, active_run_id = ?,
-              active_candidate_id = ?, updated_at = ?, metadata = ? WHERE conversation_id = ?""",
+              active_candidate_id = ?, mode = ?, primary_agent_id = ?,
+              orchestrator_agent_id = ?, active_plan_id = ?, updated_at = ?, metadata = ?
+              WHERE conversation_id = ?""",
             (
                 status if status is not None else current["status"],
                 active_contract_id if active_contract_id is not None else current.get("active_contract_id"),
                 active_run_id if active_run_id is not None else current.get("active_run_id"),
                 active_candidate_id if active_candidate_id is not None else current.get("active_candidate_id"),
+                mode if mode is not None else current.get("mode", "legacy_pipeline"),
+                primary_agent_id if primary_agent_id is not None else current.get("primary_agent_id"),
+                orchestrator_agent_id if orchestrator_agent_id is not None else current.get("orchestrator_agent_id"),
+                active_plan_id if active_plan_id is not None else current.get("active_plan_id"),
                 _now(),
                 _json(merged),
                 conversation_id,

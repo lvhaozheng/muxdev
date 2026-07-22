@@ -53,6 +53,7 @@ from .policy_snapshot import (
     freeze_policy_snapshot,
     freeze_preflight_failure,
 )
+from .delivery_standards import prepare_delivery_run_inputs, review_standards_for_role
 from .supervisor import ProcessSupervisor
 from .stage_attempt import StageAttemptMixin
 from .interactions import InteractionPendingError, InteractiveStageMixin, response_payload
@@ -65,6 +66,10 @@ PROFILE_SETTINGS = {
     "strict": {"timeout_seconds": 600, "retries": 1, "max_cost_usd": 2.0},
 }
 MAX_PARALLEL_WORKERS = 4
+
+
+def _workflow_roles(workflow: WorkflowDefinition) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(stage.role for stage in workflow.stages if stage.role))
 
 
 @dataclass(frozen=True)
@@ -117,6 +122,9 @@ class RunEngine(
         policy, workflow_definition, role_providers, max_cost_usd = self._resolve_run_settings(
             workflow_name, profile, dict(role_providers or {}), max_cost_usd
         )
+        policy, workflow_definition, delivery_standard = prepare_delivery_run_inputs(
+            policy, workflow_definition, delivery_context
+        )
         run_dir = self._run_dir(run_id)
         reserved = self.store.get_run(run_id)
         workspace_snapshot, worktree = prepare_run_subject(
@@ -144,11 +152,7 @@ class RunEngine(
             preferred=provider,
             profile=profile,
             max_cost_usd=max_cost_usd,
-            roles=tuple(
-                dict.fromkeys(
-                    stage.role for stage in workflow_definition.stages if stage.role
-                )
-            ),
+            roles=_workflow_roles(workflow_definition),
             role_providers=role_providers,
         )
         try:
@@ -167,6 +171,7 @@ class RunEngine(
                 role_providers=role_providers,
                 workspace_snapshot=workspace_snapshot,
                 run_dir=run_dir,
+                delivery_standard=delivery_standard,
             )
         except Exception as exc:
             policy_snapshot = freeze_preflight_failure(
@@ -180,6 +185,7 @@ class RunEngine(
                 route=route,
                 workspace_snapshot=workspace_snapshot,
                 run_dir=run_dir,
+                delivery_standard=delivery_standard,
             )
             self._runtime_failure(
                 run_id,
@@ -799,6 +805,10 @@ class RunEngine(
                 "context_manifest": context_pack.manifest,
                 "previous_provider_session_id": previous_session_id,
                 "interaction_responses": interaction_responses,
+                "delivery_standard": snapshot.delivery_standard,
+                "review_standards": review_standards_for_role(
+                    snapshot.delivery_standard, stage.role
+                ),
             },
             capabilities=grant,
             provider=provider,

@@ -28,16 +28,24 @@ def test_legacy_interfaces_remain_and_versioned_conversation_contract_is_explici
         "/api/v1/deliveries/{candidate_id}/accept",
         "/api/v1/auth/pair",
     } <= paths
-    assert len(product_routes) == 31
+    assert {
+        "/api/v2/agents",
+        "/api/v2/conversations",
+        "/api/v2/conversations/{conversation_id}/messages",
+        "/api/v2/conversations/{conversation_id}/orchestration/approve",
+        "/api/v2/assignments/{assignment_id}/retry",
+        "/api/v2/sessions/{session_id}/terminal",
+    } <= paths
+    assert len(product_routes) == 47
     assert len(server_manifest()["tools"]) == 8
-    assert _leaf_count(get_command(app)) == 30
+    assert _leaf_count(get_command(app)) == 40
     tools = server_manifest()["tools"]
     assert all(item["inputSchema"].get("additionalProperties") is False for item in tools)
 
 
 def test_http_and_mcp_read_surfaces(workspace: Path) -> None:
     client = TestClient(create_app(workspace))
-    assert client.get("/health").json()["tables"] == 18
+    assert client.get("/health").json()["tables"] == 22
     response = handle_jsonrpc({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, workspace=workspace)
     assert len(response["result"]["tools"]) == 8
 

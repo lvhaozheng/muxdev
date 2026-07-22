@@ -1,0 +1,11 @@
+{
+  "name": "muxdev-dashboard-assets",
+  "private": true,
+  "scripts": {
+    "build:web": "node scripts/copy-xterm-assets.mjs"
+  },
+  "devDependencies": {
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0"
+  }
+}

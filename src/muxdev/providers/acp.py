@@ -314,6 +314,13 @@ def _prompt(input: StageExecutionInput) -> str:
     prompt = f"Execute muxdev stage '{input.stage_id}' for this task: {input.task}"
     if schema := input.policy.get("output_schema"):
         prompt += f"\nReturn a JSON object matching {schema}; do not declare a gate decision or evidence score."
+        review_standards = input.context.get("review_standards")
+        if schema == "ReviewResult" and review_standards:
+            prompt += (
+                "\nAssess every frozen conversation standard below in standard_assessments. "
+                "For each one return standard_id, status satisfied or failed, and a concise note:\n"
+                + json.dumps(review_standards, ensure_ascii=False, indent=2)
+            )
     if input.feedback:
         prompt += (
             "\n\n# Previous attempt feedback (runtime-observed)\n"

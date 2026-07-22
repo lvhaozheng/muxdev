@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from ..core.redaction import redact
 from ..domain import CapabilityGrant, StageExecutionResult
-from ..models import ExecutedCheck, VerificationCommand, WorkflowDefinition
+from ..models import ExecutedCheck, StandardAssessment, VerificationCommand, WorkflowDefinition
 from ..models.evidence import (
     ArtifactEvidence,
     CheckEvidence,
@@ -353,7 +353,7 @@ class StageAttemptMixin:
                 )
                 self._append_evidence(_check_evidence(
                     unavailable, run_id=run_id, stage_id=stage_id, subject=subject,
-                    summary="Trusted verification is unavailable.",
+                    summary="Trusted verification is unavailable.", criteria_ids=[],
                 ))
             for command in commands:
                 check_subject = self._subject_digest(worktree)
@@ -370,6 +370,7 @@ class StageAttemptMixin:
                     subject=subject,
                     summary=f"Runtime executed policy command {command.id}.",
                     integrity_valid=subject_unchanged,
+                    criteria_ids=list(command.criteria_ids),
                 ))
         review_requirements = {"review", "independent_review", "security_review"} & requirements
         if role in {"review", "secure"} and review_requirements:
@@ -389,11 +390,17 @@ class StageAttemptMixin:
             target = str(parsed.get("target_subject") or subject)
             if target == "runtime-bound":
                 target = subject
+            assessments = [
+                StandardAssessment.model_validate(item)
+                for item in parsed.get("standard_assessments", [])
+                if isinstance(item, dict)
+            ]
             self._append_evidence(ReviewEvidence(
                 record_id=_record_id(), run_id=run_id, stage_id=stage_id, requirement_id=requirement_id,
                 subject_digest=subject, producer="muxdev.runtime.review", target_digest=target,
                 reviewer=provider, executor=executor, independent=provider != executor, findings=findings,
                 residual_risk=str(parsed.get("residual_risk") or ""), integrity_valid=valid,
+                standard_assessments=assessments,
             ))
         if not valid:
             self._runtime_failure(
@@ -526,6 +533,7 @@ def _check_evidence(
     stage_id: str,
     subject: str,
     summary: str,
+    criteria_ids: list[str],
     integrity_valid: bool = True,
 ) -> CheckEvidence:
     """The sole conversion from a runtime observation to trusted check evidence."""
@@ -546,6 +554,7 @@ def _check_evidence(
         stdout_summary=executed.stdout_summary,
         stderr_summary=executed.stderr_summary,
         summary=summary,
+        criteria_ids=criteria_ids,
         reproducible=executed.reproducible,
         integrity_valid=integrity_valid,
     )

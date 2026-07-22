@@ -8,7 +8,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-from . import utc_now
+from . import StandardAssessment, utc_now
 
 
 EvidenceKind = Literal["artifact", "check", "review", "interaction", "runtime"]
@@ -92,6 +92,7 @@ class CheckEvidence(EvidenceRecord):
     stdout_summary: str = ""
     stderr_summary: str = ""
     summary: str = ""
+    criteria_ids: list[str] = Field(default_factory=list)
     reproducible: bool = True
 
     @property
@@ -118,6 +119,7 @@ class ReviewEvidence(EvidenceRecord):
     independent: bool = False
     findings: list[ReviewFinding] = Field(default_factory=list)
     residual_risk: str = ""
+    standard_assessments: list[StandardAssessment] = Field(default_factory=list)
 
 
 class InteractionEvidence(EvidenceRecord):

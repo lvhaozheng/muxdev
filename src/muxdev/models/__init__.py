@@ -62,10 +62,24 @@ class ReviewFinding(BaseModel):
     remediation: str
 
 
+class StandardAssessment(BaseModel):
+    standard_id: str = Field(min_length=1, max_length=80)
+    status: Literal["satisfied", "failed"]
+    note: str = Field(default="", max_length=1000)
+
+
 class ReviewResult(BaseModel):
     target_subject: str
     findings: list[ReviewFinding] = Field(default_factory=list)
     residual_risk: str = ""
+    standard_assessments: list[StandardAssessment] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_standard_assessments(self) -> "ReviewResult":
+        identifiers = [item.standard_id for item in self.standard_assessments]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("standard assessment ids must be unique")
+        return self
 
 
 class TestCheck(BaseModel):
@@ -161,6 +175,7 @@ class RunPolicySnapshot(BaseModel):
     provider_request: str
     provider_route: dict[str, Any] = Field(default_factory=dict)
     workflow_definition: dict[str, Any]
+    delivery_standard: dict[str, Any] = Field(default_factory=dict)
     workspace_manifest: dict[str, Any]
     stage_capabilities: dict[str, dict[str, Any]] = Field(default_factory=dict)
     stage_skills: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
@@ -219,19 +234,36 @@ from .conversation import (  # noqa: E402
     DeliveryCandidate,
     DeliveryContract,
 )
+from .collaboration import (  # noqa: E402
+    AgentDefinition,
+    AgentSessionStatus,
+    AssignmentStatus,
+    CliAdapterDefinition,
+    ConversationMode,
+    DeliveryTriple,
+    OrchestrationNodeV1,
+    OrchestrationPlanStatus,
+    OrchestrationPlanV1,
+)
 
 
 __all__ = [
     "AcceptanceCriterion",
+    "AgentDefinition",
+    "AgentSessionStatus",
     "ArtifactEvidence",
+    "AssignmentStatus",
     "CandidateStatus",
     "ChangeResult",
+    "CliAdapterDefinition",
     "CheckEvidence",
     "ConversationActor",
     "ConversationIntent",
+    "ConversationMode",
     "ConversationStatus",
     "DeliveryCandidate",
     "DeliveryContract",
+    "DeliveryTriple",
     "EvidencePolicy",
     "EvidenceReport",
     "EvidenceRequirement",
@@ -244,12 +276,16 @@ __all__ = [
     "RecoverySummary",
     "PlanDecision",
     "PlanResult",
+    "OrchestrationNodeV1",
+    "OrchestrationPlanStatus",
+    "OrchestrationPlanV1",
     "ReviewEvidence",
     "ReviewFinding",
     "ReviewResult",
     "RunPolicySnapshot",
     "RunStatus",
     "RuntimeEvidence",
+    "StandardAssessment",
     "TestCheck",
     "TestResult",
     "ExecutedCheck",

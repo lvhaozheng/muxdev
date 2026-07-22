@@ -9,6 +9,7 @@ from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from ..application import TaskService
@@ -20,6 +21,7 @@ from ..services.skills import scan_skills
 from ..storage import ControlStore
 from .auth import WebAuthMiddleware, router as auth_router
 from .conversations import router as conversations_router
+from .collaboration import router as collaboration_router
 from .conversation_dashboard import conversation_dashboard_html
 
 
@@ -232,9 +234,15 @@ def create_app(
     application.state.pairing_code = pairing_code
     application.state.trusted_origins = trusted_origins
     application.add_middleware(WebAuthMiddleware)
+    application.mount(
+        "/assets",
+        StaticFiles(directory=Path(__file__).with_name("static")),
+        name="assets",
+    )
     application.include_router(router)
     application.include_router(auth_router)
     application.include_router(conversations_router)
+    application.include_router(collaboration_router)
     return application
 
 

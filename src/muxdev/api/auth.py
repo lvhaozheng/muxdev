@@ -30,7 +30,7 @@ class WebAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if not bool(getattr(request.app.state, "require_auth", False)):
             return await call_next(request)
-        if request.url.path in PUBLIC_PATHS:
+        if request.url.path in PUBLIC_PATHS or request.url.path.startswith("/assets/"):
             return await call_next(request)
         token = request.cookies.get(COOKIE_NAME)
         if not token or not _session_valid(request.app.state.workspace, token):
@@ -97,21 +97,25 @@ def _token_hash(token: str) -> str:
     return "sha256:" + hashlib.sha256(token.encode()).hexdigest()
 
 
-def _session_valid(workspace: Path, token: str) -> bool:
+def session_for_token(workspace: Path, token: str) -> dict[str, object] | None:
     token_hash = _token_hash(token)
     with ControlStore(workspace) as store:
         session = store.web_session(token_hash)
         if not session:
-            return False
+            return None
         if session.get("revoked_at") or session.get("device_status") != "active":
-            return False
+            return None
         try:
             if datetime.fromisoformat(str(session["expires_at"])) <= datetime.now(UTC):
-                return False
+                return None
         except (KeyError, ValueError):
-            return False
+            return None
         store.touch_web_session(token_hash)
-    return True
+    return session
+
+
+def _session_valid(workspace: Path, token: str) -> bool:
+    return session_for_token(workspace, token) is not None
 
 
 def _origin_valid(request: Request) -> bool:
@@ -119,10 +123,16 @@ def _origin_valid(request: Request) -> bool:
     if not origin:
         return False
     configured = tuple(getattr(request.app.state, "trusted_origins", ()))
+    return origin_is_trusted(origin, request.headers.get("host", ""), configured)
+
+
+def origin_is_trusted(origin: str, host: str, configured: tuple[str, ...] = ()) -> bool:
     if configured:
         return origin.rstrip("/") in {item.rstrip("/") for item in configured}
     parsed = urlsplit(origin)
-    return parsed.netloc == request.headers.get("host") and parsed.scheme in {"http", "https"}
+    return parsed.netloc == host and parsed.scheme in {"http", "https"}
 
 
-__all__ = ["COOKIE_NAME", "WebAuthMiddleware", "router"]
+__all__ = [
+    "COOKIE_NAME", "WebAuthMiddleware", "origin_is_trusted", "router", "session_for_token",
+]

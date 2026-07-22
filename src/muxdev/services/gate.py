@@ -142,9 +142,13 @@ def _evaluate_requirement(
         return "failed", "A deterministic check failed.", "Fix the failing check and capture a new execution record."
     runtime = [item for item in records if isinstance(item, RuntimeEvidence)]
     if any(item.status == "failed" for item in runtime):
-        return "failed", "An unresolved runtime or policy failure remains.", "Resolve the recorded runtime failure and resume the run."
+        failed = next(item for item in runtime if item.status == "failed")
+        message = str(failed.details.get("message") or "An unresolved runtime or policy failure remains.")
+        return "failed", message, "Resolve the recorded runtime failure and resume the run."
     if any(item.status == "pending" for item in runtime):
-        return "missing", "Runtime completion is still pending.", "Resume or cancel the pending run."
+        pending = next(item for item in runtime if item.status == "pending")
+        message = str(pending.details.get("message") or "Runtime completion is still pending.")
+        return "missing", message, "Complete the required verification and resume the run."
     reviews = [item for item in records if isinstance(item, ReviewEvidence)]
     if any(item.target_digest != (subject_digest or item.subject_digest) for item in reviews):
         return "failed", "Review target does not match the delivered subject.", "Review the current subject digest."

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -11,6 +12,8 @@ from muxdev.domain import StageExecutionResult
 from muxdev.providers.mock import MockProvider
 from muxdev.runtime import ConversationService, RunEngine
 from muxdev.runtime.workspace import WorkspaceConflictError
+from muxdev.models import ExecutedCheck
+from muxdev.models.evidence import canonical_hash
 
 
 def test_conversation_defers_workspace_delivery_until_acceptance(workspace) -> None:
@@ -24,6 +27,7 @@ def test_conversation_defers_workspace_delivery_until_acceptance(workspace) -> N
 
     assert result["conversation"]["status"] == "awaiting_acceptance"
     assert candidate["status"] == "verified"
+    assert result["active_delivery"]["status_label"] == "已验证，可交付"
     assert not (workspace / "muxdev_mock_change.txt").exists()
 
     service.accept_delivery(conversation_id, candidate["candidate_id"])
@@ -31,6 +35,7 @@ def test_conversation_defers_workspace_delivery_until_acceptance(workspace) -> N
 
     assert delivered["conversation"]["status"] == "delivered"
     assert delivered["candidates"][-1]["status"] == "accepted"
+    assert delivered["active_delivery"]["status_label"] == "已写入项目"
     assert (workspace / "muxdev_mock_change.txt").is_file()
     assert delivered["integrity"]["valid"] is True
     engine.store.close()
@@ -128,6 +133,12 @@ def test_conversation_http_surface_supports_messages_and_actions(workspace) -> N
     detail = client.get(f"/api/v1/conversations/{conversation_id}").json()
     assert detail["conversation"]["status"] == "awaiting_acceptance"
     assert detail["deliveries"][0]["status"] == "verified"
+    assert detail["delivery_standard"]["schema_version"] == "muxdev.delivery-standard.v2"
+    assert detail["active_delivery"]["status_label"] == "已验证，可交付"
+    assert detail["active_delivery"]["can_accept"] is True
+    assert set(detail["active_delivery"]) >= {
+        "changed_files", "standard_summary", "blocking_items", "evidence_integrity"
+    }
 
 
 def test_conversation_actions_are_idempotent_and_events_resume_by_sequence(workspace) -> None:
@@ -408,6 +419,231 @@ def test_stage_standards_are_versioned_and_projected_with_downstream_impact(work
     ]
     assert implement["custom_standards"] == ["不得改变公开 API"]
     assert detail["progress"]["method"] == "stage_completion"
+    engine.store.close()
+
+
+def test_custom_review_and_check_standards_are_hard_gates_with_runtime_evidence(workspace) -> None:
+    engine = RunEngine(workspace)
+    service = ConversationService(engine, engine.store)
+    created = service.create("verify custom delivery standards", profile="lite")
+    conversation_id = created["conversation"]["conversation_id"]
+    revised = service.revise_contract(conversation_id, {
+        "delivery_standard": {"custom_items": [
+            {
+                "id": "api-compatible",
+                "stage_id": "implement",
+                "text": "公开 API 保持向后兼容",
+                "verifier": {"type": "review"},
+            },
+            {
+                "id": "diff-clean",
+                "stage_id": "test",
+                "text": "差异通过冻结的完整性检查",
+                "verifier": {"type": "check", "command_id": "diff-integrity"},
+            },
+        ]},
+    })
+
+    detail = service.start_work(conversation_id)
+    candidate = detail["candidates"][-1]
+    report = json.loads(Path(candidate["evidence_path"]).read_text(encoding="utf-8"))
+
+    assert revised["version"] == 2
+    assert candidate["status"] == "verified"
+    assert detail["active_delivery"]["can_accept"] is True
+    assert {item["status"] for item in detail["delivery_standard"]["custom_items"]} == {"passed"}
+    assert {item["id"] for item in report["policy"]["requirements"]} >= {
+        "standard.api-compatible", "standard.diff-clean"
+    }
+    check = next(item for item in report["records"] if item["kind"] == "check")
+    review = next(item for item in report["records"] if item["kind"] == "review")
+    assert "diff-clean" in check["criteria_ids"]
+    assert review["standard_assessments"][0]["standard_id"] == "api-compatible"
+    run = engine.store.get_run(candidate["run_id"])
+    assert run["metadata"]["policy_snapshot"]["delivery_standard"] == revised["policy"]["delivery_standard"]
+    engine.store.close()
+
+
+@pytest.mark.parametrize("assessment_status", [None, "failed"])
+def test_missing_or_failed_custom_review_assessment_blocks_exact_standard(
+    workspace, monkeypatch, assessment_status
+) -> None:
+    class ReviewingProvider:
+        def execute(self, stage_input):
+            output = MockProvider().execute(stage_input)
+            if stage_input.stage_id != "review":
+                return output
+            payload = json.loads(output.content)
+            payload["standard_assessments"] = [] if assessment_status is None else [
+                {
+                    "standard_id": item["id"],
+                    "status": assessment_status,
+                    "note": "规则未满足",
+                }
+                for item in stage_input.context.get("review_standards", [])
+            ]
+            return replace(output, content=json.dumps(payload, ensure_ascii=False))
+
+    monkeypatch.setattr(
+        "muxdev.runtime.engine.get_runtime_provider",
+        lambda *_args, **_kwargs: ReviewingProvider(),
+    )
+    engine = RunEngine(workspace)
+    service = ConversationService(engine, engine.store)
+    created = service.create("block incomplete custom review", profile="lite")
+    conversation_id = created["conversation"]["conversation_id"]
+    service.revise_contract(conversation_id, {
+        "delivery_standard": {"custom_items": [{
+            "id": "review-required",
+            "stage_id": "implement",
+            "text": "Reviewer 必须逐项确认",
+        }]},
+    })
+
+    detail = service.start_work(conversation_id)
+    candidate = detail["candidates"][-1]
+    report = json.loads(Path(candidate["evidence_path"]).read_text(encoding="utf-8"))
+    evaluation = next(
+        item for item in report["decision"]["requirements"]
+        if item["requirement_id"] == "standard.review-required"
+    )
+
+    assert candidate["status"] == "failed"
+    assert evaluation["status"] == ("missing" if assessment_status is None else "failed")
+    assert any(
+        item["requirement_id"] == "standard.review-required"
+        for item in detail["active_delivery"]["blocking_items"]
+    )
+    engine.store.close()
+
+
+def test_failed_bound_check_blocks_its_custom_standard(workspace, monkeypatch) -> None:
+    def failed_check(_self, command, _worktree, _run_id, _stage_id):
+        return ExecutedCheck(
+            id=command.id,
+            argv=command.argv,
+            cwd=command.cwd,
+            cwd_digest=canonical_hash("cwd"),
+            exit_code=1,
+            duration_ms=1,
+            stdout_digest=canonical_hash(""),
+            stderr_digest=canonical_hash("failed"),
+            stderr_summary="failed",
+        )
+
+    monkeypatch.setattr(RunEngine, "_run_check", failed_check)
+    engine = RunEngine(workspace)
+    service = ConversationService(engine, engine.store)
+    created = service.create("block failed custom check", profile="lite")
+    conversation_id = created["conversation"]["conversation_id"]
+    service.revise_contract(conversation_id, {
+        "delivery_standard": {"custom_items": [{
+            "id": "bound-check",
+            "stage_id": "test",
+            "text": "冻结检查必须通过",
+            "verifier": {"type": "check", "command_id": "diff-integrity"},
+        }]},
+    })
+
+    detail = service.start_work(conversation_id)
+    report = json.loads(Path(detail["candidates"][-1]["evidence_path"]).read_text(encoding="utf-8"))
+    evaluation = next(
+        item for item in report["decision"]["requirements"]
+        if item["requirement_id"] == "standard.bound-check"
+    )
+
+    assert evaluation["status"] == "failed"
+    assert "绑定的运行检查未通过" in evaluation["reason"]
+    assert detail["active_delivery"]["can_accept"] is False
+    engine.store.close()
+
+
+def test_delivery_standard_revision_invalidates_candidate_and_rejects_baseline_edit(workspace) -> None:
+    engine = RunEngine(workspace)
+    service = ConversationService(engine, engine.store)
+    created = service.create("revise standard after verification", profile="lite")
+    conversation_id = created["conversation"]["conversation_id"]
+    candidate = service.start_work(conversation_id)["candidates"][-1]
+
+    revised = service.revise_contract(conversation_id, {
+        "delivery_standard": {"custom_items": [{
+            "id": "docs-current",
+            "stage_id": "implement",
+            "text": "受影响文档必须同步",
+        }]},
+    })
+    detail = service.get(conversation_id)
+
+    assert engine.store.get_delivery_candidate(candidate["candidate_id"])["status"] == "invalidated"
+    assert revised["policy"]["revision"]["affected_stages"] == [
+        "implement", "test", "review", "security_review", "fix"
+    ]
+    assert detail["active_delivery"]["status_label"] == "需要重新验证"
+    assert revised["policy"]["revision"]["changed_fields"] == [
+        "delivery_standard:implement"
+    ]
+    with pytest.raises(ValueError, match="built-in delivery standard fields cannot be edited"):
+        service.revise_contract(conversation_id, {
+            "delivery_standard": {"stages": []},
+        })
+    engine.store.close()
+
+
+def test_standard_profile_custom_review_cannot_pass_without_independent_reviewer(workspace) -> None:
+    engine = RunEngine(workspace)
+    service = ConversationService(engine, engine.store)
+    created = service.create("require independent custom review", profile="standard")
+    conversation_id = created["conversation"]["conversation_id"]
+    service.revise_contract(conversation_id, {
+        "delivery_standard": {"custom_items": [{
+            "id": "independent-custom-review",
+            "stage_id": "implement",
+            "text": "自定义兼容性标准必须由独立 Reviewer 确认",
+        }]},
+    })
+
+    detail = service.start_work(conversation_id)
+    report = json.loads(Path(detail["candidates"][-1]["evidence_path"]).read_text(encoding="utf-8"))
+    evaluation = next(
+        item for item in report["decision"]["requirements"]
+        if item["requirement_id"] == "standard.independent-custom-review"
+    )
+
+    blocker_ids = {
+        item["requirement_id"] for item in report["decision"]["blockers"]
+    }
+    assert evaluation["status"] == "missing"
+    assert detail["candidates"][-1]["status"] == "failed"
+    assert blocker_ids >= {
+        "independent_review", "standard.independent-custom-review"
+    }
+    engine.store.close()
+
+
+def test_missing_delivery_summary_fails_closed_and_old_baseline_snapshot_is_stable(
+    workspace, monkeypatch
+) -> None:
+    engine = RunEngine(workspace)
+    service = ConversationService(engine, engine.store)
+    created = service.create("keep the frozen baseline", profile="lite")
+    conversation_id = created["conversation"]["conversation_id"]
+    frozen = created["contracts"][-1]["policy"]["delivery_standard"]
+
+    monkeypatch.setattr(
+        "muxdev.runtime.delivery_standards._baseline_stages",
+        lambda *_args: [{"stage_id": "future-baseline"}],
+    )
+    assert service.get(conversation_id)["delivery_standard"]["baseline_version"] == "sdlc-v2"
+    assert service.get(conversation_id)["contracts"][-1]["policy"]["delivery_standard"] == frozen
+
+    candidate = service.start_work(conversation_id)["candidates"][-1]
+    Path(candidate["evidence_path"]).unlink()
+    detail = service.get(conversation_id)
+
+    assert detail["active_delivery"]["evidence_integrity"] == {
+        "available": False, "valid": False
+    }
+    assert detail["active_delivery"]["can_accept"] is False
     engine.store.close()
 
 
