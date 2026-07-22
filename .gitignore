@@ -27,3 +27,4 @@ release-artifacts/*
 !release-artifacts/login-evidence-example.json
 !release-artifacts/muxdev-teaching-playbook-cn.md
 !release-artifacts/muxdev-interview-drill-bank-cn.md
+release-artifacts/
