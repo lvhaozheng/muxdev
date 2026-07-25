@@ -62,6 +62,20 @@ def _not_found(exc: FileNotFoundError) -> HTTPException:
     return HTTPException(404, str(exc) or "conversation resource not found")
 
 
+def _v1_status_compat(value: Any) -> Any:
+    """Keep pre-v12 clients from seeing the new continuous-session idle state."""
+    if isinstance(value, list):
+        return [_v1_status_compat(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result = {key: _v1_status_compat(item) for key, item in value.items()}
+    if result.get("status") == "idle" and (
+        "conversation_id" in result or "active_contract_id" in result
+    ):
+        result["status"] = "delivered"
+    return result
+
+
 @router.post("/conversations", status_code=201)
 def create_conversation(
     body: ConversationCreateRequest,
@@ -86,7 +100,7 @@ def create_conversation(
     conversation_id = str(conversation["conversation"]["conversation_id"])
     if body.auto_start:
         background.add_task(_start_background, _workspace(request), conversation_id)
-    return {**conversation, "queued": body.auto_start}
+    return _v1_status_compat({**conversation, "queued": body.auto_start})
 
 
 @router.get("/conversations")
@@ -96,14 +110,15 @@ def list_conversations(
     limit: int = Query(100, ge=1, le=1000),
 ) -> list[dict[str, Any]]:
     with _service(_workspace(request)) as service:
-        return service.list(status=status, limit=limit)
+        normalized = "idle" if status == "delivered" else status
+        return _v1_status_compat(service.list(status=normalized, limit=limit))
 
 
 @router.get("/conversations/{conversation_id}")
 def get_conversation(conversation_id: str, request: Request) -> dict[str, Any]:
     with _service(_workspace(request)) as service:
         try:
-            return service.get(conversation_id)
+            return _v1_status_compat(service.get(conversation_id))
         except FileNotFoundError as exc:
             raise _not_found(exc) from exc
 
@@ -131,7 +146,7 @@ def add_message(
     elif resume_required:
         queued = True
         background.add_task(_resume_interaction_background, _workspace(request), conversation_id)
-    return {**result, "queued": queued}
+    return _v1_status_compat({**result, "queued": queued})
 
 
 @router.post("/conversations/{conversation_id}/actions", status_code=202)

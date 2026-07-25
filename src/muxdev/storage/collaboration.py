@@ -9,6 +9,8 @@ from typing import Any, Mapping, Sequence
 
 COLLABORATION_TABLES = (
     "agent_sessions",
+    "session_generations",
+    "conversation_interactions",
     "orchestration_plans",
     "assignments",
     "assignment_dependencies",
@@ -26,7 +28,7 @@ COLLABORATION_SCHEMA_STATEMENTS = (
     )""",
     """CREATE TABLE IF NOT EXISTS assignments(
       assignment_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, plan_id TEXT,
-      node_id TEXT, parent_assignment_id TEXT, agent_id TEXT NOT NULL,
+      node_id TEXT, parent_assignment_id TEXT, run_id TEXT, agent_id TEXT NOT NULL,
       dispatch_kind TEXT NOT NULL, work_mode TEXT NOT NULL, status TEXT NOT NULL,
       title TEXT NOT NULL, brief TEXT NOT NULL, allowed_scope TEXT NOT NULL,
       deliverables TEXT NOT NULL, completion TEXT NOT NULL, proof TEXT NOT NULL,
@@ -36,7 +38,8 @@ COLLABORATION_SCHEMA_STATEMENTS = (
       metadata TEXT NOT NULL,
       FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id),
       FOREIGN KEY(plan_id) REFERENCES orchestration_plans(plan_id),
-      FOREIGN KEY(parent_assignment_id) REFERENCES assignments(assignment_id)
+      FOREIGN KEY(parent_assignment_id) REFERENCES assignments(assignment_id),
+      FOREIGN KEY(run_id) REFERENCES runs(run_id)
     )""",
     """CREATE TABLE IF NOT EXISTS assignment_dependencies(
       assignment_id TEXT NOT NULL, depends_on_assignment_id TEXT NOT NULL,
@@ -47,7 +50,9 @@ COLLABORATION_SCHEMA_STATEMENTS = (
     )""",
     """CREATE TABLE IF NOT EXISTS agent_sessions(
       session_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL,
-      assignment_id TEXT NOT NULL, agent_id TEXT NOT NULL, cli_id TEXT NOT NULL,
+      assignment_id TEXT, current_assignment_id TEXT, agent_id TEXT NOT NULL,
+      cli_id TEXT NOT NULL, lane_key TEXT NOT NULL DEFAULT 'main',
+      lane_type TEXT NOT NULL DEFAULT 'main', generation INTEGER NOT NULL DEFAULT 0,
       status TEXT NOT NULL, native_session_id TEXT, worktree TEXT NOT NULL,
       transcript_path TEXT NOT NULL, last_sequence INTEGER NOT NULL DEFAULT 0,
       cols INTEGER NOT NULL DEFAULT 120, rows INTEGER NOT NULL DEFAULT 32,
@@ -56,6 +61,24 @@ COLLABORATION_SCHEMA_STATEMENTS = (
       write_lease_expires_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
       metadata TEXT NOT NULL,
       FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id),
+      FOREIGN KEY(assignment_id) REFERENCES assignments(assignment_id),
+      FOREIGN KEY(current_assignment_id) REFERENCES assignments(assignment_id),
+      UNIQUE(conversation_id, agent_id, lane_key)
+    )""",
+    """CREATE TABLE IF NOT EXISTS session_generations(
+      generation_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, generation INTEGER NOT NULL,
+      backend TEXT NOT NULL, process_id TEXT, worktree TEXT NOT NULL,
+      native_session_id TEXT, recovery_mode TEXT NOT NULL, started_at TEXT NOT NULL,
+      ended_at TEXT, metadata TEXT NOT NULL, UNIQUE(session_id, generation),
+      FOREIGN KEY(session_id) REFERENCES agent_sessions(session_id)
+    )""",
+    """CREATE TABLE IF NOT EXISTS conversation_interactions(
+      interaction_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, run_id TEXT,
+      assignment_id TEXT, kind TEXT NOT NULL, requirement_id TEXT NOT NULL,
+      prompt TEXT NOT NULL, options TEXT NOT NULL, status TEXT NOT NULL,
+      response TEXT, created_at TEXT NOT NULL, responded_at TEXT, metadata TEXT NOT NULL,
+      FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id),
+      FOREIGN KEY(run_id) REFERENCES runs(run_id),
       FOREIGN KEY(assignment_id) REFERENCES assignments(assignment_id)
     )""",
 )
@@ -175,19 +198,20 @@ class CollaborationStoreMixin:
         parent_assignment_id: str | None = None,
         baseline_digest: str | None = None,
         worktree: str | None = None,
+        run_id: str | None = None,
         metadata: Mapping[str, object] | None = None,
     ) -> dict[str, Any]:
         now = _now()
         self.connection.execute(
             """INSERT INTO assignments(
-              assignment_id, conversation_id, plan_id, node_id, parent_assignment_id,
+              assignment_id, conversation_id, plan_id, node_id, parent_assignment_id, run_id,
               agent_id, dispatch_kind, work_mode, status, title, brief, allowed_scope,
               deliverables, completion, proof, baseline_digest, worktree,
               changeset_digest, recovery_attempts, created_at, updated_at,
               reported_at, completed_at, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?, NULL, NULL, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?, NULL, NULL, ?)""",
             (
-                assignment_id, conversation_id, plan_id, node_id, parent_assignment_id,
+                assignment_id, conversation_id, plan_id, node_id, parent_assignment_id, run_id,
                 agent_id, dispatch_kind, work_mode, status, title, brief,
                 _json(list(allowed_scope)), _json(list(deliverables)),
                 _json(list(completion)), _json(list(proof)), baseline_digest,
@@ -227,7 +251,7 @@ class CollaborationStoreMixin:
             raise FileNotFoundError(assignment_id)
         allowed = {
             "agent_id", "status", "baseline_digest", "worktree", "changeset_digest",
-            "recovery_attempts", "reported_at", "completed_at",
+            "recovery_attempts", "reported_at", "completed_at", "run_id",
         }
         assignments: list[str] = []
         params: list[object] = []
@@ -274,7 +298,7 @@ class CollaborationStoreMixin:
         *,
         session_id: str,
         conversation_id: str,
-        assignment_id: str,
+        assignment_id: str | None,
         agent_id: str,
         cli_id: str,
         status: str,
@@ -283,18 +307,24 @@ class CollaborationStoreMixin:
         recovery_mode: str = "fresh",
         control_token_hash: str | None = None,
         token_expires_at: str | None = None,
+        lane_key: str = "main",
+        lane_type: str = "main",
+        current_assignment_id: str | None = None,
+        generation: int = 0,
         metadata: Mapping[str, object] | None = None,
     ) -> dict[str, Any]:
         now = _now()
         self.connection.execute(
             """INSERT INTO agent_sessions(
-              session_id, conversation_id, assignment_id, agent_id, cli_id, status,
+              session_id, conversation_id, assignment_id, current_assignment_id,
+              agent_id, cli_id, lane_key, lane_type, generation, status,
               native_session_id, worktree, transcript_path, last_sequence, cols, rows,
               recovery_mode, control_token_hash, token_expires_at, write_lease_id,
               write_lease_holder, write_lease_expires_at, created_at, updated_at, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, 0, 120, 32, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 0, 120, 32, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?)""",
             (
-                session_id, conversation_id, assignment_id, agent_id, cli_id, status,
+                session_id, conversation_id, assignment_id, current_assignment_id,
+                agent_id, cli_id, lane_key, lane_type, generation, status,
                 worktree, transcript_path, recovery_mode, control_token_hash,
                 token_expires_at, now, now, _json(metadata or {}),
             ),
@@ -315,6 +345,17 @@ class CollaborationStoreMixin:
         ).fetchall()
         return [_decode(row, "metadata") or {} for row in rows]
 
+    def find_agent_session(
+        self, conversation_id: str, agent_id: str, lane_key: str = "main"
+    ) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """SELECT * FROM agent_sessions
+               WHERE conversation_id = ? AND agent_id = ? AND lane_key = ?
+               ORDER BY created_at LIMIT 1""",
+            (conversation_id, agent_id, lane_key),
+        ).fetchone()
+        return _decode(row, "metadata")
+
     def update_agent_session(self, session_id: str, **changes: object) -> dict[str, Any]:
         current = self.get_agent_session(session_id)
         if not current:
@@ -323,6 +364,7 @@ class CollaborationStoreMixin:
             "status", "native_session_id", "last_sequence", "cols", "rows",
             "recovery_mode", "control_token_hash", "token_expires_at",
             "write_lease_id", "write_lease_holder", "write_lease_expires_at",
+            "assignment_id", "current_assignment_id", "generation", "worktree",
         }
         assignments: list[str] = []
         params: list[object] = []
@@ -346,3 +388,161 @@ class CollaborationStoreMixin:
         self.connection.commit()
         return self.get_agent_session(session_id) or {}
 
+    def create_session_generation(
+        self,
+        *,
+        session_id: str,
+        generation: int,
+        backend: str,
+        worktree: str,
+        recovery_mode: str,
+        native_session_id: str | None = None,
+        process_id: str | None = None,
+        metadata: Mapping[str, object] | None = None,
+    ) -> dict[str, Any]:
+        generation_id = f"sgen_{session_id}_{generation}"
+        self.connection.execute(
+            """INSERT INTO session_generations(
+              generation_id, session_id, generation, backend, process_id, worktree,
+              native_session_id, recovery_mode, started_at, ended_at, metadata
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)""",
+            (
+                generation_id, session_id, generation, backend, process_id, worktree,
+                native_session_id, recovery_mode, _now(), _json(metadata or {}),
+            ),
+        )
+        self.connection.commit()
+        return self.get_session_generation(session_id, generation) or {}
+
+    def get_session_generation(self, session_id: str, generation: int) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM session_generations WHERE session_id = ? AND generation = ?",
+            (session_id, generation),
+        ).fetchone()
+        return _decode(row, "metadata")
+
+    def list_session_generations(self, session_id: str) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM session_generations WHERE session_id = ? ORDER BY generation",
+            (session_id,),
+        ).fetchall()
+        return [_decode(row, "metadata") or {} for row in rows]
+
+    def finish_session_generation(self, session_id: str, generation: int) -> None:
+        self.connection.execute(
+            """UPDATE session_generations SET ended_at = ?
+               WHERE session_id = ? AND generation = ? AND ended_at IS NULL""",
+            (_now(), session_id, generation),
+        )
+        self.connection.commit()
+
+    def update_session_generation(
+        self,
+        session_id: str,
+        generation: int,
+        *,
+        native_session_id: str | None = None,
+        process_id: str | None = None,
+    ) -> None:
+        current = self.get_session_generation(session_id, generation)
+        if not current:
+            raise FileNotFoundError(f"{session_id}:{generation}")
+        self.connection.execute(
+            """UPDATE session_generations SET native_session_id = ?, process_id = ?
+               WHERE session_id = ? AND generation = ?""",
+            (
+                native_session_id if native_session_id is not None else current.get("native_session_id"),
+                process_id if process_id is not None else current.get("process_id"),
+                session_id,
+                generation,
+            ),
+        )
+        self.connection.commit()
+
+    def create_conversation_interaction(
+        self,
+        *,
+        conversation_id: str,
+        kind: str,
+        requirement_id: str,
+        prompt: str,
+        options: Sequence[Mapping[str, object]] | None = None,
+        run_id: str | None = None,
+        assignment_id: str | None = None,
+        metadata: Mapping[str, object] | None = None,
+    ) -> dict[str, Any]:
+        interaction_id = f"cint_{__import__('uuid').uuid4().hex}"
+        self.connection.execute(
+            """INSERT INTO conversation_interactions(
+              interaction_id, conversation_id, run_id, assignment_id, kind,
+              requirement_id, prompt, options, status, response, created_at,
+              responded_at, metadata
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, NULL, ?)""",
+            (
+                interaction_id, conversation_id, run_id, assignment_id, kind,
+                requirement_id, prompt, _json(list(options or [])), _now(),
+                _json(metadata or {}),
+            ),
+        )
+        self.connection.commit()
+        interaction = self.get_conversation_interaction(interaction_id) or {}
+        self.create_review_record(
+            conversation_id,
+            review_id=f"review_{interaction_id}",
+            kind="interaction",
+            status="pending",
+            prompt=prompt,
+            options=list(options or []),
+            actor_kind="agent",
+            actor_id=str((metadata or {}).get("agent_id") or "runtime"),
+            run_id=run_id,
+            assignment_id=assignment_id,
+            metadata={
+                "interaction_id": interaction_id,
+                "requirement_id": requirement_id,
+                **dict(metadata or {}),
+            },
+        )
+        return interaction
+
+    def get_conversation_interaction(self, interaction_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM conversation_interactions WHERE interaction_id = ?",
+            (interaction_id,),
+        ).fetchone()
+        return _decode(row, "options", "metadata")
+
+    def list_conversation_interactions(
+        self, conversation_id: str, *, pending_only: bool = False
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM conversation_interactions WHERE conversation_id = ?"
+        if pending_only:
+            sql += " AND status = 'pending'"
+        sql += " ORDER BY created_at, interaction_id"
+        rows = self.connection.execute(sql, (conversation_id,)).fetchall()
+        return [_decode(row, "options", "metadata") or {} for row in rows]
+
+    def respond_conversation_interaction(
+        self, interaction_id: str, response: str
+    ) -> dict[str, Any]:
+        cursor = self.connection.execute(
+            """UPDATE conversation_interactions
+               SET status = 'responded', response = ?, responded_at = ?
+               WHERE interaction_id = ? AND status = 'pending'""",
+            (response, _now(), interaction_id),
+        )
+        self.connection.commit()
+        if cursor.rowcount != 1:
+            if not self.get_conversation_interaction(interaction_id):
+                raise FileNotFoundError(interaction_id)
+            raise RuntimeError("interaction has already been answered")
+        interaction = self.get_conversation_interaction(interaction_id) or {}
+        review = self.get_review_record(f"review_{interaction_id}")
+        if review and review.get("status") == "pending":
+            self.resolve_review_record(
+                str(review["review_id"]),
+                status="responded",
+                response=response,
+                actor_id="developer",
+            )
+        return interaction

@@ -3,8 +3,8 @@ cli_adapters:
     cli_id: mock
     command: [python, -m, muxdev.runtime.mock_cli]
     env_allowlist: []
-    supports_pty: true
-    supports_resize: true
+    supports_pty: false
+    supports_resize: false
     supports_resume: false
   codex:
     cli_id: codex
@@ -14,6 +14,7 @@ cli_adapters:
     model_arg: --model
     env_allowlist: [OPENAI_API_KEY, OPENAI_BASE_URL]
     supports_pty: true
+    requires_pty: true
     supports_resize: true
     supports_resume: true
     native_session_id_pattern: '(?i)(?:session(?: id)?|resume)[:= ]+([0-9a-f-]{20,})'
@@ -25,8 +26,45 @@ cli_adapters:
     model_arg: --model
     env_allowlist: [ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL]
     supports_pty: true
+    requires_pty: true
     supports_resize: true
     supports_resume: true
+    prefer_tmux: true
+  qwen:
+    cli_id: qwen
+    command: [qwen]
+    env_allowlist: [QWEN_API_KEY, DASHSCOPE_API_KEY, OPENAI_API_KEY, OPENAI_BASE_URL]
+    supports_pty: true
+    requires_pty: true
+    supports_resize: true
+    supports_resume: false
+    prefer_tmux: true
+  kimi:
+    cli_id: kimi
+    command: [kimi]
+    env_allowlist: [KIMI_API_KEY, MOONSHOT_API_KEY, OPENAI_API_KEY, OPENAI_BASE_URL]
+    supports_pty: true
+    requires_pty: true
+    supports_resize: true
+    supports_resume: false
+    prefer_tmux: true
+  trae:
+    cli_id: trae
+    command: [trae]
+    env_allowlist: []
+    supports_pty: true
+    requires_pty: true
+    supports_resize: true
+    supports_resume: false
+    prefer_tmux: true
+  antigravity:
+    cli_id: antigravity
+    command: [antigravity]
+    env_allowlist: []
+    supports_pty: true
+    requires_pty: true
+    supports_resize: true
+    supports_resume: false
     prefer_tmux: true
 
 agents:
@@ -76,5 +114,43 @@ agents:
     capability_tags: [code, review, orchestrate, terminal, resume]
     can_orchestrate: true
     max_concurrency: 4
+    default_permissions: workspace-write
+    enabled: true
+  qwen:
+    agent_id: qwen
+    display_name: Qwen Code
+    cli_id: qwen
+    role_prompt: Own the assignment end to end and report only verifiable deliverables.
+    capability_tags: [code, review, security-review, orchestrate, terminal]
+    can_orchestrate: true
+    max_concurrency: 4
+    default_permissions: workspace-write
+    enabled: true
+  kimi:
+    agent_id: kimi
+    display_name: Kimi Code
+    cli_id: kimi
+    role_prompt: Own the assignment end to end and report only verifiable deliverables.
+    capability_tags: [code, review, security-review, orchestrate, terminal]
+    can_orchestrate: true
+    max_concurrency: 4
+    default_permissions: workspace-write
+    enabled: true
+  trae:
+    agent_id: trae
+    display_name: Trae
+    cli_id: trae
+    role_prompt: Own the assignment end to end and report only verifiable deliverables.
+    capability_tags: [code, terminal]
+    max_concurrency: 2
+    default_permissions: workspace-write
+    enabled: true
+  antigravity:
+    agent_id: antigravity
+    display_name: Antigravity
+    cli_id: antigravity
+    role_prompt: Own the assignment end to end and report only verifiable deliverables.
+    capability_tags: [code, terminal]
+    max_concurrency: 2
     default_permissions: workspace-write
     enabled: true

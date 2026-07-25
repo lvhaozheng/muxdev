@@ -37,6 +37,7 @@ def main() -> int:
                     raise SystemExit("refusing to clean release directory outside the output root")
                 shutil.rmtree(folder)
             folder.mkdir(parents=True, exist_ok=True)
+            _clean_generated_build_tree()
             _run([sys.executable, "-m", "build", "--no-isolation", "--outdir", str(folder)])
             for sdist in folder.glob("*.tar.gz"):
                 _normalize_sdist(sdist)
@@ -87,6 +88,16 @@ def main() -> int:
     (output / "RELEASE_MANIFEST.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps({"status": "ready" if args.metadata_only or reproducible else "failed", "output": str(output), "manifest": manifest}, sort_keys=True))
     return 0
+
+
+def _clean_generated_build_tree() -> None:
+    """Prevent deleted modules from leaking out of setuptools' incremental cache."""
+    folder = (ROOT / "build").resolve()
+    if not folder.exists():
+        return
+    if folder.parent != ROOT.resolve() or folder.name != "build":
+        raise SystemExit("refusing to clean build directory outside the repository root")
+    shutil.rmtree(folder)
 
 
 def _run(command: list[str]) -> None:

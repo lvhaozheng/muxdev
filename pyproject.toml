@@ -27,6 +27,7 @@ dependencies = [
   "fastapi>=0.110",
   "uvicorn>=0.27",
   "cryptography>=43",
+  "watchfiles>=0.24,<2",
   "pywinpty>=3; platform_system == 'Windows'",
 ]
 

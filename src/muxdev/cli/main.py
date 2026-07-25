@@ -5,9 +5,13 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import socket
+import urllib.error
+import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated
+from uuid import uuid4
 
 import typer
 from rich.console import Console
@@ -30,7 +34,13 @@ from ..services.skills import (
     verify_skill_lock,
     write_skill_lock,
 )
-from ..storage import ControlStore, compact_database_status, migrate_workspace
+from ..storage import (
+    SCHEMA_VERSION,
+    ControlStore,
+    compact_database_status,
+    migrate_workspace,
+)
+from ..workbench import WorkbenchRegistry, daemon_state_path, utc_now
 
 
 app = typer.Typer(no_args_is_help=True, help="Trusted delivery control plane for coding agents.")
@@ -44,6 +54,7 @@ mcp_app = typer.Typer(no_args_is_help=True)
 agent_app = typer.Typer(no_args_is_help=True)
 collab_app = typer.Typer(no_args_is_help=True)
 collab_plan_app = typer.Typer(no_args_is_help=True)
+project_app = typer.Typer(no_args_is_help=True)
 app.add_typer(evidence_app, name="evidence")
 app.add_typer(route_app, name="route")
 app.add_typer(provider_app, name="provider")
@@ -53,6 +64,7 @@ app.add_typer(migrate_app, name="migrate")
 app.add_typer(mcp_app, name="mcp")
 app.add_typer(agent_app, name="agent")
 app.add_typer(collab_app, name="collab")
+app.add_typer(project_app, name="project")
 collab_app.add_typer(collab_plan_app, name="plan")
 console = Console()
 Workspace = Annotated[Path, typer.Option("--workspace", "-w", resolve_path=True)]
@@ -103,6 +115,10 @@ def _collab_identity(service: CollaborationService) -> dict[str, object]:
         raise typer.BadParameter(str(exc)) from exc
 
 
+def _identity_assignment(identity: dict[str, object]) -> str:
+    return str(identity.get("current_assignment_id") or identity.get("assignment_id") or "")
+
+
 def _load_json_file(path: Path) -> dict[str, object]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -120,6 +136,87 @@ def _run_report(workspace: Path, run_id: str) -> Path:
         raise typer.BadParameter(f"run not found: {run_id}")
     metadata = run.get("metadata") if isinstance(run.get("metadata"), dict) else {}
     return Path(str(metadata.get("run_dir") or workspace / ".muxdev" / "runs" / run_id)) / "evidence-report.json"
+
+
+def _daemon_state() -> dict[str, object] | None:
+    path = daemon_state_path()
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _daemon_base_url(state: dict[str, object]) -> str:
+    host = str(state.get("host") or "127.0.0.1")
+    display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    return f"http://{display_host}:{int(state.get('port') or 8765)}"
+
+
+def _daemon_health(state: dict[str, object]) -> dict[str, object] | None:
+    try:
+        with urllib.request.urlopen(
+            _daemon_base_url(state) + "/api/v2/workbench/health",
+            timeout=0.75,
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError, urllib.error.URLError):
+        return None
+    if not isinstance(payload, dict) or payload.get("service") != "muxdev-workbench":
+        return None
+    expected = str(state.get("instance_id") or "")
+    if expected and str(payload.get("instance_id") or "") != expected:
+        return None
+    return payload
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _port_is_open(host: str, port: int) -> bool:
+    target = "127.0.0.1" if host in {"0.0.0.0", "::", "localhost"} else host
+    try:
+        with socket.create_connection((target, port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def _write_daemon_state(value: dict[str, object]) -> None:
+    target = daemon_state_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(f".{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+    os.replace(temporary, target)
+
+
+def _clear_daemon_state(instance_id: str | None = None) -> None:
+    target = daemon_state_path()
+    current = _daemon_state()
+    if instance_id and current and str(current.get("instance_id") or "") != instance_id:
+        return
+    target.unlink(missing_ok=True)
+
+
+def _project_url(project_id: str, state: dict[str, object]) -> str:
+    return f"{_daemon_base_url(state)}/projects/{project_id}"
+
+
+def _print_project_url(project_id: str, state: dict[str, object]) -> None:
+    url = _project_url(project_id, state)
+    console.print(f"[bold]Muxdev Workbench[/bold]  [link={url}]{url}[/link]")
 
 
 @app.command("init")
@@ -321,7 +418,7 @@ def collab_plan_propose(
     resolved = _collab_workspace(workspace)
     with _collaboration(resolved) as service:
         identity = _collab_identity(service)
-        assignment = service.store.get_assignment(str(identity["assignment_id"])) or {}
+        assignment = service.store.get_assignment(_identity_assignment(identity)) or {}
         if assignment.get("dispatch_kind") != "orchestrate":
             raise typer.BadParameter("only the orchestrator assignment may propose a plan")
         _print(
@@ -345,7 +442,7 @@ def collab_dispatch(
             service.dispatch(
                 str(identity["conversation_id"]),
                 _load_json_file(file),
-                parent_assignment_id=str(identity["assignment_id"]),
+                parent_assignment_id=_identity_assignment(identity) or None,
             )
         )
 
@@ -399,7 +496,10 @@ def collab_report(
     resolved = _collab_workspace(workspace)
     with _collaboration(resolved) as service:
         identity = _collab_identity(service)
-        _print(service.report(str(identity["assignment_id"]), _load_json_file(file)))
+        assignment_id = _identity_assignment(identity)
+        if not assignment_id:
+            raise typer.BadParameter("the main Session has no active Assignment")
+        _print(service.report(assignment_id, _load_json_file(file)))
 
 
 @collab_app.command("deliver")
@@ -410,7 +510,40 @@ def collab_deliver(
     resolved = _collab_workspace(workspace)
     with _collaboration(resolved) as service:
         identity = _collab_identity(service)
-        _print(service.report(str(identity["assignment_id"]), _load_json_file(manifest)))
+        assignment_id = _identity_assignment(identity)
+        if not assignment_id:
+            raise typer.BadParameter("the main Session has no active Assignment")
+        _print(service.report(assignment_id, _load_json_file(manifest)))
+
+
+@collab_app.command("clarify")
+def collab_clarify(
+    file: Annotated[Path, typer.Option("--file", resolve_path=True)],
+    workspace: Workspace = Path.cwd(),
+) -> None:
+    resolved = _collab_workspace(workspace)
+    with _collaboration(resolved) as service:
+        identity = _collab_identity(service)
+        assessment = _load_json_file(file)
+        assignment_id = _identity_assignment(identity)
+        if assignment_id:
+            _print(service.request_assignment_input(assignment_id, assessment))
+        else:
+            _print(service.clarify(str(identity["conversation_id"]), assessment))
+
+
+@collab_app.command("ready")
+def collab_ready(
+    file: Annotated[Path, typer.Option("--file", resolve_path=True)],
+    workspace: Workspace = Path.cwd(),
+) -> None:
+    resolved = _collab_workspace(workspace)
+    with _collaboration(resolved) as service:
+        identity = _collab_identity(service)
+        conversation = service.store.get_conversation(str(identity["conversation_id"])) or {}
+        if str(identity.get("agent_id") or "") != str(conversation.get("primary_agent_id") or ""):
+            raise typer.BadParameter("only the primary Agent may freeze requirements")
+        _print(service.ready(str(identity["conversation_id"]), _load_json_file(file)))
 
 
 @skill_app.command("list")
@@ -496,12 +629,85 @@ def doctor(workspace: Workspace = Path.cwd()) -> None:
         result = {
             "healthy": set(tables) == set(CORE_TABLES),
             "database": str(store.path),
-            "schema_version": 10,
+            "schema_version": SCHEMA_VERSION,
             "tables": list(tables),
         }
     _print(result)
     if not result["healthy"]:
         raise typer.Exit(1)
+
+
+@project_app.command("add")
+def project_add(
+    path: Annotated[Path, typer.Argument(resolve_path=True)] = Path.cwd(),
+    name: Annotated[str | None, typer.Option("--name")] = None,
+) -> None:
+    registry = WorkbenchRegistry.user()
+    try:
+        _print(registry.register(path, name=name))
+    finally:
+        registry.store.close()
+
+
+@project_app.command("list")
+def project_list() -> None:
+    registry = WorkbenchRegistry.user()
+    try:
+        _print(registry.list_projects())
+    finally:
+        registry.store.close()
+
+
+@project_app.command("remove")
+def project_remove(project_id: str) -> None:
+    registry = WorkbenchRegistry.user()
+    try:
+        project = registry.store.get_project(project_id)
+        if not project:
+            raise typer.BadParameter(f"project not found: {project_id}")
+        path = Path(str(project["path"]))
+        if path.is_dir():
+            with ControlStore(path) as store:
+                active = [
+                    session
+                    for conversation in store.list_conversations(limit=1000)
+                    for session in store.list_agent_sessions(
+                        str(conversation["conversation_id"])
+                    )
+                    if session.get("status") not in {"closed", "failed"}
+                ]
+            if active:
+                raise typer.BadParameter(
+                    "project has active Agent Sessions; stop them before removing it"
+                )
+        removed = registry.store.remove_project(project_id)
+        _print(
+            {
+                "project_id": project_id,
+                "status": "removed",
+                "path": removed["path"],
+                "data_deleted": False,
+            }
+        )
+    finally:
+        registry.store.close()
+
+
+@project_app.command("open")
+def project_open(project_id: str) -> None:
+    registry = WorkbenchRegistry.user()
+    try:
+        if not registry.store.get_project(project_id):
+            raise typer.BadParameter(f"project not found: {project_id}")
+        state = _daemon_state()
+        if not state or not _daemon_health(state):
+            raise typer.BadParameter(
+                "Muxdev Workbench is not running; run `muxdev serve` in a project first"
+            )
+        registry.store.update_project(project_id, touch=True)
+        _print_project_url(project_id, state)
+    finally:
+        registry.store.close()
 
 
 @app.command("serve")
@@ -514,23 +720,87 @@ def serve(
 ) -> None:
     import uvicorn
 
+    workspace = workspace.resolve()
     loopback = host in {"127.0.0.1", "localhost", "::1"}
     if not loopback and not allow_remote:
         raise typer.BadParameter("non-loopback Web binding requires --allow-remote")
+    registry = WorkbenchRegistry.user()
+    try:
+        project = registry.register(workspace)
+    except (FileNotFoundError, NotADirectoryError, OSError, ValueError) as exc:
+        registry.store.close()
+        raise typer.BadParameter(str(exc)) from exc
+    project_id = str(project["project_id"])
+
+    state = _daemon_state()
+    if state:
+        health = _daemon_health(state)
+        if health:
+            registry.store.update_project(project_id, touch=True)
+            _print_project_url(project_id, state)
+            registry.store.close()
+            return
+        pid = int(state.get("pid") or 0)
+        if _pid_is_alive(pid):
+            registry.store.close()
+            raise typer.BadParameter(
+                "recorded Muxdev Daemon is alive but unhealthy; stop it before restarting"
+            )
+        _clear_daemon_state(str(state.get("instance_id") or "") or None)
+
+    probe = {"host": host, "port": port, "instance_id": ""}
+    discovered = _daemon_health(probe)
+    if discovered:
+        recovered = {
+            "instance_id": str(discovered.get("instance_id") or ""),
+            "pid": int(discovered.get("pid") or 0),
+            "host": str(discovered.get("host") or host),
+            "port": int(discovered.get("port") or port),
+            "started_at": str(discovered.get("started_at") or ""),
+        }
+        _write_daemon_state(recovered)
+        _print_project_url(project_id, recovered)
+        registry.store.close()
+        return
+    if _port_is_open(host, port):
+        registry.store.close()
+        raise typer.BadParameter(
+            f"{host}:{port} is occupied by a non-Muxdev process; choose another --port"
+        )
+
     pairing_code = secrets.token_urlsafe(8) if allow_remote else None
     if pairing_code:
         console.print("Remote Web access is protected. Pair a browser with this one-time code:")
         console.print(f"[bold]{pairing_code}[/bold]")
-    uvicorn.run(
-        create_app(
-            workspace,
-            require_auth=allow_remote,
-            pairing_code=pairing_code,
-            trusted_origins=tuple(trusted_origin or ()),
-        ),
-        host=host,
-        port=port,
-    )
+    instance_id = f"daemon_{uuid4().hex}"
+    started_at = utc_now()
+    state = {
+        "instance_id": instance_id,
+        "pid": os.getpid(),
+        "host": host,
+        "port": port,
+        "started_at": started_at,
+    }
+    _write_daemon_state(state)
+    _print_project_url(project_id, state)
+    try:
+        uvicorn.run(
+            create_app(
+                workspace,
+                workbench=registry,
+                instance_id=instance_id,
+                host=host,
+                port=port,
+                require_auth=allow_remote,
+                pairing_code=pairing_code,
+                trusted_origins=tuple(trusted_origin or ()),
+            ),
+            host=host,
+            port=port,
+        )
+    finally:
+        _clear_daemon_state(instance_id)
+        registry.store.close()
 
 
 if __name__ == "__main__":

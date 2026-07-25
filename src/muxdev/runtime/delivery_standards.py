@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from copy import deepcopy
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from ..core.redaction import redact
 from ..models import VerificationCommand, WorkflowDefinition
@@ -36,6 +36,89 @@ def build_delivery_standard(
         "stages": _baseline_stages(workflow_name, profile),
         "custom_items": items,
     }
+
+
+def compile_deliverables(
+    workflow_name: str,
+    profile: str,
+    deliverables: Sequence[Mapping[str, object]],
+) -> dict[str, Any]:
+    """Compile the simple type-first UX into the existing hard v2 contract."""
+    workflow = load_workflow(workflow_name)
+    valid_stages = applicable_custom_stage_ids(workflow, profile)
+    implementation_stage = "implement" if "implement" in valid_stages else next(iter(sorted(valid_stages)))
+    review_stage = "review" if "review" in valid_stages else implementation_stage
+    commands = available_verification_commands(workflow)
+    items: list[dict[str, object]] = []
+    supported = {"code_change", "file", "report", "runnable", "answer", "other"}
+    for index, raw in enumerate(deliverables):
+        kind = str(raw.get("type") or "").strip()
+        if kind not in supported:
+            raise ValueError(f"unsupported deliverable type: {kind}")
+        target = str(raw.get("path") or raw.get("name") or raw.get("format") or "").strip()
+        description = str(raw.get("description") or "").strip()
+        label = target or description or {
+            "code_change": "代码修改",
+            "file": "指定文件",
+            "report": "报告/文档",
+            "runnable": "可运行应用或 API",
+            "answer": "结构化分析回答",
+            "other": "自定义交付物",
+        }[kind]
+        base = {
+            "id": f"deliverable.{kind}.{index + 1}",
+            "source": "conversation",
+            "required": True,
+        }
+        if kind == "code_change":
+            items.append({
+                **base,
+                "stage_id": review_stage,
+                "deliverable": "内容寻址 ChangeSet",
+                "completion": f"{label} 已完成且未超出冻结范围",
+                "proof": "冻结差异检查与独立 Agent review",
+                "verifier": {"type": "agent_review", "capability": "review"},
+            })
+        elif kind in {"file", "report"}:
+            items.append({
+                **base,
+                "stage_id": implementation_stage,
+                "deliverable": label,
+                "completion": f"{label} 存在、非空且格式符合约定",
+                "proof": "内容寻址 artifact",
+                "verifier": {"type": "artifact", "artifact_kind": kind},
+            })
+        elif kind == "runnable":
+            items.append({
+                **base,
+                "stage_id": implementation_stage,
+                "deliverable": label,
+                "completion": f"{label} 的构建产物可被验证",
+                "proof": "内容寻址构建 artifact",
+                "verifier": {"type": "artifact", "artifact_kind": "runnable"},
+            })
+            check_id = str(raw.get("check_id") or ("diff-integrity" if "diff-integrity" in commands else ""))
+            if check_id:
+                items.append({
+                    "id": f"deliverable.{kind}.{index + 1}.check",
+                    "stage_id": "test" if "test" in valid_stages else implementation_stage,
+                    "deliverable": f"{label} 的冻结运行检查",
+                    "completion": "冻结 Runtime check 成功",
+                    "proof": f"Runtime command {check_id} 的退出状态和日志",
+                    "source": "conversation",
+                    "required": True,
+                    "verifier": {"type": "runtime_check", "command_id": check_id},
+                })
+        else:
+            items.append({
+                **base,
+                "stage_id": review_stage,
+                "deliverable": label,
+                "completion": description or f"{label} 已按冻结需求完整交付",
+                "proof": "结构化产物与独立 Agent review",
+                "verifier": {"type": "agent_review", "capability": "review"},
+            })
+    return build_delivery_standard(workflow_name, profile, items)
 
 
 def normalize_custom_items(
@@ -526,6 +609,7 @@ __all__ = [
     "bind_standard_checks",
     "build_delivery_standard",
     "custom_items",
+    "compile_deliverables",
     "conversation_task_prompt",
     "delivery_standard_diff",
     "extend_evidence_policy",

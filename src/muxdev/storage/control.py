@@ -29,9 +29,19 @@ from .collaboration import (
     COLLABORATION_TABLES,
     CollaborationStoreMixin,
 )
+from .change_tracking import (
+    CHANGE_TRACKING_SCHEMA_STATEMENTS,
+    CHANGE_TRACKING_TABLES,
+    ChangeTrackingStoreMixin,
+)
+from .experience import (
+    EXPERIENCE_SCHEMA_STATEMENTS,
+    EXPERIENCE_TABLES,
+    ExperienceStoreMixin,
+)
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 13
 CORE_TABLES = (
     "schema_migrations",
     "runs",
@@ -45,7 +55,12 @@ CORE_TABLES = (
     "routing_decisions",
     "attestations",
     "skill_locks",
-) + CONVERSATION_TABLES + COLLABORATION_TABLES
+) + (
+    CONVERSATION_TABLES
+    + COLLABORATION_TABLES
+    + CHANGE_TRACKING_TABLES
+    + EXPERIENCE_TABLES
+)
 
 
 def utc_now() -> str:
@@ -69,7 +84,12 @@ def _decode_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return result
 
 
-class ControlStore(CollaborationStoreMixin, ConversationStoreMixin):
+class ControlStore(
+    ExperienceStoreMixin,
+    ChangeTrackingStoreMixin,
+    CollaborationStoreMixin,
+    ConversationStoreMixin,
+):
     """Explicit repository over the compact control-plane schema."""
 
     def __init__(self, workspace: Path | str, *, database: Path | None = None) -> None:
@@ -81,6 +101,7 @@ class ControlStore(CollaborationStoreMixin, ConversationStoreMixin):
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA foreign_keys=ON")
+        self._backup_before_v13()
         self._create_schema()
 
     def __enter__(self) -> "ControlStore":
@@ -91,6 +112,29 @@ class ControlStore(CollaborationStoreMixin, ConversationStoreMixin):
 
     def close(self) -> None:
         self.connection.close()
+
+    def _backup_before_v13(self) -> None:
+        """Create one consistent project-local backup before the v13 migration."""
+        table = self.connection.execute(
+            """SELECT 1 FROM sqlite_master
+               WHERE type = 'table' AND name = 'schema_migrations'"""
+        ).fetchone()
+        if not table:
+            return
+        row = self.connection.execute(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
+        ).fetchone()
+        version = int(row[0]) if row else 0
+        if version != 12:
+            return
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        backup_dir = self.root / "backups" / f"schema-v12-to-v13-{stamp}"
+        backup_dir.mkdir(parents=True, exist_ok=False)
+        destination = sqlite3.connect(backup_dir / "control.sqlite")
+        try:
+            self.connection.backup(destination)
+        finally:
+            destination.close()
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -108,6 +152,9 @@ class ControlStore(CollaborationStoreMixin, ConversationStoreMixin):
             for statement in statements:
                 conn.execute(statement)
             self._ensure_schema_v10(conn)
+            self._ensure_schema_v11(conn)
+            self._ensure_schema_v12(conn)
+            self._ensure_schema_v13(conn)
             conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations(version, applied_at, checksum) VALUES (?, ?, ?)",
                 (SCHEMA_VERSION, utc_now(), _schema_checksum(statements)),
@@ -133,6 +180,152 @@ class ControlStore(CollaborationStoreMixin, ConversationStoreMixin):
             "UPDATE conversations SET mode = 'legacy_pipeline' WHERE mode IS NULL OR mode = ''"
         )
 
+    @staticmethod
+    def _ensure_schema_v11(conn: sqlite3.Connection) -> None:
+        """Upgrade Run ownership and logical Agent Session lanes in-place."""
+        run_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(runs)")}
+        for name, definition in {
+            "run_kind": "TEXT NOT NULL DEFAULT 'legacy_pipeline'",
+            "conversation_id": "TEXT",
+            "assignment_id": "TEXT",
+            "session_id": "TEXT",
+        }.items():
+            if name not in run_columns:
+                conn.execute(f"ALTER TABLE runs ADD COLUMN {name} {definition}")
+        conn.execute(
+            """UPDATE runs SET run_kind = 'delivery_verification'
+               WHERE metadata LIKE '%\"collaboration_native\":true%'"""
+        )
+
+        assignment_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(assignments)")
+        }
+        if "run_id" not in assignment_columns:
+            conn.execute("ALTER TABLE assignments ADD COLUMN run_id TEXT")
+
+        session_info = conn.execute("PRAGMA table_info(agent_sessions)").fetchall()
+        session_columns = {str(row[1]) for row in session_info}
+        assignment_not_null = next(
+            (bool(row[3]) for row in session_info if str(row[1]) == "assignment_id"), False
+        )
+        required = {"current_assignment_id", "lane_key", "lane_type", "generation"}
+        migrated_sessions = False
+        if assignment_not_null or not required <= session_columns:
+            migrated_sessions = True
+            conn.execute("DROP TABLE IF EXISTS session_generations")
+            conn.execute("ALTER TABLE agent_sessions RENAME TO agent_sessions_v10")
+            conn.execute(next(
+                statement for statement in COLLABORATION_SCHEMA_STATEMENTS
+                if "CREATE TABLE IF NOT EXISTS agent_sessions" in statement
+            ))
+            conn.execute(
+                """INSERT INTO agent_sessions(
+                  session_id, conversation_id, assignment_id, current_assignment_id,
+                  agent_id, cli_id, lane_key, lane_type, generation, status,
+                  native_session_id, worktree, transcript_path, last_sequence, cols, rows,
+                  recovery_mode, control_token_hash, token_expires_at, write_lease_id,
+                  write_lease_holder, write_lease_expires_at, created_at, updated_at, metadata
+                ) SELECT session_id, conversation_id, assignment_id, assignment_id,
+                  agent_id, cli_id, 'assignment:' || assignment_id, 'temporary', 1, status,
+                  native_session_id, worktree, transcript_path, last_sequence, cols, rows,
+                  recovery_mode, control_token_hash, token_expires_at, write_lease_id,
+                  write_lease_holder, write_lease_expires_at, created_at, updated_at, metadata
+                  FROM agent_sessions_v10"""
+            )
+            conn.execute("DROP TABLE agent_sessions_v10")
+
+        for statement in COLLABORATION_SCHEMA_STATEMENTS:
+            if (
+                "CREATE TABLE IF NOT EXISTS session_generations" in statement
+                or "CREATE TABLE IF NOT EXISTS conversation_interactions" in statement
+            ):
+                conn.execute(statement)
+        if migrated_sessions:
+            conn.execute(
+                """INSERT OR IGNORE INTO session_generations(
+                  generation_id, session_id, generation, backend, process_id, worktree,
+                  native_session_id, recovery_mode, started_at, ended_at, metadata
+                ) SELECT 'sgen_' || session_id || '_' || generation, session_id,
+                  generation, 'legacy', NULL, worktree, native_session_id, recovery_mode,
+                  created_at,
+                  CASE WHEN status IN ('closed', 'failed') THEN updated_at ELSE NULL END,
+                  '{\"migrated_from_v10\":true}'
+                  FROM agent_sessions WHERE generation > 0"""
+            )
+        conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS uq_runs_assignment
+               ON runs(assignment_id) WHERE assignment_id IS NOT NULL"""
+        )
+
+    @staticmethod
+    def _ensure_schema_v12(conn: sqlite3.Connection) -> None:
+        """Add continuous-turn and versioned activity fields in place."""
+        run_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(runs)")}
+        for name, definition in {
+            "turn_index": "INTEGER NOT NULL DEFAULT 1",
+            "review_state": "TEXT NOT NULL DEFAULT 'pending'",
+            "reviewed_at": "TEXT",
+        }.items():
+            if name not in run_columns:
+                conn.execute(f"ALTER TABLE runs ADD COLUMN {name} {definition}")
+
+        event_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(conversation_events)")
+        }
+        for name, definition in {
+            "schema_version": "INTEGER NOT NULL DEFAULT 1",
+            "actor_kind": "TEXT",
+            "actor_id": "TEXT",
+            "assignment_id": "TEXT",
+            "session_id": "TEXT",
+            "generation": "INTEGER",
+            "correlation_id": "TEXT",
+            "capture_grade": "TEXT NOT NULL DEFAULT 'recorded'",
+        }.items():
+            if name not in event_columns:
+                conn.execute(
+                    f"ALTER TABLE conversation_events ADD COLUMN {name} {definition}"
+                )
+        conn.execute(
+            """UPDATE conversation_events
+               SET actor_kind = CASE
+                 WHEN actor = 'developer' THEN 'developer'
+                 WHEN actor IN ('runtime', 'supervisor', 'system') THEN 'runtime'
+                 ELSE 'agent'
+               END,
+               actor_id = actor
+               WHERE actor_kind IS NULL OR actor_id IS NULL"""
+        )
+        conn.execute(
+            """UPDATE conversations SET status = 'idle'
+               WHERE status = 'delivered'"""
+        )
+        for statement in CHANGE_TRACKING_SCHEMA_STATEMENTS:
+            conn.execute(statement)
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS ix_conversation_events_cursor
+               ON conversation_events(conversation_id, sequence)"""
+        )
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS ix_conversation_events_correlation
+               ON conversation_events(correlation_id)
+               WHERE correlation_id IS NOT NULL"""
+        )
+
+    @staticmethod
+    def _ensure_schema_v13(conn: sqlite3.Connection) -> None:
+        """Add Conversation memory, Review history, and Rule projections."""
+        for statement in EXPERIENCE_SCHEMA_STATEMENTS:
+            conn.execute(statement)
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS ix_memory_conversation_version
+               ON conversation_memory_checkpoints(conversation_id, version)"""
+        )
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS ix_review_conversation_created
+               ON review_records(conversation_id, created_at)"""
+        )
+
     def table_names(self) -> tuple[str, ...]:
         rows = self.connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
@@ -149,14 +342,27 @@ class ControlStore(CollaborationStoreMixin, ConversationStoreMixin):
         provider: str,
         policy_hash: str,
         metadata: Mapping[str, object] | None = None,
+        run_kind: str = "legacy_pipeline",
+        conversation_id: str | None = None,
+        assignment_id: str | None = None,
+        session_id: str | None = None,
+        turn_index: int = 1,
+        review_state: str = "pending",
     ) -> dict[str, Any]:
         now = utc_now()
         self.connection.execute(
             """INSERT INTO runs(
-                run_id, task, workflow, profile, provider, status, policy_hash,
-                current_stage, created_at, updated_at, metadata
-            ) VALUES (?, ?, ?, ?, ?, 'created', ?, NULL, ?, ?, ?)""",
-            (run_id, task, workflow, profile, provider, policy_hash, now, now, _json(metadata or {})),
+                run_id, run_kind, conversation_id, assignment_id, session_id,
+                task, workflow, profile, provider, status, policy_hash,
+                current_stage, turn_index, review_state, reviewed_at,
+                created_at, updated_at, metadata
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'created', ?, NULL, ?, ?, NULL, ?, ?, ?)""",
+            (
+                run_id, run_kind, conversation_id, assignment_id, session_id,
+                task, workflow, profile, provider, policy_hash,
+                max(1, int(turn_index)), review_state, now, now,
+                _json(metadata or {}),
+            ),
         )
         self.connection.commit()
         self.append_event(run_id, "run.created", {"workflow": workflow, "profile": profile, "provider": provider})
@@ -176,6 +382,14 @@ class ControlStore(CollaborationStoreMixin, ConversationStoreMixin):
         params.append(max(1, min(limit, 1000)))
         return [_decode_row(row) or {} for row in self.connection.execute(sql, params).fetchall()]
 
+    def list_conversation_runs(self, conversation_id: str) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """SELECT * FROM runs WHERE conversation_id = ?
+               ORDER BY created_at, run_id""",
+            (conversation_id,),
+        ).fetchall()
+        return [_decode_row(row) or {} for row in rows]
+
     def update_run(self, run_id: str, *, status: str, current_stage: str | None = None) -> None:
         self.connection.execute(
             "UPDATE runs SET status = ?, current_stage = ?, updated_at = ? WHERE run_id = ?",
@@ -183,6 +397,63 @@ class ControlStore(CollaborationStoreMixin, ConversationStoreMixin):
         )
         self.connection.commit()
         self.append_event(run_id, "run.status_changed", {"status": status, "current_stage": current_stage})
+
+    def bind_run_session(self, run_id: str, session_id: str) -> dict[str, Any]:
+        self.connection.execute(
+            "UPDATE runs SET session_id = ?, updated_at = ? WHERE run_id = ?",
+            (session_id, utc_now(), run_id),
+        )
+        self.connection.commit()
+        run = self.get_run(run_id)
+        if not run:
+            raise FileNotFoundError(run_id)
+        return run
+
+    def settle_run_review(self, run_id: str, review_state: str) -> dict[str, Any]:
+        if review_state not in {
+            "pending", "accepted", "rolled_back", "answered", "superseded"
+        }:
+            raise ValueError(f"unsupported run review state: {review_state}")
+        reviewed_at = None if review_state == "pending" else utc_now()
+        self.connection.execute(
+            """UPDATE runs SET review_state = ?, reviewed_at = ?, updated_at = ?
+               WHERE run_id = ?""",
+            (review_state, reviewed_at, utc_now(), run_id),
+        )
+        self.connection.commit()
+        run = self.get_run(run_id)
+        if not run:
+            raise FileNotFoundError(run_id)
+        self.append_event(
+            run_id,
+            "run.review_settled",
+            {"review_state": review_state, "reviewed_at": reviewed_at},
+        )
+        settled = self.get_run(run_id) or run
+        conversation_id = str(settled.get("conversation_id") or "")
+        if review_state != "pending" and conversation_id:
+            try:
+                from .conversation_memory import ensure_conversation_checkpoint
+
+                ensure_conversation_checkpoint(
+                    self,
+                    conversation_id,
+                    force=True,
+                    created_by="runtime",
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                self.append_conversation_event(
+                    conversation_id,
+                    "memory.checkpoint_failed",
+                    {
+                        "run_id": run_id,
+                        "error_type": type(exc).__name__,
+                        "message": str(exc)[:500],
+                    },
+                    actor="runtime",
+                    run_id=run_id,
+                )
+        return settled
 
     def freeze_run_policy(self, run_id: str, snapshot: Mapping[str, object], snapshot_hash: str) -> None:
         """Attach the policy snapshot exactly once, before execution begins."""
@@ -534,8 +805,12 @@ def _schema_statements() -> tuple[str, ...]:
     return (
         "CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, checksum TEXT NOT NULL)",
         """CREATE TABLE IF NOT EXISTS runs(
-          run_id TEXT PRIMARY KEY, task TEXT NOT NULL, workflow TEXT NOT NULL, profile TEXT NOT NULL,
+          run_id TEXT PRIMARY KEY, run_kind TEXT NOT NULL DEFAULT 'legacy_pipeline',
+          conversation_id TEXT, assignment_id TEXT, session_id TEXT,
+          task TEXT NOT NULL, workflow TEXT NOT NULL, profile TEXT NOT NULL,
           provider TEXT NOT NULL, status TEXT NOT NULL, policy_hash TEXT NOT NULL, current_stage TEXT,
+          turn_index INTEGER NOT NULL DEFAULT 1,
+          review_state TEXT NOT NULL DEFAULT 'pending', reviewed_at TEXT,
           created_at TEXT NOT NULL, updated_at TEXT NOT NULL, metadata TEXT NOT NULL
         )""",
         """CREATE TABLE IF NOT EXISTS stages(
@@ -582,7 +857,12 @@ def _schema_statements() -> tuple[str, ...]:
           lock_id TEXT PRIMARY KEY, skill_name TEXT NOT NULL, version TEXT NOT NULL, digest TEXT NOT NULL,
           created_at TEXT NOT NULL, payload TEXT NOT NULL, UNIQUE(skill_name, version)
         )""",
-    ) + CONVERSATION_SCHEMA_STATEMENTS + COLLABORATION_SCHEMA_STATEMENTS
+    ) + (
+        CONVERSATION_SCHEMA_STATEMENTS
+        + COLLABORATION_SCHEMA_STATEMENTS
+        + CHANGE_TRACKING_SCHEMA_STATEMENTS
+        + EXPERIENCE_SCHEMA_STATEMENTS
+    )
 
 
 def compact_database_status(workspace: Path | str) -> dict[str, object]:

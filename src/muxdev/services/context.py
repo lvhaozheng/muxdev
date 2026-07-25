@@ -12,13 +12,14 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from ..core.redaction import redact
 from ..models.evidence import canonical_hash
 from ..storage.control import ControlStore
 from .evidence_verify import verify_evidence_report
 from .repo_map import build_repo_map
+from .conversation_memory import ensure_conversation_checkpoint
 
 
 @dataclass(frozen=True)
@@ -53,8 +54,15 @@ def build_context_pack(
         f"- [{hit.run_id}] task={hit.task}; subject={hit.subject_digest}; {hit.summary}"
         for hit in hits
     )
+    project_rules_path = workspace / "MUXDEV.md"
+    project_rules = (
+        project_rules_path.read_text(encoding="utf-8", errors="replace")[:4_000]
+        if project_rules_path.is_file()
+        else ""
+    )
     sections = [
         ("Upstream structured facts", upstream),
+        ("Approved MuxDev project rules", project_rules),
         ("Deterministic repository map", repo_map),
         ("Verified delivery memory", memory),
     ]
@@ -85,6 +93,208 @@ def build_context_pack(
         "context_digest": canonical_hash(text),
     }
     return ContextPack(text=text, manifest=manifest)
+
+
+def build_conversation_context_pack(
+    workspace: Path,
+    worktree: Path,
+    store: ControlStore,
+    *,
+    conversation_id: str,
+    contract: Mapping[str, Any],
+    task: str,
+    max_chars: int = 12_000,
+) -> ContextPack:
+    """Build the Conversation-native pack with frozen facts taking priority."""
+    checkpoint = ensure_conversation_checkpoint(
+        store,
+        conversation_id,
+        force=False,
+        created_by="runtime",
+    )
+    critical_section, pending, rule_snapshot = _conversation_critical_section(
+        store, conversation_id, contract, max_chars=max_chars
+    )
+    sections, facts = _conversation_context_sections(
+        workspace,
+        worktree,
+        store,
+        conversation_id=conversation_id,
+        task=task,
+        checkpoint=checkpoint,
+    )
+    text, truncated = _render_context_sections(
+        critical_section, sections, max_chars=max_chars
+    )
+    assignments = facts["assignments"]
+    hits = facts["hits"]
+    return ContextPack(
+        text=text,
+        manifest={
+            "schema": "muxdev.context-pack.v3",
+            "conversation_id": conversation_id,
+            "max_chars": max_chars,
+            "used_chars": len(text),
+            "critical_sections_truncated": False,
+            "truncated_sections": truncated,
+            "pending_interaction_ids": [item["interaction_id"] for item in pending],
+            "assignment_ids": [item["assignment_id"] for item in assignments],
+            "memory_checkpoint_id": (
+                str(checkpoint["checkpoint_id"]) if checkpoint else None
+            ),
+            "memory_checkpoint_version": (
+                int(checkpoint["version"]) if checkpoint else None
+            ),
+            "memory_through_sequence": facts["checkpoint_sequence"],
+            "rule_snapshot_id": (
+                str(rule_snapshot["snapshot_id"]) if rule_snapshot else None
+            ),
+            "memory_run_ids": [hit.run_id for hit in hits],
+            "project_rules_digest": canonical_hash(facts["project_rules"]),
+            "repo_map_digest": canonical_hash(facts["repo_map"]),
+            "context_digest": canonical_hash(text),
+        },
+    )
+
+
+def _conversation_critical_section(
+    store: ControlStore,
+    conversation_id: str,
+    contract: Mapping[str, Any],
+    *,
+    max_chars: int,
+) -> tuple[str, list[dict[str, Any]], dict[str, Any] | None]:
+    pending = store.list_conversation_interactions(conversation_id, pending_only=True)
+    rule_snapshot = store.latest_conversation_rule_snapshot(conversation_id)
+    critical_payload = {
+        "contract": {
+            "contract_id": contract.get("contract_id"),
+            "goal": contract.get("goal"),
+            "acceptance_criteria": contract.get("acceptance_criteria"),
+            "allowed_scope": contract.get("allowed_scope"),
+            "profile": contract.get("profile"),
+            "delivery_standard": (contract.get("policy") or {}).get("delivery_standard"),
+        },
+        "pending_questions": [
+            {
+                "interaction_id": item.get("interaction_id"),
+                "requirement_id": item.get("requirement_id"),
+                "prompt": item.get("prompt"),
+                "options": item.get("options"),
+            }
+            for item in pending
+        ],
+        "frozen_rules": list((rule_snapshot or {}).get("rules") or []),
+    }
+    critical = json.dumps(critical_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    critical_section = "## Frozen contract and unresolved questions\n" + critical
+    if len(critical_section) > max_chars:
+        raise ValueError(
+            "frozen contract and unresolved questions exceed the 12,000 character context budget"
+        )
+    return critical_section, pending, rule_snapshot
+
+
+def _conversation_context_sections(
+    workspace: Path,
+    worktree: Path,
+    store: ControlStore,
+    *,
+    conversation_id: str,
+    task: str,
+    checkpoint: Mapping[str, Any] | None,
+) -> tuple[list[tuple[str, str]], dict[str, Any]]:
+    assignments = store.list_assignments(conversation_id)
+    assignment_outputs = "\n".join(
+        json.dumps(
+            {
+                "assignment_id": item.get("assignment_id"),
+                "agent_id": item.get("agent_id"),
+                "status": item.get("status"),
+                "report": (item.get("metadata") or {}).get("report"),
+                "changeset_digest": item.get("changeset_digest"),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        for item in assignments
+        if item.get("status") in {"reported", "ready_to_merge", "completed"}
+    )
+    events = store.conversation_events(conversation_id)
+    checkpoint_sequence = int((checkpoint or {}).get("through_sequence") or 0)
+    recent = "\n".join(
+        json.dumps(
+            {"type": item.get("type"), "actor": item.get("actor"), "payload": item.get("payload")},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        for item in events
+        if int(item.get("sequence") or 0) > checkpoint_sequence
+        if item.get("type") in {
+            "user.message", "requirements.ready", "interaction.responded", "assignment.reported"
+        }
+    )
+    repo_map = build_repo_map(worktree, task, max_chars=5_000)
+    hits = retrieve_verified_memory(workspace, store, task, limit=3)
+    memory = "\n".join(
+        f"- [{hit.run_id}] task={hit.task}; subject={hit.subject_digest}; {hit.summary}"
+        for hit in hits
+    )
+    project_rules_path = workspace / "MUXDEV.md"
+    project_rules = (
+        project_rules_path.read_text(encoding="utf-8", errors="replace")[:4_000]
+        if project_rules_path.is_file()
+        else ""
+    )
+    sections = [
+        (
+            "Shared Conversation memory checkpoint",
+            json.dumps(
+                (checkpoint or {}).get("content") or {},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if checkpoint
+            else "",
+        ),
+        ("Dependency Assignment outputs", assignment_outputs),
+        ("Facts after the memory checkpoint", recent),
+        ("Legacy MUXDEV.md advisory guidance", project_rules),
+        ("Deterministic repository map", repo_map),
+        ("Still-verifiable PASS delivery memory", memory),
+    ]
+    return sections, {
+        "assignments": assignments,
+        "hits": hits,
+        "checkpoint_sequence": checkpoint_sequence,
+        "project_rules": project_rules,
+        "repo_map": repo_map,
+    }
+
+
+def _render_context_sections(
+    critical_section: str,
+    sections: list[tuple[str, str]],
+    *,
+    max_chars: int,
+) -> tuple[str, list[str]]:
+    rendered = [critical_section]
+    truncated: list[str] = []
+    remaining = max_chars - len(critical_section) - 2
+    for title, body in sections:
+        if not body or remaining <= len(title) + 6:
+            continue
+        header = f"## {title}\n"
+        clipped = _clip(body, remaining - len(header))
+        if clipped != body:
+            truncated.append(title)
+        rendered.append(header + clipped)
+        remaining -= len(header) + len(clipped) + 2
+    text = "\n\n".join(rendered)
+    return text, truncated
 
 
 def retrieve_verified_memory(

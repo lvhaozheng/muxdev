@@ -15,6 +15,13 @@ def test_builtin_agent_config_is_valid(workspace):
     registry = AgentRegistry(workspace, config=config)
     assert registry.get("codex").can_orchestrate is True
     assert registry.adapter_for("codex").supports_resume is True
+    assert registry.adapter_for("codex").requires_pty is True
+    assert registry.adapter_for("claude-code").requires_pty is True
+    assert registry.adapter_for("qwen").requires_pty is True
+    assert registry.adapter_for("kimi").requires_pty is True
+    assert registry.get("qwen").can_orchestrate is True
+    assert registry.get("kimi").can_orchestrate is True
+    assert registry.adapter_for("mock").requires_pty is False
 
 
 def test_cli_adapter_rejects_shell_text_and_unknown_placeholders():
@@ -57,3 +64,91 @@ def test_orchestration_plan_rejects_cycles():
                 ],
             }
         )
+
+
+def test_agent_registry_resolves_windows_script_invocation(workspace, monkeypatch):
+    config = load_config(workspace)
+    registry = AgentRegistry(workspace, config=config)
+    monkeypatch.setattr(
+        registry,
+        "_resolve_executable",
+        lambda command: (
+            r"C:\Tools\codex.CMD" if command == "codex" else r"C:\Python\python.exe"
+        ),
+    )
+    monkeypatch.setattr(
+        "muxdev.services.agents.script_invocation",
+        lambda command, args: ["launcher", command, *args],
+    )
+
+    argv = registry.build_argv("codex", worktree=workspace)
+
+    assert argv[:3] == ["launcher", r"C:\Tools\codex.CMD", "--no-alt-screen"]
+    assert argv[-2:] == ["-C", str(workspace.resolve())]
+
+
+def test_unavailable_agent_is_rejected_before_conversation_creation(
+    workspace, monkeypatch
+):
+    registry = AgentRegistry(workspace)
+    monkeypatch.setattr(registry, "_resolve_executable", lambda _command: None)
+
+    with pytest.raises(ValueError, match="当前不可用"):
+        registry.require_available("claude-code")
+
+
+def test_agent_registry_auto_detects_supported_provider_commands(
+    workspace, monkeypatch
+):
+    registry = AgentRegistry(workspace)
+    resolved = {
+        "codex": r"C:\Tools\codex.CMD",
+        "claude-code": r"C:\Tools\claude-code.CMD",
+        "qwen": r"C:\Tools\qwen.PS1",
+    }
+    monkeypatch.setattr(
+        registry,
+        "_resolve_executable",
+        lambda command: resolved.get(command),
+    )
+    monkeypatch.setattr(
+        "muxdev.services.agents._terminal_capabilities",
+        lambda **_kwargs: {
+            "backend": "conpty",
+            "pty": True,
+            "resize": True,
+            "process_resume": False,
+            "degraded": False,
+            "degradation_reason": None,
+        },
+    )
+
+    agents = {item["agent_id"]: item for item in registry.list()}
+
+    assert agents["qwen"]["available"] is True
+    assert agents["qwen"]["installed"] is True
+    assert agents["qwen"]["detected_command"] == "qwen"
+    assert agents["qwen"]["provider_id"] == "qwen"
+    assert agents["kimi"]["available"] is False
+    assert agents["kimi"]["command_candidates"] == ["kimi"]
+    assert agents["claude-code"]["available"] is True
+    assert agents["claude-code"]["detected_command"] == "claude-code"
+
+
+def test_agent_registry_launches_the_auto_detected_provider_command(
+    workspace, monkeypatch
+):
+    registry = AgentRegistry(workspace)
+    monkeypatch.setattr(
+        registry,
+        "_resolve_executable",
+        lambda command: r"C:\Tools\qwen.PS1" if command == "qwen" else None,
+    )
+    monkeypatch.setattr(
+        "muxdev.services.agents.script_invocation",
+        lambda command, args: ["launcher", command, *args],
+    )
+
+    argv = registry.build_argv("qwen", worktree=workspace)
+
+    assert argv == ["launcher", r"C:\Tools\qwen.PS1"]

@@ -28,24 +28,42 @@ def test_legacy_interfaces_remain_and_versioned_conversation_contract_is_explici
         "/api/v1/deliveries/{candidate_id}/accept",
         "/api/v1/auth/pair",
     } <= paths
+    project = "/api/v2/projects/{project_id}"
     assert {
-        "/api/v2/agents",
-        "/api/v2/conversations",
-        "/api/v2/conversations/{conversation_id}/messages",
-        "/api/v2/conversations/{conversation_id}/orchestration/approve",
-        "/api/v2/assignments/{assignment_id}/retry",
-        "/api/v2/sessions/{session_id}/terminal",
-    } <= paths
-    assert len(product_routes) == 47
+        "/api/v2/projects",
+        "/api/v2/rules",
+        f"{project}/agents",
+        f"{project}/conversations",
+        f"{project}/conversations/{{conversation_id}}/messages",
+        f"{project}/conversations/{{conversation_id}}/execute",
+        f"{project}/conversations/{{conversation_id}}/interactions/{{interaction_id}}/respond",
+        f"{project}/conversations/{{conversation_id}}/orchestration/approve",
+        f"{project}/assignments/{{assignment_id}}/retry",
+        f"{project}/sessions/{{session_id}}/resume",
+        f"{project}/sessions/{{session_id}}/restart",
+        f"{project}/sessions/{{session_id}}/interrupt",
+        f"{project}/sessions/{{session_id}}/terminal",
+        f"{project}/conversations/{{conversation_id}}/snapshot",
+        f"{project}/conversations/{{conversation_id}}/stream",
+        f"{project}/conversations/{{conversation_id}}/changes",
+        f"{project}/conversations/{{conversation_id}}/file",
+        f"{project}/conversations/{{conversation_id}}/review",
+        f"{project}/conversations/{{conversation_id}}/replay",
+        f"{project}/sessions/{{session_id}}/preview",
+        f"{project}/deliveries/{{candidate_id}}/discard",
+        } <= paths
+    assert "/api/v2/conversations" not in paths
+    assert f"{project}/conversations/{{conversation_id}}/room" not in paths
+    assert len(product_routes) >= 59
     assert len(server_manifest()["tools"]) == 8
-    assert _leaf_count(get_command(app)) == 40
+    assert _leaf_count(get_command(app)) == 46
     tools = server_manifest()["tools"]
     assert all(item["inputSchema"].get("additionalProperties") is False for item in tools)
 
 
 def test_http_and_mcp_read_surfaces(workspace: Path) -> None:
     client = TestClient(create_app(workspace))
-    assert client.get("/health").json()["tables"] == 22
+    assert client.get("/health").json()["tables"] == 31
     response = handle_jsonrpc({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, workspace=workspace)
     assert len(response["result"]["tools"]) == 8
 

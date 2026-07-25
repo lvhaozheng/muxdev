@@ -31,9 +31,13 @@ CONVERSATION_SCHEMA_STATEMENTS = (
     )""",
     """CREATE TABLE IF NOT EXISTS conversation_events(
       event_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, run_id TEXT,
-      run_event_id TEXT, actor TEXT NOT NULL, type TEXT NOT NULL, sequence INTEGER NOT NULL,
-      created_at TEXT NOT NULL, payload TEXT NOT NULL, previous_hash TEXT NOT NULL,
-      event_hash TEXT NOT NULL, UNIQUE(conversation_id, sequence),
+      run_event_id TEXT, actor TEXT NOT NULL, actor_kind TEXT, actor_id TEXT,
+      assignment_id TEXT, session_id TEXT, generation INTEGER,
+      schema_version INTEGER NOT NULL DEFAULT 1, type TEXT NOT NULL,
+      sequence INTEGER NOT NULL, created_at TEXT NOT NULL,
+      capture_grade TEXT NOT NULL DEFAULT 'recorded', correlation_id TEXT,
+      payload TEXT NOT NULL, previous_hash TEXT NOT NULL, event_hash TEXT NOT NULL,
+      UNIQUE(conversation_id, sequence),
       FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id)
     )""",
     """CREATE TABLE IF NOT EXISTS delivery_contracts(
@@ -88,6 +92,86 @@ def _decode(row: Any, *json_fields: str) -> dict[str, Any] | None:
             except json.JSONDecodeError:
                 pass
     return result
+
+
+def _actor_kind(actor: str) -> str:
+    if actor == "developer":
+        return "developer"
+    if actor in {"runtime", "supervisor", "system"}:
+        return "runtime"
+    return "agent"
+
+
+def _v2_fact(
+    *,
+    event_id: str,
+    conversation_id: str,
+    sequence: int,
+    event_type: str,
+    actor_kind: str,
+    actor_id: str,
+    run_id: str | None,
+    assignment_id: str | None,
+    session_id: str | None,
+    generation: int | None,
+    occurred_at: str,
+    capture_grade: str,
+    correlation_id: str | None,
+    payload: Mapping[str, object],
+    previous_hash: str,
+) -> dict[str, object]:
+    return {
+        "event_id": event_id,
+        "conversation_id": conversation_id,
+        "sequence": sequence,
+        "schema_version": 2,
+        "type": event_type,
+        "actor": {"kind": actor_kind, "id": actor_id},
+        "source": {
+            "run_id": run_id,
+            "assignment_id": assignment_id,
+            "session_id": session_id,
+            "generation": generation,
+        },
+        "occurred_at": occurred_at,
+        "capture_grade": capture_grade,
+        "correlation_id": correlation_id,
+        "payload": dict(payload),
+        "previous_hash": previous_hash,
+    }
+
+
+def _activity_view(row: Mapping[str, Any]) -> dict[str, Any]:
+    payload = dict(row.get("payload") or {})
+    if int(row.get("schema_version") or 1) == 1:
+        payload.setdefault("_legacy_schema_version", 1)
+    return {
+        "event_id": str(row["event_id"]),
+        "conversation_id": str(row["conversation_id"]),
+        "sequence": int(row["sequence"]),
+        "schema_version": 2,
+        "type": str(row["type"]),
+        "actor": {
+            "kind": str(row.get("actor_kind") or _actor_kind(str(row["actor"]))),
+            "id": str(row.get("actor_id") or row["actor"]),
+        },
+        "source": {
+            "run_id": str(row["run_id"]) if row.get("run_id") else None,
+            "assignment_id": (
+                str(row["assignment_id"]) if row.get("assignment_id") else None
+            ),
+            "session_id": str(row["session_id"]) if row.get("session_id") else None,
+            "generation": int(row["generation"]) if row.get("generation") else None,
+        },
+        "occurred_at": str(row["created_at"]),
+        "capture_grade": str(row.get("capture_grade") or "recorded"),
+        "correlation_id": (
+            str(row["correlation_id"]) if row.get("correlation_id") else None
+        ),
+        "payload": payload,
+        "previous_hash": str(row["previous_hash"]),
+        "event_hash": str(row["event_hash"]),
+    }
 
 
 class ConversationStoreMixin:
@@ -191,42 +275,82 @@ class ConversationStoreMixin:
         run_id: str | None = None,
         run_event_id: str | None = None,
         event_id: str | None = None,
+        assignment_id: str | None = None,
+        session_id: str | None = None,
+        generation: int | None = None,
+        correlation_id: str | None = None,
+        capture_grade: str = "recorded",
+        actor_kind: str | None = None,
+        schema_version: int = 2,
     ) -> str:
-        previous = self.connection.execute(
-            "SELECT event_hash FROM conversation_events WHERE conversation_id = ? ORDER BY sequence DESC LIMIT 1",
-            (conversation_id,),
-        ).fetchone()
-        previous_hash = str(previous[0]) if previous else "sha256:" + "0" * 64
-        sequence = int(self.connection.execute(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM conversation_events WHERE conversation_id = ?",
-            (conversation_id,),
-        ).fetchone()[0])
-        created_at = _now()
+        if schema_version != 2:
+            raise ValueError("new Conversation events must use schema_version 2")
+        if capture_grade not in {"recorded", "observed", "verified"}:
+            raise ValueError(f"unsupported capture grade: {capture_grade}")
+        actor_kind = actor_kind or _actor_kind(actor)
         event_id = event_id or f"cevt_{uuid4().hex}"
-        fact = {
-            "event_id": event_id,
-            "conversation_id": conversation_id,
-            "run_id": run_id,
-            "run_event_id": run_event_id,
-            "actor": actor,
-            "type": event_type,
-            "sequence": sequence,
-            "created_at": created_at,
-            "payload": dict(payload),
-            "previous_hash": previous_hash,
-        }
-        event_hash = "sha256:" + hashlib.sha256(_json(fact).encode()).hexdigest()
-        self.connection.execute(
-            """INSERT INTO conversation_events(
-              event_id, conversation_id, run_id, run_event_id, actor, type, sequence,
-              created_at, payload, previous_hash, event_hash
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                event_id, conversation_id, run_id, run_event_id, actor, event_type, sequence,
-                created_at, _json(payload), previous_hash, event_hash,
-            ),
-        )
-        self.connection.commit()
+        with self.transaction() as conn:
+            previous = conn.execute(
+                """SELECT event_hash FROM conversation_events
+                   WHERE conversation_id = ? ORDER BY sequence DESC LIMIT 1""",
+                (conversation_id,),
+            ).fetchone()
+            previous_hash = str(previous[0]) if previous else "sha256:" + "0" * 64
+            sequence = int(conn.execute(
+                """SELECT COALESCE(MAX(sequence), 0) + 1
+                   FROM conversation_events WHERE conversation_id = ?""",
+                (conversation_id,),
+            ).fetchone()[0])
+            created_at = _now()
+            fact = _v2_fact(
+                event_id=event_id,
+                conversation_id=conversation_id,
+                sequence=sequence,
+                event_type=event_type,
+                actor_kind=actor_kind,
+                actor_id=actor,
+                run_id=run_id,
+                assignment_id=assignment_id,
+                session_id=session_id,
+                generation=generation,
+                occurred_at=created_at,
+                capture_grade=capture_grade,
+                correlation_id=correlation_id,
+                payload=payload,
+                previous_hash=previous_hash,
+            )
+            event_hash = "sha256:" + hashlib.sha256(_json(fact).encode()).hexdigest()
+            conn.execute(
+                """INSERT INTO conversation_events(
+                  event_id, conversation_id, run_id, run_event_id, actor,
+                  actor_kind, actor_id, assignment_id, session_id, generation,
+                  schema_version, type, sequence, created_at, capture_grade,
+                  correlation_id, payload, previous_hash, event_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    event_id,
+                    conversation_id,
+                    run_id,
+                    run_event_id,
+                    actor,
+                    actor_kind,
+                    actor,
+                    assignment_id,
+                    session_id,
+                    generation,
+                    event_type,
+                    sequence,
+                    created_at,
+                    capture_grade,
+                    correlation_id,
+                    _json(payload),
+                    previous_hash,
+                    event_hash,
+                ),
+            )
+        from .activity_feed import activity_feed
+
+        activity_feed.publish(self.workspace, conversation_id, sequence)
         return event_id
 
     def claim_conversation_action(
@@ -258,14 +382,54 @@ class ConversationStoreMixin:
         ).fetchall()
         return [_decode(row, "payload") or {} for row in rows]
 
+    def conversation_activity(
+        self,
+        conversation_id: str,
+        *,
+        after: int = 0,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """SELECT * FROM (
+                 SELECT * FROM conversation_events
+                 WHERE conversation_id = ? AND sequence > ?
+                 ORDER BY sequence DESC LIMIT ?
+               ) ORDER BY sequence""",
+            (conversation_id, after, max(1, min(limit, 1000))),
+        ).fetchall()
+        return [_activity_view(_decode(row, "payload") or {}) for row in rows]
+
     def verify_conversation_event_chain(self, conversation_id: str) -> tuple[bool, list[str]]:
         errors: list[str] = []
         expected_previous = "sha256:" + "0" * 64
         for row in self.conversation_events(conversation_id):
-            fact = {key: row[key] for key in (
-                "event_id", "conversation_id", "run_id", "run_event_id", "actor", "type",
-                "sequence", "created_at", "payload", "previous_hash",
-            )}
+            if int(row.get("schema_version") or 1) == 1:
+                fact = {key: row[key] for key in (
+                    "event_id", "conversation_id", "run_id", "run_event_id", "actor", "type",
+                    "sequence", "created_at", "payload", "previous_hash",
+                )}
+            else:
+                fact = _v2_fact(
+                    event_id=str(row["event_id"]),
+                    conversation_id=str(row["conversation_id"]),
+                    sequence=int(row["sequence"]),
+                    event_type=str(row["type"]),
+                    actor_kind=str(row.get("actor_kind") or _actor_kind(str(row["actor"]))),
+                    actor_id=str(row.get("actor_id") or row["actor"]),
+                    run_id=str(row["run_id"]) if row.get("run_id") else None,
+                    assignment_id=(
+                        str(row["assignment_id"]) if row.get("assignment_id") else None
+                    ),
+                    session_id=str(row["session_id"]) if row.get("session_id") else None,
+                    generation=int(row["generation"]) if row.get("generation") else None,
+                    occurred_at=str(row["created_at"]),
+                    capture_grade=str(row.get("capture_grade") or "recorded"),
+                    correlation_id=(
+                        str(row["correlation_id"]) if row.get("correlation_id") else None
+                    ),
+                    payload=row.get("payload") if isinstance(row.get("payload"), dict) else {},
+                    previous_hash=str(row["previous_hash"]),
+                )
             expected_hash = "sha256:" + hashlib.sha256(_json(fact).encode()).hexdigest()
             if row["previous_hash"] != expected_previous:
                 errors.append(f"conversation event {row['event_id']} has an invalid previous hash")

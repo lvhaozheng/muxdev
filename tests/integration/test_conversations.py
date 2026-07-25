@@ -33,7 +33,7 @@ def test_conversation_defers_workspace_delivery_until_acceptance(workspace) -> N
     service.accept_delivery(conversation_id, candidate["candidate_id"])
     delivered = service.get(conversation_id)
 
-    assert delivered["conversation"]["status"] == "delivered"
+    assert delivered["conversation"]["status"] == "idle"
     assert delivered["candidates"][-1]["status"] == "accepted"
     assert delivered["active_delivery"]["status_label"] == "已写入项目"
     assert (workspace / "muxdev_mock_change.txt").is_file()

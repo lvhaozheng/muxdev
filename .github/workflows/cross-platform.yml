@@ -76,6 +76,31 @@ jobs:
           tests/integration/test_interfaces.py
           tests/unit/test_trusted_harness.py
 
+  web:
+    name: web / source-assets-e2e / ubuntu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: Install Web and daemon dependencies
+        run: |
+          python -m pip install -e ".[test]"
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Build Web assets and verify the committed package is current
+        run: |
+          npm run typecheck:web
+          npm run build:web
+          git diff --exit-code -- src/muxdev/api/static/app
+      - name: Run responsive Conversation Workbench checks
+        run: npm run test:e2e
+
   release:
     name: release / replay-security-package / py3.12
     runs-on: ubuntu-latest

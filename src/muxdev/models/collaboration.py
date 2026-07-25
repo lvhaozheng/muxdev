@@ -68,6 +68,7 @@ class CliAdapterDefinition(BaseModel):
     model_arg: str | None = None
     env_allowlist: list[str] = Field(default_factory=list)
     supports_pty: bool = True
+    requires_pty: bool = False
     supports_resize: bool = True
     supports_resume: bool = False
     native_session_id_pattern: str | None = None
@@ -85,6 +86,8 @@ class CliAdapterDefinition(BaseModel):
                     raise ValueError(f"unsupported CLI argv placeholder: {token}")
         if self.supports_resume and not self.resume_command:
             raise ValueError("resume-capable CLI adapters require resume_command")
+        if self.requires_pty and not self.supports_pty:
+            raise ValueError("PTY-required CLI adapters must support PTY")
         if len(self.env_allowlist) != len(set(self.env_allowlist)):
             raise ValueError("CLI environment allowlist entries must be unique")
         if any(not _ENV_NAME.fullmatch(name) for name in self.env_allowlist):
@@ -186,3 +189,50 @@ class OrchestrationPlanV1(BaseModel):
             visit(node_id)
         return self
 
+
+class OrchestrationNodeV2(OrchestrationNodeV1):
+    """A plan node that declares whether Muxdev or the primary CLI owns execution."""
+
+    executor_kind: Literal["agent_session", "native_subagent"] = "agent_session"
+    parent_agent_id: str | None = Field(default=None, min_length=1, max_length=80)
+
+    @model_validator(mode="after")
+    def validate_executor(self) -> "OrchestrationNodeV2":
+        if self.executor_kind == "native_subagent":
+            if not self.parent_agent_id:
+                object.__setattr__(self, "parent_agent_id", self.agent_id)
+            if self.agent_id != self.parent_agent_id:
+                raise ValueError(
+                    "native subagent nodes execute inside the declared parent Agent Session"
+                )
+        elif self.parent_agent_id:
+            raise ValueError("agent_session nodes cannot declare parent_agent_id")
+        return self
+
+
+class OrchestrationPlanV2(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["muxdev.orchestration-plan.v2"] = (
+        "muxdev.orchestration-plan.v2"
+    )
+    summary: str = Field(min_length=1)
+    nodes: list[OrchestrationNodeV2] = Field(min_length=1)
+    max_parallel: int = Field(default=4, ge=1, le=4)
+
+    @model_validator(mode="after")
+    def validate_graph(self) -> "OrchestrationPlanV2":
+        OrchestrationPlanV1.model_validate(
+            {
+                "summary": self.summary,
+                "max_parallel": self.max_parallel,
+                "nodes": [
+                    node.model_dump(
+                        exclude={"executor_kind", "parent_agent_id"},
+                        mode="json",
+                    )
+                    for node in self.nodes
+                ],
+            }
+        )
+        return self

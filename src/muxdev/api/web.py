@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from ..application import TaskService
 from ..providers import detect_providers
-from ..runtime import RunEngine
+from ..runtime import ConversationService, RunEngine
+from ..runtime.collaboration_service import CollaborationService
 from ..services.evidence_verify import verify_evidence_report
 from ..services.router import ProviderRouter
 from ..services.skills import scan_skills
@@ -22,7 +25,9 @@ from ..storage import ControlStore
 from .auth import WebAuthMiddleware, router as auth_router
 from .conversations import router as conversations_router
 from .collaboration import router as collaboration_router
-from .conversation_dashboard import conversation_dashboard_html
+from .conversation_experience import router as conversation_experience_router
+from .projects import router as projects_router
+from ..workbench import WorkbenchRegistry
 
 
 router = APIRouter()
@@ -70,9 +75,43 @@ def _report_path(run: dict[str, Any], workspace: Path) -> Path:
     return Path(str(metadata.get("run_dir") or workspace / ".muxdev" / "runs" / run["run_id"])) / "evidence-report.json"
 
 
-@router.get("/", response_class=HTMLResponse)
-def dashboard() -> str:
-    return conversation_dashboard_html()
+def _conversation_app_response() -> FileResponse:
+    path = Path(__file__).with_name("static") / "app" / "index.html"
+    if not path.is_file():
+        raise HTTPException(
+            503,
+            "Conversation SPA assets are not built; run npm run build:web",
+        )
+    return FileResponse(
+        path,
+        media_type="text/html",
+        headers={
+            "Content-Security-Policy": (
+                "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+                "img-src 'self' data:; font-src 'self' data:; connect-src 'self' ws: wss:; "
+                "frame-src http://127.0.0.1:* http://localhost:*; object-src 'none'; "
+                "base-uri 'self'; frame-ancestors 'self'"
+            )
+        },
+    )
+
+
+@router.get("/")
+def dashboard():
+    return _conversation_app_response()
+
+
+@router.get("/app")
+def conversation_app() -> FileResponse:
+    return _conversation_app_response()
+
+
+@router.get("/projects/{project_id}")
+def project_app(project_id: str, request: Request) -> FileResponse:
+    if not request.app.state.workbench.store.get_project(project_id):
+        raise HTTPException(404, f"project not found: {project_id}")
+    request.app.state.workbench.store.update_project(project_id, touch=True)
+    return _conversation_app_response()
 
 
 @router.get("/health")
@@ -224,12 +263,58 @@ def replay_route(run_id: str, request: Request) -> dict[str, Any]:
 def create_app(
     workspace: Path | None = None,
     *,
+    workbench: WorkbenchRegistry | None = None,
+    instance_id: str | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8765,
     require_auth: bool = False,
     pairing_code: str | None = None,
     trusted_origins: tuple[str, ...] = (),
 ) -> FastAPI:
-    application = FastAPI(title="muxdev", version="4")
-    application.state.workspace = (workspace or Path.cwd()).resolve()
+    resolved_workspace = (workspace or Path.cwd()).resolve()
+    registry = workbench or WorkbenchRegistry.local(resolved_workspace)
+    initial_project = registry.register(resolved_workspace)
+
+    async def schedule_capacity_queue() -> None:
+        cursor = 0
+        while True:
+            projects = registry.store.list_projects()
+            if projects:
+                offset = cursor % len(projects)
+                projects = projects[offset:] + projects[:offset]
+                cursor += 1
+            for project in projects:
+                path = Path(str(project["path"]))
+                if not path.is_dir():
+                    continue
+                engine = RunEngine(path)
+                try:
+                    CollaborationService(
+                        ConversationService(engine, engine.store),
+                        engine.store,
+                    ).schedule_queued()
+                finally:
+                    engine.store.close()
+            await asyncio.sleep(0.5)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        registry.reconcile()
+        scheduler = asyncio.create_task(schedule_capacity_queue())
+        try:
+            yield
+        finally:
+            scheduler.cancel()
+            with suppress(asyncio.CancelledError):
+                await scheduler
+
+    application = FastAPI(title="muxdev", version="4", lifespan=lifespan)
+    application.state.workspace = resolved_workspace
+    application.state.workbench = registry
+    application.state.initial_project_id = str(initial_project["project_id"])
+    application.state.instance_id = instance_id or f"daemon_{uuid4().hex}"
+    application.state.host = host
+    application.state.port = port
     application.state.require_auth = require_auth
     application.state.pairing_code = pairing_code
     application.state.trusted_origins = trusted_origins
@@ -241,14 +326,18 @@ def create_app(
     )
     application.include_router(router)
     application.include_router(auth_router)
+    application.include_router(projects_router)
     application.include_router(conversations_router)
     application.include_router(collaboration_router)
+    application.include_router(conversation_experience_router)
+
     return application
 
 
 def write_dashboard(workspace: Path, output: Path) -> Path:
     del workspace
-    output.write_text(conversation_dashboard_html(), encoding="utf-8")
+    source = Path(__file__).with_name("static") / "app" / "index.html"
+    output.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
     return output
 
 

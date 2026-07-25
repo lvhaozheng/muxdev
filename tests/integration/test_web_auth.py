@@ -48,3 +48,15 @@ def test_remote_web_requires_pairing_and_uses_device_session(workspace) -> None:
     })
     assert reused.status_code == 401
 
+    devices = client.get("/api/v1/devices")
+    assert devices.status_code == 200
+    assert [item["label"] for item in devices.json()] == ["phone"]
+    device_id = devices.json()[0]["device_id"]
+    assert client.delete(f"/api/v1/devices/{device_id}").status_code == 403
+    revoked = client.delete(
+        f"/api/v1/devices/{device_id}",
+        headers={"origin": "https://muxdev.example"},
+    )
+    assert revoked.status_code == 200
+    assert revoked.json()["status"] == "revoked"
+    assert client.get("/api/v1/conversations").status_code == 401

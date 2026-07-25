@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 from uuid import uuid4
 
 from ..models import (
@@ -14,11 +13,23 @@ from ..models import (
     ConversationMode,
     OrchestrationPlanStatus,
     OrchestrationPlanV1,
+    OrchestrationPlanV2,
 )
 from ..models.evidence import canonical_hash
 from ..services.agents import AgentRegistry
+from ..services.context import build_conversation_context_pack
 from ..storage import ControlStore
-from .agent_sessions import AgentSessionManager, agent_session_manager
+from .agent_sessions import (
+    AgentSessionManager,
+    agent_session_manager,
+)
+from .collaboration_requirements import CollaborationRequirementsMixin
+from .collaboration_scheduling import CollaborationSchedulingMixin
+from .change_tracking import (
+    ChangeTrackingContext,
+    ChangeTrackingService,
+    change_monitors,
+)
 from .conversation_service import ConversationService
 from .workspace import (
     ChangeSet,
@@ -30,7 +41,6 @@ from .workspace import (
 from .worktree import WorktreeManager
 
 
-_MENTION = re.compile(r"(?:^|\s)@([A-Za-z0-9][A-Za-z0-9_-]{0,79})")
 _ACTIVE_ASSIGNMENT_STATES = {
     AssignmentStatus.QUEUED.value,
     AssignmentStatus.RUNNING.value,
@@ -43,7 +53,10 @@ _ACTIVE_ASSIGNMENT_STATES = {
 
 
 @dataclass
-class CollaborationService:
+class CollaborationService(
+    CollaborationSchedulingMixin,
+    CollaborationRequirementsMixin,
+):
     conversations: ConversationService
     store: ControlStore
 
@@ -52,178 +65,6 @@ class CollaborationService:
         self.registry = AgentRegistry(self.workspace)
         self.sessions: AgentSessionManager = agent_session_manager(self.workspace)
 
-    def create(
-        self,
-        goal: str,
-        *,
-        mode: str = ConversationMode.DIRECT.value,
-        agent_id: str | None = None,
-        orchestrator_agent_id: str | None = None,
-        title: str | None = None,
-        acceptance_criteria: list[str] | None = None,
-        allowed_scope: list[str] | None = None,
-        profile: str = "standard",
-        delivery_standard: Mapping[str, object] | None = None,
-        max_cost_usd: float = 0.5,
-        max_parallel: int = 4,
-    ) -> dict[str, Any]:
-        parsed_mode = ConversationMode(mode)
-        if parsed_mode == ConversationMode.LEGACY_PIPELINE:
-            return self.conversations.create(
-                goal,
-                title=title,
-                acceptance_criteria=acceptance_criteria,
-                allowed_scope=allowed_scope,
-                profile=profile,
-                provider=agent_id or "mock",
-                max_cost_usd=max_cost_usd,
-            )
-        max_parallel = max(1, min(int(max_parallel), 4))
-        primary_id = agent_id or (orchestrator_agent_id if parsed_mode == ConversationMode.ORCHESTRATED else "mock")
-        primary = self.registry.get(str(primary_id))
-        orchestrator = None
-        if parsed_mode == ConversationMode.ORCHESTRATED:
-            orchestrator = self.registry.get(orchestrator_agent_id or primary.agent_id)
-            if not orchestrator.can_orchestrate:
-                raise ValueError(f"agent cannot orchestrate: {orchestrator.agent_id}")
-        detail = self.conversations.create(
-            goal,
-            title=title,
-            acceptance_criteria=acceptance_criteria,
-            allowed_scope=allowed_scope,
-            profile=profile,
-            provider=primary.agent_id,
-            max_cost_usd=max_cost_usd,
-        )
-        conversation_id = str(detail["conversation"]["conversation_id"])
-        if delivery_standard is not None:
-            detail = self.conversations.revise_contract(
-                conversation_id, {"delivery_standard": dict(delivery_standard)}
-            )
-        self.store.update_conversation(
-            conversation_id,
-            mode=parsed_mode.value,
-            primary_agent_id=primary.agent_id,
-            orchestrator_agent_id=orchestrator.agent_id if orchestrator else None,
-            metadata={"max_parallel": max_parallel, "cli_native": True},
-        )
-        self.store.append_conversation_event(
-            conversation_id,
-            "conversation.mode_selected",
-            {
-                "mode": parsed_mode.value,
-                "primary_agent_id": primary.agent_id,
-                "orchestrator_agent_id": orchestrator.agent_id if orchestrator else None,
-                "max_parallel": max_parallel,
-            },
-            actor="developer",
-        )
-        contract = self._active_contract(conversation_id)
-        if parsed_mode == ConversationMode.DIRECT:
-            assignment = self._create_assignment(
-                conversation_id=conversation_id,
-                agent_id=primary.agent_id,
-                dispatch_kind="direct",
-                work_mode="write",
-                status=AssignmentStatus.QUEUED.value,
-                title=str(detail["conversation"]["title"]),
-                brief=goal,
-                allowed_scope=list(contract["allowed_scope"]),
-                deliverables=["完成任务目标并报告改动内容"],
-                completion=list(contract["acceptance_criteria"]),
-                proof=["内容寻址 ChangeSet", "Runtime 确定性检查", "独立交付评审"],
-            )
-            self._start_assignment(assignment)
-        else:
-            assignment = self._create_assignment(
-                conversation_id=conversation_id,
-                agent_id=orchestrator.agent_id,
-                dispatch_kind="orchestrate",
-                work_mode="consult",
-                status=AssignmentStatus.QUEUED.value,
-                title="提出多 Agent 编排计划",
-                brief=goal,
-                allowed_scope=list(contract["allowed_scope"]),
-                deliverables=["可确认的 OrchestrationPlanV1"],
-                completion=["计划无环、覆盖任务契约并显式分配 Agent"],
-                proof=["Runtime 校验通过的计划版本"],
-            )
-            self._start_assignment(assignment)
-        return self.get(conversation_id)
-
-    def get(self, conversation_id: str) -> dict[str, Any]:
-        detail = self.conversations.get(conversation_id)
-        conversation = detail["conversation"]
-        detail.update(
-            {
-                "participants": self._participants(conversation_id),
-                "plans": self.store.list_orchestration_plans(conversation_id),
-                "assignments": self._assignments_with_dependencies(conversation_id),
-                "sessions": self.store.list_agent_sessions(conversation_id),
-                "timeline": self.store.conversation_events(conversation_id),
-                "mode": conversation.get("mode", ConversationMode.LEGACY_PIPELINE.value),
-            }
-        )
-        return detail
-
-    def add_message(
-        self,
-        conversation_id: str,
-        content: str,
-        *,
-        recipients: Sequence[str] | None = None,
-        dispatch_kind: str | None = None,
-    ) -> dict[str, Any]:
-        conversation = self._conversation(conversation_id)
-        content = content.strip()
-        if not content:
-            raise ValueError("message content is required")
-        requested = list(dict.fromkeys([*(recipients or []), *_MENTION.findall(content)]))
-        if not requested:
-            requested = [str(conversation.get("primary_agent_id") or "")]
-        requested = [item for item in requested if item]
-        event_id = self.store.append_conversation_event(
-            conversation_id,
-            "user.message",
-            {
-                "content": content,
-                "recipients": requested,
-                "dispatch_kind": dispatch_kind or "message",
-            },
-            actor="developer",
-        )
-        routed: list[dict[str, str]] = []
-        for recipient in requested:
-            self.registry.get(recipient)
-            active = next(
-                (
-                    item for item in reversed(self.store.list_assignments(conversation_id))
-                    if item["agent_id"] == recipient and item["status"] in _ACTIVE_ASSIGNMENT_STATES
-                ),
-                None,
-            )
-            if active and dispatch_kind not in {"consult", "write"}:
-                session = self._session_for_assignment(str(active["assignment_id"]))
-                if session:
-                    self.sessions.send_runtime(str(session["session_id"]), content)
-                    routed.append({"agent_id": recipient, "assignment_id": str(active["assignment_id"])})
-                    continue
-            kind = dispatch_kind or "consult"
-            assignment = self.dispatch(
-                conversation_id,
-                {
-                    "agent_id": recipient,
-                    "dispatch_kind": kind,
-                    "work_mode": "write" if kind == "write" else "consult",
-                    "title": f"定向协作：{content[:60]}",
-                    "brief": content,
-                    "deliverables": ["面向发起者的结构化回报"],
-                    "completion": ["回答定向问题或完成声明范围"],
-                    "proof": ["Agent report manifest"],
-                },
-            )
-            routed.append({"agent_id": recipient, "assignment_id": str(assignment["assignment_id"])})
-        return {"event_id": event_id, "recipients": routed}
 
     def propose_plan(
         self,
@@ -242,7 +83,7 @@ class CollaborationService:
         orchestrator = self.registry.get(actor)
         if not orchestrator.can_orchestrate:
             raise ValueError(f"agent cannot orchestrate: {actor}")
-        plan = OrchestrationPlanV1.model_validate(value)
+        plan = self._parse_plan(value)
         for node in plan.nodes:
             self.registry.get(node.agent_id)
         existing = self.store.list_orchestration_plans(conversation_id)
@@ -293,16 +134,24 @@ class CollaborationService:
                 deliverables=node.deliverables,
                 completion=node.completion,
                 proof=node.proof,
-                metadata={"role": node.role, "plan_version": version},
+                metadata={
+                    "role": node.role,
+                    "plan_version": version,
+                    "executor_kind": str(
+                        getattr(node, "executor_kind", "agent_session")
+                    ),
+                    "parent_agent_id": getattr(node, "parent_agent_id", None),
+                },
             )
         for node in plan.nodes:
             self.store.add_assignment_dependencies(
                 str(node_assignments[node.id]["assignment_id"]),
                 [str(node_assignments[item]["assignment_id"]) for item in node.dependencies],
             )
+        requires_confirmation = str(contract.get("profile") or "standard") != "lite"
         self.store.update_conversation(
             conversation_id,
-            status="needs_user",
+            status="needs_user" if requires_confirmation else "working",
             active_plan_id=plan_id,
         )
         self.store.append_conversation_event(
@@ -311,9 +160,21 @@ class CollaborationService:
             {"plan_id": plan_id, "version": version, "plan": plan.model_dump(mode="json")},
             actor=actor,
         )
-        return stored
+        if not requires_confirmation:
+            return self.approve_plan(
+                conversation_id,
+                plan_id,
+                actor="runtime",
+            )
+        return {**stored, "requires_confirmation": True}
 
-    def approve_plan(self, conversation_id: str, plan_id: str) -> dict[str, Any]:
+    def approve_plan(
+        self,
+        conversation_id: str,
+        plan_id: str,
+        *,
+        actor: str = "developer",
+    ) -> dict[str, Any]:
         conversation = self._conversation(conversation_id)
         if str(conversation.get("active_plan_id") or "") != plan_id:
             raise ValueError("only the active orchestration plan can be approved")
@@ -337,7 +198,7 @@ class CollaborationService:
             conversation_id,
             "orchestration.plan_approved",
             {"plan_id": plan_id, "version": plan["version"], "approved_at": approved_at},
-            actor="developer",
+            actor=actor,
         )
         self._schedule(conversation_id, plan_id)
         return self.get(conversation_id)
@@ -350,8 +211,8 @@ class CollaborationService:
         orchestrator_agent_id: str | None = None,
     ) -> dict[str, Any]:
         current = self._active_plan(conversation_id)
-        revised = OrchestrationPlanV1.model_validate(value)
-        old = OrchestrationPlanV1.model_validate(current["plan"])
+        revised = self._parse_plan(value)
+        old = self._parse_plan(current["plan"])
         boundary_expansion = self._plan_expands_boundary(old, revised)
         stored = self.propose_plan(
             conversation_id,
@@ -430,6 +291,25 @@ class CollaborationService:
             reported_at=now,
             metadata={"report": dict(manifest)},
         )
+        run_id = str(assignment.get("run_id") or "")
+        session = self._session_for_assignment(assignment_id)
+        if run_id and assignment["work_mode"] == "write":
+            change_monitors.stop(run_id)
+            ChangeTrackingService(self.workspace, self.store).reconcile(
+                ChangeTrackingContext(
+                    conversation_id=str(assignment["conversation_id"]),
+                    run_id=run_id,
+                    assignment_id=assignment_id,
+                    session_id=str((session or {}).get("session_id") or "") or None,
+                    generation=(
+                        int(session["generation"])
+                        if session and session.get("generation")
+                        else None
+                    ),
+                    worktree=Path(str(assignment["worktree"])),
+                    author=str(assignment["agent_id"]),
+                )
+            )
         self.store.append_conversation_event(
             str(assignment["conversation_id"]),
             "assignment.reported",
@@ -454,6 +334,25 @@ class CollaborationService:
         if assignment.get("plan_id"):
             self._drain_merges(conversation_id, str(assignment["plan_id"]))
             self._schedule(conversation_id, str(assignment["plan_id"]))
+        if run_id:
+            stage = next(
+                (item for item in self.store.stages(run_id) if item["stage_id"] == "assignment"),
+                None,
+            )
+            self.store.upsert_stage(
+                run_id,
+                "assignment",
+                role=str(assignment["dispatch_kind"]),
+                provider=str(assignment["agent_id"]),
+                status="completed",
+                attempt=int((stage or {}).get("attempt") or 1),
+                result={"manifest": dict(manifest), "assignment_status": assignment["status"]},
+            )
+            self.store.update_run(run_id, status="completed", current_stage=None)
+        if session and session.get("lane_type") == "main":
+            self.store.update_agent_session(
+                str(session["session_id"]), current_assignment_id=None
+            )
         self._ensure_reviewers_or_finalize(conversation_id)
         return self.store.get_assignment(assignment_id) or assignment
 
@@ -496,11 +395,15 @@ class CollaborationService:
                 self.sessions.close(str(session["session_id"]))
             except RuntimeError:
                 pass
-        return self.store.update_assignment(
+        updated = self.store.update_assignment(
             assignment_id,
             status=AssignmentStatus.CANCELLED.value,
             completed_at=self._now(),
         )
+        if updated.get("run_id"):
+            change_monitors.stop(str(updated["run_id"]))
+            self.store.cancel_run(str(updated["run_id"]))
+        return updated
 
     def authorize_scoped_token(self, raw_token: str, *, assignment_id: str | None = None) -> dict[str, Any]:
         session = self.sessions.authorize_control_token(raw_token)
@@ -541,62 +444,144 @@ class CollaborationService:
         )
         return assignment
 
-    def _start_assignment(self, assignment: Mapping[str, Any], *, recovery: bool = False) -> dict[str, Any]:
+    def _assignment_worktree(
+        self,
+        assignment: Mapping[str, Any],
+        integration: Path,
+    ) -> tuple[Path, str, bool]:
         assignment_id = str(assignment["assignment_id"])
         conversation_id = str(assignment["conversation_id"])
-        conversation = self._conversation(conversation_id)
-        integration = Path(str((conversation.get("metadata") or {}).get("worktree") or ""))
-        if assignment["dispatch_kind"] == "direct":
-            worktree = integration
-            strategy = "conversation_integration"
-        else:
-            assignment_dir = (
-                self.workspace / ".muxdev" / "conversations" / conversation_id / "assignments" / assignment_id
+        use_main_lane = (
+            assignment["dispatch_kind"] in {"direct", "orchestrate"}
+            or assignment["work_mode"] == "consult"
+        )
+        if use_main_lane:
+            main = self.store.find_agent_session(
+                conversation_id, str(assignment["agent_id"]), "main"
             )
-            assignment_dir.mkdir(parents=True, exist_ok=True)
-            prepared = WorktreeManager(
-                integration,
-                worktrees_root=assignment_dir.parent / "worktrees",
-            ).prepare(assignment_id, assignment_dir)
-            worktree, strategy = prepared.path, prepared.strategy
-        baseline = snapshot_workspace(worktree)
-        updated = self.store.update_assignment(
-            assignment_id,
-            status=AssignmentStatus.RUNNING.value,
-            baseline_digest=baseline.digest,
-            worktree=str(worktree),
-            metadata={"baseline_manifest": baseline.to_dict(), "worktree_strategy": strategy},
+            current_id = str((main or {}).get("current_assignment_id") or "")
+            current = self.store.get_assignment(current_id) if current_id else None
+            if (
+                current
+                and current_id != assignment_id
+                and current.get("status") in _ACTIVE_ASSIGNMENT_STATES
+            ):
+                use_main_lane = False
+        if use_main_lane:
+            return integration, "conversation_integration", True
+        assignment_dir = (
+            self.workspace
+            / ".muxdev"
+            / "conversations"
+            / conversation_id
+            / "assignments"
+            / assignment_id
         )
-        bootstrap = self._bootstrap(updated)
-        session = self._session_for_assignment(assignment_id)
-        if recovery and session:
-            try:
-                self.sessions.close(str(session["session_id"]))
-            except (RuntimeError, FileNotFoundError):
-                pass
-            session = None
-        session_record = self.sessions.start(
+        assignment_dir.mkdir(parents=True, exist_ok=True)
+        prepared = WorktreeManager(
+            integration,
+            worktrees_root=assignment_dir.parent / "worktrees",
+        ).prepare(assignment_id, assignment_dir)
+        return prepared.path, prepared.strategy, False
+
+    def _ensure_assignment_run(
+        self,
+        assignment: Mapping[str, Any],
+        *,
+        contract: Mapping[str, Any],
+        agent_id: str,
+    ) -> tuple[dict[str, Any], str, int]:
+        updated = dict(assignment)
+        run_id = str(updated.get("run_id") or "")
+        if run_id:
+            previous = self.store.stages(run_id)
+            attempt = max((int(item["attempt"]) for item in previous), default=0) + 1
+            self.store.update_run(run_id, status="running", current_stage="assignment")
+            return updated, run_id, attempt
+        conversation_id = str(updated["conversation_id"])
+        run_id = f"run_{uuid4().hex}"
+        turn_index = max(
+            (
+                int(item.get("turn_index") or 1)
+                for item in self.store.list_conversation_runs(conversation_id)
+            ),
+            default=0,
+        ) + 1
+        self.store.create_run(
+            run_id=run_id,
+            run_kind="assignment",
             conversation_id=conversation_id,
-            assignment_id=assignment_id,
-            agent_id=str(updated["agent_id"]),
-            worktree=worktree,
-            bootstrap=bootstrap,
+            assignment_id=str(updated["assignment_id"]),
+            session_id=None,
+            task=str(updated["brief"]),
+            workflow=str(contract["workflow"]),
+            profile=str(contract["profile"]),
+            provider=agent_id,
+            policy_hash=canonical_hash(contract.get("policy") or {}),
+            metadata={"contract_id": contract["contract_id"], "attempt": 1},
+            turn_index=turn_index,
         )
-        self.store.append_conversation_event(
-            conversation_id,
-            "assignment.started",
-            {
-                "assignment_id": assignment_id,
-                "agent_id": updated["agent_id"],
-                "session_id": session_record["session_id"],
-                "worktree_strategy": strategy,
-            },
-            actor="supervisor",
+        updated = self.store.update_assignment(
+            str(updated["assignment_id"]), run_id=run_id
         )
-        return updated
+        return updated, run_id, 1
+
+    def _activate_assignment_session(
+        self,
+        assignment: Mapping[str, Any],
+        *,
+        worktree: Path,
+        bootstrap: str,
+        lane_key: str,
+        lane_type: str,
+        recovery: bool,
+    ) -> dict[str, Any]:
+        assignment_id = str(assignment["assignment_id"])
+        conversation_id = str(assignment["conversation_id"])
+        agent_id = str(assignment["agent_id"])
+        session_record = self.store.find_agent_session(conversation_id, agent_id, lane_key)
+        if session_record:
+            session_id = str(session_record["session_id"])
+            if recovery:
+                try:
+                    self.sessions.close(session_id)
+                except (RuntimeError, FileNotFoundError):
+                    pass
+            self.store.update_agent_session(
+                session_id,
+                current_assignment_id=assignment_id,
+                assignment_id=assignment_id if lane_type == "temporary" else session_record.get("assignment_id"),
+                worktree=str(worktree),
+            )
+            if recovery:
+                session_record = self.sessions.restart(session_id, bootstrap=bootstrap)
+            else:
+                session_record = self.sessions.ensure_live(session_id)
+                self.sessions.send_runtime(session_id, bootstrap)
+                session_record = self.store.get_agent_session(session_id) or session_record
+        else:
+            session_record = self.sessions.start(
+                conversation_id=conversation_id,
+                assignment_id=assignment_id,
+                agent_id=agent_id,
+                worktree=worktree,
+                bootstrap=bootstrap,
+                lane_key=lane_key,
+                lane_type=lane_type,
+            )
+        return session_record
+
 
     def _bootstrap(self, assignment: Mapping[str, Any]) -> str:
         contract = self._active_contract(str(assignment["conversation_id"]))
+        context_pack = build_conversation_context_pack(
+            self.workspace,
+            Path(str(assignment["worktree"])),
+            self.store,
+            conversation_id=str(assignment["conversation_id"]),
+            contract=contract,
+            task=str(assignment["brief"]),
+        )
         dependencies = [
             self._assignment(item)
             for item in self.store.list_assignment_dependencies(str(assignment["assignment_id"]))
@@ -625,7 +610,26 @@ class CollaborationService:
                     "completion", "proof",
                 )
             },
+            "executor": {
+                "kind": str(
+                    (assignment.get("metadata") or {}).get(
+                        "executor_kind", "agent_session"
+                    )
+                ),
+                "parent_agent_id": (assignment.get("metadata") or {}).get(
+                    "parent_agent_id"
+                ),
+                "terminal_stream": "shared",
+                "independent_review": False
+                if (assignment.get("metadata") or {}).get("executor_kind")
+                == "native_subagent"
+                else None,
+            },
             "dependency_outputs": dependency_outputs,
+            "context_pack": {
+                "text": context_pack.text,
+                "manifest": context_pack.manifest,
+            },
             "collaboration_commands": [
                 "muxdev collab roster",
                 "muxdev collab dispatch --file <assignment.json>",
@@ -633,6 +637,7 @@ class CollaborationService:
                 "muxdev collab ask",
                 "muxdev collab report --file <report.json>",
                 "muxdev collab deliver --manifest <delivery.json>",
+                "muxdev collab clarify --file assessment.json",
             ],
             "security": "The role prompt is not a permission boundary. Runtime scope and delivery gates are authoritative.",
         }
@@ -744,40 +749,6 @@ class CollaborationService:
             actor="supervisor",
         )
 
-    def _schedule(self, conversation_id: str, plan_id: str) -> None:
-        plan = self.store.get_orchestration_plan(plan_id)
-        if not plan or plan["status"] not in {
-            OrchestrationPlanStatus.RUNNING.value,
-            OrchestrationPlanStatus.APPROVED.value,
-        }:
-            return
-        max_parallel = min(int((plan.get("plan") or {}).get("max_parallel", 4)), 4)
-        assignments = [
-            item for item in self.store.list_assignments(conversation_id) if item.get("plan_id") == plan_id
-        ]
-        running = sum(1 for item in assignments if item["status"] == AssignmentStatus.RUNNING.value)
-        for assignment in sorted(assignments, key=lambda item: str(item["assignment_id"])):
-            if running >= max_parallel:
-                break
-            if assignment["status"] != AssignmentStatus.QUEUED.value:
-                continue
-            dependencies = self.store.list_assignment_dependencies(str(assignment["assignment_id"]))
-            if any(self._assignment(item)["status"] != AssignmentStatus.COMPLETED.value for item in dependencies):
-                continue
-            self._start_assignment(assignment)
-            running += 1
-        latest = [
-            item for item in self.store.list_assignments(conversation_id) if item.get("plan_id") == plan_id
-        ]
-        if latest and all(item["status"] == AssignmentStatus.COMPLETED.value for item in latest):
-            self.store.update_orchestration_plan(plan_id, status=OrchestrationPlanStatus.COMPLETED.value)
-            self.store.append_conversation_event(
-                conversation_id,
-                "orchestration.completed",
-                {"plan_id": plan_id},
-                actor="supervisor",
-            )
-
     def _ensure_reviewers_or_finalize(self, conversation_id: str) -> None:
         assignments = self.store.list_assignments(conversation_id)
         primary = [item for item in assignments if item["dispatch_kind"] in {"direct", "orchestrated"}]
@@ -878,13 +849,29 @@ class CollaborationService:
         agent_ids = {
             str(item["agent_id"]) for item in self.store.list_assignments(conversation_id)
         }
+        agent_ids.update(
+            str(item["agent_id"]) for item in self.store.list_agent_sessions(conversation_id)
+        )
+        conversation = self._conversation(conversation_id)
+        metadata = (
+            conversation.get("metadata")
+            if isinstance(conversation.get("metadata"), dict)
+            else {}
+        )
+        if conversation.get("primary_agent_id"):
+            agent_ids.add(str(conversation["primary_agent_id"]))
+        agent_ids.update(
+            str(item) for item in metadata.get("collaborator_agent_ids") or []
+        )
         available = {str(item["agent_id"]): item for item in self.registry.list()}
         return [available[item] for item in sorted(agent_ids) if item in available]
 
     def _session_for_assignment(self, assignment_id: str) -> dict[str, Any] | None:
         row = self.store.connection.execute(
-            "SELECT * FROM agent_sessions WHERE assignment_id = ? ORDER BY created_at DESC LIMIT 1",
-            (assignment_id,),
+            """SELECT * FROM agent_sessions
+               WHERE assignment_id = ? OR current_assignment_id = ?
+               ORDER BY updated_at DESC LIMIT 1""",
+            (assignment_id, assignment_id),
         ).fetchone()
         if not row:
             return None
@@ -943,7 +930,7 @@ class CollaborationService:
         return True
 
     @staticmethod
-    def _plan_expands_boundary(old: OrchestrationPlanV1, new: OrchestrationPlanV1) -> bool:
+    def _plan_expands_boundary(old: Any, new: Any) -> bool:
         if new.max_parallel > old.max_parallel:
             return True
         old_nodes = {item.id: item for item in old.nodes}
@@ -953,7 +940,17 @@ class CollaborationService:
                 continue
             if node.agent_id != previous.agent_id or node.work_mode != previous.work_mode:
                 return True
+            if getattr(node, "executor_kind", "agent_session") != getattr(
+                previous, "executor_kind", "agent_session"
+            ):
+                return True
         return False
+
+    @staticmethod
+    def _parse_plan(value: Mapping[str, object]) -> OrchestrationPlanV1 | OrchestrationPlanV2:
+        if str(value.get("schema_version") or "") == "muxdev.orchestration-plan.v2":
+            return OrchestrationPlanV2.model_validate(value)
+        return OrchestrationPlanV1.model_validate(value)
 
     @staticmethod
     def _now() -> str:

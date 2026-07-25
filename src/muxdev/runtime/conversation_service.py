@@ -12,15 +12,15 @@ from ..core.redaction import redact
 from ..models import ConversationIntent, ConversationStatus
 from ..models.evidence import canonical_hash
 from ..services.evidence_verify import verify_evidence_report
-from ..services.router import ProviderRouter
 from ..storage import ControlStore
-from ..workflows import execution_waves, load_workflow, validate_role_providers
+from ..workflows import load_workflow, validate_role_providers
 from .engine import MAX_PARALLEL_WORKERS, RunEngine, new_run_id
 from .conversation_projection import (
     affected_stages, conversation_delivery_projections, normalize_stage_standards,
     progress_projection, stage_delivery_projection,
 )
 from .conversation_health import ConversationHealthMixin
+from .conversation_team import ConversationTeamMixin
 from .delivery_standards import build_delivery_standard, conversation_task_prompt, delivery_standard_diff, revised_delivery_standard, standard_from_contract_policy
 from .workspace import (
     ChangeSet, WorkspaceConflictError, apply_change_set, diff_text, snapshot_workspace,
@@ -44,7 +44,7 @@ CONVERSATION_ACTIONS = {
 
 
 @dataclass
-class ConversationService(ConversationHealthMixin):
+class ConversationService(ConversationHealthMixin, ConversationTeamMixin):
     engine: RunEngine
     store: ControlStore
 
@@ -621,9 +621,21 @@ class ConversationService(ConversationHealthMixin):
             "candidate_id": candidate_id,
         })
         accepted = self.store.update_delivery_candidate(candidate_id, status="accepted", metadata={"applied_files": applied})
+        self.store.create_review_record(
+            conversation_id,
+            kind="decision",
+            status="accepted",
+            prompt="接受本轮交付",
+            response="用户接受已验证的交付候选",
+            actor_kind="developer",
+            actor_id="developer",
+            run_id=str(candidate["run_id"]),
+            metadata={"candidate_id": candidate_id, "applied_files": applied},
+        )
+        self.store.settle_run_review(str(candidate["run_id"]), "accepted")
         self.store.update_conversation(
             conversation_id,
-            status=ConversationStatus.DELIVERED,
+            status=ConversationStatus.IDLE,
             active_candidate_id=candidate_id,
             metadata={"baseline_manifest": snapshot_workspace(worktree).to_dict()},
         )
@@ -721,6 +733,34 @@ class ConversationService(ConversationHealthMixin):
         )
         waiting = str(run.get("status") or "") == "awaiting_approval"
         verified = decision.get("status") == "PASS" and not waiting and not stale_contract
+        operations = (
+            change_set.get("operations")
+            if isinstance(change_set.get("operations"), list)
+            else []
+        )
+        if verified and not operations:
+            self.store.settle_run_review(run_id, "answered")
+            self.store.update_conversation(
+                conversation_id,
+                status=ConversationStatus.IDLE,
+                active_run_id=run_id,
+                metadata={"last_answered_run_id": run_id},
+            )
+            self.store.append_conversation_event(
+                conversation_id,
+                "delivery.answered",
+                {
+                    "run_id": run_id,
+                    "summary": str(
+                        (report.get("subject") or {}).get("name")
+                        or "The requested answer was delivered without file changes."
+                    ),
+                },
+                actor="supervisor",
+                run_id=run_id,
+                capture_grade="verified",
+            )
+            return self.get(conversation_id)
         previous_id = conversation.get("active_candidate_id")
         if previous_id:
             previous = self.store.get_delivery_candidate(str(previous_id))
@@ -905,90 +945,6 @@ class ConversationService(ConversationHealthMixin):
             actor="supervisor",
             run_id=run_id,
         )
-
-    def _team_projection(
-        self,
-        contract: Mapping[str, Any] | None,
-        run: Mapping[str, Any] | None,
-    ) -> dict[str, Any]:
-        if not contract:
-            return {
-                "mode": "role_pipeline", "max_parallel": MAX_PARALLEL_WORKERS,
-                "roles": [], "workers": [], "active_stage_ids": [],
-            }
-        workflow = load_workflow(str(contract["workflow"]))
-        policy = contract.get("policy") if isinstance(contract.get("policy"), dict) else {}
-        overrides = dict(policy.get("role_providers") or {})
-        route: dict[str, Any] = {}
-        run_id = str(run.get("run_id") or "") if run else ""
-        if run_id:
-            try:
-                route_row = ProviderRouter(self.store).explain(run_id)
-            except FileNotFoundError:
-                route_row = {}
-            if isinstance(route_row.get("payload"), dict):
-                route = dict(route_row["payload"])
-        assignments = (
-            route.get("role_assignments")
-            if isinstance(route.get("role_assignments"), dict) else {}
-        )
-        stage_rows = {
-            str(item["stage_id"]): item for item in self.store.stages(run_id)
-        } if run_id else {}
-        wave_by_stage = {
-            stage_id: wave_index
-            for wave_index, wave in enumerate(execution_waves(workflow), start=1)
-            for stage_id in wave
-        }
-        workers = []
-        profile = str(contract.get("profile") or "standard")
-        for stage in workflow.stages:
-            if stage.type == "human_gate":
-                continue
-            row = stage_rows.get(stage.id, {})
-            provider = str(
-                row.get("provider")
-                or overrides.get(str(stage.role or ""))
-                or assignments.get(str(stage.role or ""))
-                or (
-                    "auto（独立）"
-                    if stage.role in {"review", "secure"}
-                    and profile in {"standard", "strict"}
-                    else contract.get("provider")
-                )
-                or "auto"
-            )
-            status = str(row.get("status") or "pending")
-            if stage.when == "profile.strict" and profile != "strict" and not row:
-                status = "skipped"
-            result = row.get("result") if isinstance(row.get("result"), dict) else {}
-            workers.append({
-                "worker_id": (
-                    f"{run_id}:{stage.id}:{int(row.get('attempt') or 1)}"
-                    if run_id and row else None
-                ),
-                "stage_id": stage.id,
-                "role": stage.role,
-                "provider": provider,
-                "status": status,
-                "attempt": int(row.get("attempt") or 0),
-                "read_only": bool(stage.read_only),
-                "wave": wave_by_stage.get(stage.id),
-                "summary": redact(str(result.get("summary") or result.get("error") or ""))[:500],
-            })
-        current_stage = str(run.get("current_stage") or "") if run else ""
-        active_stage_ids = (
-            current_stage.removeprefix("fanout:").split(",") if current_stage else []
-        )
-        return {
-            "mode": "role_pipeline",
-            "max_parallel": MAX_PARALLEL_WORKERS,
-            "roles": list(dict.fromkeys(
-                str(item["role"]) for item in workers if item.get("role")
-            )),
-            "workers": workers,
-            "active_stage_ids": [item for item in active_stage_ids if item],
-        }
 
     def _task_prompt(self, conversation_id: str, contract: Mapping[str, Any]) -> str:
         return conversation_task_prompt(self.store, conversation_id, contract)

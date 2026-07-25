@@ -1,20 +1,29 @@
 # muxdev 中文设计与运维指南
 
+面向日常操作的说明请先阅读：[muxdev 产品使用手册](product-user-manual.md)。
+
 ## 1. 设计理念
 
 muxdev 是 Coding CLI 的薄控制面，不是 Agent SDK wrapper。它不重建 Codex 或 Claude Code 的记忆、工具协议、Skill、MCP、Plan Mode 和审批；它只管理 CLI 进程之外必须由产品负责的事实：Conversation、PTY、Assignment、权限、工作树、合并、Evidence、交付候选与接受后写回。
 
 角色提示只影响行为，不是安全边界。argv/env 白名单、Assignment 范围、worktree 隔离、确定性检查和交付 Gate 由 Runtime 强制执行。
 
+Workbench 是当前用户的单例 Daemon。`muxdev serve` 把当前目录登记为项目；已有健康实例时只输出该项目深链并退出。全局库只保存项目登记、Rule、设备认证和 Daemon 状态；Conversation、Run、Evidence、ChangeSet 和 transcript 仍留在各项目的 `.muxdev/control.sqlite` 与制品目录。HTTP、SSE、Terminal 和文件接口均以 `project_id` 为边界。
+
 ## 2. Agent、Conversation、Assignment
 
 - `CliAdapterDefinition` 描述完整 CLI 的启动 argv、恢复 argv、工作目录和模型参数、环境变量白名单、PTY/resize/resume 能力与 session ID 发现方式。
 - `AgentDefinition` 描述显示名、CLI、模型、角色提示、能力标签、编排资格、最大并发和默认权限。
+- 内置 Conversation Agent 目录覆盖 Codex、Claude Code、Qwen Code、Kimi Code、Trae 和 Antigravity。Agent Registry 复用 Provider 的命令及别名扫描 daemon `PATH`，新建窗口按“已检测到 / 未就绪”展示；检测结果同时用于创建前校验和实际进程启动。
 - `Conversation` 是用户可见的长期协作容器，拥有模式、主 Agent、编排者、活动计划、集成工作树和 DeliveryContract。
-- `Assignment` 是最小派发和交付单位，固定状态从 `proposed` 到 `completed/blocked/failed/cancelled`。
-- `AgentSession` 为 Agent/Assignment 管理独立 CLI 进程、终端、原生 session ID、transcript、写入租约和恢复方式。
+- `Interaction` 保存澄清问题、回答和 Run 中途提问；它不是 Run。
+- `Assignment` 是边界明确的 `consult/write/review` 执行段；每个 Assignment 唯一对应一个 Run，重试和重派记录为同一 Run 的 Attempt。
+- `AgentSession` 按 `Conversation × Agent × lane` 管理逻辑终端。默认复用 `main` lane，并发或隔离写任务使用临时 lane。
+- `SessionGeneration` 记录每次物理进程启动、原生恢复或上下文重建；Generation 改变时逻辑 Session ID 和 transcript 序号不变。
 
-Agent 只收到冻结任务契约、自己的简报、依赖节点产物和定向消息，不会自动获得完整 Conversation transcript。派发、回报、提问、合并和交付会投影到共享时间线。
+Conversation 先进入 `clarifying`。需求不完整时只创建 1–3 个 Interaction；需求冻结为 `ready` 后才自动执行。普通消息默认进入主 Agent Session，`@agent` 只加入协作，显式咨询、写任务或评审才创建 Assignment Run。Agent 上下文包不超过 12,000 字符，优先保留冻结契约、用户决策、未决问题、依赖产物和仍通过 Evidence 校验的交付记忆。
+
+项目 schema v13 的 Conversation Memory Checkpoint 记录覆盖序列、源哈希、目标、约束、人工决定、Assignment 结果、验证状态和未解决问题。Run 结算或未压缩尾部超过约 8,000 token 时生成；纠正只追加新版本。所有 Agent 注入同一共享检查点，再叠加各自 transcript、Assignment 和依赖输出。
 
 ## 3. 直接模式与编排模式
 
@@ -50,7 +59,7 @@ Runtime 校验无环依赖、Agent、能力、并发、范围和三段式标准�
 
 每个 Assignment 最多使用两次安全恢复额度。超过额度后转为 `blocked`。所有子 Agent 都不能直接写回用户项目。
 
-daemon 重启后：tmux 直接 reattach；普通 PTY 使用 CLI 原生 session ID；不支持 resume 的 CLI 会用任务简报、依赖产物和 transcript 摘要启动新会话，并标记 `rebuilt_context`。
+daemon 启动时会 reconcile 孤立 Session。tmux 直接 reattach；普通 PTY 使用 CLI 原生 session ID；不支持 resume 的 CLI 会用任务简报、依赖产物和 transcript 摘要启动新 Generation，并标记 `rebuilt_context`。Windows 缺少 ConPTY 时实际后端为 `pipe`，Doctor、API 和界面会一致禁用 resize/resume。
 
 ## 5. Web 终端和远程安全
 
@@ -59,13 +68,15 @@ Dashboard 使用本地打包的 xterm.js 与 fit addon，不依赖 CDN。WebSock
 - 客户端：`attach`、`input`、`resize`、`release_write`；
 - 服务端：`output`、`status`、`lease`、`error`。
 
-终端 transcript 是带序号的本地 JSONL，权限尽量限制为所有者读写。一个 Session 只有一个有效写入租约，其他设备只读。输出断线重放使用 `after_seq`，输入帧限制 64 KiB，并有滑动窗口限流。
+终端 transcript 是带序号的本地 JSONL，权限尽量限制为所有者读写。Web attach 默认只读；用户点击“获取控制权”后才申请写租约。一个 Session 只有一个有效写入租约，其他设备只读。输出断线重放使用 `after_seq`，输入帧限制 64 KiB，并有滑动窗口限流。`interrupt` 只向当前前台命令发送 Ctrl+C/SIGINT，不关闭 Session。
 
 远程模式必须启用 HTTPS 反向代理或 VPN，并完成一次性设备配对。WebSocket 不依赖 HTTP 中间件，自己校验 Cookie、Origin、Session、帧大小和速率。
 
+Dashboard 提供已配对设备列表和撤销操作；撤销设备会同时使它的 Web Session 失效。终端标题持续显示写租约状态，接管操作会明确覆盖其他设备的有效租约。
+
 ## 6. 三段式团队交付标准
 
-`muxdev.delivery-standard.v2` 的每一项都包含：
+普通用户先选择代码修改、指定文件、报告/文档、可运行应用/API、分析回答或其他；系统将其编译为 `muxdev.delivery-standard.v2`。默认界面只显示“交付什么、是否达标、还缺什么”，阶段、Verifier、契约和 Evidence 留在高级视图。每一项包含：
 
 - `deliverable`：需要交付的内容；
 - `completion`：可判定的完成条件；
@@ -76,6 +87,8 @@ Dashboard 使用本地打包的 xterm.js 与 fit addon，不依赖 CDN。WebSock
 内置基线不可删除或降级。Runtime check 只能引用 Workflow 中冻结的 argv 命令；Agent review 必须绑定 Reviewer 身份和当前 Subject；artifact 必须内容寻址；人工接受必须是结构化事件。
 
 标准修改会生成新 Contract、记录受影响 Assignment 并使旧 Candidate 失效。已接受的 Candidate、Contract 和 Evidence 不会被改写。
+
+`ReviewRecordV1` 以不可变记录保存三类人工事实：`interaction`、`decision` 和带文件/行号引用的 `change_request`。Rule 分为代码规范、CI 门禁、文档模板与交付标准，来源可以是内置、个人全局或项目绑定；Conversation 创建或修订时冻结具体版本。CI Rule 只能引用 Workflow 已登记的 argv 命令。Memory Candidate 批准后生成 Rule 草稿，不自动修改 `MUXDEV.md`。
 
 ## 7. Agent 配置与排错
 
@@ -96,7 +109,7 @@ muxdev doctor
 
 ## 8. 迁移与兼容
 
-schema v9 打开时自动增加 v10 列和四张协作表；旧记录标记为 `legacy_pipeline`。`/api/v1`、`/runs`、ACP/MCP、headless Provider 与固定四工作流不删除，但新 Dashboard 默认使用 `/api/v2`。
+旧数据库打开时幂等迁移到项目 schema v13，并在 v12→v13 前创建 SQLite 备份。项目数据不会移动到全局数据库。无 `project_id` 的旧 v2 路由不再提供；`/api/v1`、`/runs`、ACP/MCP、headless Provider 与固定四工作流保持兼容。
 
 ## 9. 与 botmux 的关系
 

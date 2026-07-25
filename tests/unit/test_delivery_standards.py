@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from muxdev.runtime.delivery_standards import build_delivery_standard
+from muxdev.runtime.delivery_standards import build_delivery_standard, compile_deliverables
 
 
 @pytest.mark.parametrize(
@@ -87,3 +87,29 @@ def test_baseline_fields_cannot_be_submitted_as_conversation_rules() -> None:
             "text": "可选规则",
             "required": False,
         }])
+
+
+@pytest.mark.parametrize(
+    "deliverable",
+    [
+        {"type": "code_change"},
+        {"type": "file", "path": "dist/result.json"},
+        {"type": "report", "name": "审计报告"},
+        {"type": "runnable", "name": "health API"},
+        {"type": "answer"},
+        {"type": "other", "description": "一份可导入的配置"},
+    ],
+)
+def test_deliverable_templates_compile_to_hard_v2_rules(deliverable) -> None:
+    standard = compile_deliverables("change", "standard", [deliverable])
+
+    assert standard["schema_version"] == "muxdev.delivery-standard.v2"
+    assert standard["baseline_version"] == "sdlc-v2"
+    assert standard["custom_items"]
+    assert all(item["required"] for item in standard["custom_items"])
+    assert all(
+        item["verifier"]["type"] in {
+            "agent_review", "runtime_check", "artifact", "human_acceptance"
+        }
+        for item in standard["custom_items"]
+    )

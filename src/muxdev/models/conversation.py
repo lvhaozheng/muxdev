@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 
 class ConversationStatus(StrEnum):
+    IDLE = "idle"
     CLARIFYING = "clarifying"
     WORKING = "working"
     NEEDS_USER = "needs_user"
@@ -75,4 +76,3 @@ class DeliveryCandidate(BaseModel):
     created_at: str
     updated_at: str
     metadata: dict[str, Any] = Field(default_factory=dict)
-

@@ -62,6 +62,10 @@ class TerminalBackend(ABC):
     def attach(self) -> TerminalSnapshot:
         return self.snapshot()
 
+    def interrupt(self) -> None:
+        """Interrupt the foreground command without closing the terminal session."""
+        self.write("\x03")
+
     @abstractmethod
     def snapshot(self) -> TerminalSnapshot: ...
 
@@ -124,6 +128,17 @@ class PipeTerminalBackend(TerminalBackend):
     def snapshot(self) -> TerminalSnapshot:
         code = self.process.poll() if self.process else None
         return TerminalSnapshot(self.backend_name, self.process is not None and code is None, code, self.cols, self.rows, False)
+
+    def interrupt(self) -> None:
+        if not self.process or self.process.poll() is not None:
+            raise RuntimeError("terminal process is not running")
+        try:
+            if os.name == "nt":
+                self.process.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                self.process.send_signal(signal.SIGINT)
+        except (OSError, ValueError):
+            super().interrupt()
 
     def close(self) -> None:
         if self.process and self.process.poll() is None:
@@ -196,6 +211,14 @@ class PosixPtyBackend(TerminalBackend):
     def snapshot(self) -> TerminalSnapshot:
         code = self.process.poll() if self.process else None
         return TerminalSnapshot(self.backend_name, self.process is not None and code is None, code, self.cols, self.rows, self.resumable)
+
+    def interrupt(self) -> None:
+        if not self.process or self.process.poll() is not None:
+            raise RuntimeError("terminal process is not running")
+        try:
+            os.killpg(os.getpgid(self.process.pid), signal.SIGINT)
+        except (ProcessLookupError, PermissionError):
+            super().interrupt()
 
     def close(self) -> None:
         if self.process and self.process.poll() is None:
@@ -284,6 +307,11 @@ class ConPtyBackend(TerminalBackend):
         code = None if alive or self.process is None else int(self.process.exitstatus)  # type: ignore[attr-defined]
         return TerminalSnapshot(self.backend_name, alive, code, self.cols, self.rows, False)
 
+    def interrupt(self) -> None:
+        if self.process is None or not self._alive():
+            raise RuntimeError("terminal process is not running")
+        self.process.write("\x03")  # type: ignore[attr-defined]
+
     def close(self) -> None:
         if self.process is not None and self._alive():
             self.process.terminate(force=False)  # type: ignore[attr-defined]
@@ -317,11 +345,33 @@ def terminal_backend(
     return PosixPtyBackend()
 
 
+def terminal_capabilities(*, supports_pty: bool, prefer_tmux: bool = False) -> dict[str, object]:
+    """Report the backend this host can actually provide, not adapter wishes."""
+    backend = terminal_backend(
+        supports_pty=supports_pty,
+        prefer_tmux=prefer_tmux,
+        tmux_session_name="muxdev-doctor",
+    )
+    real_pty = backend.backend_name != "pipe"
+    return {
+        "backend": backend.backend_name,
+        "pty": real_pty,
+        "resize": bool(real_pty and backend.supports_resize),
+        "process_resume": bool(real_pty and backend.resumable),
+        "degraded": bool(supports_pty and not real_pty),
+        "degradation_reason": (
+            "ConPTY/PTY backend is unavailable; interactive resize and resume are disabled"
+            if supports_pty and not real_pty
+            else None
+        ),
+    }
+
+
 def _dimensions(cols: int, rows: int) -> tuple[int, int]:
     return max(20, min(int(cols), 500)), max(5, min(int(rows), 200))
 
 
 __all__ = [
     "ConPtyBackend", "PipeTerminalBackend", "PosixPtyBackend", "TerminalBackend",
-    "TerminalSnapshot", "TmuxTerminalBackend", "terminal_backend",
+    "TerminalSnapshot", "TmuxTerminalBackend", "terminal_backend", "terminal_capabilities",
 ]

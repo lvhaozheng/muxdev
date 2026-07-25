@@ -28,6 +28,7 @@ from .delivery_standards import (
     standard_from_contract_policy,
     standard_requirement_id,
 )
+from .change_tracking import ChangeTrackingContext, ChangeTrackingService
 from .workspace import (
     ChangeSet,
     WorkspaceSnapshot,
@@ -118,6 +119,8 @@ def _prepare_context(service: Any, conversation_id: str) -> DeliveryContext:
     run_dir.mkdir(parents=True, exist_ok=True)
     service.store.create_run(
         run_id=run_id,
+        run_kind="delivery_verification",
+        conversation_id=conversation_id,
         task=str(contract["goal"]),
         workflow=str(contract["workflow"]),
         profile=str(contract["profile"]),
@@ -135,6 +138,25 @@ def _prepare_context(service: Any, conversation_id: str) -> DeliveryContext:
                 "delivery_standard": standard,
             },
         },
+        turn_index=max(
+            (
+                int(item.get("turn_index") or 1)
+                for item in service.store.list_conversation_runs(conversation_id)
+            ),
+            default=1,
+        ),
+    )
+    tracking = ChangeTrackingContext(
+        conversation_id=conversation_id,
+        run_id=run_id,
+        worktree=integration,
+        author=str(conversation.get("primary_agent_id") or "runtime"),
+    )
+    tracker = ChangeTrackingService(service.workspace, service.store)
+    tracker.capture_snapshot_baseline(tracking, before)
+    tracker.reconcile(tracking)
+    service.store.update_conversation(
+        conversation_id, active_run_id=run_id, status="verifying"
     )
     paths = _write_delivery_inputs(service, run_id, run_dir, conversation, contract, change_set, integration)
     artifacts = _register_delivery_artifacts(service, run_id, paths)
@@ -297,6 +319,18 @@ def _record_check(
         summary="Runtime executed frozen git diff integrity check.",
         reproducible=True,
         integrity_valid=observed_digest == context.subject_digest,
+    )
+    service.store.create_verification_attempt(
+        conversation_id=context.conversation_id,
+        run_id=context.run_id,
+        command=list(check.argv),
+        status="passed" if check.returncode == 0 else "failed",
+        exit_code=check.returncode,
+        duration_ms=check.duration_ms,
+        summary="git diff --check passed" if check.returncode == 0 else (
+            check.stderr[-1000:] or check.stdout[-1000:] or "git diff --check failed"
+        ),
+        evidence_ref=record.record_id,
     )
     if "deterministic_check" in requirement_ids:
         _append(service, context, records, record)

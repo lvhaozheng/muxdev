@@ -19,7 +19,7 @@ def test_simplification_targets() -> None:
     assert metrics["architecture"]["layer_cycles"] == []
     assert metrics["architecture"]["four_layers"]["reverse_dependency_violations"] == []
     assert surfaces == {
-        "http_routes": 45, "typer_commands": 40, "sqlite_tables": 22, "workflows": 4,
+        "http_routes": 81, "typer_commands": 46, "sqlite_tables": 39, "workflows": 4,
         "workflow_names": ["change", "design", "review", "test"], "builtin_skills": 5,
         "builtin_skill_names": ["default-code", "default-plan", "default-review", "default-secure", "default-test"],
         "delivery_standard_sections": 0,
