@@ -8,11 +8,19 @@ import os
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..storage import ControlStore
 from ..runtime.delivery_standards import available_verification_commands
+from ..services.rule_sources import (
+    RuleSourceError,
+    fetch_public_webpage,
+    normalize_uploaded_source,
+    source_digest,
+    store_source_markdown,
+)
+from ..workbench import utc_now
 from ..workflows import load_workflow
 
 
@@ -55,6 +63,26 @@ class RuleDeliveryItemV1(BaseModel):
     verifier: RuleVerifierV1
 
 
+class RuleSourceV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_id: str = Field(min_length=1, max_length=100)
+    kind: Literal["file", "url", "builtin"]
+    display_name: str = Field(min_length=1, max_length=300)
+    original_url: str | None = Field(default=None, max_length=4000)
+    local_markdown_path: str | None = Field(default=None, max_length=1000)
+    digest: str | None = Field(default=None, max_length=80)
+    content_type: str | None = Field(default=None, max_length=120)
+    size_bytes: int | None = Field(default=None, ge=0, le=5 * 1024 * 1024)
+    captured_at: str | None = Field(default=None, max_length=80)
+    license: str | None = Field(default=None, max_length=200)
+    revision: str | None = Field(default=None, max_length=80)
+
+
+class RuleSourceUrlRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=4000)
+
+
 class RuleDefinitionV1(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -75,10 +103,11 @@ class RuleDefinitionV1(BaseModel):
     )
     path_patterns: list[str] = Field(default_factory=list, max_length=50)
     agent_roles: list[str] = Field(default_factory=list, max_length=20)
-    instructions: str = Field(default="", max_length=12000)
+    instructions: str = Field(default="", max_length=262144)
     enforcement: Literal["advisory", "required"] = "required"
     delivery_items: list[RuleDeliveryItemV1] = Field(default_factory=list, max_length=30)
-    template: str | None = Field(default=None, max_length=12000)
+    template: str | None = Field(default=None, max_length=262144)
+    source_documents: list[RuleSourceV1] = Field(default_factory=list, max_length=20)
     digest: str = ""
 
     @model_validator(mode="after")
@@ -213,12 +242,129 @@ def remove_project(project_id: str, request: Request) -> dict[str, Any]:
     }
 
 
+def _rule_response(item: dict[str, Any]) -> dict[str, Any]:
+    value = dict(item.get("definition") or {})
+    value["status"] = str(item.get("status") or "active")
+    return value
+
+
+def _source_response(request: Request, item: dict[str, Any]) -> dict[str, Any]:
+    local_path = str(item.get("local_markdown_path") or "")
+    target = (request.app.state.workbench.store.path.parent / local_path).resolve()
+    markdown = ""
+    try:
+        target.relative_to(request.app.state.workbench.store.path.parent.resolve())
+        markdown = target.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        markdown = ""
+    return {
+        "source_id": str(item["source_id"]),
+        "kind": str(item["kind"]),
+        "display_name": str(item["display_name"]),
+        "original_url": item.get("original_url"),
+        "local_markdown_path": local_path,
+        "digest": str(item["digest"]),
+        "content_type": str(item["content_type"]),
+        "size_bytes": int(item["size_bytes"]),
+        "captured_at": str(item["captured_at"]),
+        "license": item.get("license"),
+        "markdown": markdown,
+    }
+
+
+def _save_rule_source(
+    request: Request,
+    *,
+    kind: Literal["file", "url"],
+    markdown: str,
+    display_name: str,
+    content_type: str,
+    original_url: str | None = None,
+) -> dict[str, Any]:
+    store = request.app.state.workbench.store
+    digest, target = store_source_markdown(store.path.parent, markdown)
+    identity = hashlib.sha256(
+        f"{kind}\0{original_url or display_name}\0{digest}".encode("utf-8")
+    ).hexdigest()[:24]
+    item = store.put_rule_source(
+        {
+            "source_id": f"rule-src-{identity}",
+            "kind": kind,
+            "display_name": display_name,
+            "original_url": original_url,
+            "local_markdown_path": target.relative_to(store.path.parent).as_posix(),
+            "digest": f"sha256:{digest}",
+            "content_type": content_type,
+            "size_bytes": len(markdown.encode("utf-8")),
+            "license": None,
+            "captured_at": utc_now(),
+            "metadata": {},
+        }
+    )
+    return _source_response(request, item)
+
+
 @router.get("/rules")
-def list_rules(request: Request) -> list[dict[str, Any]]:
+def list_rules(
+    request: Request,
+    include_archived: bool = Query(default=False),
+) -> list[dict[str, Any]]:
     return [
-        dict(item.get("definition") or {})
-        for item in request.app.state.workbench.store.list_rules()
+        _rule_response(item)
+        for item in request.app.state.workbench.store.list_rules(
+            include_archived=include_archived
+        )
     ]
+
+
+@router.get("/rule-sources")
+def list_rule_sources(request: Request) -> list[dict[str, Any]]:
+    return [
+        _source_response(request, item)
+        for item in request.app.state.workbench.store.list_rule_sources()
+    ]
+
+
+@router.post("/rule-sources/upload", status_code=201)
+async def upload_rule_source(
+    request: Request,
+    filename: str = Query(min_length=1, max_length=300),
+) -> dict[str, Any]:
+    payload = await request.body()
+    try:
+        markdown, metadata = normalize_uploaded_source(
+            filename,
+            payload,
+            content_type=str(request.headers.get("content-type") or ""),
+        )
+    except RuleSourceError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return _save_rule_source(
+        request,
+        kind="file",
+        markdown=markdown,
+        display_name=str(metadata["display_name"]),
+        content_type=str(metadata["content_type"]),
+    )
+
+
+@router.post("/rule-sources/import-url", status_code=201)
+def import_rule_source_url(
+    body: RuleSourceUrlRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        markdown, metadata = fetch_public_webpage(body.url)
+    except RuleSourceError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return _save_rule_source(
+        request,
+        kind="url",
+        markdown=markdown,
+        display_name=str(metadata["display_name"]),
+        content_type=str(metadata["content_type"]),
+        original_url=str(metadata["original_url"]),
+    )
 
 
 @router.post("/rules", status_code=201)
@@ -252,8 +398,36 @@ def create_rule(body: RuleDefinitionV1, request: Request) -> dict[str, Any]:
             409,
             "Rule version must be greater than the latest stored version",
         )
+    for source in body.source_documents:
+        if source.kind == "builtin":
+            continue
+        stored_source = request.app.state.workbench.store.get_rule_source(source.source_id)
+        if not stored_source:
+            raise HTTPException(422, f"Rule source not found: {source.source_id}")
+        if source.digest and source.digest != stored_source.get("digest"):
+            raise HTTPException(409, f"Rule source changed: {source.source_id}")
     stored = request.app.state.workbench.store.put_rule(body.model_dump(mode="json"))
-    return dict(stored.get("definition") or {})
+    return _rule_response(stored)
+
+
+@router.delete("/rules/{rule_id}")
+def archive_rule(rule_id: str, request: Request) -> dict[str, Any]:
+    try:
+        return _rule_response(request.app.state.workbench.store.archive_rule(rule_id))
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@router.post("/rules/{rule_id}/restore")
+def restore_rule(rule_id: str, request: Request) -> dict[str, Any]:
+    try:
+        return _rule_response(request.app.state.workbench.store.restore_rule(rule_id))
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @router.get("/projects/{project_id}/rules")
@@ -281,8 +455,15 @@ def project_rules(project_id: str, request: Request) -> dict[str, Any]:
         "project_id": project_id,
         "bindings": items,
         "library": [
-            dict(item.get("definition") or {})
+            _rule_response(item)
             for item in request.app.state.workbench.store.list_rules()
+        ],
+        "archived_library": [
+            _rule_response(item)
+            for item in request.app.state.workbench.store.list_rules(
+                include_archived=True
+            )
+            if str(item.get("status")) == "archived"
         ],
         "legacy_guidance": {
             "path": "MUXDEV.md",
@@ -319,4 +500,4 @@ def bind_project_rule(
     }
 
 
-__all__ = ["RuleDefinitionV1", "router"]
+__all__ = ["RuleDefinitionV1", "RuleSourceV1", "router"]

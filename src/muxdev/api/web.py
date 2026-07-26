@@ -27,6 +27,7 @@ from .conversations import router as conversations_router
 from .collaboration import router as collaboration_router
 from .conversation_experience import router as conversation_experience_router
 from .projects import router as projects_router
+from .skills import router as skills_router
 from ..workbench import WorkbenchRegistry
 
 
@@ -289,10 +290,12 @@ def create_app(
                     continue
                 engine = RunEngine(path)
                 try:
-                    CollaborationService(
+                    service = CollaborationService(
                         ConversationService(engine, engine.store),
                         engine.store,
-                    ).schedule_queued()
+                    )
+                    service.schedule_queued()
+                    service.dispatch_pending_messages()
                 finally:
                     engine.store.close()
             await asyncio.sleep(0.5)
@@ -330,6 +333,7 @@ def create_app(
     application.include_router(conversations_router)
     application.include_router(collaboration_router)
     application.include_router(conversation_experience_router)
+    application.include_router(skills_router)
 
     return application
 

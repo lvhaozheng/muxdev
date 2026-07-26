@@ -15,6 +15,7 @@ EvidenceKind = Literal["artifact", "check", "review", "interaction", "runtime"]
 RequirementStatus = Literal["satisfied", "missing", "failed", "not_applicable"]
 GateStatus = Literal["PASS", "BLOCKED", "WAITING_HUMAN"]
 RecoveryStatus = Literal["not_needed", "recovering", "recovered", "needs_action", "exhausted"]
+SkillCaptureGrade = Literal["verified", "observed", "claimed", "unavailable"]
 
 
 def canonical_hash(value: object) -> str:
@@ -136,6 +137,25 @@ class RuntimeEvidence(EvidenceRecord):
     details: dict[str, Any] = Field(default_factory=dict)
 
 
+class SkillEvidenceV1(BaseModel):
+    """Frozen Skill usage manifest kept alongside objective Evidence records."""
+
+    qualified_name: str
+    version: str
+    revision: str
+    source_id: str
+    relative_file: str = "SKILL.md"
+    digest: str = ""
+    consumer: str = "unknown"
+    activation: str = "unknown"
+    capture_grade: SkillCaptureGrade
+    session_id: str | None = None
+    assignment_id: str | None = None
+    generation: int | None = None
+    usage_id: str | None = None
+    required: bool = False
+
+
 AnyEvidenceRecord = Annotated[
     ArtifactEvidence | CheckEvidence | ReviewEvidence | InteractionEvidence | RuntimeEvidence,
     Field(discriminator="kind"),
@@ -242,5 +262,6 @@ class EvidenceReport(BaseModel):
     routing: dict[str, Any] = Field(default_factory=dict)
     reviewer: dict[str, Any] = Field(default_factory=dict)
     harness: dict[str, Any] = Field(default_factory=dict)
+    skills: list[SkillEvidenceV1] = Field(default_factory=list)
     recovery: RecoverySummary | None = None
     generated_at: str = Field(default_factory=utc_now)

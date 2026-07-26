@@ -27,7 +27,7 @@ async function projectApi(request) {
   return `/api/v2/projects/${encodeURIComponent(project.project_id)}`;
 }
 
-test("desktop creates a task and opens its logical Agent terminal", async ({ page }) => {
+test("desktop hides Mock choices and opens a logical Agent terminal", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "MuxDev 工作台" })).toBeVisible();
@@ -69,31 +69,44 @@ test("desktop creates a task and opens its logical Agent terminal", async ({ pag
   } else {
     await expect(qwenOption).toBeDisabled();
   }
-  for (const definition of agentDefinitions) {
+  for (const definition of agentDefinitions.filter(
+    (item) => item.selectable !== false,
+  )) {
     const option = agentSelect.locator(`option[value="${definition.agent_id}"]`);
     if (!definition.available) await expect(option).toHaveAttribute("disabled", "");
   }
-  await expect
-    .poll(() =>
-      agentSelect.locator("option:checked").evaluate((option) => option.disabled),
-    )
-    .toBe(false);
+  await expect(agentSelect.locator('option[value="mock"]')).toHaveCount(0);
+  await expect(agentSelect.locator('option[value="mock-review"]')).toHaveCount(0);
+  await expect(agentSelect.locator('option[value="mock-orchestrator"]')).toHaveCount(0);
   await page.getByLabel("任务目标").fill("Inspect README.md and report findings");
-  await agentSelect.selectOption("mock");
   await page.getByLabel("最终想拿到什么").selectOption("answer");
   await page.screenshot({
     path: `${auditDir}/02-create-dialog-agent-availability.png`,
     fullPage: false,
   });
-  await page.getByRole("button", { name: "创建任务" }).click();
+  await page.keyboard.press("Escape");
+  const created = await page.request.post(`${api}/conversations`, {
+    data: {
+      goal: "Inspect README.md and report findings",
+      mode: "direct",
+      agent_id: "mock",
+      deliverables: [{ type: "answer" }],
+      auto_start_when_ready: true,
+    },
+  });
+  expect(created.ok(), await created.text()).toBeTruthy();
+  await page.reload();
   const createdConversation = page.getByRole("button", {
     name: "Inspect README.md and report findings",
   });
   await expect(createdConversation).toBeVisible();
   await createdConversation.click();
+  await expect(
+    page.getByRole("heading", { name: "Inspect README.md and report findings" }),
+  ).toBeVisible();
   await expectNoHorizontalOverflow(page);
 
-  await page.getByRole("button", { name: "Terminal" }).click();
+  await page.getByRole("button", { name: "Terminal", exact: true }).click();
   const terminalButton = page.getByRole("button", { name: /打开终端/ }).first();
   await expect(terminalButton).toBeVisible();
   await terminalButton.click();
@@ -115,14 +128,14 @@ test("failed Session keeps transcript read-only and restarts explicitly", async 
   await page
     .getByRole("button", { name: "Restart failed Agent Session" })
     .click();
-  await page.getByRole("button", { name: "Terminal" }).click();
+  await page.getByRole("button", { name: "Terminal", exact: true }).click();
 
   const readOnly = page.getByRole("button", {
     name: "只读查看失败输出",
   });
   await expect(readOnly).toBeVisible();
   await readOnly.click();
-  await expect(page.getByRole("alert")).toContainText(
+  await expect(page.locator(".terminal-failure[role='alert']")).toContainText(
     "Simulated Agent process exit",
   );
   await expect(page.locator("#terminal-lease-status")).toContainText(
@@ -133,7 +146,7 @@ test("failed Session keeps transcript read-only and restarts explicitly", async 
   await expect(
     page.getByLabel("多 Agent Web 终端").locator("option:checked"),
   ).toContainText("G2");
-  await expect(page.getByRole("alert")).toBeHidden();
+  await expect(page.locator(".terminal-failure[role='alert']")).toBeHidden();
   await expect(page.locator("#terminal-lease-status")).toContainText(
     /已连接|只读/,
   );
@@ -149,7 +162,114 @@ test("failed Session keeps transcript read-only and restarts explicitly", async 
   const response = await sentResponse;
   expect(response.status(), await response.text()).toBe(202);
   await expect(
-    page.getByRole("status").filter({ hasText: "消息已发送" }),
+    page.getByRole("status").filter({ hasText: "已交给 mock（G2），正在执行" }),
+  ).toBeVisible();
+});
+
+test("consecutive events from the same participant fold across semantic types", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1024, height: 768 });
+  await page.goto("/");
+  await page
+    .getByRole("button", { name: "Harden checkout retry handling" })
+    .click();
+
+  const group = page
+    .locator(".timeline-event-group")
+    .filter({ hasText: "Agent progress message 4" })
+    .first();
+  const toggle = group.getByRole("button", {
+    name: /codex · 连续 4 条活动/,
+  });
+  await expect(toggle).toHaveAttribute("aria-expanded", "false");
+  await expect(toggle).toContainText("Agent 已返回新的进度");
+  await expect(group.locator(".timeline-event")).toHaveCount(1);
+  await toggle.focus();
+  await page.keyboard.press("Enter");
+  await expect(toggle).toHaveAttribute("aria-expanded", "true");
+  await expect(group.locator(".timeline-event")).toHaveCount(4);
+  await page.keyboard.press("Space");
+  await expect(toggle).toHaveAttribute("aria-expanded", "false");
+});
+
+test("execution graph switches to a single Agent lifecycle and inspects nodes", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1200, height: 820 });
+  await page.goto("/");
+  await page
+    .getByRole("button", { name: "Harden checkout retry handling" })
+    .click();
+
+  const graphToggle = page.getByRole("button", { name: /Agent 执行流程/ });
+  await expect(graphToggle).toHaveAttribute("aria-expanded", "false");
+  await graphToggle.click();
+  await expect(graphToggle).toHaveAttribute("aria-expanded", "true");
+  await page.getByRole("button", { name: "单 Agent" }).click();
+  const graph = page.getByLabel("Agent 执行 DAG");
+  await expect(graph).toBeVisible();
+  const node = graph.locator(".execution-dag-node").first();
+  await node.click();
+  await expect(page.getByText("NODE INSPECTOR")).toBeVisible();
+  await expect(page.getByText(/条关联事件/)).toBeVisible();
+});
+
+test("CLI usage blocker explains the required action and Review is not misleading", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1200, height: 820 });
+  await page.goto("/");
+  await page
+    .getByRole("button", { name: "CLI usage limit requires Terminal" })
+    .click();
+
+  const blocker = page.locator(".runtime-attention-card[role='alert']").filter({
+    hasText: "Agent CLI 已暂停，需在 Terminal 处理",
+  });
+  await expect(blocker).toContainText("已明确报告当前使用额度耗尽");
+  await expect(blocker).toContainText("额度恢复后在原 Session 继续");
+  await expect(
+    page.getByText("Agent 正在工作，可随时从 Composer 继续补充上下文。"),
+  ).toHaveCount(0);
+  await expect(page.getByLabel("发送消息")).toHaveAttribute(
+    "placeholder",
+    /当前阻塞需先在 Terminal 处理/,
+  );
+
+  await page.getByRole("button", { name: "Review", exact: true }).click();
+  await expect(
+    page.getByRole("heading", { name: "尚未进入交付评审" }),
+  ).toBeVisible();
+  await expect(page.getByText("尚未形成交付候选，因此没有人工评审内容。")).toBeVisible();
+  await page.getByRole("button", { name: "打开 Terminal", exact: true }).click();
+  await expect(page.getByLabel("多 Agent Web 终端")).toBeVisible();
+});
+
+test("Skills canvas separates project, global, and online catalogs", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1200, height: 820 });
+  await page.goto("/");
+  await page
+    .getByRole("button", { name: "Harden checkout retry handling" })
+    .click();
+  await page.getByRole("button", { name: "Skills" }).click();
+
+  const projectSection = page.getByRole("button", { name: /项目使用中/ });
+  const globalSection = page.getByRole("button", {
+    name: /全局已安装、当前项目未使用/,
+  });
+  const onlineSection = page.getByRole("button", { name: /联网搜索与下载/ });
+  await expect(projectSection).toHaveAttribute("aria-expanded", "true");
+  await expect(globalSection).toHaveAttribute("aria-expanded", "false");
+  await expect(onlineSection).toHaveAttribute("aria-expanded", "false");
+  await onlineSection.click();
+  await expect(page.getByLabel("搜索联网 Skills")).toBeVisible();
+  await expect(page.getByLabel("GitHub Skill 目录 URL")).toBeVisible();
+  await globalSection.click();
+  await expect(
+    page.getByText(/来源连接、信任与文件审计/),
   ).toBeVisible();
 });
 
@@ -166,7 +286,10 @@ test("390x844 keeps the composer reachable and answers clarification by keyboard
 
   await page.goto("/");
   await page.getByRole("button", { name: new RegExp(goal) }).click();
-  await expect(page.getByText("需要你确认", { exact: true }).first()).toBeVisible();
+  const clarification = page.locator(".interaction-card").filter({
+    hasText: "需要你确认",
+  });
+  await expect(clarification).toBeVisible();
   await expectNoHorizontalOverflow(page);
 
   const composer = page.locator("#composer");
@@ -181,7 +304,7 @@ test("390x844 keeps the composer reachable and answers clarification by keyboard
   await answer.fill("交付一份结构化分析报告");
   await answer.press("Enter");
   await expect(page.getByRole("status").filter({ hasText: "回答已提交" })).toBeVisible();
-  await expect(page.getByText("需要你确认", { exact: true }).first()).toBeHidden();
+  await expect(clarification).toBeHidden();
   await expect(answer).toBeHidden();
   await expect(page.locator(".conversation-status")).toContainText("进行中");
   await page.screenshot({
@@ -251,7 +374,7 @@ test("review request-changes preserves the draft until success and starts the ne
   await expect(
     page.getByRole("button", { name: /revise-browser\.txt/ }),
   ).toBeVisible();
-  await page.getByRole("button", { name: "Review" }).click();
+  await page.getByRole("button", { name: "Review", exact: true }).click();
   await expect(page.getByText(/本轮变更 \d+ 个文件/)).toBeVisible();
   const feedback = page.getByLabel("修改意见");
   await feedback.fill("请补充空输入的边界测试。");
@@ -280,7 +403,7 @@ test("accept settles a genuine Evidence v3 candidate to idle", async ({ page }) 
   await expect(
     page.getByRole("button", { name: /accept-browser\.txt/ }),
   ).toBeVisible();
-  await page.getByRole("button", { name: "Review" }).click();
+  await page.getByRole("button", { name: "Review", exact: true }).click();
   await page.screenshot({
     path: `${auditDir}/08-review-before-accept.png`,
     fullPage: false,
@@ -300,7 +423,7 @@ test("rollback restores bytes, settles idle, and appears in the timeline", async
   await page
     .getByRole("button", { name: "Rollback verified browser delivery" })
     .click();
-  await page.getByRole("button", { name: "Review" }).click();
+  await page.getByRole("button", { name: "Review", exact: true }).click();
   await page.getByRole("button", { name: "回退本轮" }).click();
   await expect(
     page.getByRole("status").filter({ hasText: "本轮变更已安全回退" }),
@@ -339,6 +462,17 @@ test("Rule canvas creates a safe custom Rule without arbitrary shell input", asy
     page.getByRole("status").filter({ hasText: `Rule 已创建：${title}` }),
   ).toBeVisible();
   await expect(page.getByText(title, { exact: true })).toBeVisible();
+  const detailTrigger = page.getByRole("button", {
+    name: `查看 Rule：${title}`,
+  });
+  await detailTrigger.click();
+  const dialog = page.getByRole("dialog", { name: title });
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText(ruleId);
+  await expect(dialog).toContainText("只修改任务范围内文件");
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+  await expect(detailTrigger).toBeFocused();
   await expect(page.getByText(/CI 门禁只能由已登记的 argv 验证命令/)).toBeHidden();
   await expectNoHorizontalOverflow(page);
 });

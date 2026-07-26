@@ -91,12 +91,13 @@ muxdev agent doctor --agent-id codex
 
 Web 新建任务窗口会禁用未安装的 Agent，并显示不可用原因。多 Agent 编排模式还要求主要 Agent 具备 `orchestrate` 能力。
 
-内置可发现目录包括 Codex、Claude Code、Qwen Code、Kimi Code、Trae 和 Antigravity。每次打开“新建任务”，工作台都会重新扫描 daemon 的 `PATH`：
+内置可发现目录包括 Codex、Claude Code、Deep Code、Qwen Code、Kimi Code、Trae 和 Antigravity。每次打开“新建任务”，工作台都会重新扫描 daemon 的 `PATH`。Deep Code 可通过 `npm install -g @vegamo/deepcode-cli` 安装，需要 Node.js 22+ 和真实 PTY/ConPTY；其 API 配置可保存在 `~/.deepcode/settings.json`，也可使用 `DEEPCODE_API_KEY`、`DEEPCODE_BASE_URL`、`DEEPCODE_MODEL`：
 
 - “已检测到”中的 Agent 可以直接作为主 Agent；
 - “未就绪”中的 Agent 尚未安装、daemon 看不到其命令，或缺少所需 PTY；
 - Windows 安装 npm CLI 后通常会检测到对应 `.cmd` / `.ps1` 启动器；
 - 安装新 CLI 后若仍未出现，请从能够执行该命令的终端重启 muxdev daemon。
+- Codex 默认以 Approve for me 启动，不再逐次审批 `muxdev collab`；运行仍限制在 `workspace-write`，额外可写范围只有项目 `.muxdev` 控制目录。
 
 ## 3. 五分钟完成第一个任务
 

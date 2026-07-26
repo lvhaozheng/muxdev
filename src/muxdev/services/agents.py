@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from pathlib import Path
@@ -215,6 +216,7 @@ class AgentRegistry:
         *,
         worktree: Path,
         native_session_id: str | None = None,
+        initial_prompt: str | None = None,
     ) -> list[str]:
         agent = self.get(agent_id)
         adapter = self.adapter_for(agent)
@@ -223,8 +225,14 @@ class AgentRegistry:
             if not adapter.supports_resume:
                 raise ValueError(f"CLI adapter {adapter.cli_id} does not support native resume")
             template = adapter.resume_command
+        normalized_worktree = os.path.normcase(str(Path(worktree).resolve()))
         replacements = {
             "{worktree}": str(Path(worktree).resolve()),
+            "{worktree_toml}": json.dumps(
+                normalized_worktree,
+                ensure_ascii=False,
+            ),
+            "{control_dir}": str((self.workspace / ".muxdev").resolve()),
             "{model}": str(agent.model or ""),
             "{native_session_id}": str(native_session_id or ""),
         }
@@ -233,6 +241,12 @@ class AgentRegistry:
             argv.extend([adapter.working_directory_arg, str(Path(worktree).resolve())])
         if agent.model and adapter.model_arg and not any("{model}" in item for item in template):
             argv.extend([adapter.model_arg, agent.model])
+        if initial_prompt:
+            if adapter.bootstrap_transport != "argv":
+                raise ValueError(
+                    f"CLI adapter {adapter.cli_id} does not accept an argv bootstrap"
+                )
+            argv.append(initial_prompt)
         if argv[0] == adapter.command[0]:
             _detected_command, executable = self._resolve_adapter_executable(adapter)
         else:
@@ -264,7 +278,14 @@ class AgentRegistry:
             if not key.startswith("MUXDEV_"):
                 raise ValueError("runtime-injected CLI variables must use the MUXDEV_ prefix")
             env[key] = value
-        env.setdefault("TERM", "xterm-256color")
+        if adapter.supports_pty:
+            # A daemon may be launched from a non-interactive shell that exports
+            # TERM=dumb. Interactive coding CLIs then stop for confirmation
+            # before their prompt exists, so PTY adapters need a real terminal
+            # capability declaration regardless of the parent shell.
+            env["TERM"] = "xterm-256color"
+        else:
+            env.setdefault("TERM", "xterm-256color")
         return env
 
     @staticmethod

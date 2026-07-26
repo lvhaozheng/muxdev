@@ -31,6 +31,52 @@ from .project_context import workspace_for_request, workspace_for_websocket
 router = APIRouter(prefix="/api/v2/projects/{project_id}")
 
 
+class _TerminalRateLimiter:
+    """Small per-WebSocket sliding-window limiter with semantic buckets."""
+
+    window_seconds = 10.0
+
+    def __init__(self) -> None:
+        self._buckets: dict[str, list[tuple[float, int]]] = {
+            "input_bytes": [],
+            "resize": [],
+            "control": [],
+        }
+        self._violations: list[float] = []
+
+    def allow(
+        self,
+        scope: Literal["input_bytes", "resize", "control"],
+        amount: int,
+        limit: int,
+        *,
+        now: float | None = None,
+    ) -> tuple[bool, int]:
+        current = time.monotonic() if now is None else now
+        cutoff = current - self.window_seconds
+        bucket = [
+            item for item in self._buckets[scope] if item[0] > cutoff
+        ]
+        self._buckets[scope] = bucket
+        used = sum(item[1] for item in bucket)
+        if used + amount <= limit:
+            bucket.append((current, amount))
+            return True, 0
+        retry_after = (
+            max(1, int((bucket[0][0] + self.window_seconds - current) * 1000))
+            if bucket
+            else int(self.window_seconds * 1000)
+        )
+        return False, retry_after
+
+    def note_violation(self, *, now: float | None = None) -> bool:
+        current = time.monotonic() if now is None else now
+        cutoff = current - self.window_seconds
+        self._violations = [item for item in self._violations if item > cutoff]
+        self._violations.append(current)
+        return len(self._violations) >= 5
+
+
 class DeliverableRequest(BaseModel):
     type: Literal["code_change", "file", "report", "runnable", "answer", "other"]
     path: str | None = Field(default=None, max_length=500)
@@ -483,10 +529,12 @@ def restart_agent_session(session_id: str, request: Request) -> dict[str, Any]:
                     retryable=True,
                     session_id=session_id,
                 )
+            delivered_messages = service.dispatch_pending_messages(force=True)
             generations = service.store.list_session_generations(session_id)
             return {
                 "session": updated,
                 "generation": generations[-1] if generations else None,
+                "delivered_messages": delivered_messages,
                 "assignment": (
                     service.store.get_assignment(assignment_id)
                     if assignment_id
@@ -643,7 +691,8 @@ async def terminal_websocket(websocket: WebSocket, session_id: str) -> None:
     await websocket.accept()
     cursor = 0
     lease_id = ""
-    timestamps: list[float] = []
+    limiter = _TerminalRateLimiter()
+    last_resize: tuple[int, int] | None = None
     try:
         while True:
             try:
@@ -651,47 +700,23 @@ async def terminal_websocket(websocket: WebSocket, session_id: str) -> None:
             except TimeoutError:
                 frame = ""
             if frame:
-                if len(frame.encode("utf-8")) > 65536:
-                    await websocket.send_json({"type": "error", "code": "frame_too_large"})
-                    continue
-                now = time.monotonic()
-                timestamps = [item for item in timestamps if now - item < 10]
-                if len(timestamps) >= 100:
-                    await websocket.send_json({"type": "error", "code": "rate_limited"})
-                    continue
-                timestamps.append(now)
-                try:
-                    message = json.loads(frame)
-                except json.JSONDecodeError:
-                    await websocket.send_json({"type": "error", "code": "invalid_json"})
-                    continue
-                try:
-                    cursor, lease_id, record = await _handle_terminal_message(
+                cursor, lease_id, record, last_resize, closed = (
+                    await _handle_terminal_frame(
                         websocket,
                         manager,
                         workspace,
                         session_id,
                         holder,
                         record,
-                        message,
+                        frame,
                         cursor,
                         lease_id,
+                        limiter,
+                        last_resize,
                     )
-                except (FileNotFoundError, PermissionError, RuntimeError, ValueError) as exc:
-                    detail = (
-                        exc.detail()
-                        if isinstance(
-                            exc,
-                            (AgentUnavailableError, SessionLifecycleError),
-                        )
-                        else {
-                            "code": "terminal_operation_failed",
-                            "message": str(exc),
-                            "remediation": "检查 Session 状态后重试。",
-                            "retryable": True,
-                        }
-                    )
-                    await websocket.send_json({"type": "error", **detail})
+                )
+                if closed:
+                    return
             events = manager.events(session_id, after_seq=cursor, limit=1000)
             for event in events:
                 cursor = max(cursor, int(event["seq"]))
@@ -704,6 +729,97 @@ async def terminal_websocket(websocket: WebSocket, session_id: str) -> None:
     finally:
         if lease_id:
             manager.release_write_lease(session_id, holder=holder, lease_id=lease_id)
+
+
+async def _handle_terminal_frame(
+    websocket: WebSocket,
+    manager: AgentSessionManager,
+    workspace: Path,
+    session_id: str,
+    holder: str,
+    record: dict[str, Any],
+    frame: str,
+    cursor: int,
+    lease_id: str,
+    limiter: _TerminalRateLimiter,
+    last_resize: tuple[int, int] | None,
+) -> tuple[int, str, dict[str, Any], tuple[int, int] | None, bool]:
+    if len(frame.encode("utf-8")) > 72 * 1024:
+        await websocket.send_json({"type": "error", "code": "frame_too_large"})
+        return cursor, lease_id, record, last_resize, False
+    try:
+        message = json.loads(frame)
+    except json.JSONDecodeError:
+        await websocket.send_json({"type": "error", "code": "invalid_json"})
+        return cursor, lease_id, record, last_resize, False
+    kind = str(message.get("type") or "")
+    allowed = True
+    retry_after_ms = 0
+    scope: Literal["input_bytes", "resize", "control"] = "control"
+    dimensions: tuple[int, int] | None = None
+    if kind == "resize":
+        try:
+            dimensions = (
+                int(message.get("cols") or 120),
+                int(message.get("rows") or 32),
+            )
+        except (TypeError, ValueError):
+            await websocket.send_json({"type": "error", "code": "invalid_resize"})
+            return cursor, lease_id, record, last_resize, False
+        if dimensions == last_resize:
+            return cursor, lease_id, record, last_resize, False
+    if kind == "input":
+        scope = "input_bytes"
+        amount = len(str(message.get("data") or "").encode("utf-8"))
+        allowed, retry_after_ms = limiter.allow(scope, amount, 1024 * 1024)
+    elif kind == "resize":
+        scope = "resize"
+        allowed, retry_after_ms = limiter.allow(scope, 1, 20)
+    elif kind != "heartbeat":
+        allowed, retry_after_ms = limiter.allow(scope, 1, 30)
+    if not allowed:
+        await websocket.send_json(
+            {
+                "type": "error",
+                "code": "rate_limited",
+                "scope": scope,
+                "retry_after_ms": retry_after_ms,
+            }
+        )
+        if limiter.note_violation():
+            await websocket.close(
+                code=4429,
+                reason=f"terminal {scope} rate limit exceeded",
+            )
+            return cursor, lease_id, record, last_resize, True
+        return cursor, lease_id, record, last_resize, False
+    if dimensions is not None:
+        last_resize = dimensions
+    try:
+        cursor, lease_id, record = await _handle_terminal_message(
+            websocket,
+            manager,
+            workspace,
+            session_id,
+            holder,
+            record,
+            message,
+            cursor,
+            lease_id,
+        )
+    except (FileNotFoundError, PermissionError, RuntimeError, ValueError) as exc:
+        detail = (
+            exc.detail()
+            if isinstance(exc, (AgentUnavailableError, SessionLifecycleError))
+            else {
+                "code": "terminal_operation_failed",
+                "message": str(exc),
+                "remediation": "检查 Session 状态后重试。",
+                "retryable": True,
+            }
+        )
+        await websocket.send_json({"type": "error", **detail})
+    return cursor, lease_id, record, last_resize, False
 
 
 async def _handle_terminal_message(
@@ -724,6 +840,16 @@ async def _handle_terminal_message(
             record = store.get_agent_session(session_id) or record
         if str(record.get("status")) == "resumable":
             record = manager.ensure_live(session_id)
+        if str(message.get("replay_scope") or "") == "current_generation":
+            metadata = (
+                record.get("metadata")
+                if isinstance(record.get("metadata"), Mapping)
+                else {}
+            )
+            generation_start = max(
+                1, int((metadata or {}).get("generation_start_sequence") or 1)
+            )
+            cursor = max(cursor, generation_start - 1)
         snapshot = manager.snapshot(session_id)
         terminal_info = (record.get("metadata") or {}).get("terminal") or {}
         if snapshot["attached"] and terminal_info.get("resize"):

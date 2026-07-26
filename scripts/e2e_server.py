@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from uuid import uuid4
 
 import uvicorn
 
@@ -14,6 +15,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from muxdev.api import create_app
 from muxdev.runtime import ConversationService, RunEngine
 from muxdev.runtime.agent_sessions import agent_session_manager
+from muxdev.runtime.agent_session_state import project_runtime_waiting
 from muxdev.runtime.collaboration_service import CollaborationService
 from muxdev.storage import ControlStore
 
@@ -136,6 +138,19 @@ def seed_design_conversation(workspace: Path) -> None:
                 actor="runtime" if grade != "recorded" else "codex",
                 run_id=run_id,
                 capture_grade=grade,
+            )
+        for index, event_type in enumerate(
+            ("agent.message", "assistant.message", "provider.message", "agent.message")
+        ):
+            store.append_conversation_event(
+                conversation_id,
+                event_type,
+                {"content": f"Agent progress message {index + 1}"},
+                actor="codex",
+                run_id=run_id,
+                session_id="session_e2e_group",
+                generation=1,
+                capture_grade="recorded",
             )
         candidate = store.create_delivery_candidate(
             conversation_id,
@@ -301,11 +316,31 @@ def seed_failed_conversation(workspace: Path) -> None:
         engine.store.close()
 
 
+def seed_runtime_waiting_conversation(workspace: Path) -> None:
+    engine = RunEngine(workspace)
+    service = CollaborationService(
+        ConversationService(engine, engine.store),
+        engine.store,
+    )
+    try:
+        detail = service.create(
+            "Inspect the CLI usage blocker",
+            title="CLI usage limit requires Terminal",
+            mode="direct",
+            agent_id="mock",
+        )
+        session_id = str(detail["sessions"][0]["session_id"])
+        if not project_runtime_waiting(workspace, session_id):
+            raise RuntimeError("failed to seed the runtime waiting projection")
+    finally:
+        engine.store.close()
+
+
 def main() -> None:
     workspace = Path(
         os.environ.get(
             "MUXDEV_E2E_WORKSPACE",
-            f".test_workspaces/browser-e2e-{os.getpid()}",
+            f".test_workspaces/browser-e2e-{os.getpid()}-{uuid4().hex}",
         )
     ).resolve()
     workspace.mkdir(parents=True, exist_ok=True)
@@ -330,6 +365,7 @@ def main() -> None:
         filename="rollback-browser.txt",
     )
     seed_failed_conversation(workspace)
+    seed_runtime_waiting_conversation(workspace)
     uvicorn.run(
         create_app(workspace),
         host="127.0.0.1",

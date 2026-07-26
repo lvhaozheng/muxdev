@@ -4,6 +4,10 @@ import type {
   Conversation,
   Project,
   ProjectRules,
+  ProjectSkills,
+  MessageDeliveryResponse,
+  RemoteSkillSearch,
+  RuleSource,
   ReviewView,
   ConversationSnapshot,
 } from "./types";
@@ -13,12 +17,14 @@ export interface ApiErrorDetail {
   message: string;
   remediation?: string;
   retryable?: boolean;
+  retry_after_ms?: number;
 }
 
 export class ApiError extends Error {
   code: string;
   remediation?: string;
   retryable: boolean;
+  retryAfterMs?: number;
   status: number;
 
   constructor(status: number, detail: ApiErrorDetail) {
@@ -28,6 +34,7 @@ export class ApiError extends Error {
     this.code = detail.code;
     this.remediation = detail.remediation;
     this.retryable = Boolean(detail.retryable);
+    this.retryAfterMs = detail.retry_after_ms;
   }
 }
 
@@ -61,6 +68,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
           message: value.message || detail.message,
           remediation: value.remediation,
           retryable: value.retryable ?? detail.retryable,
+          retry_after_ms: value.retry_after_ms,
         };
       }
     } catch {
@@ -129,7 +137,7 @@ export function sendMessage(
   interactionId?: string,
   recipients: string[] = [],
   dispatchKind = "message",
-): Promise<Record<string, unknown>> {
+): Promise<MessageDeliveryResponse> {
   return request(
     projectApi(
       projectId,
@@ -277,4 +285,135 @@ export function createRule(
     method: "POST",
     body: JSON.stringify({ ...body, scope: "user" }),
   });
+}
+
+export function uploadRuleSource(file: File): Promise<RuleSource> {
+  return request<RuleSource>(
+    `/api/v2/rule-sources/upload?filename=${encodeURIComponent(file.name)}`,
+    {
+      method: "POST",
+      headers: { "content-type": file.type || "application/octet-stream" },
+      body: file,
+    },
+  );
+}
+
+export function importRuleSource(url: string): Promise<RuleSource> {
+  return request<RuleSource>("/api/v2/rule-sources/import-url", {
+    method: "POST",
+    body: JSON.stringify({ url }),
+  });
+}
+
+export function archiveRule(ruleId: string): Promise<import("./types").RuleDefinition> {
+  return request<import("./types").RuleDefinition>(
+    `/api/v2/rules/${encodeURIComponent(ruleId)}`,
+    { method: "DELETE" },
+  );
+}
+
+export function restoreRule(ruleId: string): Promise<import("./types").RuleDefinition> {
+  return request<import("./types").RuleDefinition>(
+    `/api/v2/rules/${encodeURIComponent(ruleId)}/restore`,
+    { method: "POST" },
+  );
+}
+
+export function getProjectSkills(projectId: string): Promise<ProjectSkills> {
+  return request<ProjectSkills>(projectApi(projectId, "/skills"));
+}
+
+export function searchRemoteSkills(
+  query: string,
+  provider: "all" | "openai" | "anthropic" = "all",
+  cursor?: string | null,
+): Promise<RemoteSkillSearch> {
+  const params = new URLSearchParams({ q: query, provider, limit: "20" });
+  if (cursor) params.set("cursor", cursor);
+  return request<RemoteSkillSearch>(
+    `/api/v2/skills/remote/search?${params.toString()}`,
+  );
+}
+
+export function importRemoteSkillSource(body: {
+  url: string;
+  ref?: string;
+  display_name?: string;
+}) {
+  return request<import("./types").SkillSource>(
+    "/api/v2/skill-sources/import-remote",
+    { method: "POST", body: JSON.stringify(body) },
+  );
+}
+
+export function bindProjectSkill(
+  projectId: string,
+  qualifiedName: string,
+  body: { enabled: boolean; required: boolean },
+) {
+  return request<import("./types").SkillBinding>(
+    projectApi(
+      projectId,
+      `/skills/${encodeURIComponent(qualifiedName)}/binding`,
+    ),
+    {
+      method: "PUT",
+      body: JSON.stringify({ scope: "project", ...body }),
+    },
+  );
+}
+
+export function activateConversationSkill(
+  projectId: string,
+  conversationId: string,
+  qualifiedName: string,
+) {
+  return request<Record<string, unknown>>(
+    projectApi(
+      projectId,
+      `/conversations/${encodeURIComponent(conversationId)}/skills/${encodeURIComponent(
+        qualifiedName,
+      )}/activate`,
+    ),
+    { method: "POST" },
+  );
+}
+
+export function createSkillSource(body: {
+  path: string;
+  display_name?: string;
+  mode: "connect" | "copy";
+}) {
+  return request<import("./types").SkillSource>("/api/v2/skill-sources", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function updateSkillSource(
+  sourceId: string,
+  body: {
+    trust_state?: "user_trusted" | "org_trusted" | "untrusted" | "needs_review" | "quarantined";
+    enabled?: boolean;
+    auto_enable?: boolean;
+  },
+) {
+  return request<import("./types").SkillSource>(
+    `/api/v2/skill-sources/${encodeURIComponent(sourceId)}`,
+    { method: "PATCH", body: JSON.stringify(body) },
+  );
+}
+
+export function rescanSkillSource(sourceId: string) {
+  return request<import("./types").SkillSource>(
+    `/api/v2/skill-sources/${encodeURIComponent(sourceId)}/rescan`,
+    { method: "POST" },
+  );
+}
+
+export function disconnectSkillSource(sourceId: string) {
+  return request<import("./types").SkillSource>(
+    `/api/v2/skill-sources/${encodeURIComponent(sourceId)}`,
+    { method: "DELETE" },
+  );
 }

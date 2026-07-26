@@ -13,11 +13,14 @@ from ..core.processes import ProcessSupervisor
 from ..models.evidence import (
     ArtifactEvidence,
     CheckEvidence,
+    EvidencePolicy,
     EvidenceReport,
+    EvidenceRequirement,
     InteractionEvidence,
     ReviewEvidence,
     ReviewFinding,
     RuntimeEvidence,
+    SkillEvidenceV1,
     canonical_hash,
 )
 from ..services.evidence_policy import load_evidence_policy
@@ -53,6 +56,7 @@ class DeliveryContext:
     run_dir: Path
     paths: dict[str, Path]
     artifacts: dict[str, dict[str, Any]]
+    skill_bindings: tuple[dict[str, Any], ...]
 
 
 def finalize_delivery(service: Any, conversation_id: str) -> dict[str, Any]:
@@ -72,6 +76,7 @@ def finalize_delivery(service: Any, conversation_id: str) -> dict[str, Any]:
         review_records,
         human_approved,
     )
+    skill_manifest = _record_skill_evidence(service, context, records)
     decision = evaluate_gate(
         context.policy,
         records,
@@ -81,7 +86,14 @@ def finalize_delivery(service: Any, conversation_id: str) -> dict[str, Any]:
         "awaiting_approval" if decision.status == "WAITING_HUMAN" else "blocked"
     )
     service.store.update_run(context.run_id, status=run_status)
-    report_path = _write_report(service, context, records, decision, review_records)
+    report_path = _write_report(
+        service,
+        context,
+        records,
+        decision,
+        review_records,
+        skill_manifest,
+    )
     return service.conversations._record_result(
         conversation_id,
         context.run_id,
@@ -114,6 +126,15 @@ def _prepare_context(service: Any, conversation_id: str) -> DeliveryContext:
         ),
         standard,
     )
+    skill_bindings = tuple(
+        item
+        for item in service.store.list_skill_bindings(
+            conversation_id=conversation_id,
+            enabled_only=True,
+        )
+        if bool(item.get("required"))
+    )
+    policy = _extend_skill_policy(policy, skill_bindings)
     run_id = f"collab_{uuid4().hex}"
     run_dir = service.workspace / ".muxdev" / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -174,6 +195,39 @@ def _prepare_context(service: Any, conversation_id: str) -> DeliveryContext:
         run_dir=run_dir,
         paths=paths,
         artifacts=artifacts,
+        skill_bindings=skill_bindings,
+    )
+
+
+def _skill_requirement_id(binding: Mapping[str, Any]) -> str:
+    identity = str(binding.get("binding_id") or binding.get("qualified_name") or "")
+    return "required_skill_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
+
+
+def _extend_skill_policy(
+    policy: EvidencePolicy,
+    bindings: tuple[dict[str, Any], ...],
+) -> EvidencePolicy:
+    if not bindings:
+        return policy
+    requirements = list(policy.requirements)
+    requirements.extend(
+        EvidenceRequirement(
+            id=_skill_requirement_id(binding),
+            description=(
+                "当前 Session generation 必须通过 MuxDev 审计加载器验证加载 Skill："
+                f"{binding['qualified_name']} ({binding['revision']})"
+            ),
+            accepted_kinds=["runtime"],
+            subject_selector="run",
+            require_integrity=True,
+        )
+        for binding in bindings
+    )
+    return EvidencePolicy(
+        policy_id=policy.policy_id,
+        version=policy.version,
+        requirements=requirements,
     )
 
 
@@ -526,6 +580,7 @@ def _write_report(
     records: list[Any],
     decision: Any,
     review_records: Mapping[str, ReviewEvidence],
+    skill_manifest: list[SkillEvidenceV1],
 ) -> Path:
     chain_valid, chain_errors = service.store.verify_event_chain(context.run_id)
     chain = service.store.events(context.run_id)
@@ -569,6 +624,7 @@ def _write_report(
                 for item in service.store.list_assignments(context.conversation_id)
             ],
         },
+        skills=skill_manifest,
     )
     report_path = context.run_dir / "evidence-report.json"
     report_path.write_text(report.model_dump_json(indent=2) + "\n", encoding="utf-8")
@@ -580,6 +636,118 @@ def _write_report(
         media_type="application/json",
     )
     return report_path
+
+
+def _record_skill_evidence(
+    service: Any,
+    context: DeliveryContext,
+    records: list[Any],
+) -> list[SkillEvidenceV1]:
+    sessions = service.store.list_agent_sessions(context.conversation_id)
+    current_generations = {
+        (str(item.get("session_id") or ""), int(item.get("generation") or 0))
+        for item in sessions
+        if str(item.get("status") or "") not in {"closed", "failed"}
+    }
+    required_by_id = {
+        str(item["binding_id"]): item for item in context.skill_bindings
+    }
+    usage = service.store.list_skill_usage(
+        conversation_id=context.conversation_id,
+    )
+    manifest: list[SkillEvidenceV1] = []
+    satisfied: set[str] = set()
+    allowed_grades = {"verified", "observed", "claimed", "unavailable"}
+    for item in usage:
+        session_generation = (
+            str(item.get("session_id") or ""),
+            int(item.get("generation") or 0),
+        )
+        if session_generation not in current_generations:
+            continue
+        metadata = (
+            item.get("metadata")
+            if isinstance(item.get("metadata"), Mapping)
+            else {}
+        )
+        binding_id = str(metadata.get("binding_id") or "")
+        binding = required_by_id.get(binding_id)
+        capture_grade = str(item.get("capture_grade") or "unavailable")
+        if capture_grade not in allowed_grades:
+            capture_grade = "unavailable"
+        is_required = binding is not None
+        manifest.append(
+            SkillEvidenceV1(
+                qualified_name=str(item["qualified_name"]),
+                version=str(item.get("version") or "unversioned"),
+                revision=str(item.get("revision") or ""),
+                source_id=str(item.get("source_id") or "unknown"),
+                relative_file=str(item.get("relative_file") or "SKILL.md"),
+                digest=str(item.get("digest") or ""),
+                consumer=str(item.get("consumer") or "unknown"),
+                activation=str(item.get("activation") or "unknown"),
+                capture_grade=capture_grade,
+                session_id=str(item.get("session_id") or "") or None,
+                assignment_id=str(item.get("assignment_id") or "") or None,
+                generation=int(item.get("generation") or 0) or None,
+                usage_id=str(item.get("usage_id") or "") or None,
+                required=is_required,
+            )
+        )
+        if (
+            binding is None
+            or capture_grade != "verified"
+            or str(item.get("revision") or "") != str(binding.get("revision") or "")
+        ):
+            continue
+        binding_assignment = str(binding.get("assignment_id") or "")
+        if binding_assignment and binding_assignment != str(item.get("assignment_id") or ""):
+            continue
+        requirement_id = _skill_requirement_id(binding)
+        records.append(
+            RuntimeEvidence(
+                record_id=f"evidence_{uuid4().hex}",
+                run_id=context.run_id,
+                stage_id=binding_id,
+                requirement_id=requirement_id,
+                subject_digest=context.subject_digest,
+                producer="muxdev.skill-loader",
+                event_type="skill.loaded",
+                status="passed",
+                details={
+                    "usage_id": item.get("usage_id"),
+                    "qualified_name": item["qualified_name"],
+                    "revision": item["revision"],
+                    "source_id": item["source_id"],
+                    "relative_file": item["relative_file"],
+                    "digest": item["digest"],
+                    "capture_grade": "verified",
+                    "session_id": item.get("session_id"),
+                    "generation": item.get("generation"),
+                },
+            )
+        )
+        satisfied.add(binding_id)
+    for binding_id, binding in required_by_id.items():
+        if binding_id in satisfied:
+            continue
+        metadata = (
+            binding.get("metadata")
+            if isinstance(binding.get("metadata"), Mapping)
+            else {}
+        )
+        manifest.append(
+            SkillEvidenceV1(
+                qualified_name=str(binding["qualified_name"]),
+                version=str(metadata.get("version") or "unversioned"),
+                revision=str(binding.get("revision") or ""),
+                source_id=str(metadata.get("source_id") or "unknown"),
+                capture_grade="unavailable",
+                assignment_id=str(binding.get("assignment_id") or "") or None,
+                required=True,
+            )
+        )
+    return manifest
 
 
 def _text_digest(value: str) -> str:

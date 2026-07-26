@@ -225,6 +225,7 @@ from .evidence import (  # noqa: E402
     RecoverySummary,
     ReviewEvidence,
     RuntimeEvidence,
+    SkillEvidenceV1,
 )
 from .conversation import (  # noqa: E402
     CandidateStatus,
@@ -316,6 +317,7 @@ __all__ = [
     "RunPolicySnapshot",
     "RunStatus",
     "RuntimeEvidence",
+    "SkillEvidenceV1",
     "StandardAssessment",
     "TestCheck",
     "TestResult",

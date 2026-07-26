@@ -10,6 +10,7 @@ import signal
 import struct
 import subprocess
 import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -315,6 +316,11 @@ class ConPtyBackend(TerminalBackend):
     def close(self) -> None:
         if self.process is not None and self._alive():
             self.process.terminate(force=False)  # type: ignore[attr-defined]
+            deadline = time.monotonic() + 0.75
+            while self._alive() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if self._alive():
+                self.process.terminate(force=True)  # type: ignore[attr-defined]
 
 
 class TmuxTerminalBackend(PosixPtyBackend):

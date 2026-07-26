@@ -10,6 +10,7 @@ from typing import Any, Mapping, Sequence
 COLLABORATION_TABLES = (
     "agent_sessions",
     "session_generations",
+    "message_deliveries",
     "conversation_interactions",
     "orchestration_plans",
     "assignments",
@@ -59,10 +60,11 @@ COLLABORATION_SCHEMA_STATEMENTS = (
       recovery_mode TEXT NOT NULL DEFAULT 'fresh', control_token_hash TEXT,
       token_expires_at TEXT, write_lease_id TEXT, write_lease_holder TEXT,
       write_lease_expires_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-      metadata TEXT NOT NULL,
+      metadata TEXT NOT NULL, superseded_by_session_id TEXT,
       FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id),
       FOREIGN KEY(assignment_id) REFERENCES assignments(assignment_id),
       FOREIGN KEY(current_assignment_id) REFERENCES assignments(assignment_id),
+      FOREIGN KEY(superseded_by_session_id) REFERENCES agent_sessions(session_id),
       UNIQUE(conversation_id, agent_id, lane_key)
     )""",
     """CREATE TABLE IF NOT EXISTS session_generations(
@@ -81,6 +83,24 @@ COLLABORATION_SCHEMA_STATEMENTS = (
       FOREIGN KEY(run_id) REFERENCES runs(run_id),
       FOREIGN KEY(assignment_id) REFERENCES assignments(assignment_id)
     )""",
+    """CREATE TABLE IF NOT EXISTS message_deliveries(
+      delivery_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL,
+      message_event_id TEXT NOT NULL, recipient_agent_id TEXT NOT NULL,
+      assignment_id TEXT, run_id TEXT, session_id TEXT, target_generation INTEGER,
+      status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      dispatched_at TEXT, metadata TEXT NOT NULL,
+      UNIQUE(message_event_id, recipient_agent_id),
+      FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id),
+      FOREIGN KEY(message_event_id) REFERENCES conversation_events(event_id),
+      FOREIGN KEY(assignment_id) REFERENCES assignments(assignment_id),
+      FOREIGN KEY(run_id) REFERENCES runs(run_id),
+      FOREIGN KEY(session_id) REFERENCES agent_sessions(session_id)
+    )""",
+    """CREATE INDEX IF NOT EXISTS ix_message_deliveries_pending
+      ON message_deliveries(status, updated_at, delivery_id)""",
+    """CREATE INDEX IF NOT EXISTS ix_message_deliveries_conversation
+      ON message_deliveries(conversation_id, created_at, delivery_id)""",
 )
 
 
@@ -340,10 +360,24 @@ class CollaborationStoreMixin:
 
     def list_agent_sessions(self, conversation_id: str) -> list[dict[str, Any]]:
         rows = self.connection.execute(
-            "SELECT * FROM agent_sessions WHERE conversation_id = ? ORDER BY created_at",
+            """SELECT * FROM agent_sessions
+               WHERE conversation_id = ? AND superseded_by_session_id IS NULL
+               ORDER BY created_at""",
             (conversation_id,),
         ).fetchall()
         return [_decode(row, "metadata") or {} for row in rows]
+
+    def find_conversation_agent_session(
+        self, conversation_id: str, agent_id: str
+    ) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """SELECT * FROM agent_sessions
+               WHERE conversation_id = ? AND agent_id = ?
+                 AND superseded_by_session_id IS NULL
+               ORDER BY updated_at DESC, created_at DESC LIMIT 1""",
+            (conversation_id, agent_id),
+        ).fetchone()
+        return _decode(row, "metadata")
 
     def find_agent_session(
         self, conversation_id: str, agent_id: str, lane_key: str = "main"
@@ -351,6 +385,7 @@ class CollaborationStoreMixin:
         row = self.connection.execute(
             """SELECT * FROM agent_sessions
                WHERE conversation_id = ? AND agent_id = ? AND lane_key = ?
+                 AND superseded_by_session_id IS NULL
                ORDER BY created_at LIMIT 1""",
             (conversation_id, agent_id, lane_key),
         ).fetchone()
@@ -365,6 +400,7 @@ class CollaborationStoreMixin:
             "recovery_mode", "control_token_hash", "token_expires_at",
             "write_lease_id", "write_lease_holder", "write_lease_expires_at",
             "assignment_id", "current_assignment_id", "generation", "worktree",
+            "lane_key", "lane_type", "superseded_by_session_id",
         }
         assignments: list[str] = []
         params: list[object] = []
@@ -387,6 +423,117 @@ class CollaborationStoreMixin:
         )
         self.connection.commit()
         return self.get_agent_session(session_id) or {}
+
+    def get_message_delivery(self, delivery_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """SELECT delivery.*, event.payload AS message_payload
+               FROM message_deliveries AS delivery
+               JOIN conversation_events AS event
+                 ON event.event_id = delivery.message_event_id
+               WHERE delivery.delivery_id = ?""",
+            (delivery_id,),
+        ).fetchone()
+        return _decode(row, "metadata", "message_payload")
+
+    def list_message_deliveries(
+        self,
+        *,
+        conversation_id: str | None = None,
+        statuses: Sequence[str] | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if conversation_id:
+            clauses.append("delivery.conversation_id = ?")
+            params.append(conversation_id)
+        if statuses:
+            clauses.append(
+                "delivery.status IN (" + ",".join("?" for _ in statuses) + ")"
+            )
+            params.extend(statuses)
+        sql = (
+            """SELECT delivery.*, event.payload AS message_payload
+               FROM message_deliveries AS delivery
+               JOIN conversation_events AS event
+                 ON event.event_id = delivery.message_event_id"""
+        )
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY delivery.created_at, delivery.delivery_id LIMIT ?"
+        params.append(max(1, min(limit, 1000)))
+        rows = self.connection.execute(sql, params).fetchall()
+        return [
+            _decode(row, "metadata", "message_payload") or {}
+            for row in rows
+        ]
+
+    def claim_message_delivery(self, delivery_id: str) -> dict[str, Any] | None:
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                """UPDATE message_deliveries
+                   SET status = 'dispatching', attempts = attempts + 1,
+                       updated_at = ?, last_error = NULL
+                   WHERE delivery_id = ? AND status = 'pending'""",
+                (_now(), delivery_id),
+            )
+            if cursor.rowcount != 1:
+                return None
+        return self.get_message_delivery(delivery_id)
+
+    def update_message_delivery(
+        self,
+        delivery_id: str,
+        *,
+        status: str,
+        session_id: str | None = None,
+        target_generation: int | None = None,
+        last_error: str | None = None,
+        metadata: Mapping[str, object] | None = None,
+    ) -> dict[str, Any]:
+        current = self.get_message_delivery(delivery_id)
+        if not current:
+            raise FileNotFoundError(delivery_id)
+        merged = dict(current.get("metadata") or {})
+        if metadata:
+            merged.update(metadata)
+        dispatched_at = (
+            _now() if status == "dispatched" else current.get("dispatched_at")
+        )
+        self.connection.execute(
+            """UPDATE message_deliveries
+               SET status = ?, session_id = ?, target_generation = ?,
+                   last_error = ?, updated_at = ?, dispatched_at = ?, metadata = ?
+               WHERE delivery_id = ?""",
+            (
+                status,
+                session_id if session_id is not None else current.get("session_id"),
+                (
+                    target_generation
+                    if target_generation is not None
+                    else current.get("target_generation")
+                ),
+                last_error,
+                _now(),
+                dispatched_at,
+                _json(merged),
+                delivery_id,
+            ),
+        )
+        self.connection.commit()
+        return self.get_message_delivery(delivery_id) or {}
+
+    def reconcile_message_deliveries(self) -> int:
+        """Fence deliveries interrupted between claim and durable receipt."""
+        cursor = self.connection.execute(
+            """UPDATE message_deliveries
+               SET status = 'uncertain', last_error = 'daemon_restarted_during_dispatch',
+                   updated_at = ?
+               WHERE status = 'dispatching'""",
+            (_now(),),
+        )
+        self.connection.commit()
+        return int(cursor.rowcount)
 
     def create_session_generation(
         self,

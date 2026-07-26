@@ -2,6 +2,8 @@
 
 面向日常操作的说明请先阅读：[muxdev 产品使用手册](product-user-manual.md)。
 
+Skills 来源、冻结、审计加载和 Evidence 门禁见：[Skills 与可信交付设计](skills-trusted-delivery.md)。
+
 ## 1. 设计理念
 
 muxdev 是 Coding CLI 的薄控制面，不是 Agent SDK wrapper。它不重建 Codex 或 Claude Code 的记忆、工具协议、Skill、MCP、Plan Mode 和审批；它只管理 CLI 进程之外必须由产品负责的事实：Conversation、PTY、Assignment、权限、工作树、合并、Evidence、交付候选与接受后写回。
@@ -14,7 +16,8 @@ Workbench 是当前用户的单例 Daemon。`muxdev serve` 把当前目录登记
 
 - `CliAdapterDefinition` 描述完整 CLI 的启动 argv、恢复 argv、工作目录和模型参数、环境变量白名单、PTY/resize/resume 能力与 session ID 发现方式。
 - `AgentDefinition` 描述显示名、CLI、模型、角色提示、能力标签、编排资格、最大并发和默认权限。
-- 内置 Conversation Agent 目录覆盖 Codex、Claude Code、Qwen Code、Kimi Code、Trae 和 Antigravity。Agent Registry 复用 Provider 的命令及别名扫描 daemon `PATH`，新建窗口按“已检测到 / 未就绪”展示；检测结果同时用于创建前校验和实际进程启动。
+- 内置 Conversation Agent 目录覆盖 Codex、Claude Code、Deep Code、Qwen Code、Kimi Code、Trae 和 Antigravity。Agent Registry 扫描 daemon `PATH`，新建窗口按“已检测到 / 未就绪”展示；检测结果同时用于创建前校验和实际进程启动。Deep Code 通过真实 PTY/ConPTY 启动，支持原生 `--resume <session-id>`，并识别 `.deepcode/skills` 与 `.agents/skills`。
+- 内置 Codex Session 使用 `workspace-write` 与 Approve for me（`--ask-for-approval never`）；为避免 `muxdev collab` 反复审批，只额外授予项目 `.muxdev` 控制目录写权限，不使用会关闭整个沙箱的危险 bypass 模式。
 - `Conversation` 是用户可见的长期协作容器，拥有模式、主 Agent、编排者、活动计划、集成工作树和 DeliveryContract。
 - `Interaction` 保存澄清问题、回答和 Run 中途提问；它不是 Run。
 - `Assignment` 是边界明确的 `consult/write/review` 执行段；每个 Assignment 唯一对应一个 Run，重试和重派记录为同一 Run 的 Attempt。
@@ -23,7 +26,7 @@ Workbench 是当前用户的单例 Daemon。`muxdev serve` 把当前目录登记
 
 Conversation 先进入 `clarifying`。需求不完整时只创建 1–3 个 Interaction；需求冻结为 `ready` 后才自动执行。普通消息默认进入主 Agent Session，`@agent` 只加入协作，显式咨询、写任务或评审才创建 Assignment Run。Agent 上下文包不超过 12,000 字符，优先保留冻结契约、用户决策、未决问题、依赖产物和仍通过 Evidence 校验的交付记忆。
 
-项目 schema v13 的 Conversation Memory Checkpoint 记录覆盖序列、源哈希、目标、约束、人工决定、Assignment 结果、验证状态和未解决问题。Run 结算或未压缩尾部超过约 8,000 token 时生成；纠正只追加新版本。所有 Agent 注入同一共享检查点，再叠加各自 transcript、Assignment 和依赖输出。
+项目 schema v14 的 Conversation Memory Checkpoint 记录覆盖序列、源哈希、目标、约束、人工决定、Assignment 结果、验证状态和未解决问题。Run 结算或未压缩尾部超过约 8,000 token 时生成；纠正只追加新版本。所有 Agent 注入同一共享检查点，再叠加各自 transcript、Assignment 和依赖输出。
 
 ## 3. 直接模式与编排模式
 
@@ -68,7 +71,7 @@ Dashboard 使用本地打包的 xterm.js 与 fit addon，不依赖 CDN。WebSock
 - 客户端：`attach`、`input`、`resize`、`release_write`；
 - 服务端：`output`、`status`、`lease`、`error`。
 
-终端 transcript 是带序号的本地 JSONL，权限尽量限制为所有者读写。Web attach 默认只读；用户点击“获取控制权”后才申请写租约。一个 Session 只有一个有效写入租约，其他设备只读。输出断线重放使用 `after_seq`，输入帧限制 64 KiB，并有滑动窗口限流。`interrupt` 只向当前前台命令发送 Ctrl+C/SIGINT，不关闭 Session。
+终端 transcript 是带序号的本地 JSONL，权限尽量限制为所有者读写。Web attach 默认只读；用户点击“获取控制权”后才申请写租约。一个 Session 只有一个有效写入租约，其他设备只读。输出断线重放使用 `after_seq`。输入单帧限制 64 KiB、10 秒累计 1 MiB；resize 去重后限制为 20 次/10 秒，其他控制帧为 30 次/10 秒，合法 heartbeat 不占控制桶。限流不会立即释放写租约，连续五次违规才关闭连接。`interrupt` 只向当前前台命令发送 Ctrl+C/SIGINT，不关闭 Session。
 
 远程模式必须启用 HTTPS 反向代理或 VPN，并完成一次性设备配对。WebSocket 不依赖 HTTP 中间件，自己校验 Cookie、Origin、Session、帧大小和速率。
 
@@ -109,7 +112,7 @@ muxdev doctor
 
 ## 8. 迁移与兼容
 
-旧数据库打开时幂等迁移到项目 schema v13，并在 v12→v13 前创建 SQLite 备份。项目数据不会移动到全局数据库。无 `project_id` 的旧 v2 路由不再提供；`/api/v1`、`/runs`、ACP/MCP、headless Provider 与固定四工作流保持兼容。
+旧数据库打开时幂等迁移到项目 schema v14，并在 v12→v13 前创建 SQLite 备份。项目数据不会移动到全局数据库。无 `project_id` 的旧 v2 路由不再提供；`/api/v1`、`/runs`、ACP/MCP、headless Provider 与固定四工作流保持兼容。
 
 ## 9. 与 botmux 的关系
 

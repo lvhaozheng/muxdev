@@ -46,6 +46,11 @@ from ..storage import ControlStore
 from ..storage.activity_feed import activity_feed
 from .project_context import workspace_for_request
 from .projects import RuleDefinitionV1
+from .conversation_attention import (
+    attention_bucket,
+    attention_detail,
+    next_actions,
+)
 
 
 router = APIRouter(prefix="/api/v2/projects/{project_id}")
@@ -110,31 +115,6 @@ def _run_for(
     ):
         raise HTTPException(404, f"run not found for conversation: {identifier}")
     return run
-
-
-def _attention(status: str) -> str:
-    if status == "needs_user":
-        return "needs_you"
-    if status in {"candidate_ready", "awaiting_acceptance"}:
-        return "ready"
-    if status in {"working", "verifying", "recovering", "clarifying"}:
-        return "active"
-    return "history"
-
-
-def _next_actions(conversation: dict[str, Any], run: dict[str, Any] | None) -> list[str]:
-    status = str(conversation["status"])
-    if status == "needs_user":
-        return ["respond", "continue", "close"]
-    if status in {"candidate_ready", "awaiting_acceptance"}:
-        return ["request_changes", "discard", "accept"]
-    if status in {"working", "verifying", "recovering"}:
-        return ["pause"]
-    if status == "idle":
-        return ["continue", "close"]
-    if run and run.get("review_state") == "answered":
-        return ["continue", "close"]
-    return ["reopen"] if status == "closed" else ["continue"]
 
 
 def _review_record_view(item: dict[str, Any]) -> ReviewRecordV1:
@@ -202,15 +182,24 @@ def conversation_snapshot(
             manager.snapshot(str(item["session_id"]))
             for item in detail.get("sessions") or []
         ]
+        interactions = list(detail.get("interactions") or [])
+        assignments = list(detail.get("assignments") or [])
+        attention_detail_value = attention_detail(
+            conversation,
+            interactions=interactions,
+            assignments=assignments,
+            sessions=session_snapshots,
+        )
         return ConversationSnapshotV1(
             conversation=conversation,
-            attention=_attention(str(conversation["status"])),
+            attention=attention_bucket(str(conversation["status"])),
+            attention_detail=attention_detail_value,
             active_turn=active_run,
             participants=list(detail.get("participants") or []),
             sessions=session_snapshots,
-            assignments=list(detail.get("assignments") or []),
+            assignments=assignments,
             orchestration_plans=list(detail.get("orchestration_plans") or []),
-            interactions=list(detail.get("interactions") or []),
+            interactions=interactions,
             timeline=[ActivityEventV2.model_validate(item) for item in activity],
             tool_summaries={
                 "changes": {
@@ -251,7 +240,11 @@ def conversation_snapshot(
                     "frozen": list((rule_snapshot or {}).get("rules") or []),
                 },
             },
-            next_actions=_next_actions(conversation, active_run),
+            next_actions=next_actions(
+                conversation,
+                active_run,
+                attention_detail_value,
+            ),
             last_sequence=int(activity[-1]["sequence"]) if activity else after,
         )
 

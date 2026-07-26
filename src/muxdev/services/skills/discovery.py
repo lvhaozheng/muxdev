@@ -31,12 +31,19 @@ PROJECT_SCAN_DIRS = [
     "skills",
     ".codex/skills",
     ".claude/skills",
+    ".deepcode/skills",
     ".openhands/skills",
     ".continue/skills",
     ".cline/skills",
     ".roo/skills",
 ]
-GLOBAL_SCAN_DIRS = [".muxdev/skills", ".agents/skills", ".codex/skills", ".claude/skills"]
+GLOBAL_SCAN_DIRS = [
+    ".muxdev/skills",
+    ".agents/skills",
+    ".codex/skills",
+    ".claude/skills",
+    ".deepcode/skills",
+]
 
 
 def load_skills_config(workspace: Path, *, env: dict[str, str] | None = None) -> dict[str, Any]:

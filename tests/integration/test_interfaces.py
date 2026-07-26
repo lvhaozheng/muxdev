@@ -32,7 +32,17 @@ def test_legacy_interfaces_remain_and_versioned_conversation_contract_is_explici
     assert {
         "/api/v2/projects",
         "/api/v2/rules",
+        "/api/v2/rule-sources",
+        "/api/v2/rule-sources/upload",
+        "/api/v2/rule-sources/import-url",
+        "/api/v2/skill-sources",
+        "/api/v2/skill-sources/import-remote",
+        "/api/v2/skills/remote/search",
         f"{project}/agents",
+        f"{project}/skills",
+        f"{project}/skills/{{qualified_name}}",
+        f"{project}/skills/{{qualified_name}}/binding",
+        f"{project}/skill-usage",
         f"{project}/conversations",
         f"{project}/conversations/{{conversation_id}}/messages",
         f"{project}/conversations/{{conversation_id}}/execute",
@@ -50,20 +60,21 @@ def test_legacy_interfaces_remain_and_versioned_conversation_contract_is_explici
         f"{project}/conversations/{{conversation_id}}/review",
         f"{project}/conversations/{{conversation_id}}/replay",
         f"{project}/sessions/{{session_id}}/preview",
+        f"{project}/conversations/{{conversation_id}}/skills/{{qualified_name}}/activate",
         f"{project}/deliveries/{{candidate_id}}/discard",
         } <= paths
     assert "/api/v2/conversations" not in paths
     assert f"{project}/conversations/{{conversation_id}}/room" not in paths
     assert len(product_routes) >= 59
     assert len(server_manifest()["tools"]) == 8
-    assert _leaf_count(get_command(app)) == 46
+    assert _leaf_count(get_command(app)) == 47
     tools = server_manifest()["tools"]
     assert all(item["inputSchema"].get("additionalProperties") is False for item in tools)
 
 
 def test_http_and_mcp_read_surfaces(workspace: Path) -> None:
     client = TestClient(create_app(workspace))
-    assert client.get("/health").json()["tables"] == 31
+    assert client.get("/health").json()["tables"] == 35
     response = handle_jsonrpc({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, workspace=workspace)
     assert len(response["result"]["tools"]) == 8
 

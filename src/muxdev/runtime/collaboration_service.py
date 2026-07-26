@@ -18,6 +18,7 @@ from ..models import (
 from ..models.evidence import canonical_hash
 from ..services.agents import AgentRegistry
 from ..services.context import build_conversation_context_pack
+from ..services.skills.product import skill_catalog_preamble
 from ..storage import ControlStore
 from .agent_sessions import (
     AgentSessionManager,
@@ -31,6 +32,7 @@ from .change_tracking import (
     change_monitors,
 )
 from .conversation_service import ConversationService
+from .message_delivery import CollaborationMessageDeliveryMixin
 from .workspace import (
     ChangeSet,
     WorkspaceConflictError,
@@ -56,6 +58,7 @@ _ACTIVE_ASSIGNMENT_STATES = {
 class CollaborationService(
     CollaborationSchedulingMixin,
     CollaborationRequirementsMixin,
+    CollaborationMessageDeliveryMixin,
 ):
     conversations: ConversationService
     store: ControlStore
@@ -351,7 +354,9 @@ class CollaborationService(
             self.store.update_run(run_id, status="completed", current_stage=None)
         if session and session.get("lane_type") == "main":
             self.store.update_agent_session(
-                str(session["session_id"]), current_assignment_id=None
+                str(session["session_id"]),
+                current_assignment_id=None,
+                status="ready",
             )
         self._ensure_reviewers_or_finalize(conversation_id)
         return self.store.get_assignment(assignment_id) or assignment
@@ -388,7 +393,7 @@ class CollaborationService(
         return self.store.get_assignment(assignment_id) or updated
 
     def cancel(self, assignment_id: str) -> dict[str, Any]:
-        assignment = self._assignment(assignment_id)
+        self._assignment(assignment_id)
         session = self._session_for_assignment(assignment_id)
         if session and session["status"] not in {"closed", "failed"}:
             try:
@@ -539,21 +544,26 @@ class CollaborationService(
         assignment_id = str(assignment["assignment_id"])
         conversation_id = str(assignment["conversation_id"])
         agent_id = str(assignment["agent_id"])
-        session_record = self.store.find_agent_session(conversation_id, agent_id, lane_key)
+        session_record = self.store.find_conversation_agent_session(
+            conversation_id, agent_id
+        )
         if session_record:
             session_id = str(session_record["session_id"])
-            if recovery:
-                try:
-                    self.sessions.close(session_id)
-                except (RuntimeError, FileNotFoundError):
-                    pass
+            previous_assignment_id = str(
+                session_record.get("current_assignment_id") or ""
+            )
+            previous_worktree = Path(str(session_record["worktree"])).resolve()
+            worktree_changed = previous_worktree != worktree.resolve()
+            assignment_changed = previous_assignment_id != assignment_id
             self.store.update_agent_session(
                 session_id,
                 current_assignment_id=assignment_id,
-                assignment_id=assignment_id if lane_type == "temporary" else session_record.get("assignment_id"),
+                assignment_id=assignment_id,
                 worktree=str(worktree),
+                lane_key="main",
+                lane_type="main",
             )
-            if recovery:
+            if recovery or assignment_changed or worktree_changed:
                 session_record = self.sessions.restart(session_id, bootstrap=bootstrap)
             else:
                 session_record = self.sessions.ensure_live(session_id)
@@ -566,8 +576,8 @@ class CollaborationService(
                 agent_id=agent_id,
                 worktree=worktree,
                 bootstrap=bootstrap,
-                lane_key=lane_key,
-                lane_type=lane_type,
+                lane_key="main",
+                lane_type="main",
             )
         return session_record
 
@@ -595,6 +605,12 @@ class CollaborationService(
             }
             for item in dependencies
         ]
+        skill_catalog = skill_catalog_preamble(
+            self.workspace,
+            self.store,
+            conversation_id=str(assignment["conversation_id"]),
+            assignment_id=str(assignment["assignment_id"]),
+        )
         payload = {
             "schema": "muxdev.assignment-brief.v1",
             "contract": {
@@ -630,6 +646,7 @@ class CollaborationService(
                 "text": context_pack.text,
                 "manifest": context_pack.manifest,
             },
+            "skill_catalog": skill_catalog,
             "collaboration_commands": [
                 "muxdev collab roster",
                 "muxdev collab dispatch --file <assignment.json>",
@@ -638,6 +655,7 @@ class CollaborationService(
                 "muxdev collab report --file <report.json>",
                 "muxdev collab deliver --manifest <delivery.json>",
                 "muxdev collab clarify --file assessment.json",
+                "muxdev skill load <qualified-name> [--file SKILL.md]",
             ],
             "security": "The role prompt is not a permission boundary. Runtime scope and delivery gates are authoritative.",
         }
@@ -870,7 +888,9 @@ class CollaborationService(
         row = self.store.connection.execute(
             """SELECT * FROM agent_sessions
                WHERE assignment_id = ? OR current_assignment_id = ?
-               ORDER BY updated_at DESC LIMIT 1""",
+               ORDER BY
+                 CASE WHEN superseded_by_session_id IS NULL THEN 0 ELSE 1 END,
+                 updated_at DESC LIMIT 1""",
             (assignment_id, assignment_id),
         ).fetchone()
         if not row:

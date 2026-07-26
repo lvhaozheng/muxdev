@@ -155,6 +155,7 @@ class ConversationSnapshotV1(BaseModel):
     )
     conversation: dict[str, Any]
     attention: str
+    attention_detail: dict[str, Any] | None = None
     active_turn: dict[str, Any] | None = None
     participants: list[dict[str, Any]] = Field(default_factory=list)
     sessions: list[dict[str, Any]] = Field(default_factory=list)

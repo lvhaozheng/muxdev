@@ -218,6 +218,125 @@ def test_rule_library_binding_freezing_review_and_memory_apis(
     registry.store.close()
 
 
+def test_rule_source_upload_archive_restore_preserves_bound_version(
+    workspace: Path,
+) -> None:
+    registry = _registry(workspace / ".global")
+    project_id = str(registry.register(workspace)["project_id"])
+    client = TestClient(create_app(workspace, workbench=registry))
+
+    uploaded = client.post(
+        "/api/v2/rule-sources/upload?filename=design.html",
+        content=b"<html><body><main><h1>Design</h1><p>Keep evidence.</p></main></body></html>",
+        headers={"content-type": "text/html"},
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    source = uploaded.json()
+    assert source["local_markdown_path"].startswith("rule-sources/")
+    assert "# Design" in source["markdown"]
+    assert (registry.store.path.parent / source["local_markdown_path"]).is_file()
+
+    created = client.post(
+        "/api/v2/rules",
+        json={
+            "rule_id": "team.design",
+            "version": 1,
+            "title": "Team design",
+            "kind": "document_template",
+            "workflows": ["design"],
+            "instructions": source["markdown"],
+            "template": source["markdown"],
+            "enforcement": "advisory",
+            "source_documents": [
+                {key: value for key, value in source.items() if key != "markdown"}
+            ],
+        },
+    )
+    assert created.status_code == 201, created.text
+    assert client.put(
+        f"/api/v2/projects/{project_id}/rules/team.design",
+        json={"version": 1, "enabled": True, "workflows": ["design"]},
+    ).status_code == 200
+
+    archived = client.delete("/api/v2/rules/team.design")
+    assert archived.status_code == 200
+    assert archived.json()["status"] == "archived"
+    assert not any(item["rule_id"] == "team.design" for item in client.get("/api/v2/rules").json())
+    bound = client.get(f"/api/v2/projects/{project_id}/rules").json()["bindings"][0]
+    assert bound["available"] is True
+    assert bound["rule"]["rule_id"] == "team.design"
+
+    restored = client.post("/api/v2/rules/team.design/restore")
+    assert restored.status_code == 200
+    assert restored.json()["status"] == "active"
+    registry.store.close()
+
+
+def test_skill_source_review_binding_drift_and_disconnect_are_non_destructive(
+    workspace: Path,
+) -> None:
+    registry = _registry(workspace / ".global")
+    project_id = str(registry.register(workspace)["project_id"])
+    client = TestClient(create_app(workspace, workbench=registry))
+    source_root = workspace / "external-skill-source"
+    skill_root = source_root / "api-skill"
+    skill_root.mkdir(parents=True)
+    skill_file = skill_root / "SKILL.md"
+    skill_file.write_text(
+        (
+            "---\nname: api-skill\n"
+            "description: API managed Skill\n"
+            "version: 1.0.0\n---\n\n# API Skill\n\nOriginal.\n"
+        ),
+        encoding="utf-8",
+    )
+
+    created = client.post(
+        "/api/v2/skill-sources",
+        json={"path": str(source_root), "mode": "connect"},
+    )
+    assert created.status_code == 201, created.text
+    source = created.json()
+    source_id = source["source_id"]
+    assert source["trust_state"] == "needs_review"
+    assert source["enabled"] is False
+    assert client.patch(
+        f"/api/v2/skill-sources/{source_id}",
+        json={"enabled": True},
+    ).status_code == 409
+
+    trusted = client.patch(
+        f"/api/v2/skill-sources/{source_id}",
+        json={"trust_state": "user_trusted", "enabled": True},
+    )
+    assert trusted.status_code == 200, trusted.text
+    catalog = client.get(f"/api/v2/projects/{project_id}/skills").json()
+    skill = next(item for item in catalog["catalog"] if item["name"] == "api-skill")
+    binding = client.put(
+        f"/api/v2/projects/{project_id}/skills/{skill['qualified_name']}/binding",
+        json={"required": True, "enabled": True},
+    )
+    assert binding.status_code == 200, binding.text
+    frozen_revision = binding.json()["revision"]
+
+    skill_file.write_text(
+        skill_file.read_text(encoding="utf-8").replace("Original.", "Drifted."),
+        encoding="utf-8",
+    )
+    rescanned = client.post(f"/api/v2/skill-sources/{source_id}/rescan")
+    assert rescanned.status_code == 200, rescanned.text
+    assert rescanned.json()["metadata"]["drifted"] is True
+    assert rescanned.json()["revision"] != frozen_revision
+    bindings = client.get(f"/api/v2/projects/{project_id}/skills").json()["bindings"]
+    assert bindings[0]["revision"] == frozen_revision
+
+    disconnected = client.delete(f"/api/v2/skill-sources/{source_id}")
+    assert disconnected.status_code == 200
+    assert disconnected.json()["status"] == "disconnected"
+    assert skill_file.is_file()
+    registry.store.close()
+
+
 def test_workbench_store_is_thread_safe_and_lists_100_projects_under_budget(
     workspace: Path,
 ) -> None:

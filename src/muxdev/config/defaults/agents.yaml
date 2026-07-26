@@ -8,8 +8,8 @@ cli_adapters:
     supports_resume: false
   codex:
     cli_id: codex
-    command: [codex, --no-alt-screen]
-    resume_command: [codex, --no-alt-screen, resume, "{native_session_id}"]
+    command: [codex, -c, check_for_update_on_startup=false, -c, 'projects={ {worktree_toml}={trust_level="trusted"} }', --no-alt-screen, --sandbox, workspace-write, --ask-for-approval, never, --add-dir, "{control_dir}"]
+    resume_command: [codex, -c, check_for_update_on_startup=false, -c, 'projects={ {worktree_toml}={trust_level="trusted"} }', --no-alt-screen, --sandbox, workspace-write, --ask-for-approval, never, --add-dir, "{control_dir}", resume, "{native_session_id}"]
     working_directory_arg: -C
     model_arg: --model
     env_allowlist: [OPENAI_API_KEY, OPENAI_BASE_URL]
@@ -19,6 +19,13 @@ cli_adapters:
     supports_resume: true
     native_session_id_pattern: '(?i)(?:session(?: id)?|resume)[:= ]+([0-9a-f-]{20,})'
     prefer_tmux: true
+    startup_ready_pattern: 'OpenAI Codex'
+    startup_blocking_pattern: 'Do you trust the contents of this directory|Continue anyway\?|Press enter to continue'
+    runtime_waiting_pattern: '(?i)you(?:''ve| have) hit (?:your )?usage limit|usage limit (?:has been )?reached|rate limit exceeded'
+    runtime_approval_pattern: '(?i)Would you like to run the following command\?|Press enter to confirm or esc to cancel'
+    startup_timeout_seconds: 30
+    prompt_transport: bracketed_paste
+    bootstrap_transport: argv
   claude-code:
     cli_id: claude-code
     command: [claude]
@@ -30,6 +37,27 @@ cli_adapters:
     supports_resize: true
     supports_resume: true
     prefer_tmux: true
+  deepcode:
+    cli_id: deepcode
+    command: [deepcode]
+    resume_command: [deepcode, --resume, "{native_session_id}"]
+    env_allowlist:
+      - DEEPCODE_API_KEY
+      - DEEPCODE_BASE_URL
+      - DEEPCODE_MODEL
+      - DEEPCODE_THINKING_ENABLED
+      - DEEPCODE_REASONING_EFFORT
+      - DEEPCODE_TELEMETRY_ENABLED
+    supports_pty: true
+    requires_pty: true
+    supports_resize: true
+    supports_resume: true
+    native_session_id_pattern: '(?i)session(?: id)?[^0-9a-f]+([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})'
+    prefer_tmux: true
+    startup_ready_pattern: 'Type your message\.\.\.'
+    turn_completed_pattern: '(?im)^status:\s*completed(?:\s*[·•]\s*tokens:\s*\d+)?\s*$'
+    startup_timeout_seconds: 30
+    prompt_transport: bracketed_paste
   qwen:
     cli_id: qwen
     command: [qwen]
@@ -77,6 +105,7 @@ agents:
     max_concurrency: 4
     default_permissions: workspace-write
     enabled: true
+    selectable: false
   mock-review:
     agent_id: mock-review
     display_name: Mock Reviewer
@@ -86,6 +115,7 @@ agents:
     max_concurrency: 4
     default_permissions: read
     enabled: true
+    selectable: false
   mock-orchestrator:
     agent_id: mock-orchestrator
     display_name: Mock Orchestrator
@@ -96,6 +126,7 @@ agents:
     max_concurrency: 4
     default_permissions: workspace-write
     enabled: true
+    selectable: false
   codex:
     agent_id: codex
     display_name: Codex
@@ -112,6 +143,16 @@ agents:
     cli_id: claude-code
     role_prompt: Own the assignment end to end and report only verifiable deliverables.
     capability_tags: [code, review, orchestrate, terminal, resume]
+    can_orchestrate: true
+    max_concurrency: 4
+    default_permissions: workspace-write
+    enabled: true
+  deepcode:
+    agent_id: deepcode
+    display_name: Deep Code
+    cli_id: deepcode
+    role_prompt: Own the assignment end to end and report only verifiable deliverables.
+    capability_tags: [code, review, security-review, orchestrate, terminal, resume]
     can_orchestrate: true
     max_concurrency: 4
     default_permissions: workspace-write

@@ -39,9 +39,15 @@ from .experience import (
     EXPERIENCE_TABLES,
     ExperienceStoreMixin,
 )
+from .skills import (
+    SKILL_SCHEMA_STATEMENTS,
+    SKILL_TABLES,
+    SkillStoreMixin,
+    ensure_skill_schema,
+)
 
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 16
 CORE_TABLES = (
     "schema_migrations",
     "runs",
@@ -55,7 +61,7 @@ CORE_TABLES = (
     "routing_decisions",
     "attestations",
     "skill_locks",
-) + (
+) + SKILL_TABLES + (
     CONVERSATION_TABLES
     + COLLABORATION_TABLES
     + CHANGE_TRACKING_TABLES
@@ -85,6 +91,7 @@ def _decode_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
 
 class ControlStore(
+    SkillStoreMixin,
     ExperienceStoreMixin,
     ChangeTrackingStoreMixin,
     CollaborationStoreMixin,
@@ -102,6 +109,7 @@ class ControlStore(
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA foreign_keys=ON")
         self._backup_before_v13()
+        self._backup_before_v16()
         self._create_schema()
 
     def __enter__(self) -> "ControlStore":
@@ -121,14 +129,41 @@ class ControlStore(
         ).fetchone()
         if not table:
             return
-        row = self.connection.execute(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
-        ).fetchone()
-        version = int(row[0]) if row else 0
-        if version != 12:
+        versions = {
+            int(row[0])
+            for row in self.connection.execute(
+                "SELECT version FROM schema_migrations"
+            ).fetchall()
+        }
+        if 12 not in versions or 13 in versions:
             return
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
         backup_dir = self.root / "backups" / f"schema-v12-to-v13-{stamp}"
+        backup_dir.mkdir(parents=True, exist_ok=False)
+        destination = sqlite3.connect(backup_dir / "control.sqlite")
+        try:
+            self.connection.backup(destination)
+        finally:
+            destination.close()
+
+    def _backup_before_v16(self) -> None:
+        """Back up the control DB before converging duplicate Agent Sessions."""
+        table = self.connection.execute(
+            """SELECT 1 FROM sqlite_master
+               WHERE type = 'table' AND name = 'schema_migrations'"""
+        ).fetchone()
+        if not table:
+            return
+        versions = {
+            int(row[0])
+            for row in self.connection.execute(
+                "SELECT version FROM schema_migrations"
+            ).fetchall()
+        }
+        if 15 not in versions or 16 in versions:
+            return
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        backup_dir = self.root / "backups" / f"schema-v15-to-v16-{stamp}"
         backup_dir.mkdir(parents=True, exist_ok=False)
         destination = sqlite3.connect(backup_dir / "control.sqlite")
         try:
@@ -155,6 +190,21 @@ class ControlStore(
             self._ensure_schema_v11(conn)
             self._ensure_schema_v12(conn)
             self._ensure_schema_v13(conn)
+            self._ensure_schema_v14(conn)
+            self._ensure_schema_v15(conn)
+            self._ensure_schema_v16(conn)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at, checksum) VALUES (?, ?, ?)",
+                (13, utc_now(), _schema_checksum(statements)),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at, checksum) VALUES (?, ?, ?)",
+                (14, utc_now(), _schema_checksum(statements)),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at, checksum) VALUES (?, ?, ?)",
+                (15, utc_now(), _schema_checksum(statements)),
+            )
             conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations(version, applied_at, checksum) VALUES (?, ?, ?)",
                 (SCHEMA_VERSION, utc_now(), _schema_checksum(statements)),
@@ -324,6 +374,113 @@ class ControlStore(
         conn.execute(
             """CREATE INDEX IF NOT EXISTS ix_review_conversation_created
                ON review_records(conversation_id, created_at)"""
+        )
+
+    @staticmethod
+    def _ensure_schema_v14(conn: sqlite3.Connection) -> None:
+        """Add product-managed Skill bindings, frozen snapshots, and usage facts."""
+        ensure_skill_schema(conn)
+
+    @staticmethod
+    def _ensure_schema_v15(conn: sqlite3.Connection) -> None:
+        """Add durable, generation-fenced Conversation message deliveries."""
+        for statement in COLLABORATION_SCHEMA_STATEMENTS:
+            if "message_deliveries" in statement:
+                conn.execute(statement)
+
+    @staticmethod
+    def _ensure_schema_v16(conn: sqlite3.Connection) -> None:
+        """Enforce one current logical CLI Session per Conversation and Agent."""
+        columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(agent_sessions)").fetchall()
+        }
+        if "superseded_by_session_id" not in columns:
+            conn.execute(
+                "ALTER TABLE agent_sessions ADD COLUMN superseded_by_session_id TEXT"
+            )
+
+        active_assignment_states = (
+            "running",
+            "waiting_user",
+            "reported",
+            "verifying",
+            "ready_to_merge",
+            "merging",
+        )
+        groups = conn.execute(
+            """SELECT conversation_id, agent_id
+               FROM agent_sessions
+               WHERE superseded_by_session_id IS NULL
+               GROUP BY conversation_id, agent_id
+               HAVING COUNT(*) > 1"""
+        ).fetchall()
+        for conversation_id, agent_id in groups:
+            rows = conn.execute(
+                """SELECT session.*, assignment.status AS assignment_status
+                   FROM agent_sessions AS session
+                   LEFT JOIN assignments AS assignment
+                     ON assignment.assignment_id = session.current_assignment_id
+                   WHERE session.conversation_id = ? AND session.agent_id = ?
+                     AND session.superseded_by_session_id IS NULL
+                   ORDER BY
+                     CASE
+                       WHEN assignment.status IN (?, ?, ?, ?, ?, ?) THEN 0
+                       WHEN session.status IN ('starting', 'ready', 'waiting_input') THEN 1
+                       WHEN session.status = 'resumable' THEN 2
+                       ELSE 3
+                     END,
+                     session.updated_at DESC,
+                     session.created_at DESC,
+                     session.session_id DESC""",
+                (conversation_id, agent_id, *active_assignment_states),
+            ).fetchall()
+            winner = rows[0]
+            winner_id = str(winner["session_id"])
+            for duplicate in rows[1:]:
+                duplicate_id = str(duplicate["session_id"])
+                try:
+                    metadata = json.loads(str(duplicate["metadata"] or "{}"))
+                except json.JSONDecodeError:
+                    metadata = {}
+                metadata.update(
+                    {
+                        "superseded_reason": "conversation_agent_session_deduplicated",
+                        "superseded_by_session_id": winner_id,
+                    }
+                )
+                conn.execute(
+                    """UPDATE agent_sessions
+                       SET status = 'closed',
+                           lane_key = ?,
+                           lane_type = 'superseded',
+                           current_assignment_id = NULL,
+                           write_lease_id = NULL,
+                           write_lease_holder = NULL,
+                           write_lease_expires_at = NULL,
+                           superseded_by_session_id = ?,
+                           updated_at = ?,
+                           metadata = ?
+                       WHERE session_id = ?""",
+                    (
+                        f"superseded:{duplicate_id}",
+                        winner_id,
+                        utc_now(),
+                        _json(metadata),
+                        duplicate_id,
+                    ),
+                )
+            conn.execute(
+                """UPDATE agent_sessions
+                   SET lane_key = 'main', lane_type = 'main', updated_at = ?
+                   WHERE session_id = ?""",
+                (utc_now(), winner_id),
+            )
+        conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS
+               uq_agent_sessions_conversation_agent_current
+               ON agent_sessions(conversation_id, agent_id)
+               WHERE superseded_by_session_id IS NULL"""
         )
 
     def table_names(self) -> tuple[str, ...]:
@@ -796,7 +953,6 @@ class ControlStore(
         self.connection.commit()
         return lock_id
 
-
 def _schema_checksum(statements: Sequence[str]) -> str:
     return hashlib.sha256("\n".join(statements).encode()).hexdigest()
 
@@ -857,7 +1013,7 @@ def _schema_statements() -> tuple[str, ...]:
           lock_id TEXT PRIMARY KEY, skill_name TEXT NOT NULL, version TEXT NOT NULL, digest TEXT NOT NULL,
           created_at TEXT NOT NULL, payload TEXT NOT NULL, UNIQUE(skill_name, version)
         )""",
-    ) + (
+    ) + SKILL_SCHEMA_STATEMENTS + (
         CONVERSATION_SCHEMA_STATEMENTS
         + COLLABORATION_SCHEMA_STATEMENTS
         + CHANGE_TRACKING_SCHEMA_STATEMENTS

@@ -8,7 +8,7 @@ Role prompts guide behavior but are not security boundaries. argv-only adapters,
 
 One user-scoped Workbench Daemon owns the Web port for every registered local project. `muxdev serve` registers the current directory; if the healthy user instance already exists, it prints that project's `/projects/{project_id}` deep link and exits. The global store contains project registrations, Rules, device authentication, and daemon state only. Conversation, Run, Evidence, ChangeSet, and transcript facts remain in each project's `.muxdev` directory, and all v2 HTTP, SSE, terminal, and file APIs enforce `project_id`.
 
-The built-in Conversation Agent catalog covers Codex, Claude Code, Qwen Code, Kimi Code, Trae, and Antigravity. The Agent Registry reuses each Provider's command aliases to scan the daemon `PATH`; the same detected executable drives UI availability, preflight validation, and process launch.
+The built-in Conversation Agent catalog covers Codex, Claude Code, Deep Code, Qwen Code, Kimi Code, Trae, and Antigravity. The Agent Registry scans the daemon `PATH`; the same detected executable drives UI availability, preflight validation, and process launch. Deep Code runs through a real PTY/ConPTY, supports native `--resume <session-id>`, and recognizes `.deepcode/skills` plus `.agents/skills`.
 
 ## Execution modes
 

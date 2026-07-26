@@ -41,7 +41,12 @@ export function NewConversationDialog({
   const dialogRef = useRef<HTMLElement>(null);
   const closeRef = useRef(onClose);
   const primaryAgents = useMemo(
-    () => agents.filter((item) => item.capability_tags?.includes("code") ?? true),
+    () =>
+      agents.filter(
+        (item) =>
+          item.selectable !== false &&
+          (item.capability_tags?.includes("code") ?? true),
+      ),
     [agents],
   );
   const availableAgents = useMemo(
@@ -285,6 +290,7 @@ export function NewConversationDialog({
             <div className="choice-grid">
               {agents
                 .filter((item) => item.available && item.agent_id !== agent)
+                .filter((item) => item.selectable !== false)
                 .map((item) => (
                   <label key={item.agent_id}>
                     <input
@@ -301,7 +307,12 @@ export function NewConversationDialog({
                     <span>{item.display_name || item.agent_id}</span>
                   </label>
                 ))}
-              {!agents.some((item) => item.available && item.agent_id !== agent) ? (
+              {!agents.some(
+                (item) =>
+                  item.selectable !== false &&
+                  item.available &&
+                  item.agent_id !== agent,
+              ) ? (
                 <p>暂无其他可用 Agent；任务会由主 Agent 串行执行。</p>
               ) : null}
             </div>

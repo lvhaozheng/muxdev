@@ -73,15 +73,29 @@ class CliAdapterDefinition(BaseModel):
     supports_resume: bool = False
     native_session_id_pattern: str | None = None
     prefer_tmux: bool = False
+    startup_ready_pattern: str | None = None
+    startup_blocking_pattern: str | None = None
+    runtime_waiting_pattern: str | None = None
+    runtime_approval_pattern: str | None = None
+    turn_completed_pattern: str | None = None
+    startup_timeout_seconds: float = Field(default=15.0, ge=0.1, le=120.0)
+    prompt_transport: Literal["line", "bracketed_paste"] = "line"
+    bootstrap_transport: Literal["terminal", "argv"] = "terminal"
 
     @model_validator(mode="after")
     def validate_argv_and_environment(self) -> "CliAdapterDefinition":
         values = self.command + self.resume_command
         if any(not isinstance(item, str) or not item for item in values):
             raise ValueError("CLI commands must be non-empty argv arrays")
-        allowed_placeholders = {"{worktree}", "{model}", "{native_session_id}"}
+        allowed_placeholders = {
+            "{worktree}",
+            "{worktree_toml}",
+            "{control_dir}",
+            "{model}",
+            "{native_session_id}",
+        }
         for item in values:
-            for token in re.findall(r"\{[^{}]+\}", item):
+            for token in re.findall(r"\{[A-Za-z_][A-Za-z0-9_]*\}", item):
                 if token not in allowed_placeholders:
                     raise ValueError(f"unsupported CLI argv placeholder: {token}")
         if self.supports_resume and not self.resume_command:
@@ -94,6 +108,16 @@ class CliAdapterDefinition(BaseModel):
             raise ValueError("CLI environment allowlist contains an invalid name")
         if self.native_session_id_pattern:
             re.compile(self.native_session_id_pattern)
+        if self.startup_ready_pattern:
+            re.compile(self.startup_ready_pattern)
+        if self.startup_blocking_pattern:
+            re.compile(self.startup_blocking_pattern)
+        if self.runtime_waiting_pattern:
+            re.compile(self.runtime_waiting_pattern)
+        if self.runtime_approval_pattern:
+            re.compile(self.runtime_approval_pattern)
+        if self.turn_completed_pattern:
+            re.compile(self.turn_completed_pattern)
         return self
 
 
@@ -110,6 +134,7 @@ class AgentDefinition(BaseModel):
     max_concurrency: int = Field(default=1, ge=1, le=4)
     default_permissions: Literal["read", "workspace-write"] = "workspace-write"
     enabled: bool = True
+    selectable: bool = True
 
     @model_validator(mode="after")
     def validate_capabilities(self) -> "AgentDefinition":

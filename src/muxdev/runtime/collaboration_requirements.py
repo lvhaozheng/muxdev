@@ -11,7 +11,7 @@ from ..models import AssignmentStatus, ConversationMode
 from ..services.agents import AgentUnavailableError
 from .agent_sessions import SessionLifecycleError
 from .change_tracking import change_monitors
-from .delivery_standards import compile_deliverables
+from .delivery_standards import build_delivery_standard, compile_deliverables
 
 
 _MENTION = re.compile(r"(?:^|\s)@([A-Za-z0-9][A-Za-z0-9_-]{0,79})")
@@ -70,7 +70,9 @@ class CollaborationRequirementsMixin:
             status="needs_user",
             metadata={"startup_error": error_detail},
         )
-        session = self.store.find_agent_session(conversation_id, agent_id, lane_key)
+        session = self.store.find_conversation_agent_session(
+            conversation_id, agent_id
+        )
         session_id = str((session or {}).get("session_id") or "") or None
         self.store.append_conversation_event(
             conversation_id,
@@ -127,6 +129,30 @@ class CollaborationRequirementsMixin:
             )
             if not orchestrator.can_orchestrate:
                 raise ValueError(f"agent cannot orchestrate: {orchestrator.agent_id}")
+        compiled_standard = (
+            compile_deliverables("change", profile, list(deliverables or []))
+            if deliverables
+            else None
+        )
+        if delivery_standard is not None and set(delivery_standard) - {"custom_items"}:
+            raise ValueError("built-in delivery standard fields cannot be edited")
+        if delivery_standard is not None or compiled_standard is not None:
+            standard_input = {
+                "custom_items": [
+                    *list((compiled_standard or {}).get("custom_items") or []),
+                    *list((delivery_standard or {}).get("custom_items") or []),
+                ]
+            }
+            # Validate every user- and Rule-derived delivery item before
+            # creating a Conversation.  A rejected create must not leave an
+            # orphaned contract or worktree behind.
+            build_delivery_standard(
+                "change",
+                profile,
+                standard_input["custom_items"],
+            )
+        else:
+            standard_input = None
         detail = self.conversations.create(
             goal,
             title=title,
@@ -137,19 +163,7 @@ class CollaborationRequirementsMixin:
             max_cost_usd=max_cost_usd,
         )
         conversation_id = str(detail["conversation"]["conversation_id"])
-        compiled_standard = (
-            compile_deliverables("change", profile, list(deliverables or []))
-            if deliverables
-            else None
-        )
-        if delivery_standard is not None and compiled_standard is not None:
-            raise ValueError("use deliverables or delivery_standard, not both")
-        if delivery_standard is not None or compiled_standard is not None:
-            standard_input = (
-                dict(delivery_standard)
-                if delivery_standard is not None
-                else {"custom_items": list((compiled_standard or {}).get("custom_items") or [])}
-            )
+        if standard_input is not None:
             detail = self.conversations.revise_contract(
                 conversation_id,
                 {"delivery_standard": standard_input},
@@ -290,26 +304,40 @@ class CollaborationRequirementsMixin:
             for recipient in requested:
                 self.registry.require_available(recipient)
 
-        event_id = self.store.append_conversation_event(
-            conversation_id,
-            "user.message",
-            {
-                "content": content,
-                "recipients": requested,
-                "dispatch_kind": kind,
-            },
-            actor="developer",
-        )
         if kind == "message":
-            routed = self._send_prepared_message(prepared_routes, content)
+            event_id, deliveries = self.store.create_user_message_with_deliveries(
+                conversation_id,
+                content=content,
+                recipients=requested,
+                dispatch_kind=kind,
+                routes=prepared_routes,
+            )
+            routed = self._dispatch_message_deliveries(deliveries)
+            delivery_status = self._aggregate_delivery_status(routed)
         else:
+            event_id = self.store.append_conversation_event(
+                conversation_id,
+                "user.message",
+                {
+                    "content": content,
+                    "recipients": requested,
+                    "dispatch_kind": kind,
+                },
+                actor="developer",
+            )
             routed = self._dispatch_explicit_routes(
                 conversation_id,
                 content,
                 requested,
                 kind,
             )
-        return {"event_id": event_id, "recipients": routed, "interaction_id": interaction_id}
+            delivery_status = self._aggregate_delivery_status(routed)
+        return {
+            "event_id": event_id,
+            "recipients": routed,
+            "interaction_id": interaction_id,
+            "delivery_status": delivery_status,
+        }
 
     def _start_next_turn(
         self,
@@ -342,23 +370,34 @@ class CollaborationRequirementsMixin:
                 "proof": ["内容寻址 ChangeSet 与 Runtime 验证"],
             },
         )
+        session = self._session_for_assignment(str(assignment["assignment_id"]))
+        route_status = (
+            "failed"
+            if str(assignment.get("status") or "") == AssignmentStatus.FAILED.value
+            else "dispatched"
+        )
         return {
             "event_id": event_id,
             "recipients": [{
                 "agent_id": agent_id,
+                "status": route_status,
                 "assignment_id": str(assignment["assignment_id"]),
                 "run_id": str(assignment.get("run_id") or ""),
+                "session_id": str((session or {}).get("session_id") or "") or None,
+                "generation": int((session or {}).get("generation") or 0) or None,
+                "resumed_assignment": False,
             }],
             "interaction_id": None,
             "new_turn": True,
+            "delivery_status": route_status,
         }
 
     def _prepare_message_routes(
         self,
         conversation_id: str,
         recipients: Sequence[str],
-    ) -> list[tuple[str, dict[str, Any] | None, dict[str, Any]]]:
-        routes: list[tuple[str, dict[str, Any] | None, dict[str, Any]]] = []
+    ) -> list[dict[str, Any]]:
+        routes: list[dict[str, Any]] = []
         assignments = self.store.list_assignments(conversation_id)
         for recipient in recipients:
             self.registry.require_available(recipient)
@@ -376,29 +415,44 @@ class CollaborationRequirementsMixin:
                 if active
                 else None
             )
-            if session:
-                self.sessions.ensure_live(str(session["session_id"]))
-            else:
+            if not session:
                 session = self._ensure_main_session(conversation_id, recipient)
-            routes.append((recipient, active, session))
+                if active:
+                    session = self.store.update_agent_session(
+                        str(session["session_id"]),
+                        current_assignment_id=str(active["assignment_id"]),
+                    )
+            session_status = str(session.get("status") or "")
+            if session_status == "failed":
+                raise SessionLifecycleError(
+                    "Agent Session 已失败，需要明确重新启动后才能继续。",
+                    code="session_restart_required",
+                    remediation="查看失败输出，然后点击“重新启动”。",
+                    retryable=True,
+                    session_id=str(session["session_id"]),
+                )
+            if session_status == "closed":
+                raise SessionLifecycleError(
+                    "Agent Session 已关闭，不能投递消息。",
+                    code="session_closed",
+                    remediation="重新打开 Conversation 或显式重新启动 Session。",
+                    retryable=True,
+                    session_id=str(session["session_id"]),
+                )
+            routes.append(
+                {
+                    "agent_id": recipient,
+                    "assignment_id": (
+                        str(active["assignment_id"]) if active else None
+                    ),
+                    "run_id": str((active or {}).get("run_id") or "") or None,
+                    "session_id": str(session["session_id"]),
+                    "resumed_assignment": bool(
+                        active and str(active.get("status") or "") == "waiting_user"
+                    ),
+                }
+            )
         return routes
-
-    def _send_prepared_message(
-        self,
-        routes: Sequence[tuple[str, dict[str, Any] | None, dict[str, Any]]],
-        content: str,
-    ) -> list[dict[str, str]]:
-        routed: list[dict[str, str]] = []
-        for recipient, active, session in routes:
-            self.sessions.send_runtime(str(session["session_id"]), content)
-            route = {
-                "agent_id": recipient,
-                "session_id": str(session["session_id"]),
-            }
-            if active:
-                route["assignment_id"] = str(active["assignment_id"])
-            routed.append(route)
-        return routed
 
     def _dispatch_explicit_routes(
         self,
@@ -424,6 +478,12 @@ class CollaborationRequirementsMixin:
             )
             routed.append({
                 "agent_id": recipient,
+                "status": (
+                    "failed"
+                    if str(assignment.get("status") or "")
+                    == AssignmentStatus.FAILED.value
+                    else "dispatched"
+                ),
                 "assignment_id": str(assignment["assignment_id"]),
                 "run_id": str(assignment.get("run_id") or ""),
             })
@@ -689,7 +749,9 @@ class CollaborationRequirementsMixin:
     ) -> dict[str, Any]:
         conversation = self._conversation(conversation_id)
         worktree = Path(str((conversation.get("metadata") or {}).get("worktree") or ""))
-        existing = self.store.find_agent_session(conversation_id, agent_id, "main")
+        existing = self.store.find_conversation_agent_session(
+            conversation_id, agent_id
+        )
         if existing:
             session_id = str(existing["session_id"])
             existing = self.sessions.ensure_live(session_id)

@@ -1,5 +1,5 @@
 import { ArrowsClockwise, HandPalm, Plug, Stop, TerminalWindow } from "@phosphor-icons/react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
@@ -14,7 +14,32 @@ export function TerminalPanel({
   projectId: string;
   sessions: AgentSession[];
 }) {
-  const [sessionId, setSessionId] = useState(sessions[0]?.session_id ?? "");
+  const visibleSessions = useMemo(() => {
+    const byAgent = new Map<string, AgentSession>();
+    const statusRank = (status: string) =>
+      ["starting", "ready", "busy", "waiting_input"].includes(status)
+        ? 3
+        : status === "resumable"
+          ? 2
+          : status === "failed"
+            ? 1
+            : 0;
+    for (const session of sessions) {
+      const current = byAgent.get(session.agent_id);
+      if (
+        !current ||
+        statusRank(session.status) > statusRank(current.status) ||
+        (statusRank(session.status) === statusRank(current.status) &&
+          session.generation > current.generation)
+      ) {
+        byAgent.set(session.agent_id, session);
+      }
+    }
+    return Array.from(byAgent.values());
+  }, [sessions]);
+  const [sessionId, setSessionId] = useState(
+    visibleSessions[0]?.session_id ?? "",
+  );
   const [connected, setConnected] = useState(false);
   const [lease, setLease] = useState("未连接");
   const [failure, setFailure] = useState<string>("");
@@ -25,18 +50,19 @@ export function TerminalPanel({
   const host = useRef<HTMLDivElement>(null);
   const socket = useRef<WebSocket | null>(null);
   const terminal = useRef<Terminal | null>(null);
+  const outputCursor = useRef(0);
   const heartbeat = useRef<number | null>(null);
   const resizeObserver = useRef<ResizeObserver | null>(null);
-  const selected = sessions.find((item) => item.session_id === sessionId);
+  const selected = visibleSessions.find((item) => item.session_id === sessionId);
   const currentSession = sessionState?.session_id === sessionId
     ? sessionState
     : selected;
 
   useEffect(() => {
-    if (!sessions.some((item) => item.session_id === sessionId)) {
-      setSessionId(sessions[0]?.session_id ?? "");
+    if (!visibleSessions.some((item) => item.session_id === sessionId)) {
+      setSessionId(visibleSessions[0]?.session_id ?? "");
     }
-  }, [sessionId, sessions]);
+  }, [sessionId, visibleSessions]);
 
   useEffect(() => {
     setSessionState(selected ?? null);
@@ -62,6 +88,7 @@ export function TerminalPanel({
     socket.current = null;
     terminal.current?.dispose();
     terminal.current = null;
+    outputCursor.current = 0;
     if (host.current) host.current.replaceChildren();
     setConnected(false);
     setWritable(false);
@@ -72,6 +99,9 @@ export function TerminalPanel({
   function connect(requestWrite = false) {
     if (!sessionId || !host.current) return;
     disconnect();
+    const terminalCapabilities =
+      currentSession?.metadata?.terminal as Record<string, unknown> | undefined;
+    const supportsResize = Boolean(terminalCapabilities?.resize);
     const term = new Terminal({
       convertEol: true,
       cursorBlink: true,
@@ -103,6 +133,7 @@ export function TerminalPanel({
         JSON.stringify({
           type: "attach",
           after_seq: 0,
+          replay_scope: "current_generation",
           request_write: requestWrite,
           cols: term.cols,
           rows: term.rows,
@@ -111,7 +142,13 @@ export function TerminalPanel({
     };
     ws.onmessage = (event) => {
       const frame = JSON.parse(String(event.data)) as Record<string, unknown>;
-      if (frame.type === "output") term.write(String(frame.data ?? ""));
+      if (frame.type === "output") {
+        outputCursor.current = Math.max(
+          outputCursor.current,
+          Number(frame.seq ?? 0),
+        );
+        term.write(String(frame.data ?? ""));
+      }
       if (frame.type === "lease") {
         const granted = Boolean(frame.granted);
         setWritable(granted);
@@ -152,20 +189,59 @@ export function TerminalPanel({
         heartbeat.current = null;
       }
     };
+    let inputBuffer = "";
+    let inputFrame: number | null = null;
+    const flushInput = () => {
+      inputFrame = null;
+      if (ws.readyState !== WebSocket.OPEN || !writableRef.current) {
+        inputBuffer = "";
+        return;
+      }
+      const pending = inputBuffer;
+      inputBuffer = "";
+      // 16K UTF-16 code units stay below the 64 KiB UTF-8 input-frame cap.
+      for (let offset = 0; offset < pending.length; offset += 16_000) {
+        ws.send(
+          JSON.stringify({
+            type: "input",
+            data: pending.slice(offset, offset + 16_000),
+          }),
+        );
+      }
+    };
     term.onData((data) => {
       if (ws.readyState === WebSocket.OPEN && writableRef.current) {
-        ws.send(JSON.stringify({ type: "input", data }));
+        inputBuffer += data;
+        if (inputFrame === null) {
+          inputFrame = window.requestAnimationFrame(flushInput);
+        }
       }
     });
+    let resizeTimer: number | null = null;
+    let lastDimensions = "";
     const resize = new ResizeObserver(() => {
       fit.fit();
-      if (ws.readyState === WebSocket.OPEN) {
+      if (!supportsResize) return;
+      if (resizeTimer !== null) window.clearTimeout(resizeTimer);
+      resizeTimer = window.setTimeout(() => {
+        resizeTimer = null;
+        const dimensions = `${term.cols}x${term.rows}`;
+        if (ws.readyState !== WebSocket.OPEN || dimensions === lastDimensions) return;
+        lastDimensions = dimensions;
         ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
-      }
+      }, 100);
     });
     resizeObserver.current = resize;
     resize.observe(host.current);
-    ws.addEventListener("close", () => resize.disconnect(), { once: true });
+    ws.addEventListener(
+      "close",
+      () => {
+        resize.disconnect();
+        if (inputFrame !== null) window.cancelAnimationFrame(inputFrame);
+        if (resizeTimer !== null) window.clearTimeout(resizeTimer);
+      },
+      { once: true },
+    );
   }
 
   async function restart() {
@@ -184,7 +260,7 @@ export function TerminalPanel({
     }
   }
 
-  if (!sessions.length) {
+  if (!visibleSessions.length) {
     return (
       <div className="tool-empty">
         <TerminalWindow />
@@ -198,9 +274,18 @@ export function TerminalPanel({
     <section className="terminal-panel" aria-label="多 Agent Web 终端">
       <div className="terminal-picker">
         <select value={sessionId} onChange={(event) => setSessionId(event.target.value)}>
-          {sessions.map((session) => (
+          {visibleSessions.map((session) => (
             <option key={session.session_id} value={session.session_id}>
-              {session.agent_id} · G{session.generation} · {labelStatus(session.status)}
+              {session.agent_id} · G
+              {session.session_id === sessionId && sessionState
+                ? sessionState.generation
+                : session.generation}{" "}
+              ·{" "}
+              {labelStatus(
+                session.session_id === sessionId && sessionState
+                  ? sessionState.status
+                  : session.status,
+              )}
             </option>
           ))}
         </select>
@@ -229,7 +314,8 @@ export function TerminalPanel({
               ws.send(
                 JSON.stringify({
                   type: writable ? "release_write" : "attach",
-                  after_seq: 0,
+                  after_seq: outputCursor.current,
+                  replay_scope: "current_generation",
                   request_write: !writable,
                   cols: term.cols,
                   rows: term.rows,

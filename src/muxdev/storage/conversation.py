@@ -141,6 +141,90 @@ def _v2_fact(
     }
 
 
+def _insert_v2_event(
+    conn: Any,
+    *,
+    conversation_id: str,
+    event_type: str,
+    payload: Mapping[str, object],
+    actor: str,
+    run_id: str | None = None,
+    run_event_id: str | None = None,
+    event_id: str | None = None,
+    assignment_id: str | None = None,
+    session_id: str | None = None,
+    generation: int | None = None,
+    correlation_id: str | None = None,
+    capture_grade: str = "recorded",
+    actor_kind: str | None = None,
+) -> tuple[str, int]:
+    if capture_grade not in {"recorded", "observed", "verified"}:
+        raise ValueError(f"unsupported capture grade: {capture_grade}")
+    resolved_actor_kind = actor_kind or _actor_kind(actor)
+    resolved_event_id = event_id or f"cevt_{uuid4().hex}"
+    previous = conn.execute(
+        """SELECT event_hash FROM conversation_events
+           WHERE conversation_id = ? ORDER BY sequence DESC LIMIT 1""",
+        (conversation_id,),
+    ).fetchone()
+    previous_hash = str(previous[0]) if previous else "sha256:" + "0" * 64
+    sequence = int(
+        conn.execute(
+            """SELECT COALESCE(MAX(sequence), 0) + 1
+               FROM conversation_events WHERE conversation_id = ?""",
+            (conversation_id,),
+        ).fetchone()[0]
+    )
+    created_at = _now()
+    fact = _v2_fact(
+        event_id=resolved_event_id,
+        conversation_id=conversation_id,
+        sequence=sequence,
+        event_type=event_type,
+        actor_kind=resolved_actor_kind,
+        actor_id=actor,
+        run_id=run_id,
+        assignment_id=assignment_id,
+        session_id=session_id,
+        generation=generation,
+        occurred_at=created_at,
+        capture_grade=capture_grade,
+        correlation_id=correlation_id,
+        payload=payload,
+        previous_hash=previous_hash,
+    )
+    event_hash = "sha256:" + hashlib.sha256(_json(fact).encode()).hexdigest()
+    conn.execute(
+        """INSERT INTO conversation_events(
+          event_id, conversation_id, run_id, run_event_id, actor,
+          actor_kind, actor_id, assignment_id, session_id, generation,
+          schema_version, type, sequence, created_at, capture_grade,
+          correlation_id, payload, previous_hash, event_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            resolved_event_id,
+            conversation_id,
+            run_id,
+            run_event_id,
+            actor,
+            resolved_actor_kind,
+            actor,
+            assignment_id,
+            session_id,
+            generation,
+            event_type,
+            sequence,
+            created_at,
+            capture_grade,
+            correlation_id,
+            _json(payload),
+            previous_hash,
+            event_hash,
+        ),
+    )
+    return resolved_event_id, sequence
+
+
 def _activity_view(row: Mapping[str, Any]) -> dict[str, Any]:
     payload = dict(row.get("payload") or {})
     if int(row.get("schema_version") or 1) == 1:
@@ -285,73 +369,107 @@ class ConversationStoreMixin:
     ) -> str:
         if schema_version != 2:
             raise ValueError("new Conversation events must use schema_version 2")
-        if capture_grade not in {"recorded", "observed", "verified"}:
-            raise ValueError(f"unsupported capture grade: {capture_grade}")
-        actor_kind = actor_kind or _actor_kind(actor)
-        event_id = event_id or f"cevt_{uuid4().hex}"
         with self.transaction() as conn:
-            previous = conn.execute(
-                """SELECT event_hash FROM conversation_events
-                   WHERE conversation_id = ? ORDER BY sequence DESC LIMIT 1""",
-                (conversation_id,),
-            ).fetchone()
-            previous_hash = str(previous[0]) if previous else "sha256:" + "0" * 64
-            sequence = int(conn.execute(
-                """SELECT COALESCE(MAX(sequence), 0) + 1
-                   FROM conversation_events WHERE conversation_id = ?""",
-                (conversation_id,),
-            ).fetchone()[0])
-            created_at = _now()
-            fact = _v2_fact(
-                event_id=event_id,
+            event_id, sequence = _insert_v2_event(
+                conn,
                 conversation_id=conversation_id,
-                sequence=sequence,
                 event_type=event_type,
-                actor_kind=actor_kind,
-                actor_id=actor,
+                payload=payload,
+                actor=actor,
                 run_id=run_id,
+                run_event_id=run_event_id,
+                event_id=event_id,
                 assignment_id=assignment_id,
                 session_id=session_id,
                 generation=generation,
-                occurred_at=created_at,
-                capture_grade=capture_grade,
                 correlation_id=correlation_id,
-                payload=payload,
-                previous_hash=previous_hash,
-            )
-            event_hash = "sha256:" + hashlib.sha256(_json(fact).encode()).hexdigest()
-            conn.execute(
-                """INSERT INTO conversation_events(
-                  event_id, conversation_id, run_id, run_event_id, actor,
-                  actor_kind, actor_id, assignment_id, session_id, generation,
-                  schema_version, type, sequence, created_at, capture_grade,
-                  correlation_id, payload, previous_hash, event_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    event_id,
-                    conversation_id,
-                    run_id,
-                    run_event_id,
-                    actor,
-                    actor_kind,
-                    actor,
-                    assignment_id,
-                    session_id,
-                    generation,
-                    event_type,
-                    sequence,
-                    created_at,
-                    capture_grade,
-                    correlation_id,
-                    _json(payload),
-                    previous_hash,
-                    event_hash,
-                ),
+                capture_grade=capture_grade,
+                actor_kind=actor_kind,
             )
         from .activity_feed import activity_feed
 
         activity_feed.publish(self.workspace, conversation_id, sequence)
         return event_id
+
+    def create_user_message_with_deliveries(
+        self,
+        conversation_id: str,
+        *,
+        content: str,
+        recipients: list[str],
+        dispatch_kind: str,
+        routes: list[Mapping[str, object]],
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Atomically record one user message and its durable delivery outbox."""
+        event_payload = {
+            "content": content,
+            "recipients": recipients,
+            "dispatch_kind": dispatch_kind,
+        }
+        deliveries: list[dict[str, Any]] = []
+        now = _now()
+        with self.transaction() as conn:
+            event_id, sequence = _insert_v2_event(
+                conn,
+                conversation_id=conversation_id,
+                event_type="user.message",
+                payload=event_payload,
+                actor="developer",
+            )
+            for route in routes:
+                delivery_id = f"mdel_{uuid4().hex}"
+                recipient = str(route["agent_id"])
+                assignment_id = str(route.get("assignment_id") or "") or None
+                run_id = str(route.get("run_id") or "") or None
+                session_id = str(route.get("session_id") or "") or None
+                metadata = {
+                    "resumed_assignment": bool(route.get("resumed_assignment")),
+                }
+                conn.execute(
+                    """INSERT INTO message_deliveries(
+                      delivery_id, conversation_id, message_event_id,
+                      recipient_agent_id, assignment_id, run_id, session_id,
+                      target_generation, status, attempts, last_error,
+                      created_at, updated_at, dispatched_at, metadata
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'pending', 0, NULL,
+                      ?, ?, NULL, ?)""",
+                    (
+                        delivery_id,
+                        conversation_id,
+                        event_id,
+                        recipient,
+                        assignment_id,
+                        run_id,
+                        session_id,
+                        now,
+                        now,
+                        _json(metadata),
+                    ),
+                )
+                deliveries.append(
+                    {
+                        "delivery_id": delivery_id,
+                        "conversation_id": conversation_id,
+                        "message_event_id": event_id,
+                        "recipient_agent_id": recipient,
+                        "assignment_id": assignment_id,
+                        "run_id": run_id,
+                        "session_id": session_id,
+                        "target_generation": None,
+                        "status": "pending",
+                        "attempts": 0,
+                        "last_error": None,
+                        "created_at": now,
+                        "updated_at": now,
+                        "dispatched_at": None,
+                        "metadata": metadata,
+                        "message_payload": event_payload,
+                    }
+                )
+        from .activity_feed import activity_feed
+
+        activity_feed.publish(self.workspace, conversation_id, sequence)
+        return event_id, deliveries
 
     def claim_conversation_action(
         self,

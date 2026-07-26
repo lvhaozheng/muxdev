@@ -34,6 +34,7 @@ from ..services.skills import (
     verify_skill_lock,
     write_skill_lock,
 )
+from ..services.skills.product import load_product_skill
 from ..storage import (
     SCHEMA_VERSION,
     ControlStore,
@@ -554,6 +555,30 @@ def skill_list(workspace: Workspace = Path.cwd()) -> None:
 @skill_app.command("show")
 def skill_get(name: str, workspace: Workspace = Path.cwd()) -> None:
     _print(skill_show(workspace, name))
+
+
+@skill_app.command("load")
+def skill_load(
+    name: str,
+    file: Annotated[str, typer.Option("--file")] = "SKILL.md",
+    workspace: Workspace = Path.cwd(),
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    resolved = Path(os.environ.get("MUXDEV_WORKSPACE") or workspace).resolve()
+    try:
+        result = load_product_skill(
+            resolved,
+            name,
+            control_token=os.environ.get("MUXDEV_CONTROL_TOKEN", ""),
+            relative_file=file,
+            activation="auto",
+        )
+    except (FileNotFoundError, PermissionError, RuntimeError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if as_json:
+        _print(result, as_json=True)
+    else:
+        typer.echo(str(result["content"]), nl=False)
 
 
 @skill_app.command("verify")

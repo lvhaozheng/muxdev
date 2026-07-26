@@ -10,28 +10,44 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   acceptDelivery,
+  activateConversationSkill,
   ApiError,
+  archiveRule,
+  bindProjectSkill,
+  createSkillSource,
   createConversation,
   createRule,
   discardDelivery,
+  disconnectSkillSource,
   getChanges,
   getFile,
   getReview,
   getConversationSnapshot,
   getProjectRules,
+  getProjectSkills,
+  importRemoteSkillSource,
   listAgents,
   listConversations,
   listProjects,
+  importRuleSource,
   registerProject,
+  restoreRule,
+  rescanSkillSource,
   reviseConversationRules,
   requestChanges,
   sendMessage,
+  searchRemoteSkills,
+  updateSkillSource,
+  uploadRuleSource,
 } from "./api";
 import { NewConversationDialog } from "./components/NewConversationDialog";
 import { ConversationRail } from "./components/ConversationRail";
 import { ConversationTimeline } from "./components/ConversationTimeline";
 import { ProjectRail } from "./components/ProjectRail";
-import { ToolCanvas } from "./components/ToolCanvas";
+import {
+  ToolCanvas,
+  type ToolCanvasTab,
+} from "./components/ToolCanvas";
 import { useActivityStream } from "./hooks/useActivityStream";
 import { labelStatus } from "./labels";
 
@@ -57,6 +73,10 @@ export default function App() {
   const [fileRequest, setFileRequest] = useState<{
     path: string;
     view: "baseline" | "current" | "diff";
+  } | null>(null);
+  const [toolRequest, setToolRequest] = useState<{
+    tab: ToolCanvasTab;
+    requestId: number;
   } | null>(null);
 
   const projects = useQuery({
@@ -94,6 +114,11 @@ export default function App() {
   const rules = useQuery({
     queryKey: ["projects", projectId, "rules"],
     queryFn: () => getProjectRules(projectId!),
+    enabled: Boolean(projectId),
+  });
+  const skills = useQuery({
+    queryKey: ["projects", projectId, "skills"],
+    queryFn: () => getProjectSkills(projectId!),
     enabled: Boolean(projectId),
   });
 
@@ -193,8 +218,37 @@ export default function App() {
         recipients,
         dispatchKind,
       ),
-    onSuccess: async (_result, variables) => {
-      setToast(variables.interactionId ? "回答已提交" : "消息已发送");
+    onSuccess: async (result, variables) => {
+      if (variables.interactionId) {
+        setToast("回答已提交，Agent 已恢复执行");
+      } else if (result.delivery_status === "queued") {
+        setToast("消息已排队；处理 Terminal 阻塞后将自动执行");
+      } else if (result.delivery_status === "failed") {
+        const failed = result.recipients.find(
+          (item) => item.status === "failed" || item.status === "uncertain",
+        );
+        setToast(
+          failed?.status === "uncertain"
+            ? "消息投递状态不确定，请查看 Terminal 后重试"
+            : `消息未执行：${failed?.error?.message || "Agent Session 不可用"}`,
+        );
+      } else if (result.delivery_status === "mixed") {
+        const dispatched = result.recipients.filter(
+          (item) => item.status === "dispatched",
+        ).length;
+        const queued = result.recipients.filter(
+          (item) => item.status === "queued",
+        ).length;
+        setToast(`消息已处理：${dispatched} 个已执行，${queued} 个排队中`);
+      } else {
+        const route = result.recipients[0];
+        const generation = route?.generation ? `（G${route.generation}）` : "";
+        setToast(
+          route?.resumed_assignment
+            ? `已交给 ${route.agent_id}${generation}，任务已恢复`
+            : `已交给 ${route?.agent_id || "Agent"}${generation}，正在执行`,
+        );
+      }
       await refresh();
     },
     onError: (error) => setToast(`发送失败：${formatError(error)}`),
@@ -315,7 +369,8 @@ export default function App() {
               <span
                 className={`conversation-status ${conversationSnapshot.attention}`}
               >
-                {labelStatus(conversationSnapshot.conversation.status)}
+                {conversationSnapshot.attention_detail?.label ||
+                  labelStatus(conversationSnapshot.conversation.status)}
               </span>
             </div>
             <div className="header-actions">
@@ -328,6 +383,34 @@ export default function App() {
             <ConversationTimeline
               snapshot={conversationSnapshot}
               sending={send.isPending}
+              skills={skills.data}
+              onActivateSkill={async (qualifiedName) => {
+                await activateConversationSkill(
+                  projectId!,
+                  conversationSnapshot.conversation.conversation_id,
+                  qualifiedName,
+                );
+                setToast(`Skill 已加载：${qualifiedName}`);
+                await Promise.all([
+                  queryClient.invalidateQueries({
+                    queryKey: ["projects", projectId, "skills"],
+                  }),
+                  queryClient.invalidateQueries({
+                    queryKey: [
+                      "projects",
+                      projectId,
+                      "conversation",
+                      conversationSnapshot.conversation.conversation_id,
+                    ],
+                  }),
+                ]);
+              }}
+              onOpenTool={(tab) =>
+                setToolRequest((current) => ({
+                  tab,
+                  requestId: (current?.requestId ?? 0) + 1,
+                }))
+              }
               onSend={async (content, interactionId, recipients, dispatchKind) => {
                 await send.mutateAsync({
                   content,
@@ -343,6 +426,7 @@ export default function App() {
               changes={changes.data}
               review={review.data}
               rules={rules.data}
+              skills={skills.data}
               busy={action.isPending || revise.isPending || reviseRules.isPending}
               fileContent={file.data}
               onLoadFile={(path, view) => setFileRequest({ path, view })}
@@ -357,6 +441,68 @@ export default function App() {
               onCreateRule={(rule) =>
                 addRule.mutateAsync(rule).then(() => undefined)
               }
+              onUploadRuleSource={uploadRuleSource}
+              onImportRuleSource={importRuleSource}
+              onArchiveRule={async (ruleId) => {
+                const rule = await archiveRule(ruleId);
+                setToast(`Rule 已归档：${rule.title}`);
+                await queryClient.invalidateQueries({
+                  queryKey: ["projects", projectId, "rules"],
+                });
+              }}
+              onRestoreRule={async (ruleId) => {
+                const rule = await restoreRule(ruleId);
+                setToast(`Rule 已恢复：${rule.title}`);
+                await queryClient.invalidateQueries({
+                  queryKey: ["projects", projectId, "rules"],
+                });
+              }}
+              onBindSkill={async (qualifiedName, enabled, required) => {
+                await bindProjectSkill(projectId!, qualifiedName, { enabled, required });
+                setToast(`${enabled ? "已启用" : "已停用"} Skill：${qualifiedName}`);
+                await queryClient.invalidateQueries({
+                  queryKey: ["projects", projectId, "skills"],
+                });
+              }}
+              onCreateSkillSource={async (path, mode) => {
+                const source = await createSkillSource({ path, mode });
+                setToast(`Skill 来源已连接：${source.display_name}`);
+                await queryClient.invalidateQueries({
+                  queryKey: ["projects", projectId, "skills"],
+                });
+              }}
+              onUpdateSkillSource={async (sourceId, update) => {
+                await updateSkillSource(sourceId, update);
+                await queryClient.invalidateQueries({
+                  queryKey: ["projects", projectId, "skills"],
+                });
+              }}
+              onRescanSkillSource={async (sourceId) => {
+                await rescanSkillSource(sourceId);
+                setToast("Skill 来源已重新扫描");
+                await queryClient.invalidateQueries({
+                  queryKey: ["projects", projectId, "skills"],
+                });
+              }}
+              onDisconnectSkillSource={async (sourceId) => {
+                await disconnectSkillSource(sourceId);
+                setToast("Skill 来源已断开；原目录和托管副本均未删除");
+                await queryClient.invalidateQueries({
+                  queryKey: ["projects", projectId, "skills"],
+                });
+              }}
+              onSearchRemoteSkills={searchRemoteSkills}
+              onImportRemoteSkill={async (url, displayName) => {
+                const source = await importRemoteSkillSource({
+                  url,
+                  display_name: displayName,
+                });
+                setToast(`Skill 已下载，等待审核：${source.display_name}`);
+                await queryClient.invalidateQueries({
+                  queryKey: ["projects", projectId, "skills"],
+                });
+              }}
+              requestedTab={toolRequest}
             />
           </div>
         </section>
